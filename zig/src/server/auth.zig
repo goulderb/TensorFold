@@ -300,6 +300,7 @@ test "auth cleanup after invalid initialization" {
 }
 
 test "auth cleanup on every initialization allocation failure" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -363,6 +364,7 @@ fn meta(fd: ?posix.fd_t, path: ?[*:0]const u8) ?Meta {
 }
 
 test "the key file: refused while others can read it, read at 0600, reread after an edit" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -391,6 +393,7 @@ test "the key file: refused while others can read it, read at 0600, reread after
 }
 
 test "a request's key label outlives a reload of the key file" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var arena: std.heap.ArenaAllocator = .init(gpa);

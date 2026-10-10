@@ -132,6 +132,7 @@ const Capture = struct {
 const Reply = struct { status: u16, body: []u8 };
 
 fn exchange(srv: *server.Server, path: []const u8, body: []const u8) !Reply {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var pair: [2]std.c.fd_t = undefined;
     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
     defer _ = std.c.close(pair[0]);

@@ -470,6 +470,7 @@ const Watch = struct {
 };
 
 test "a stream compacts before it opens" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
     var eng: Eng = .{ .window = 2000 };
     var text: Text = .{};
     defer freePrompts(&eng);
@@ -481,7 +482,7 @@ test "a stream compacts before it opens" {
     const big = try pads(a, "STREAM-", 1200);
     const body = try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"stream\":true,\"max_tokens\":32,\"messages\":[{{\"role\":\"user\",\"content\":\"{s}\"}},{{\"role\":\"user\",\"content\":\"TAIL\"}}]}}", .{big});
     const raw = (try json.parse(a, body)).ok;
-    var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
+    var conn: Conn = .{ .fd = @import("platform").sock.none, .peer = "", .buf = &.{}, .gpa = a };
     var watch: Watch = .{ .eng = &eng };
     openai.run(srv, a, watch.out(), .{ .conn = &conn }, true, raw);
     try std.testing.expect(watch.opened);
