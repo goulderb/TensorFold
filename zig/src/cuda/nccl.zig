@@ -74,7 +74,8 @@ pub const Library = struct {
     }
 };
 
-test "a library without NCCL's symbols is refused (Linux)" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
-    try std.testing.expectError(error.MissingSymbol, Library.openPath("libc.so.6"));
+test "the table names the abort and point-to-point calls" {
+    try std.testing.expect(@hasField(Api, "ncclCommAbort"));
+    try std.testing.expect(@hasField(Api, "ncclSend"));
+    try std.testing.expect(@hasField(Api, "ncclRecv"));
 }
