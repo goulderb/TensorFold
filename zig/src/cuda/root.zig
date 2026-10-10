@@ -45,6 +45,7 @@ pub const modelopt = @import("modelopt.zig");
 test {
     _ = @import("memory.zig");
     _ = @import("nccl.zig");
+    _ = @import("graph.zig");
     _ = @import("grouped.zig");
     _ = @import("qlinear.zig");
     _ = @import("norms.zig");
