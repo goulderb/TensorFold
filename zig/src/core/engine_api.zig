@@ -21,6 +21,9 @@ pub const Stop = struct {
     check: *const fn (ctx: *anyopaque, emitted: []const u32) bool,
 };
 
+/// The tokenizer a call gate asks (the lanes' gate type; one definition).
+pub const CallLex = lanes.call_gate.Lex;
+
 /// tool_choice "required" or a named function: outside a think block the answer opens a call to an offered tool.
 pub const CallGate = struct {
     /// The token that opens a call, the template text before the name, and the mark that ends the name.
@@ -31,6 +34,7 @@ pub const CallGate = struct {
     names: []const []const u8 = &.{},
     think_open: ?u32 = null,
     think_end: ?u32 = null,
+    lex: CallLex,
 };
 
 /// response_format and the guided_* fields: every token keeps the reply inside this grammar.

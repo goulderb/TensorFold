@@ -36,7 +36,9 @@ pub fn opened(e: *Engine, s: *Stream) !void {
     const position: u64 = s.prompt_len;
     const drawn = try e.drawFirst(s, position);
     var feed: Feed = .{ .handle = drawn };
-    if (try e.forcedNext(s)) |t| feed = .{ .value = t };
+    const forced = try e.forcedNext(s);
+    if (forced) |t| feed = .{ .value = t };
+    if (s.gate != null and forced == null) feed = .{ .value = try s.correctCall(e.gpa, e.arena.allocator(), try e.readFeed(feed)) };
     var asked: ?u32 = null;
     if (e.cfg.family_mtp and s.drafts) {
         // the head reads the prompt's last row and the first token, and drafts the one after it
@@ -48,7 +50,7 @@ pub fn opened(e: *Engine, s: *Stream) !void {
         if (e.backend.vtable.tree) |tree| if (try tree(e.backend.ptr, s, e.gpa)) |held| {
             s.next = held; // a tree head's first drafts as host tokens, as every later round's
         };
-    } else if (e.cfg.pipelined and s.logprobs == null and s.grammar == null) {
+    } else if (e.cfg.pipelined and s.logprobs == null and s.grammar == null and s.gate == null) {
         try e.queueNext(s, feed);
     }
     const value = try e.readFeed(feed);
