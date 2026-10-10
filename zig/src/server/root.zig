@@ -50,6 +50,7 @@ test {
     _ = @import("stream_dsml_test.zig");
     _ = @import("logprobs_test.zig");
     _ = @import("late_system_test.zig");
+    _ = @import("admission_test.zig");
     _ = @import("compact_test.zig");
     _ = @import("completion_prompt_test.zig");
     _ = @import("server_init_test.zig");

@@ -433,7 +433,7 @@ fn openGlm(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]co
         return null;
     }
     const learn: ?glm.Learn = if (o.learn) |root| .{ .root = root, .cap = gibBytes(o.learn_gib), .floor = gibBytes(o.learn_min_free_gib), .daily = gibBytes(o.learn_daily_gib), .conversations = o.learn_conversations } else null;
-    const h = glm.open(gpa, io, o.dir, @intCast(window), o.speed_up, o.lanes, o.lanes_fixed, o.prompt_cache_gib, learn, o.vision) catch |e| {
+    const h = glm.open(gpa, io, o.dir, @intCast(window), o.speed_up, o.lanes, o.lanes_fixed, o.prompt_cache_gib, learn, o.vision, o.max_queued) catch |e| {
         if (e == error.LearnConversationsOnPair) problem.* = "--learn-conversations keeps states on one Mac only: serve GLM-5.3-Flash without --speed-up, or without the flag" else if (e == error.BadLoadLimit) problem.* = "GLM_LOAD_LIMIT_GB is not a load limit: give a number of GB above 0, or unset it for 70% of RAM" else problem.* = if (linkProblem(e)) |link| try std.fmt.allocPrint(a, "the native GLM-5.3-Flash engine cannot load {s}: {s}", .{ o.dir, link }) else try std.fmt.allocPrint(a, "the native GLM-5.3-Flash engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
         return null;
     };
