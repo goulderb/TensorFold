@@ -1,5 +1,6 @@
 //! A model's shape from its config.json (text_config when nested): what the planner and the memory budgets need.
 const std = @import("std");
+const env = @import("env");
 
 pub const Attention = enum(u8) { gqa, mla, linear };
 
@@ -257,7 +258,8 @@ test "GLM-5.3: every layer MLA with a 2,048-token indexer, 75 MoE layers, one MT
 }
 
 test "the real K3 config (TF_K3_DIR) parses to the literal" {
-    const dir = std.testing.environ.getPosix("TF_K3_DIR") orelse return error.SkipZigTest;
+    var env_buf: [4096]u8 = undefined;
+    const dir = (try env.getInto(&env_buf, "TF_K3_DIR")) orelse return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

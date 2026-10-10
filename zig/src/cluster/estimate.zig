@@ -1,5 +1,6 @@
 //! A checkpoint's tensor table from its config and the Hub's file list, so a cluster can be planned before the weights land.
 const std = @import("std");
+const env = @import("env");
 const checkpoint = @import("checkpoint.zig");
 const model = @import("model.zig");
 const roles = @import("roles.zig");
@@ -282,7 +283,8 @@ test "the K3 table matches every shard size to within its header" {
 }
 
 test "the real K3 file list (TF_K3_DIR): 96 files, 1.561 TB, every header under 0.01% of its file" {
-    const dir = std.testing.environ.getPosix("TF_K3_DIR") orelse return error.SkipZigTest;
+    var env_buf: [4096]u8 = undefined;
+    const dir = (try env.getInto(&env_buf, "TF_K3_DIR")) orelse return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();

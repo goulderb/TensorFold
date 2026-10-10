@@ -1,5 +1,6 @@
 //! 32 to 128 streams: what fits at 8k and 32k context, prompt rows a round, and 32 toy streams joining while others decode.
 const std = @import("std");
+const env = @import("env");
 const node = @import("node.zig");
 const plan = @import("plan.zig");
 const budget = @import("budget.zig");
@@ -115,7 +116,8 @@ test "32 toy streams join while others decode, prompt chunks in the same rounds:
 }
 
 test "the admission tables for CLUSTER.md (TF_CLUSTER_REPORT=1)" {
-    if (std.testing.environ.getPosix("TF_CLUSTER_REPORT") == null) return error.SkipZigTest;
+    var env_buf: [64]u8 = undefined;
+    if ((try env.getInto(&env_buf, "TF_CLUSTER_REPORT")) == null) return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
