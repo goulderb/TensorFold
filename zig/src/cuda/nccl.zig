@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const abi = @import("abi.zig");
+const dynlib = @import("dynlib.zig");
 
 pub const Result = c_int;
 pub const Comm = ?*opaque {};
@@ -35,24 +36,23 @@ pub const Api = struct {
 };
 
 pub const Library = struct {
-    lib: std.DynLib,
+    lib: dynlib.Library,
     api: Api,
 
+    /// None on Windows: NCCL has no Windows build, so the hostlink backend replaces it there.
     pub fn open() Error!Library {
+        if (@import("builtin").os.tag == .windows) return error.LibraryUnavailable;
         return openPath("libnccl.so.2");
     }
 
     pub fn openPath(path: []const u8) Error!Library {
-        var lib = std.DynLib.open(path) catch return error.LibraryUnavailable;
+        var lib = try dynlib.Library.open(path);
         errdefer lib.close();
-        var api: Api = undefined;
-        const info = @typeInfo(Api).@"struct";
-        inline for (info.field_names, info.field_types) |name, T| {
-            @field(api, name) = lib.lookup(T, name) orelse {
-                std.log.err("{s} has no {s}", .{ path, name });
-                return error.MissingSymbol;
-            };
-        }
+        var missing: []const u8 = "";
+        const api = lib.resolve(Api, &missing) catch {
+            std.log.err("{s} has no {s}", .{ path, missing });
+            return error.MissingSymbol;
+        };
         return .{ .lib = lib, .api = api };
     }
 
