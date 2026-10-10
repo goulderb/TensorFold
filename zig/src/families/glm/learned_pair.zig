@@ -1,6 +1,7 @@
 //! A peer's disk reservation covers its snapshot half until rank 0 has committed or removed the shared index entry.
 const std = @import("std");
 const disk = @import("lanes").learned_disk;
+const fsys = @import("lanes").learned_fs;
 pub const State = struct {
     admission: disk.Admission = .{},
     cap: u64 = std.math.maxInt(u64),
@@ -98,12 +99,11 @@ test "each rank includes actual other-identity files in its independent cap befo
     var filename: [1400]u8 = undefined;
     const current = try std.fmt.bufPrintSentinel(&one, "{s}/0000000000000001", .{root}, 0);
     const other = try std.fmt.bufPrintSentinel(&two, "{s}/0000000000000002", .{root}, 0);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdir(current, 0o700));
-    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdir(other, 0o700));
-    const fd = std.c.open(try std.fmt.bufPrintSentinel(&filename, "{s}/state.bin", .{other}, 0), .{ .ACCMODE = .WRONLY, .CREAT = true }, @as(std.c.mode_t, 0o600));
-    if (fd < 0) return error.TestCreate;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.ftruncate(fd, 96));
-    _ = std.c.close(fd);
+    try fsys.mkdir(current);
+    try fsys.mkdir(other);
+    const fd = fsys.open(try std.fmt.bufPrintSentinel(&filename, "{s}/state.bin", .{other}, 0), .{ .access = .write, .create = true }) catch return error.TestCreate;
+    try std.testing.expect(fsys.truncate(fd, 96));
+    fsys.close(fd);
     var rank0: State = .{ .admission = .{ .floor = 0, .free = Fake.free, .clock = Fake.clock }, .cap = 200 };
     var rank1: State = .{ .admission = .{ .floor = 0, .free = Fake.free, .clock = Fake.clock }, .cap = 100 };
     try std.testing.expectEqual(@as(u64, 0), rank0.need(current, 8, 2));

@@ -2,6 +2,7 @@
 const std = @import("std");
 const mtl = @import("metal");
 const lanes = @import("lanes");
+const fsys = lanes.learned_fs;
 const snapshot = @import("snapshot.zig");
 const Metal = @import("backend.zig").Metal;
 const Snap = snapshot.Snap;
@@ -20,46 +21,26 @@ pub fn path(buf: []u8, dir: []const u8, key: u64) ![:0]const u8 {
 pub fn writeFile(snap: *const Snap, file: [:0]const u8) !void {
     var tmp_buf: [1100]u8 = undefined;
     const tmp = try std.fmt.bufPrintSentinel(&tmp_buf, "{s}.part", .{file}, 0);
-    const fd = std.c.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
-    if (fd < 0) return error.SnapshotWrite;
-    errdefer _ = std.c.unlink(tmp);
+    const fd = fsys.open(tmp, .{ .access = .write, .create = true, .trunc = true }) catch return error.SnapshotWrite;
+    errdefer fsys.unlink(tmp) catch {};
     {
-        defer _ = std.c.close(fd);
+        defer fsys.close(fd);
         const head = [HEAD]u32{ FILE_MAGIC, snap.at, @intFromBool(snap.head), @truncate(snap.bytes), @truncate(snap.bytes >> 32) };
         try checked.write(fd, std.mem.sliceAsBytes(&head), snap.buf.contents()[0..snap.bytes]);
-        if (std.c.fsync(fd) != 0) return error.SnapshotWrite;
+        if (!fsys.sync(fd)) return error.SnapshotWrite;
     }
-    if (std.c.rename(tmp, file) != 0) return error.SnapshotWrite;
+    fsys.rename(tmp, file) catch return error.SnapshotWrite;
 }
 
 /// `file`'s state into `snap`, whose buffer holds its bytes; a file of another position, layout or size is refused.
 pub fn readFile(snap: *Snap, file: [:0]const u8) !void {
-    const fd = std.c.open(file, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return error.SnapshotRead;
-    defer _ = std.c.close(fd);
+    const fd = fsys.open(file, .{}) catch return error.SnapshotRead;
+    defer fsys.close(fd);
     var head: [HEAD]u32 = undefined;
-    try get(fd, std.mem.sliceAsBytes(&head), 0);
+    if (!fsys.readAt(fd, std.mem.sliceAsBytes(&head), 0)) return error.SnapshotRead;
     const bytes = @as(u64, head[3]) | @as(u64, head[4]) << 32;
     if (head[0] != FILE_MAGIC or head[1] != snap.at or head[2] != @intFromBool(snap.head) or bytes != snap.bytes) return error.SnapshotRead;
     try checked.read(fd, std.mem.sliceAsBytes(&head), snap.buf.contents()[0..snap.bytes]);
-}
-
-fn put(fd: c_int, b: []const u8) !void {
-    var done: usize = 0;
-    while (done < b.len) {
-        const n = std.c.write(fd, b.ptr + done, @min(b.len - done, 1 << 30));
-        if (n <= 0) return error.SnapshotWrite;
-        done += @intCast(n);
-    }
-}
-
-fn get(fd: c_int, b: []u8, at: u64) !void {
-    var done: usize = 0;
-    while (done < b.len) {
-        const n = std.c.pread(fd, b.ptr + done, @min(b.len - done, 1 << 30), @intCast(at + done));
-        if (n <= 0) return error.SnapshotRead;
-        done += @intCast(n);
-    }
 }
 
 /// This build's prompt-pass bits: a fixed prompt's state at a mark, hashed (a kernel or compiler change moves it).
@@ -127,7 +108,7 @@ pub fn snapRead(ptr: *anyopaque, dir: [:0]const u8, key: u64, at: u32) anyerror!
 /// --learn: learned state `key`'s file removed.
 pub fn snapForget(_: *anyopaque, dir: [:0]const u8, key: u64) void {
     var buf: [1100]u8 = undefined;
-    _ = std.c.unlink(path(&buf, dir, key) catch return);
+    fsys.unlink(path(&buf, dir, key) catch return) catch {};
 }
 
 test "a learned state's file name is its key in hex" {

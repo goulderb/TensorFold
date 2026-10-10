@@ -45,3 +45,4 @@ test {
 
 pub const learned_disk = @import("learned_disk.zig");
 pub const learned_dirs = @import("learned_dirs.zig");
+pub const learned_fs = @import("learned_fs.zig");

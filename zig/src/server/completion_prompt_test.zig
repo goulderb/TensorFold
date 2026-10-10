@@ -151,11 +151,25 @@ test "a completion prompt's boolean ids get a 400, nested or not" {
     try std.testing.expectEqual(@as(usize, 0), backend.prompt.len);
 }
 
-test "a completion prompt's nested ids past u32 decode as unknown ids" {
+test "a completion prompt rejects nested ids past u32 before decoding" {
     if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var text: ByteText = .{};
     var backend: Capture = .{};
     defer std.testing.allocator.free(backend.prompt);
-    const prompt = "[[104,4294967295,4294967296,105,9223372036854775807]]";
-    try std.testing.expectEqual(@as(?u16, 200), try complete(&backend, prompt));
-    try std.testing.expectEqualSlices(u32, &.{ 'h', 'i' }, backend.prompt);
+    const srv = try Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
+        .served_name = "m",
+        .model_ids = &.{"m"},
+        .enable_thinking = false,
+        .use_drafts = false,
+    }, null);
+    defer srv.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const raw = (try json.parse(a, "{\"model\":\"m\",\"max_tokens\":2,\"prompt\":[[104,4294967295,4294967296,105,9223372036854775807]]}")).ok;
+    var conn: Conn = .{ .fd = @import("platform").sock.none, .peer = "", .buf = &.{}, .gpa = a };
+    var reply: Reply = .{};
+    openai.run(srv, a, reply.out(), .{ .conn = &conn }, false, raw);
+    try std.testing.expectEqual(@as(?u16, 400), reply.status);
+    try std.testing.expectEqual(@as(usize, 0), backend.prompt.len);
 }
