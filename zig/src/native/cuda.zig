@@ -461,6 +461,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     try h.serve(io, loaded.facts, loaded.rows, .{
         .lanes = streams,
         .max_queued = o.max_queued,
+        .call_gates = true,
         .context_window = @intCast(window),
         .startup = h.startup,
         .prompt_cache = h.store != null,

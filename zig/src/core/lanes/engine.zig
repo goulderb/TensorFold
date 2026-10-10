@@ -379,20 +379,8 @@ pub const Engine = struct {
             }
             if (s.recall) |r| if (p.kind != .copy) r.noteHead(path.len); // its own rounds: the bar a copy must beat
         }
-        const budget_cut = s.thinkCut(committed.items);
-        const loop_cut = sm.loopCut(s, committed.items);
-        const loop_wins = if (loop_cut) |c| budget_cut == null or c < budget_cut.? else false;
-        var cut: ?usize = null;
-        if (loop_wins) {
-            cut = loop_cut;
-            path = path[0 .. loop_cut.? + 1];
-            committed.shrinkRetainingCapacity(loop_cut.? + 1);
-        } else if (budget_cut) |c| {
-            cut = c;
-            path = path[0 .. c + 1];
-            committed.shrinkRetainingCapacity(c);
-            try committed.append(a, try s.startClose(e.gpa));
-        }
+        const cut = try s.cutRound(e.gpa, a, &committed);
+        if (cut) |c| path = path[0 .. c + 1];
         s.rounds += 1;
         var committed_rows: []LogRow = &.{};
         if (rows_lp.len > 0) {
@@ -509,11 +497,13 @@ pub const Engine = struct {
         }
         var current: Feed = .{ .handle = s.inflight.? };
         s.inflight = null;
-        if (try e.forcedNext(s)) |t| current = .{ .value = t };
+        const forced = try e.forcedNext(s);
+        if (forced) |t| current = .{ .value = t };
         var token: u32 = undefined;
-        if (mode == .drain) {
-            token = try e.readFeed(current); // the last queued step: no new one
-            s.mode = .verify;
+        if (mode == .drain or s.gate != null) { // a gate reads each token before the next step is queued
+            token = try e.readFeed(current);
+            if (forced == null) token = try s.correctCall(e.gpa, e.arena.allocator(), token);
+            if (mode == .drain) s.mode = .verify else try e.queueNext(s, .{ .value = token });
         } else {
             try e.queueNext(s, current); // the GPU starts the next step first
             token = try e.readFeed(current);
@@ -534,8 +524,10 @@ pub const Engine = struct {
     fn landInflight(e: *Engine, s: *Stream) !void {
         var current: Feed = .{ .handle = s.inflight.? };
         s.inflight = null;
-        if (try e.forcedNext(s)) |t| current = .{ .value = t };
-        const token = try e.readFeed(current);
+        const forced = try e.forcedNext(s);
+        if (forced) |t| current = .{ .value = t };
+        var token = try e.readFeed(current);
+        if (forced == null) token = try s.correctCall(e.gpa, e.arena.allocator(), token);
         s.rounds += 1;
         const landed = try s.commit(e.gpa, &.{token}, &.{});
         s.pending = token;

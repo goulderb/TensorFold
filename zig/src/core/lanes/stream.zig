@@ -9,6 +9,7 @@ const Reader = @import("recall.zig").Reader;
 const Sampling = @import("sampling.zig").Sampling;
 const State = @import("depth.zig").State;
 const Row = @import("logprob.zig").Row;
+const call_gate = @import("call_gate.zig");
 
 pub const Reason = enum {
     none,
@@ -130,6 +131,7 @@ pub const Spec = struct {
     decode_spans: []const [2]u32 = &.{}, // prompt rows an earlier reply decoded (Request.decode_spans), for backends that keep their bits
     images: []const Image = &.{}, // in prompt order; the backend's tower fills their rows
     key: []const u32 = &.{}, // the prompt as the cache matches it (image rows by their image); empty: the prompt
+    call: ?call_gate.Spec = null, // tool_choice required: the stream's gate (lanes/call_gate.zig)
 };
 
 pub const Stream = struct {
@@ -171,6 +173,7 @@ pub const Stream = struct {
     context: std.ArrayList(u32) = .empty,
     pending: ?u32 = null,
     force: std.ArrayList(u32) = .empty,
+    gate: ?call_gate.Gate = null, // owned by the stream, freed in deinit
     cache_len: u64 = 0,
     finished: bool = false,
     reason: Reason = .none,
@@ -238,6 +241,7 @@ pub const Stream = struct {
             s.think_close = s.think_close[0 .. at + 1];
         };
         try s.context.appendSlice(gpa, spec.prompt);
+        if (spec.call) |c| s.gate = call_gate.Gate.afterPrompt(spec.prompt, c.opener, c.think_open, c.think_end, c.lex, c.lead, c.names, c.tail);
         return s;
     }
 
@@ -246,6 +250,7 @@ pub const Stream = struct {
         s.rows.deinit(gpa);
         s.prompt_rows.deinit(gpa);
         s.force.deinit(gpa);
+        if (s.gate) |*g| g.deinit(gpa);
         s.dropRoundState(gpa);
     }
 
@@ -364,6 +369,7 @@ pub const Stream = struct {
         for (tokens, 0..) |t, i| {
             if (s.finished) break;
             try s.context.append(gpa, t);
+            if (s.gate) |*g| try g.observe(gpa, t);
             if (rows.len > 0) try s.rows.append(gpa, rows[i]);
             landed += 1;
             if (@as(i64, t) == s.think_end) s.think_open = false;
@@ -415,8 +421,111 @@ pub const Stream = struct {
         if (s.force.items.len == 0) return null;
         return s.force.orderedRemove(0);
     }
+
+    fn setForce(s: *Stream, gpa: Allocator, tail: []const u32) !void {
+        s.force.clearRetainingCapacity();
+        try s.force.appendSlice(gpa, tail);
+    }
+
+    /// The round's cut over its committed tokens: the earliest call, loop or budget cut; tokens shortened to it.
+    pub fn cutRound(s: *Stream, gpa: Allocator, a: Allocator, committed: *std.ArrayList(u32)) !?usize {
+        const budget_cut = s.thinkCut(committed.items);
+        const loop_cut = loopCut(s, committed.items);
+        const loop_at = loop_cut orelse std.math.maxInt(usize);
+        const budget_at = budget_cut orelse std.math.maxInt(usize);
+        if (s.gate) |*g| {
+            if (try g.cut(a, committed.items)) |hit| {
+                if (hit.at <= loop_at and hit.at < budget_at) {
+                    committed.shrinkRetainingCapacity(hit.at);
+                    try committed.append(a, hit.fix[0]);
+                    try s.setForce(gpa, hit.fix[1..]);
+                    return hit.at;
+                }
+            }
+        }
+        if (loop_cut) |c| {
+            if (budget_cut == null or c < budget_cut.?) {
+                committed.shrinkRetainingCapacity(c + 1);
+                return c;
+            }
+        }
+        if (budget_cut) |c| {
+            committed.shrinkRetainingCapacity(c);
+            try committed.append(a, try s.startClose(gpa));
+            return c;
+        }
+        return null;
+    }
+
+    /// A sampled token that breaks a required call becomes the fix's first token; the rest are forced.
+    pub fn correctCall(s: *Stream, gpa: Allocator, a: Allocator, token: u32) !u32 {
+        const g = &(s.gate orelse return token);
+        const hit = (try g.cut(a, &.{token})) orelse return token;
+        if (hit.at != 0) return token;
+        try s.setForce(gpa, hit.fix[1..]);
+        return hit.fix[0];
+    }
 };
 
+const CallTestLex = struct {
+    fn blank(_: *anyopaque, token: u32) bool {
+        return token == 1;
+    }
+    fn text(_: *anyopaque, _: Allocator, token: u32) anyerror![]const u8 {
+        return switch (token) {
+            2 => "=",
+            3 => "ab",
+            4 => "ac>",
+            else => "?",
+        };
+    }
+    fn encode(_: *anyopaque, a: Allocator, s: []const u8) anyerror![]const u32 {
+        if (std.mem.eql(u8, s, "=")) return a.dupe(u32, &.{2});
+        if (std.mem.eql(u8, s, "ab>")) return a.dupe(u32, &.{ 3, 4 });
+        return a.dupe(u32, &.{});
+    }
+    fn lex() call_gate.Lex {
+        return .{ .ctx = undefined, .blank = blank, .text = text, .encode = encode };
+    }
+};
+
+fn callSpec() call_gate.Spec {
+    return .{ .opener = 9, .lead = "=", .names = &.{"ab"}, .tail = ">", .lex = CallTestLex.lex() };
+}
+
+test "a required call cut commits the opener and forces the lead's tokens" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var s = try Stream.init(gpa, .{ .id = "c", .prompt = &.{5}, .max_new = 8, .call = callSpec() });
+    defer s.deinit(gpa);
+    var committed: std.ArrayList(u32) = .empty;
+    defer committed.deinit(gpa);
+    try committed.appendSlice(gpa, &.{ 7, 8 });
+    try std.testing.expectEqual(@as(?usize, 0), try s.cutRound(gpa, arena.allocator(), &committed));
+    try std.testing.expectEqualSlices(u32, &.{9}, committed.items);
+    try std.testing.expectEqual(@as(?u32, 2), s.popForce());
+    try std.testing.expect(s.popForce() == null);
+}
+
+test "a sampled token that breaks a required call becomes the opener, and the rest is forced" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var s = try Stream.init(gpa, .{ .id = "c", .prompt = &.{5}, .max_new = 8, .call = callSpec() });
+    defer s.deinit(gpa);
+    try std.testing.expectEqual(@as(u32, 9), try s.correctCall(gpa, arena.allocator(), 7));
+    try std.testing.expectEqual(@as(?u32, 2), s.popForce());
+    try std.testing.expectEqual(@as(u32, 1), try s.correctCall(gpa, arena.allocator(), 1));
+}
+
+test "commit feeds each token to the gate, so the opener moves it to the lead" {
+    const gpa = std.testing.allocator;
+    var s = try Stream.init(gpa, .{ .id = "c", .prompt = &.{5}, .max_new = 8, .call = callSpec() });
+    defer s.deinit(gpa);
+    _ = try s.commit(gpa, &.{ 1, 9 }, &.{});
+    try std.testing.expect(s.gate.?.phase == .lead);
+}
 test "commit stops at eos and length" {
     const gpa = std.testing.allocator;
     var s = try Stream.init(gpa, .{ .id = "a", .prompt = &.{ 1, 2 }, .max_new = 3, .eos = &.{9} });
