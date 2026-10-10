@@ -571,3 +571,53 @@ test {
     _ = @import("lane_host_warm_test.zig");
     _ = @import("lane_host_rows_test.zig");
 }
+
+test "past the lanes and max_queued waiting places a foreground submit is refused Full; background work still queues" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{}, 1, 0);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1, .max_queued = 1 });
+    defer host.stop();
+    defer for (host.queued.items) |job| gpa.destroy(job); // never started: the queued jobs are the test's to free
+    const Quiet = struct {
+        fn event(_: *anyopaque, _: Id, _: *const Event) void {}
+    };
+    var ctx: u8 = 0;
+    const sink: api.Sink = .{ .ctx = &ctx, .event = Quiet.event };
+    const fg: Request = .{ .prompt = &.{1}, .max_tokens = 1 };
+    const bg: Request = .{ .prompt = &.{1}, .max_tokens = 1, .background = true };
+    const eng = host.engine();
+    try eng.submit(1, &fg, sink);
+    try eng.submit(2, &fg, sink);
+    try std.testing.expectError(error.Full, eng.submit(3, &fg, sink));
+    try eng.submit(4, &bg, sink);
+    try std.testing.expectEqual(@as(usize, 3), host.queued.items.len);
+}
+
+test "without max_queued every foreground submit queues behind the lanes, none is refused Full" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{}, 1, 0);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1 });
+    defer host.stop();
+    defer for (host.queued.items) |job| gpa.destroy(job);
+    const Quiet = struct {
+        fn event(_: *anyopaque, _: Id, _: *const Event) void {}
+    };
+    var ctx: u8 = 0;
+    const sink: api.Sink = .{ .ctx = &ctx, .event = Quiet.event };
+    const fg: Request = .{ .prompt = &.{1}, .max_tokens = 1 };
+    const eng = host.engine();
+    for (1..4) |id| try eng.submit(@intCast(id), &fg, sink);
+    try std.testing.expectEqual(@as(usize, 3), host.queued.items.len);
+}

@@ -301,6 +301,7 @@ pub const Conn = struct {
 
     fn sendJsonOr(c: *Conn, code: u16, body: []const u8) !void {
         try c.startResponse(code, null);
+        if (code == 429) try c.addHeader("Retry-After", "5"); // a refused admission: the client backs off instead of stacking up
         try c.addHeader("Content-Type", "application/json");
         var len: [24]u8 = undefined;
         try c.addHeader("Content-Length", try std.fmt.bufPrint(&len, "{d}", .{body.len}));

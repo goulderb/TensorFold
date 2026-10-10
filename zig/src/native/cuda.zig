@@ -460,6 +460,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
     try h.serve(io, loaded.facts, loaded.rows, .{
         .lanes = streams,
+        .max_queued = o.max_queued,
         .context_window = @intCast(window),
         .startup = h.startup,
         .prompt_cache = h.store != null,

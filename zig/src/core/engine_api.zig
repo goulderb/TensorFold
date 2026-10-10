@@ -253,6 +253,9 @@ pub const Info = struct {
     greedy_only: bool = false,
     /// Whether a request's caches fit beside the running streams' now (null: a free lane does); else it waits in order.
     admit: ?Admit = null,
+    /// Foreground requests that may wait for a lane once every lane is taken; a submit past them is refused ``Full``
+    /// (TENSORFOLD_MAX_QUEUED; null: no cap, every request queues).
+    max_queued: ?u32 = null,
 };
 
 pub const Admit = struct {
@@ -315,6 +318,8 @@ pub const Open = struct {
     segments: ?u32 = null,
     /// --precision (CUDA): an NVFP4 checkpoint's math, NVIDIA's own or full precision; null: the family's default.
     precision: ?Precision = null,
+    /// TENSORFOLD_MAX_QUEUED, as the engine's ``Info.max_queued``; null: no cap.
+    max_queued: ?u32 = null,
     /// --mtp-drafts and --mtp-confidence; null: the engine's defaults.
     mtp_drafts: ?u32 = null,
     mtp_confidence: ?f64 = null,
@@ -384,7 +389,7 @@ pub const Status = struct {
     fill_run: u64 = 0,
 };
 
-pub const SubmitError = error{ Closed, Busy, InvalidSpans, Stale }; // Stale: a learner's put-back has not reached the device
+pub const SubmitError = error{ Closed, Busy, Full, InvalidSpans, Stale }; // Stale: a learner's put-back has not reached the device
 
 /// What a reply refused or ended for `Stale` says, a submit's error and a queued job's failure alike.
 pub const stale_message = "a Living Weights delete could not be put back on the device: send the delete again to retry it, or restart the server";
