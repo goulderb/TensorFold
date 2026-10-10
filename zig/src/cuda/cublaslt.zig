@@ -1,7 +1,9 @@
 //! cuBLASLt opened at run time: descriptors, layouts, heuristics and matmul, with fp32 compute only (no TF32 or fast modes).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const abi = @import("abi.zig");
+const dynlib = @import("dynlib.zig");
 
 pub const Status = c_int;
 pub const Handle = ?*opaque {};
@@ -60,12 +62,13 @@ pub const Api = struct {
 };
 
 pub const Library = struct {
-    lib: std.DynLib,
+    lib: dynlib.Library,
     api: Api,
 
-    /// The CUDA 13 soname first, then the unversioned link name.
+    /// The CUDA 13 soname first, then the unversioned link name. None on Windows: cuBLASLt has no caller there.
     pub fn open() Error!Library {
-        for ([_][]const u8{ "libcublasLt.so.13", "libcublasLt.so" }) |path| {
+        const names: []const []const u8 = if (builtin.os.tag == .windows) &.{} else &.{ "libcublasLt.so.13", "libcublasLt.so" };
+        for (names) |path| {
             return openPath(path) catch |e| switch (e) {
                 error.LibraryUnavailable => continue,
                 else => return e,
@@ -75,16 +78,13 @@ pub const Library = struct {
     }
 
     pub fn openPath(path: []const u8) Error!Library {
-        var lib = std.DynLib.open(path) catch return error.LibraryUnavailable;
+        var lib = dynlib.Library.open(path) catch return error.LibraryUnavailable;
         errdefer lib.close();
-        var api: Api = undefined;
-        const info = @typeInfo(Api).@"struct";
-        inline for (info.field_names, info.field_types) |name, T| {
-            @field(api, name) = lib.lookup(T, name) orelse {
-                std.log.err("{s} has no {s}", .{ path, name });
-                return error.MissingSymbol;
-            };
-        }
+        var missing: []const u8 = "";
+        const api = lib.resolve(Api, &missing) catch {
+            std.log.err("{s} has no {s}", .{ path, missing });
+            return error.MissingSymbol;
+        };
         return .{ .lib = lib, .api = api };
     }
 

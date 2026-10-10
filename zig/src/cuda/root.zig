@@ -3,6 +3,7 @@
 pub const abi = @import("abi.zig");
 pub const Driver = @import("driver.zig").Driver;
 pub const Error = @import("driver.zig").Error;
+pub const dynlib = @import("dynlib.zig");
 pub const Context = @import("context.zig").Context;
 pub const DeviceBuffer = @import("memory.zig").DeviceBuffer;
 pub const HostBuffer = @import("memory.zig").HostBuffer;
@@ -43,6 +44,8 @@ pub const ck = @import("ck.zig");
 pub const modelopt = @import("modelopt.zig");
 
 test {
+    _ = dynlib;
+    _ = @import("driver.zig");
     _ = @import("memory.zig");
     _ = @import("nccl.zig");
     _ = @import("graph.zig");
