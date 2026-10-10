@@ -10,7 +10,6 @@ pub const Value = json.Value;
 var dir_buf: [4096]u8 = undefined;
 
 /// The fixtures directory, or null when the environment does not name one (the tests then skip).
-
 pub fn dir() ?[]const u8 {
     return env.getInto(&dir_buf, "TF_LANES_FIXTURES") catch null;
 }
