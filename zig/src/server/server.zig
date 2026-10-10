@@ -19,6 +19,7 @@ const tool_specs = @import("tool_specs.zig");
 const tool_grammar = @import("tool_grammar.zig");
 const chunk_plan = @import("chunk_plan.zig");
 const log = @import("log.zig");
+const sock = @import("platform").sock;
 const live = @import("live.zig");
 const slide_graph = @import("slide_graph.zig");
 const slide_lesson = @import("slide_lesson.zig");
@@ -301,7 +302,7 @@ pub const Server = struct {
             _ = srv.open_connections.fetchAdd(1, .acq_rel);
             const t = std.Thread.spawn(.{ .stack_size = 8 << 20 }, connection, .{ srv, c }) catch {
                 _ = srv.open_connections.fetchSub(1, .acq_rel);
-                _ = std.posix.system.close(c.fd);
+                sock.close(c.fd);
                 continue;
             };
             t.detach();
@@ -310,7 +311,7 @@ pub const Server = struct {
 
     fn connection(srv: *Server, accepted: listener_mod.Listener.Accepted) void {
         defer _ = srv.open_connections.fetchSub(1, .acq_rel);
-        defer _ = std.posix.system.close(accepted.fd);
+        defer sock.close(accepted.fd);
         var peer_buf: [64]u8 = undefined;
         const peer = listener_mod.peerText(&peer_buf, accepted.peer);
         var conn = http_conn.Conn.init(srv.gpa, accepted.fd, peer) catch return;

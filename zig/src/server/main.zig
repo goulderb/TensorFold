@@ -74,6 +74,10 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     }
     const started = std.Io.Clock.awake.now(io).toNanoseconds();
+    // the Windows build has no vision helper (it talks to Python over POSIX pipes): refused before the model is looked for
+    if (comptime @import("builtin").os.tag == .windows) {
+        for (argv[2..]) |t| if (std.mem.eql(u8, t, "--vision")) return fail("--vision is not built for Windows: the helper talks to Python over POSIX pipes");
+    }
     var u: cli.Usage = .{};
     var args = cli.parse(a, argv[2..], &u) catch |e| switch (e) {
         error.Usage => {
