@@ -95,7 +95,7 @@ pub const DeviceBuffer = struct {
         const dst = try self.span(offset, bytes.len);
         if (bytes.len == 0) return;
         try self.d.check(self.d.api.cuMemcpyHtoD_v2(dst, bytes.ptr, bytes.len), "cuMemcpyHtoD");
-        try legacyDone(self.d);
+        try self.d.check(self.d.api.cuStreamSynchronize(null), "cuStreamSynchronize");
     }
 
     pub fn download(self: DeviceBuffer, offset: usize, out: []u8) Error!void {
