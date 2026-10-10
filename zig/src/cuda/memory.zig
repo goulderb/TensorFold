@@ -95,7 +95,7 @@ pub const DeviceBuffer = struct {
         const dst = try self.span(offset, bytes.len);
         if (bytes.len == 0) return;
         try self.d.check(self.d.api.cuMemcpyHtoD_v2(dst, bytes.ptr, bytes.len), "cuMemcpyHtoD");
-        try self.d.check(self.d.api.cuStreamSynchronize(null), "cuStreamSynchronize");
+        try legacyDone(self.d);
     }
 
     pub fn download(self: DeviceBuffer, offset: usize, out: []u8) Error!void {
@@ -124,6 +124,7 @@ pub const DeviceBuffer = struct {
             try self.d.check(self.d.api.cuMemcpyDtoDAsync_v2(dst, src, n, s), "cuMemcpyDtoDAsync");
         } else {
             try self.d.check(self.d.api.cuMemcpyDtoD_v2(dst, src, n), "cuMemcpyDtoD");
+            try legacyDone(self.d);
         }
     }
 
@@ -133,6 +134,7 @@ pub const DeviceBuffer = struct {
             try self.d.check(self.d.api.cuMemsetD8Async(self.ptr, value, self.len, s), "cuMemsetD8Async");
         } else {
             try self.d.check(self.d.api.cuMemsetD8_v2(self.ptr, value, self.len), "cuMemsetD8");
+            try legacyDone(self.d);
         }
     }
 
@@ -144,9 +146,14 @@ pub const DeviceBuffer = struct {
             try self.d.check(self.d.api.cuMemsetD32Async(self.ptr, value, self.len / 4, s), "cuMemsetD32Async");
         } else {
             try self.d.check(self.d.api.cuMemsetD32_v2(self.ptr, value, self.len / 4), "cuMemsetD32");
+            try legacyDone(self.d);
         }
     }
 };
+
+fn legacyDone(d: *const Driver) Error!void {
+    try d.check(d.api.cuStreamSynchronize(null), "cuStreamSynchronize");
+}
 
 /// Page-locked host memory: the only host memory an asynchronous copy can read or write without staging.
 pub const HostBuffer = struct {
@@ -250,4 +257,76 @@ test "peak reset preserves an allocation between its read and store" {
     const after = usage(false);
     try std.testing.expectEqual(before.device + 100, after.device);
     try std.testing.expectEqual(before.device + 400, after.peak);
+}
+
+const Call = enum { htod, dtod, dtod_async, memset8, memset8_async, memset32, memset32_async, sync };
+
+const Recorder = struct {
+    var seen: [8]Call = undefined;
+    var n: usize = 0;
+    fn put(c: Call) abi.Result {
+        seen[n] = c;
+        n += 1;
+        return abi.success;
+    }
+    fn htod(_: abi.DevicePtr, _: ?*const anyopaque, _: usize) callconv(.c) abi.Result {
+        return put(.htod);
+    }
+    fn dtod(_: abi.DevicePtr, _: abi.DevicePtr, _: usize) callconv(.c) abi.Result {
+        return put(.dtod);
+    }
+    fn dtodAsync(_: abi.DevicePtr, _: abi.DevicePtr, _: usize, _: abi.Stream) callconv(.c) abi.Result {
+        return put(.dtod_async);
+    }
+    fn memset8(_: abi.DevicePtr, _: u8, _: usize) callconv(.c) abi.Result {
+        return put(.memset8);
+    }
+    fn memset8Async(_: abi.DevicePtr, _: u8, _: usize, _: abi.Stream) callconv(.c) abi.Result {
+        return put(.memset8_async);
+    }
+    fn memset32(_: abi.DevicePtr, _: c_uint, _: usize) callconv(.c) abi.Result {
+        return put(.memset32);
+    }
+    fn memset32Async(_: abi.DevicePtr, _: c_uint, _: usize, _: abi.Stream) callconv(.c) abi.Result {
+        return put(.memset32_async);
+    }
+    fn sync(_: abi.Stream) callconv(.c) abi.Result {
+        return put(.sync);
+    }
+    fn expect(want: []const Call) !void {
+        try std.testing.expectEqualSlices(Call, want, seen[0..n]);
+        n = 0;
+    }
+};
+
+test "a blocking write returns after the legacy stream is synchronized; the stream forms do not wait" {
+    var d: Driver = .{ .lib = undefined, .api = undefined };
+    d.api.cuMemcpyHtoD_v2 = Recorder.htod;
+    d.api.cuMemcpyDtoD_v2 = Recorder.dtod;
+    d.api.cuMemcpyDtoDAsync_v2 = Recorder.dtodAsync;
+    d.api.cuMemsetD8_v2 = Recorder.memset8;
+    d.api.cuMemsetD8Async = Recorder.memset8Async;
+    d.api.cuMemsetD32_v2 = Recorder.memset32;
+    d.api.cuMemsetD32Async = Recorder.memset32Async;
+    d.api.cuStreamSynchronize = Recorder.sync;
+    const b: DeviceBuffer = .{ .d = &d, .ptr = 4096, .len = 64, .borrowed = true };
+    const s: abi.Stream = @ptrFromInt(0x10);
+
+    try b.upload(0, "abcd");
+    try Recorder.expect(&.{ .htod, .sync });
+
+    try b.fill8(7, null);
+    try Recorder.expect(&.{ .memset8, .sync });
+    try b.fill8(7, s);
+    try Recorder.expect(&.{.memset8_async});
+
+    try b.fill32(9, null);
+    try Recorder.expect(&.{ .memset32, .sync });
+    try b.fill32(9, s);
+    try Recorder.expect(&.{.memset32_async});
+
+    try b.copyFrom(0, 8192, 16, null);
+    try Recorder.expect(&.{ .dtod, .sync });
+    try b.copyFrom(0, 8192, 16, s);
+    try Recorder.expect(&.{.dtod_async});
 }
