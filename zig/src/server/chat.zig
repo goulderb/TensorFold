@@ -191,6 +191,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     defer if (srv.keepalive) |k| k.end();
     srv.engine.submit(id, &request, .{ .ctx = &box, .event = Mailbox.onEvent }) catch |e| return switch (e) {
         error.Busy => cx.fail(.capacity, "the engine is busy; retry shortly", .{}),
+        error.Full => cx.fail(.admission, "every lane and waiting place is taken; retry shortly", .{}),
         error.Closed => cx.fail(.other, "the scheduler is closed", .{}),
         error.InvalidSpans => cx.fail(.request, "the prompt span layout is invalid", .{}),
     };

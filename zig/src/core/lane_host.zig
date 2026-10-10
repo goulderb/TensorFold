@@ -147,6 +147,10 @@ pub const LaneHost = struct {
             h.gpa.destroy(job);
             return error.Closed;
         }
+        if (!request.background and h.full()) {
+            h.gpa.destroy(job);
+            return error.Full;
+        }
         // foreground before background, each in arrival order (the Python job queue's priority)
         var at = h.queued.items.len;
         if (!request.background) {
@@ -157,6 +161,17 @@ pub const LaneHost = struct {
             return error.Busy;
         };
         h.wake.signal(h.io);
+    }
+
+    /// Every lane is taken and ``Info.max_queued`` foreground requests already wait. Background work is never counted.
+    /// Called under the lock, so the check and the queue insert are one step: racing submits cannot both take the last place.
+    fn full(h: *const LaneHost) bool {
+        const cap = h.info_.max_queued orelse return false;
+        var waiting: usize = 0;
+        for (h.queued.items) |job| {
+            if (!job.request.background) waiting += 1;
+        }
+        return h.admitted.items.len + waiting >= @as(usize, h.info_.lanes) + @as(usize, cap);
     }
 
     fn cancelFn(ctx: *anyopaque, id: Id) void {

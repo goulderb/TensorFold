@@ -63,6 +63,10 @@ pub fn main(init: std.process.Init) !u8 {
         },
         else => |x| return x,
     };
+    if (init.environ_map.get("TENSORFOLD_MAX_QUEUED")) |t| args.max_queued = std.fmt.parseInt(u32, std.mem.trim(u8, t, " "), 10) catch {
+        std.debug.print("tensorfold: TENSORFOLD_MAX_QUEUED={s}: a whole number\n", .{t});
+        return 2;
+    };
     var problem: []const u8 = "";
     const dir = try hub.resolve(a, io, init.environ_map, args.model, &problem) orelse return fail(problem);
     // A drafter is named like a model: a directory, or a repo id `tensorfold pull` cached.

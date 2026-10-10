@@ -116,7 +116,7 @@ pub const flags = [_]Flag{
 };
 
 /// The variables this binary honours as the Python engine does, then the CUDA build's.
-pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_NO_UPDATE_CHECK", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE", "BRAVE_SEARCH_API_KEY" } ++
+pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_MAX_QUEUED", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_NO_UPDATE_CHECK", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE", "BRAVE_SEARCH_API_KEY" } ++
     (if (cuda_build) [_][]const u8{ "TF_CUDA_DEVICE", "TF_CUDA_SEGMENTS", "TENSORFOLD_CUDA_KERNELS", "TENSORFOLD_MEMORY_RESERVE_GIB", "TENSORFOLD_CUDA_MEMORY_LIMIT_GB" } else [_][]const u8{});
 
 pub const Args = struct {
@@ -158,6 +158,7 @@ pub const Args = struct {
     slide: bool = false, // Sliding Weights learns what /v1/slide/learn is told into the served weights, live
     slide_graph: ?[]const u8 = null, // the Sliding Weights fact graph's file (null: memory only)
     parallel: []const u8 = "auto",
+    max_queued: ?u32 = null, // TENSORFOLD_MAX_QUEUED, read by main from the environment (null: no cap)
     backend: []const u8 = "auto",
     device: ?u32 = null,
     segments: ?u32 = null,
@@ -347,6 +348,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .context = args.context,
         .lanes = parallel(args.parallel) orelse 8,
         .lanes_fixed = parallelFixed(args.parallel),
+        .max_queued = args.max_queued,
         .drafts = !args.no_drafts,
         .drafter = args.drafter,
         .drafter_bits = args.drafter_bits,

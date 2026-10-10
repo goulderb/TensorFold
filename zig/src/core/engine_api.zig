@@ -164,6 +164,9 @@ pub const Info = struct {
     greedy_only: bool = false,
     /// Whether a request's caches fit beside the running streams' now (null: a free lane does); else it waits in order.
     admit: ?Admit = null,
+    /// Foreground requests that may wait for a lane once every lane is taken; a submit past them is refused ``Full``
+    /// (TENSORFOLD_MAX_QUEUED; null: no cap, every request queues).
+    max_queued: ?u32 = null,
 };
 
 pub const Admit = struct {
@@ -213,6 +216,8 @@ pub const Open = struct {
     /// --device and --segments (CUDA); null: the backend's environment fallback, then its default.
     device: ?u32 = null,
     segments: ?u32 = null,
+    /// TENSORFOLD_MAX_QUEUED, as the engine's ``Info.max_queued``; null: no cap.
+    max_queued: ?u32 = null,
     /// --mtp-drafts and --mtp-confidence; null: the engine's defaults.
     mtp_drafts: ?u32 = null,
     mtp_confidence: ?f64 = null,
@@ -259,7 +264,8 @@ pub const Status = struct {
     generation_tokens: u64 = 0,
 };
 
-pub const SubmitError = error{ Closed, Busy, InvalidSpans };
+/// Full: every lane and ``Info.max_queued`` foreground place is taken (a 429 the client may retry); Busy: the engine could not take it (503).
+pub const SubmitError = error{ Closed, Busy, Full, InvalidSpans };
 
 /// A worked example for the learner: token ids, the answer from `start`; `decide`: its assistant header's last row.
 pub const Example = struct { ids: []const u32, start: u32, decide: u32, subject: u32 = 0, value: u32 = 0 }; // subject: the row of its last token; value: the row before its answer's value (0: none)
