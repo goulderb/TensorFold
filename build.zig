@@ -153,7 +153,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&cost_run.step);
     switch (target.result.os.tag) {
         .macos => metalTargets(b, target, optimize, draft_ids, build_options, test_step),
-        .linux => cuda_build.targets(b, target, optimize, draft_ids, build_options),
+        .linux, .windows => cuda_build.targets(b, target, optimize, draft_ids, build_options),
         else => {},
     }
     const xgrammar = grammar_build.option(b);
