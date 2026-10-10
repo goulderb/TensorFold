@@ -228,7 +228,15 @@ pub fn sendWith(engine: api.Engine, route: Route, body: []const u8, start: Seen)
 
 fn sendWithBudget(engine: api.Engine, route: Route, body: []const u8, start: Seen, default_budget: i64) !Seen {
     var text: TestText = .{};
-    var srv = try server.Server.init(std.testing.allocator, std.testing.io, engine, text.text(), .{
+    return sendWithTextBudget(engine, text.text(), route, body, start, default_budget);
+}
+
+fn sendWithText(engine: api.Engine, model: model_text.Text, route: Route, body: []const u8, start: Seen) !Seen {
+    return sendWithTextBudget(engine, model, route, body, start, 0);
+}
+
+fn sendWithTextBudget(engine: api.Engine, model: model_text.Text, route: Route, body: []const u8, start: Seen, default_budget: i64) !Seen {
+    var srv = try server.Server.init(std.testing.allocator, std.testing.io, engine, model, .{
         .served_name = "test-model",
         .model_ids = &.{"test-model"},
         .enable_thinking = false,
@@ -456,4 +464,44 @@ test "unsupported budgets leave zero unset and thinking-disabled requests valid"
         try std.testing.expectEqual(@as(i64, 0), seen.preparing);
     }
     try std.testing.expectEqual(@as(usize, 3), backend.submissions);
+}
+
+/// TestText whose template marks tool calls: ``<tool_call>`` is one token, and every prompt renders a call to tfprobe_fn.
+const CallText = struct {
+    fn text(t: *@This()) model_text.Text {
+        return .{ .ctx = t, .vtable = &.{ .encode = TestText.encode, .decode = TestText.decode, .token_id = tokenId, .token_string = TestText.tokenString, .vocab_size = TestText.vocabSize, .eos_ids = TestText.eosIds, .render = render, .template_source = TestText.templateSource } };
+    }
+
+    fn tokenId(_: *anyopaque, token: []const u8) ?u32 {
+        return if (std.mem.eql(u8, token, "<tool_call>")) 1 else null;
+    }
+
+    fn render(_: *anyopaque, a: std.mem.Allocator, _: json.Value, _: model_text.RenderOptions, _: *[]const u8) model_text.Error![]u8 {
+        return a.dupe(u8, "<tool_call>\n{\"name\": \"tfprobe_fn\"}");
+    }
+};
+
+/// HiEngine's window and replies, with the call gate declared or not.
+const GateEngine = struct {
+    gates: bool,
+
+    fn engine(e: *@This()) api.Engine {
+        return .{ .ctx = e, .vtable = &.{ .info = info, .submit = HiEngine.submit, .cancel = HiEngine.cancel, .status = HiEngine.status, .memory = HiEngine.memory } };
+    }
+
+    fn info(ctx: *anyopaque) api.Info {
+        const e: *@This() = @ptrCast(@alignCast(ctx));
+        return .{ .context_window = 4096, .call_gates = e.gates };
+    }
+};
+
+test "an engine without call gates refuses tool_choice required with a 400; one that declares them serves it" {
+    var model: CallText = .{};
+    const body = "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":2,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\"}}}],\"tool_choice\":\"required\"}";
+    var ungated: GateEngine = .{ .gates = false };
+    const refused = try sendWithText(ungated.engine(), model.text(), .chat, body, .{});
+    try std.testing.expectEqual(@as(?u16, 400), refused.status);
+    var gated: GateEngine = .{ .gates = true };
+    const served = try sendWithText(gated.engine(), model.text(), .chat, body, .{});
+    try std.testing.expectEqual(@as(?u16, 200), served.status);
 }
