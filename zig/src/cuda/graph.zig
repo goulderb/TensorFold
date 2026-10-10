@@ -10,15 +10,22 @@ const launch = @import("launch.zig");
 
 pub const Node = abi.GraphNode;
 
+/// A check for the graph calls a caller recovers from (capture end, instantiate, upload): a warning, not an error.
+fn soft(d: *const Driver, res: abi.Result, what: []const u8) Error!void {
+    if (res == abi.success) return;
+    std.log.warn("{s}: {s} ({d}) {s}", .{ what, d.errorName(res), res, d.errorText(res) });
+    return if (res == 2) error.OutOfDeviceMemory else error.CudaFailed;
+}
+
 /// Starts capturing `stream`; every launch on it is recorded until `endCapture`, nothing runs.
 pub fn beginCapture(stream: Stream, mode: abi.CaptureMode) Error!void {
-    try stream.d.check(stream.d.api.cuStreamBeginCapture_v2(stream.handle, mode), "cuStreamBeginCapture");
+    try soft(stream.d, stream.d.api.cuStreamBeginCapture_v2(stream.handle, mode), "cuStreamBeginCapture");
 }
 
 /// Ends the capture; an invalidated capture returns an error and no graph.
 pub fn endCapture(stream: Stream) Error!Graph {
     var g: abi.Graph = null;
-    try stream.d.check(stream.d.api.cuStreamEndCapture(stream.handle, &g), "cuStreamEndCapture");
+    try soft(stream.d, stream.d.api.cuStreamEndCapture(stream.handle, &g), "cuStreamEndCapture");
     return .{ .d = stream.d, .handle = g };
 }
 
@@ -95,7 +102,7 @@ pub const Graph = struct {
 
     pub fn instantiate(self: Graph) Error!Exec {
         var e: abi.GraphExec = null;
-        try self.d.check(self.d.api.cuGraphInstantiateWithFlags(&e, self.handle, 0), "cuGraphInstantiateWithFlags");
+        try soft(self.d, self.d.api.cuGraphInstantiateWithFlags(&e, self.handle, 0), "cuGraphInstantiateWithFlags");
         return .{ .d = self.d, .handle = e };
     }
 };
@@ -111,7 +118,7 @@ pub const Exec = struct {
 
     /// Moves the graph's work to the device ahead of the first launch, so that launch pays no setup.
     pub fn upload(self: Exec, stream: Stream) Error!void {
-        try self.d.check(self.d.api.cuGraphUpload(self.handle, stream.handle), "cuGraphUpload");
+        try soft(self.d, self.d.api.cuGraphUpload(self.handle, stream.handle), "cuGraphUpload");
     }
 
     pub fn launchOn(self: Exec, stream: Stream) Error!void {
@@ -134,3 +141,59 @@ pub const Exec = struct {
         unreachable;
     }
 };
+
+const Fake = struct {
+    var code: abi.Result = abi.success;
+    fn name(_: abi.Result, out: *?[*:0]const u8) callconv(.c) abi.Result {
+        out.* = "CUDA_ERROR_TEST";
+        return abi.success;
+    }
+    fn text(_: abi.Result, out: *?[*:0]const u8) callconv(.c) abi.Result {
+        out.* = "test";
+        return abi.success;
+    }
+    fn begin(_: abi.Stream, _: abi.CaptureMode) callconv(.c) abi.Result {
+        return code;
+    }
+    fn end(_: abi.Stream, _: *abi.Graph) callconv(.c) abi.Result {
+        return code;
+    }
+    fn instantiate(_: *abi.GraphExec, _: abi.Graph, _: u64) callconv(.c) abi.Result {
+        return code;
+    }
+    fn upload(_: abi.GraphExec, _: abi.Stream) callconv(.c) abi.Result {
+        return code;
+    }
+};
+
+test "a capture, instantiate or upload failure: out of memory is OutOfDeviceMemory, any other CudaFailed" {
+    var d: Driver = .{ .lib = undefined, .api = undefined };
+    d.api.cuGetErrorName = Fake.name;
+    d.api.cuGetErrorString = Fake.text;
+    d.api.cuStreamBeginCapture_v2 = Fake.begin;
+    d.api.cuStreamEndCapture = Fake.end;
+    d.api.cuGraphInstantiateWithFlags = Fake.instantiate;
+    d.api.cuGraphUpload = Fake.upload;
+    const s: Stream = .{ .d = &d, .handle = null };
+    const g: Graph = .{ .d = &d, .handle = null };
+    const e: Exec = .{ .d = &d, .handle = null };
+    defer Fake.code = abi.success;
+
+    Fake.code = 2;
+    try std.testing.expectError(error.OutOfDeviceMemory, beginCapture(s, .global));
+    try std.testing.expectError(error.OutOfDeviceMemory, endCapture(s));
+    try std.testing.expectError(error.OutOfDeviceMemory, g.instantiate());
+    try std.testing.expectError(error.OutOfDeviceMemory, e.upload(s));
+
+    Fake.code = 1;
+    try std.testing.expectError(error.CudaFailed, beginCapture(s, .global));
+    try std.testing.expectError(error.CudaFailed, endCapture(s));
+    try std.testing.expectError(error.CudaFailed, g.instantiate());
+    try std.testing.expectError(error.CudaFailed, e.upload(s));
+
+    Fake.code = abi.success;
+    try beginCapture(s, .global);
+    _ = try endCapture(s);
+    _ = try g.instantiate();
+    try e.upload(s);
+}
