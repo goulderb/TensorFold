@@ -284,6 +284,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     g.ctx = try cuda.Context.init(&g.driver, @intCast(device));
     defer if (!opened) g.ctx.deinit();
     bound = &g.ctx;
+    // a failed open frees this context (and g): the thread must not keep it bound
+    defer if (!opened) {
+        bound = null;
+    };
     const capability = try g.ctx.capability();
     var name_buf: [256]u8 = undefined;
     const name = g.ctx.name(&name_buf) catch "GPU";
