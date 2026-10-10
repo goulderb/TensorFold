@@ -3,15 +3,27 @@ const std = @import("std");
 const pc = @import("prompt_cache.zig");
 
 pub fn victimBut(s: *const pc.Store, skip: ?*pc.Entry, prompt: []const u32, born: u32) ?usize {
+    return victim(s, skip, prompt, born, false);
+}
+
+pub fn victimForMark(s: *const pc.Store, skip: ?*pc.Entry, prompt: []const u32, born: u32) ?usize {
+    return victim(s, skip, prompt, born, true);
+}
+
+fn ownMark(e: *const pc.Entry, prompt: []const u32, born: u32) bool {
+    return !e.expired and e.born == born and e.tokens.len <= prompt.len and std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens);
+}
+
+fn victim(s: *const pc.Store, skip: ?*pc.Entry, prompt: []const u32, born: u32, protect: bool) ?usize {
     var best: ?usize = null;
     for (s.entries.items, 0..) |e, i| {
-        if (e.borrowers > 0 or e.shared or e.branched or e == skip or isActiveRewind(s, e, prompt)) continue;
+        if ((protect and ownMark(e, prompt, born)) or e.borrowers > 0 or e.shared or e.branched or e == skip or isActiveRewind(s, e, prompt)) continue;
         const now = born > e.born and prompt.len > e.tokens.len and std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens); // a longer request's tokens extend it
         if ((now or extended(s, e)) and (best == null or e.used < s.entries.items[best.?].used)) best = i;
     }
     if (best) |i| return i;
     var oldest: ?usize = null;
-    for (s.entries.items, 0..) |e, i| if (e.borrowers == 0 and e != skip and (oldest == null or before(s, e, s.entries.items[oldest.?], prompt))) {
+    for (s.entries.items, 0..) |e, i| if (!(protect and ownMark(e, prompt, born)) and e.borrowers == 0 and e != skip and (oldest == null or before(s, e, s.entries.items[oldest.?], prompt))) {
         oldest = i;
     };
     return oldest;

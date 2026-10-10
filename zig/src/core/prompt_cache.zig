@@ -195,7 +195,7 @@ pub const Store = struct {
             const skip = for (s.entries.items) |e| {
                 if (restoring != null and e.saved == restoring.?) break e;
             } else null;
-            s.remove(s.victimBut(skip, prompt, @intCast(prompt.len)) orelse return false);
+            s.remove(s.victimBut(skip, prompt, @intCast(prompt.len), false) orelse return false);
             s.counts.evicted += 1;
         }
         return true;
@@ -300,7 +300,7 @@ pub const Store = struct {
             if (!exists) need += s.family.vtable.bytes(s.family.ptr, at);
         }
         while (s.held + need > s.budget) {
-            const i = s.victimBut(from, prompt, born) orelse return;
+            const i = s.victimBut(from, prompt, born, false) orelse return;
             s.remove(i);
             s.counts.evicted += 1;
         }
@@ -465,7 +465,7 @@ pub const Store = struct {
                 if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
                 if (s.spare() < free_) continue;
             }
-            s.remove(s.victimBut(null, prompt, born) orelse return s.fail(at, error.CacheBorrowed)); // its storage may come back spare and take this state
+            s.remove(s.victimForMark(null, prompt, born) orelse return s.fail(at, error.CacheBorrowed)); // its storage may come back spare and take this state
             s.counts.evicted += 1;
         }
         if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
@@ -508,7 +508,7 @@ pub const Store = struct {
         if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
         while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
-            s.remove(s.victimBut(have, prompt, born) orelse return have);
+            s.remove(s.victimBut(have, prompt, born, false) orelse return have);
             s.counts.evicted += 1;
         }
         if (bytes > s.budget) return have;
@@ -553,6 +553,7 @@ pub const Store = struct {
     /// The entry to free first, never `skip`: a superseded one, no branch point, oldest; else the oldest, rewind last.
     pub const victimBut = policy.victimBut;
     const extended = policy.extended;
+    const victimForMark = policy.victimForMark;
 };
 
 /// A line on the engine's log; tests stay quiet (the build runner fails a test that writes to stderr).
