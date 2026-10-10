@@ -1,5 +1,6 @@
 //! Timed costs are measured once per engine build, chip and model shape, then read back by later loads.
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const magic = "TFWC2\n";
@@ -73,12 +74,16 @@ fn parse(comptime T: type, bytes: []const u8) ?T {
     return value;
 }
 
+fn processId() u32 {
+    return if (builtin.os.tag == .windows) std.os.windows.GetCurrentProcessId() else @intCast(std.c.getpid());
+}
+
 /// Keep `value` for `k`, written whole and renamed into place; a failure only costs the next load a measurement.
 pub fn save(comptime T: type, a: Allocator, io: std.Io, k: [32]u8, value: T) void {
     const p = (path(a, k, ".bin") catch return) orelse return;
     defer a.free(p);
     std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(p) orelse return) catch return;
-    const temp = std.fmt.allocPrint(a, "{s}.{d}.tmp", .{ p, std.c.getpid() }) catch return;
+    const temp = std.fmt.allocPrint(a, "{s}.{d}.tmp", .{ p, processId() }) catch return;
     defer a.free(temp);
     const bytes = std.mem.concat(a, u8, &.{ magic, std.mem.asBytes(&value) }) catch return;
     defer a.free(bytes);

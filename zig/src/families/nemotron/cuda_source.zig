@@ -1,7 +1,10 @@
 //! Checkpoint reads use io_uring or threads, overlapping allocations and copies through O_DIRECT slots.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
+/// io_uring is Linux's: elsewhere no ring exists and every read runs on a thread.
+const has_ring = builtin.os.tag == .linux;
 const cuda = @import("cuda");
 const core = @import("core");
 const kern = @import("cuda_kernels.zig");
@@ -69,17 +72,18 @@ pub const Source = struct {
             s.pinned[made] = h;
             s.slots[made] = @alignCast(h.bytes);
         }
-        s.ring = linux.IoUring.init(slot_count, 0) catch |err| blk: {
+        // Windows has no io_uring: its reads run on threads, as they do where the kernel refuses the ring
+        s.ring = if (has_ring) linux.IoUring.init(slot_count, 0) catch |err| blk: {
             std.log.info("io_uring unavailable ({t}): checkpoint reads run on threads", .{err});
             break :blk null;
-        };
+        } else null;
         return s;
     }
 
     /// Waits for reads still in flight, then frees the ring and slots and closes the files.
     pub fn deinit(s: *Source) void {
         while (s.in_flight > 0) s.reap(1) catch break;
-        if (s.ring) |*r| r.deinit() else s.joinAll();
+        if (s.ring) |*r| ringDeinit(r) else s.joinAll();
         s.freeSlots(slot_count);
         for (s.files.items) |*m| m.file.close();
         s.files.deinit(s.gpa);
@@ -157,8 +161,7 @@ pub const Source = struct {
         var q = p;
         q.at = @intCast(p.offset - lo);
         if (s.ring) |*r| {
-            _ = try r.read(k, p.file.fd, .{ .buffer = s.slots[k][0..dio.span(p.offset, p.len)] }, lo);
-            _ = try r.submit();
+            try ringRead(r, k, p.file.fd, s.slots[k][0..dio.span(p.offset, p.len)], lo);
         } else {
             const j = &s.jobs[k];
             j.* = .{ .file = p.file, .buf = s.slots[k], .offset = p.offset, .len = p.len };
@@ -192,7 +195,12 @@ pub const Source = struct {
 
     /// Finished reads, copied on; waits for at least `wait` of them.
     fn reap(s: *Source, wait: u32) !void {
-        const r = if (s.ring) |*ring| ring else return s.reapThreads(wait);
+        if (s.ring) |*r| return s.reapRing(r, wait);
+        return s.reapThreads(wait);
+    }
+
+    fn reapRing(s: *Source, r: *linux.IoUring, wait: u32) !void {
+        if (!has_ring) unreachable;
         var cqes: [slot_count]linux.io_uring_cqe = undefined;
         const n = try r.copy_cqes(&cqes, wait);
         for (cqes[0..n]) |c| {
@@ -207,6 +215,17 @@ pub const Source = struct {
             };
             try s.finish(k, p, got);
         }
+    }
+
+    fn ringRead(r: *linux.IoUring, k: usize, fd: dio.Fd, buf: []u8, lo: u64) !void {
+        if (!has_ring) unreachable;
+        _ = try r.read(k, fd, .{ .buffer = buf }, lo);
+        _ = try r.submit();
+    }
+
+    fn ringDeinit(r: *linux.IoUring) void {
+        if (!has_ring) unreachable;
+        r.deinit();
     }
 
     /// Page-locked slots record their copy event; pageable slots wait for the driver to stage their bytes.

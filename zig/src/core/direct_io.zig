@@ -1,4 +1,4 @@
-//! Positional reads that skip the page cache (O_DIRECT on Linux): 4 KiB-aligned spans into aligned buffers.
+//! Positional reads that skip the page cache (O_DIRECT on Linux, FILE_FLAG_NO_BUFFERING on Windows): 4 KiB-aligned spans into aligned buffers.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -19,12 +19,31 @@ pub fn fits(bytes: usize) usize {
     return bytes - 2 * alignment;
 }
 
+/// A file's handle: a descriptor on POSIX, a HANDLE on Windows.
+pub const Fd = if (builtin.os.tag == .windows) win.HANDLE else std.c.fd_t;
+
+const win = struct {
+    pub const HANDLE = *anyopaque;
+    pub const OVERLAPPED = extern struct { Internal: usize, InternalHigh: usize, Offset: u32, OffsetHigh: u32, hEvent: ?*anyopaque };
+    extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, sa: ?*anyopaque, disposition: u32, flags: u32, template: ?*anyopaque) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn ReadFile(h: HANDLE, buf: [*]u8, n: u32, read: *u32, ov: *OVERLAPPED) callconv(.winapi) i32;
+    extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) i32;
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+    const handle_eof: u32 = 38;
+    const invalid: usize = std.math.maxInt(usize);
+
+    fn isInvalid(h: ?HANDLE) bool {
+        return h == null or @intFromPtr(h.?) == invalid;
+    }
+};
+
 pub const File = struct {
-    fd: std.c.fd_t,
+    fd: Fd,
     direct: bool,
 
     /// `path` read-only, direct when its file system allows it, else through the page cache.
     pub fn open(path: [:0]const u8) !File {
+        if (builtin.os.tag == .windows) return openWindows(path);
         if (builtin.os.tag == .linux) {
             const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .DIRECT = true });
             if (fd >= 0) return .{ .fd = fd, .direct = true };
@@ -34,8 +53,25 @@ pub const File = struct {
         return .{ .fd = fd, .direct = false };
     }
 
+    fn openWindows(path: [:0]const u8) !File {
+        var buf: [1024:0]u16 = undefined;
+        const n = std.unicode.utf8ToUtf16Le(&buf, path) catch return error.FileNotFound;
+        if (n >= buf.len) return error.FileNotFound;
+        buf[n] = 0;
+        const read_only: u32 = 0x80000000;
+        const share_read: u32 = 0x1;
+        const open_existing: u32 = 3;
+        const normal: u32 = 0x80;
+        const no_buffering: u32 = 0x20000000;
+        const direct_h = win.CreateFileW(buf[0..n :0], read_only, share_read, null, open_existing, normal | no_buffering, null);
+        if (!win.isInvalid(direct_h)) return .{ .fd = direct_h.?, .direct = true };
+        const h = win.CreateFileW(buf[0..n :0], read_only, share_read, null, open_existing, normal, null);
+        if (win.isInvalid(h)) return error.FileNotFound;
+        return .{ .fd = h.?, .direct = false };
+    }
+
     pub fn close(f: *File) void {
-        _ = std.c.close(f.fd);
+        if (builtin.os.tag == .windows) _ = win.CloseHandle(f.fd) else _ = std.c.close(f.fd);
         f.* = undefined;
     }
 
@@ -46,11 +82,20 @@ pub const File = struct {
     }
 };
 
-fn sysPread(_: *anyopaque, fd: std.c.fd_t, buf: [*]u8, len: usize, offset: u64) isize {
+fn sysPread(_: *anyopaque, fd: Fd, buf: [*]u8, len: usize, offset: u64) isize {
+    if (builtin.os.tag == .windows) return winPread(fd, buf, len, offset);
     return std.c.pread(fd, buf, len, @intCast(offset));
 }
 
-fn readAt(f: File, buf: Buffer, offset: u64, len: usize, ctx: *anyopaque, pread: *const fn (*anyopaque, std.c.fd_t, [*]u8, usize, u64) isize) ![]u8 {
+/// A positional read: the bytes read, 0 at the end of the file, -1 on failure.
+fn winPread(h: Fd, buf: [*]u8, len: usize, offset: u64) isize {
+    var ov: win.OVERLAPPED = .{ .Internal = 0, .InternalHigh = 0, .Offset = @truncate(offset), .OffsetHigh = @truncate(offset >> 32), .hEvent = null };
+    var got: u32 = 0;
+    if (win.ReadFile(h, buf, @intCast(len), &got, &ov) != 0) return got;
+    return if (win.GetLastError() == win.handle_eof) 0 else -1;
+}
+
+fn readAt(f: File, buf: Buffer, offset: u64, len: usize, ctx: *anyopaque, pread: *const fn (*anyopaque, Fd, [*]u8, usize, u64) isize) ![]u8 {
     const lo = std.mem.alignBackward(u64, offset, alignment);
     const want: usize = @intCast(offset + len - lo);
     const whole = span(offset, len);
@@ -62,8 +107,8 @@ fn readAt(f: File, buf: Buffer, offset: u64, len: usize, ctx: *anyopaque, pread:
         const ask = whole - at;
         const n = pread(ctx, f.fd, buf.ptr + at, ask, lo + @as(u64, @intCast(at)));
         if (n < 0) {
-            if (std.c.errno(n) == .INTR) continue;
-            std.log.err("read of {d} bytes at {d} failed: {t}", .{ ask, lo + at, std.c.errno(n) });
+            if (builtin.os.tag != .windows and std.c.errno(n) == .INTR) continue;
+            std.log.err("read of {d} bytes at {d} failed", .{ ask, lo + at });
             return error.ReadFailed;
         }
         if (n == 0) return error.EndOfFile;
@@ -111,7 +156,7 @@ const Script = struct {
     calls: usize = 0,
     bad: bool = false,
 
-    fn pread(ctx: *anyopaque, _: std.c.fd_t, buf: [*]u8, len: usize, offset: u64) isize {
+    fn pread(ctx: *anyopaque, _: Fd, buf: [*]u8, len: usize, offset: u64) isize {
         const s: *Script = @ptrCast(@alignCast(ctx));
         if (s.calls < s.offs.len) s.offs[s.calls] = offset;
         s.calls += 1;
@@ -127,7 +172,7 @@ const Script = struct {
 
 fn direct(script: *Script, out: []u8, offset: u64) !void {
     var storage: [8192]u8 align(alignment) = undefined;
-    const f: File = .{ .fd = -1, .direct = true };
+    const f: File = .{ .fd = undefined, .direct = true };
     const got = try readAt(f, &storage, offset, out.len, script, Script.pread);
     @memcpy(out, got);
 }
