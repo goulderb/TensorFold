@@ -1,91 +1,76 @@
-//! The listening socket: SO_REUSEADDR only (never REUSEPORT, so a second server on the port fails), backlog 128.
+//! The listening socket: SO_REUSEADDR only (never REUSEPORT, so a second server on the port fails), backlog 128. On
+//! Windows the port is held exclusively (SO_EXCLUSIVEADDRUSE) instead, which gives the same refusal.
 const std = @import("std");
-const posix = std.posix;
 const net = std.Io.net;
 const log = @import("log.zig");
+const sock = @import("platform").sock;
 const Threaded = std.Io.Threaded;
 
 /// The run has said once that accepts ran out of descriptors; a successful accept arms it again.
 var nofile_logged = std.atomic.Value(bool).init(false);
 
 pub const Listener = struct {
-    fd: posix.socket_t,
+    fd: sock.Handle,
 
     pub fn open(address: net.IpAddress) !Listener {
-        var storage: Threaded.PosixAddress = undefined;
+        var storage: sock.Address = undefined;
         const len = Threaded.addressToPosix(&address, &storage);
-        const family: u32 = if (address == .ip4) posix.AF.INET else posix.AF.INET6;
-        const rc = posix.system.socket(family, posix.SOCK.STREAM, 0);
-        if (posix.errno(rc) != .SUCCESS) return error.SocketFailed;
-        const fd: posix.socket_t = @intCast(rc);
-        errdefer _ = posix.system.close(fd);
-        const one: c_int = 1;
-        try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, std.mem.asBytes(&one));
-        switch (posix.errno(posix.system.bind(fd, &storage.any, len))) {
-            .SUCCESS => {},
-            .ADDRINUSE => return error.AddressInUse,
-            .ACCES => return error.AccessDenied,
-            else => return error.BindFailed,
-        }
-        if (posix.errno(posix.system.listen(fd, 128)) != .SUCCESS) return error.ListenFailed;
+        const family: u32 = if (address == .ip4) std.posix.AF.INET else std.posix.AF.INET6;
+        const fd = sock.create(family, true) catch return error.SocketFailed;
+        errdefer sock.close(fd);
+        try sock.setListenReuse(fd);
+        try sock.bindAddr(fd, &storage, len);
+        try sock.listenOn(fd, 128);
         return .{ .fd = fd };
     }
 
     pub fn port(l: Listener) u16 {
-        var storage: Threaded.PosixAddress = undefined;
-        var len: posix.socklen_t = @sizeOf(Threaded.PosixAddress);
-        if (posix.errno(posix.system.getsockname(l.fd, &storage.any, &len)) != .SUCCESS) return 0;
-        return Threaded.addressFromPosix(&storage).getPort();
+        return sock.localPort(l.fd);
     }
 
-    pub const Accepted = struct { fd: posix.socket_t, peer: net.IpAddress };
+    pub const Accepted = struct { fd: sock.Handle, peer: net.IpAddress };
 
     /// The next connection; null once ``stop`` is set or the socket fails.
     pub fn accept(l: Listener, stop: *const std.atomic.Value(bool)) ?Accepted {
         while (true) {
             if (stop.load(.acquire)) return null;
-            var fds = [_]posix.pollfd{.{ .fd = l.fd, .events = posix.POLL.IN, .revents = 0 }};
-            const ready = posix.poll(&fds, 200) catch return null;
+            const ready = sock.poll(l.fd, sock.IN, 200) catch return null;
             if (ready == 0) continue;
-            var storage: Threaded.PosixAddress = undefined;
-            var len: posix.socklen_t = @sizeOf(Threaded.PosixAddress);
-            const rc = posix.system.accept(l.fd, &storage.any, &len);
-            const e = posix.errno(rc);
-            switch (e) {
-                .SUCCESS => {
-                    nofile_logged.store(false, .release);
-                    return .{ .fd = @intCast(rc), .peer = Threaded.addressFromPosix(&storage) };
-                },
-                .INTR, .AGAIN, .CONNABORTED, .MFILE, .NFILE, .NOBUFS, .NOMEM => {
-                    if (e != .INTR) {
-                        if (firstNofile(e)) log.line("out of file descriptors ({s}): new connections wait until open ones close; raise the open-file limit (ulimit -n)", .{@tagName(e)});
-                        std.Io.sleep(log.io(), .fromMilliseconds(10), .awake) catch {};
-                    }
+            var storage: sock.Address = undefined;
+            const fd = sock.acceptConn(l.fd, &storage) catch |e| switch (e) {
+                error.Exhausted => {
+                    if (firstExhausted()) log.line("out of file descriptors: new connections wait until open ones close; raise the open-file limit (ulimit -n)", .{});
+                    std.Io.sleep(log.io(), .fromMilliseconds(10), .awake) catch {};
                     continue;
                 },
-                else => return null,
-            }
+                error.Transient => {
+                    std.Io.sleep(log.io(), .fromMilliseconds(10), .awake) catch {};
+                    continue;
+                },
+                error.Fatal => return null,
+            };
+            nofile_logged.store(false, .release);
+            return .{ .fd = fd, .peer = Threaded.addressFromPosix(&storage) };
         }
     }
 
     pub fn close(l: Listener) void {
-        _ = posix.system.shutdown(l.fd, posix.SHUT.RDWR);
-        _ = posix.system.close(l.fd);
+        sock.shutdownBoth(l.fd);
+        sock.close(l.fd);
     }
 };
 
-/// Whether this failure is the burst's first descriptor exhaustion (EMFILE, ENFILE): one log line per burst.
-fn firstNofile(e: posix.E) bool {
-    return (e == .MFILE or e == .NFILE) and !nofile_logged.swap(true, .acq_rel);
+/// Whether this failure is the burst's first descriptor exhaustion: one log line per burst.
+fn firstExhausted() bool {
+    return !nofile_logged.swap(true, .acq_rel);
 }
 
 test "the descriptor log fires once per burst" {
     defer nofile_logged.store(false, .release);
-    try std.testing.expect(firstNofile(.MFILE));
-    try std.testing.expect(!firstNofile(.NFILE));
-    try std.testing.expect(!firstNofile(.AGAIN));
+    try std.testing.expect(firstExhausted());
+    try std.testing.expect(!firstExhausted());
     nofile_logged.store(false, .release); // what a successful accept does
-    try std.testing.expect(firstNofile(.NFILE));
+    try std.testing.expect(firstExhausted());
 }
 
 /// The peer's address as Python's ``client_address[0]`` prints it.

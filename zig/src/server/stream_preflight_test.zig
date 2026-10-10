@@ -246,7 +246,7 @@ fn sendWithBudget(engine: api.Engine, route: Route, body: []const u8, start: See
         .messages => try anthropic_translate.translate(&cx, raw, false),
         .responses => (try responses_translate.translate(&cx, raw, NoHistory{})).chat,
     };
-    var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
+    var conn: Conn = .{ .fd = Conn.no_socket, .peer = "", .buf = &.{}, .gpa = a };
     var seen = start;
     openai.run(srv, a, seen.out(), .{ .conn = &conn }, true, chat);
     seen.preparing = srv.preparing.load(.acquire);

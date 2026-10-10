@@ -1,5 +1,7 @@
 //! Bounded-name learned directories: both ranks plan the same identity deletions before either writes.
 const std = @import("std");
+const builtin = @import("builtin");
+// Windows has no learned-state file layer yet (W2-fs): every entry point refuses there.
 pub fn rootOf(dir: []const u8) []const u8 {
     return std.fs.path.dirname(dir) orelse ".";
 }
@@ -12,6 +14,7 @@ fn isCurrent(keep: []const u8, id: u64) bool {
     return std.mem.eql(u8, std.fs.path.basename(keep), formatted);
 }
 pub fn next(root: []const u8, keep: []const u8, after: ?u64) !?u64 {
+    if (comptime builtin.os.tag == .windows) return error.LearnedUnsupported;
     var buf: [1100]u8 = undefined;
     const d = std.c.opendir(try std.fmt.bufPrintSentinel(&buf, "{s}", .{root}, 0)) orelse return error.LearnedDirectoryRead;
     defer _ = std.c.closedir(d);
@@ -28,6 +31,7 @@ pub fn next(root: []const u8, keep: []const u8, after: ?u64) !?u64 {
     return out;
 }
 pub fn unlink(file: [:0]const u8) !void {
+    if (comptime builtin.os.tag == .windows) return error.LearnedUnsupported;
     const rc = std.c.unlink(file);
     if (rc != 0 and std.c.errno(rc) != .NOENT) return error.LearnedUnlink;
 }
@@ -110,6 +114,7 @@ pub fn removeUnindexed(dir: [:0]const u8, metas: anytype) !void {
     }
 }
 pub fn bytes(dir: [:0]const u8) !u64 {
+    if (comptime builtin.os.tag == .windows) return error.LearnedUnsupported;
     const d = std.c.opendir(dir) orelse return if (std.c.errno(-1) == .NOENT) 0 else error.LearnedDirectoryRead;
     defer _ = std.c.closedir(d);
     var n: u64 = 0;
@@ -129,6 +134,7 @@ pub fn bytes(dir: [:0]const u8) !u64 {
     return n;
 }
 pub fn fileBytes(file: [:0]const u8) !u64 {
+    if (comptime builtin.os.tag == .windows) return error.LearnedUnsupported;
     const fd = std.c.open(file, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
     if (fd < 0) return if (std.c.errno(fd) == .NOENT) 0 else error.LearnedDirectoryRead;
     defer _ = std.c.close(fd);
@@ -137,11 +143,13 @@ pub fn fileBytes(file: [:0]const u8) !u64 {
     return @intCast(end);
 }
 pub fn otherBytes(root: []const u8, keep: []const u8, id: u64) !u64 {
+    if (comptime builtin.os.tag == .windows) return error.LearnedUnsupported;
     if (isCurrent(keep, id)) return 0;
     var buf: [1100]u8 = undefined;
     return bytes(try path(&buf, root, id));
 }
 pub fn totalOthers(root: []const u8, keep: []const u8) !u64 {
+    if (comptime builtin.os.tag == .windows) return error.LearnedUnsupported;
     var cursor: ?u64 = null;
     var n: u64 = 0;
     while (try next(root, keep, cursor)) |id| {
@@ -151,9 +159,11 @@ pub fn totalOthers(root: []const u8, keep: []const u8) !u64 {
     return n;
 }
 pub fn total(root: []const u8) !u64 {
+    if (comptime builtin.os.tag == .windows) return error.LearnedUnsupported;
     return totalOthers(root, "-");
 }
 pub fn used(root: []const u8, id: u64) !u64 {
+    if (comptime builtin.os.tag == .windows) return error.LearnedUnsupported;
     var buf: [1100]u8 = undefined;
     const f = try std.fmt.bufPrintSentinel(&buf, "{s}/{x:0>16}/used", .{ root, id }, 0);
     const fd = std.c.open(f, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
@@ -174,6 +184,7 @@ pub fn used(root: []const u8, id: u64) !u64 {
     return n;
 }
 pub fn removeOther(root: []const u8, keep: []const u8, id: u64) !void {
+    if (comptime builtin.os.tag == .windows) return error.LearnedUnsupported;
     if (isCurrent(keep, id)) return;
     var buf: [1100]u8 = undefined;
     const dir = try path(&buf, root, id);
@@ -191,6 +202,7 @@ pub fn removeOther(root: []const u8, keep: []const u8, id: u64) !void {
     if (rc != 0 and std.c.errno(rc) != .NOENT) return error.LearnedUnlink;
 }
 test "acknowledged deletion refuses a directory and accepts an absent file" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     var buf: [128]u8 = undefined;
     const dir = try std.fmt.bufPrintSentinel(&buf, "/tmp/tf-unlink-{d}", .{std.c.getpid()}, 0);
     try std.testing.expectEqual(@as(c_int, 0), std.c.mkdir(dir, 0o700));

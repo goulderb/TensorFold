@@ -431,37 +431,92 @@ pub fn callFunc(rt: *Rt, f: v.Func, pos: []const Value, kw: []const Kw) Error!Va
     }
 }
 
-const Tm = extern struct { sec: c_int, min: c_int, hour: c_int, mday: c_int, mon: c_int, year: c_int, wday: c_int, yday: c_int, isdst: c_int, gmtoff: c_long, zone: ?[*:0]const u8 };
+const Tm = if (builtin.os.tag == .windows) extern struct {
+    sec: c_int,
+    min: c_int,
+    hour: c_int,
+    mday: c_int,
+    mon: c_int,
+    year: c_int,
+    wday: c_int,
+    yday: c_int,
+    isdst: c_int,
+} else extern struct { sec: c_int, min: c_int, hour: c_int, mday: c_int, mon: c_int, year: c_int, wday: c_int, yday: c_int, isdst: c_int, gmtoff: c_long, zone: ?[*:0]const u8 };
 extern "c" fn localtime_r(t: *const std.c.time_t, out: *Tm) ?*Tm;
+extern "c" fn _localtime64_s(out: *Tm, t: *const i64) c_int;
 extern "c" fn strftime(buf: [*]u8, max: usize, fmt: [*:0]const u8, tm: *const Tm) usize;
+extern "kernel32" fn GetSystemTimePreciseAsFileTime(ft: *u64) callconv(.winapi) void;
+
+/// The wall clock as Unix seconds and microseconds.
+fn wallClock() struct { sec: i64, usec: u32 } {
+    if (builtin.os.tag == .windows) {
+        var ft: u64 = 0;
+        GetSystemTimePreciseAsFileTime(&ft);
+        // FILETIME counts 100 ns ticks from 1601-01-01; the Unix epoch is 11644473600 s later
+        const unix_us = ft / 10 - 11644473600 * 1_000_000;
+        return .{ .sec = @intCast(unix_us / 1_000_000), .usec = @intCast(unix_us % 1_000_000) };
+    }
+    var tv: std.c.timeval = undefined;
+    _ = std.c.gettimeofday(&tv, null);
+    return .{ .sec = @intCast(tv.sec), .usec = @intCast(tv.usec) };
+}
+
+/// The local broken-down time of `sec`, or false where the C library refuses it.
+fn localTm(sec: i64, tm: *Tm) bool {
+    if (builtin.os.tag == .windows) {
+        var t = sec;
+        return _localtime64_s(tm, &t) == 0;
+    }
+    var t: std.c.time_t = @intCast(sec);
+    return localtime_r(&t, tm) != null;
+}
 
 /// datetime.now().strftime(): %f, %z and %Z are Python's own (naive time), the rest is the C library's.
 fn strftimeNow(rt: *Rt, fmt: []const u8) Error![]const u8 {
     if (!builtin.link_libc) return rt.fail("strftime_now needs libc", .{});
-    var tv: std.c.timeval = undefined;
-    _ = std.c.gettimeofday(&tv, null);
     var tm: Tm = undefined;
-    if (localtime_r(&tv.sec, &tm) == null) return rt.fail("localtime failed", .{});
+    const now = wallClock();
+    if (!localTm(now.sec, &tm)) return rt.fail("localtime failed", .{});
+    return formatTm(rt.a, fmt, &tm, now.usec);
+}
+
+/// ``fmt`` against the broken-down local time ``tm`` and ``usec`` microseconds. The caller owns the result.
+fn formatTm(a: std.mem.Allocator, fmt: []const u8, tm: *const Tm, usec: u32) std.mem.Allocator.Error![]const u8 {
     var pre: std.ArrayList(u8) = .empty;
+    defer pre.deinit(a);
     var i: usize = 0;
     while (i < fmt.len) : (i += 1) {
         if (fmt[i] != '%' or i + 1 >= fmt.len) {
-            try pre.append(rt.a, fmt[i]);
+            try pre.append(a, fmt[i]);
             continue;
         }
         i += 1;
         switch (fmt[i]) {
-            'f' => try pre.print(rt.a, "{d:0>6}", .{@as(u64, @intCast(tv.usec))}),
+            'f' => try pre.print(a, "{d:0>6}", .{usec}),
             'z', 'Z' => {},
-            else => try pre.appendSlice(rt.a, &.{ '%', fmt[i] }),
+            else => try pre.appendSlice(a, &.{ '%', fmt[i] }),
         }
     }
-    try pre.append(rt.a, 0);
+    try pre.append(a, 0);
     var size: usize = 256;
     while (size <= 1 << 20) : (size *= 2) {
-        const buf = try rt.a.alloc(u8, size);
-        const n = strftime(buf.ptr, size, @ptrCast(pre.items.ptr), &tm);
-        if (n > 0 or pre.items.len == 1) return buf[0..n];
+        const buf = try a.alloc(u8, size);
+        const n = strftime(buf.ptr, size, @ptrCast(pre.items.ptr), tm);
+        if (n > 0 or pre.items.len == 1) return a.realloc(buf, n);
+        a.free(buf);
     }
-    return "";
+    return a.alloc(u8, 0);
+}
+
+test "strftime_now formats a fixed instant with Python's %f and drops %z and %Z" {
+    var tm: Tm = std.mem.zeroes(Tm);
+    tm.year = 126; // 2026
+    tm.mon = 9; // October
+    tm.mday = 10;
+    tm.hour = 14;
+    tm.min = 5;
+    tm.sec = 9;
+    const out = try formatTm(std.testing.allocator, "%Y-%m-%d %H:%M:%S.%f%z%Z", &tm, 123456);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("2026-10-10 14:05:09.123456", out);
 }

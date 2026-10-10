@@ -1,8 +1,8 @@
 //! One HTTP/1.1 connection as Python's BaseHTTPRequestHandler serves it: bounded heads, keep-alive, error pages.
 const std = @import("std");
-const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const log = @import("log.zig");
+const sock = @import("platform").sock;
 
 pub const max_line = 65536;
 pub const max_headers = 100;
@@ -27,7 +27,10 @@ pub const StatusHook = struct {
 };
 
 pub const Conn = struct {
-    fd: posix.socket_t,
+    /// A connection with no socket (tests drive the handlers with one).
+    pub const no_socket: sock.Handle = sock.none;
+
+    fd: sock.Handle,
     peer: []const u8,
     timeouts: Timeouts = .{},
     buf: []u8,
@@ -49,7 +52,7 @@ pub const Conn = struct {
     broken: bool = false,
     quiet_log: bool = false,
 
-    pub fn init(gpa: Allocator, fd: posix.socket_t, peer: []const u8) !Conn {
+    pub fn init(gpa: Allocator, fd: sock.Handle, peer: []const u8) !Conn {
         return .{ .fd = fd, .peer = peer, .gpa = gpa, .buf = try gpa.alloc(u8, 2 * max_line + 8192) };
     }
 
@@ -67,10 +70,9 @@ pub const Conn = struct {
             c.end -= c.start;
             c.start = 0;
         }
-        var fds = [_]posix.pollfd{.{ .fd = c.fd, .events = posix.POLL.IN, .revents = 0 }};
-        const ready = posix.poll(&fds, timeout_ms) catch return error.Closed;
+        const ready = sock.poll(c.fd, sock.IN, timeout_ms) catch return error.Closed;
         if (ready == 0) return error.Timeout;
-        const got = posix.read(c.fd, c.buf[c.end..]) catch return error.Closed;
+        const got = sock.read(c.fd, c.buf[c.end..]) catch return error.Closed;
         c.end += got;
         return got;
     }
@@ -111,16 +113,11 @@ pub const Conn = struct {
     /// Whether the peer has gone: readable with nothing to read (Python's socket_cancellation).
     pub fn peerGone(c: *Conn) bool {
         if (c.broken) return true;
-        var fds = [_]posix.pollfd{.{ .fd = c.fd, .events = posix.POLL.IN | posix.POLL.PRI, .revents = 0 }};
-        const ready = posix.poll(&fds, 0) catch return true;
+        const ready = sock.poll(c.fd, sock.IN | sock.PRI, 0) catch return true;
         if (ready == 0) return false;
         var probe: [1]u8 = undefined;
-        const rc = posix.system.recvfrom(c.fd, &probe, 1, posix.MSG.PEEK | posix.MSG.DONTWAIT, null, null);
-        return switch (posix.errno(rc)) {
-            .SUCCESS => rc == 0,
-            .AGAIN, .INTR => false,
-            else => true,
-        };
+        const n = sock.peek(c.fd, &probe) catch |e| return e == error.ReadFailed;
+        return n == 0;
     }
 
     /// Writes ``data`` whole; a write that cannot progress for ``write_ms`` marks the client gone.
@@ -128,15 +125,13 @@ pub const Conn = struct {
         if (c.broken) return error.Closed;
         var sent: usize = 0;
         while (sent < data.len) {
-            var fds = [_]posix.pollfd{.{ .fd = c.fd, .events = posix.POLL.OUT, .revents = 0 }};
-            const ready = posix.poll(&fds, c.timeouts.write_ms) catch return c.fail();
+            const ready = sock.poll(c.fd, sock.OUT, c.timeouts.write_ms) catch return c.fail();
             if (ready == 0) return c.fail();
-            const rc = posix.system.write(c.fd, data[sent..].ptr, data.len - sent);
-            switch (posix.errno(rc)) {
-                .SUCCESS => sent += @intCast(rc),
-                .AGAIN, .INTR => {},
-                else => return c.fail(),
-            }
+            const n = sock.write(c.fd, data[sent..]) catch |e| switch (e) {
+                error.WouldBlock => continue,
+                error.WriteFailed => return c.fail(),
+            };
+            sent += n;
         }
     }
 
@@ -475,4 +470,64 @@ test "versions and repr" {
     defer arena.deinit();
     try std.testing.expectEqualStrings("\"a'b\"", try pyRepr(arena.allocator(), "a'b"));
     try std.testing.expectEqualStrings("'\\x7f\\xa0\xc3\xa9\\t'", try pyRepr(arena.allocator(), "\x7f\xa0\xe9\t"));
+}
+
+/// A listener on the loopback address, a client connected to it, and the accepted side of that connection.
+const Pair = struct { listener: sock.Handle, client: sock.Handle, server: sock.Handle };
+
+fn loopbackPair() !Pair {
+    const std_addr = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+    var bound: sock.Address = undefined;
+    const len = std.Io.Threaded.addressToPosix(&std_addr, &bound);
+    const listener = try sock.create(std.posix.AF.INET, true);
+    errdefer sock.close(listener);
+    try sock.setListenReuse(listener);
+    try sock.bindAddr(listener, &bound, len);
+    try sock.listenOn(listener, 4);
+    var target: sock.Address = undefined;
+    const to = try std.Io.net.IpAddress.parse("127.0.0.1", sock.localPort(listener));
+    const tlen = std.Io.Threaded.addressToPosix(&to, &target);
+    const client = try sock.create(std.posix.AF.INET, true);
+    errdefer sock.close(client);
+    try sock.connectAddr(client, &target, tlen);
+    var peer: sock.Address = undefined;
+    const server = try sock.acceptConn(listener, &peer);
+    return .{ .listener = listener, .client = client, .server = server };
+}
+
+fn closePair(p: Pair) void {
+    sock.close(p.server);
+    sock.close(p.client);
+    sock.close(p.listener);
+}
+
+test "a write a client never reads is cut at the write timeout" {
+    const p = try loopbackPair();
+    defer closePair(p);
+    var conn = try Conn.init(std.testing.allocator, p.server, "test");
+    defer conn.deinit();
+    conn.timeouts = .{ .write_ms = 100 };
+    const block = try std.testing.allocator.alloc(u8, 1 << 20);
+    defer std.testing.allocator.free(block);
+    @memset(block, 'x');
+    var cut = false;
+    var sent: usize = 0;
+    while (sent < 512 << 20) : (sent += block.len) {
+        conn.writeAll(block) catch {
+            cut = true;
+            break;
+        };
+    }
+    try std.testing.expect(cut);
+    try std.testing.expect(conn.broken);
+}
+
+test "a client that half-closes its side is reaped; an open one is not" {
+    const p = try loopbackPair();
+    defer closePair(p);
+    var conn = try Conn.init(std.testing.allocator, p.server, "test");
+    defer conn.deinit();
+    try std.testing.expect(!conn.peerGone());
+    sock.shutdownWrite(p.client);
+    try std.testing.expect(conn.peerGone());
 }
