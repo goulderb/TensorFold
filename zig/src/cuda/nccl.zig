@@ -21,6 +21,8 @@ pub const Api = struct {
     ncclCommInitRank: *const fn (*Comm, c_int, UniqueId, c_int) callconv(.c) R,
     ncclCommInitAll: *const fn ([*]Comm, c_int, ?[*]const c_int) callconv(.c) R,
     ncclCommDestroy: *const fn (Comm) callconv(.c) R,
+    /// frees the communicator and ends its pending operations (a lost peer: NCCL then returns instead of waiting)
+    ncclCommAbort: *const fn (Comm) callconv(.c) R,
     ncclGetErrorString: *const fn (R) callconv(.c) ?[*:0]const u8,
     ncclAllReduce: *const fn (D, D, usize, DataType, RedOp, Comm, abi.Stream) callconv(.c) R,
     ncclAllGather: *const fn (D, D, usize, DataType, Comm, abi.Stream) callconv(.c) R,
@@ -71,3 +73,8 @@ pub const Library = struct {
         return v;
     }
 };
+
+test "a library without NCCL's symbols is refused (Linux)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    try std.testing.expectError(error.MissingSymbol, Library.openPath("libc.so.6"));
+}
