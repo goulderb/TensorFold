@@ -30,10 +30,17 @@ pub const DType = enum {
         };
     }
 
+    const names = .{ .{ "BOOL", .bool }, .{ "U8", .u8 }, .{ "I8", .i8 }, .{ "U16", .u16 }, .{ "I16", .i16 }, .{ "F16", .f16 }, .{ "BF16", .bf16 }, .{ "U32", .u32 }, .{ "I32", .i32 }, .{ "F32", .f32 }, .{ "U64", .u64 }, .{ "I64", .i64 }, .{ "F64", .f64 }, .{ "F8_E4M3", .f8_e4m3 }, .{ "F8_E5M2", .f8_e5m2 }, .{ "F8_E8M0", .f8_e8m0 } };
+
     pub fn parse(text: []const u8) ?DType {
-        const names = .{ .{ "BOOL", .bool }, .{ "U8", .u8 }, .{ "I8", .i8 }, .{ "U16", .u16 }, .{ "I16", .i16 }, .{ "F16", .f16 }, .{ "BF16", .bf16 }, .{ "U32", .u32 }, .{ "I32", .i32 }, .{ "F32", .f32 }, .{ "U64", .u64 }, .{ "I64", .i64 }, .{ "F64", .f64 }, .{ "F8_E4M3", .f8_e4m3 }, .{ "F8_E5M2", .f8_e5m2 }, .{ "F8_E8M0", .f8_e8m0 } };
         inline for (names) |n| if (std.mem.eql(u8, text, n[0])) return n[1];
         return null;
+    }
+
+    /// The header's spelling ("I16", "F16", ...).
+    pub fn name(self: DType) []const u8 {
+        inline for (names) |n| if (self == n[1]) return n[0];
+        unreachable;
     }
 };
 
@@ -66,7 +73,10 @@ pub fn parseHeaderPrefix(arena: std.mem.Allocator, json: []const u8, data_len: u
     var out: Header = .empty;
     var it = parsed.object.iterator();
     while (it.next()) |kv| {
-        if (std.mem.eql(u8, kv.key_ptr.*, "__metadata__")) continue;
+        if (std.mem.eql(u8, kv.key_ptr.*, "__metadata__")) {
+            try checkMetadata(kv.value_ptr.*);
+            continue;
+        }
         if (prefix) |p| if (!std.mem.startsWith(u8, kv.key_ptr.*, p)) continue;
         if (kv.value_ptr.* != .object) return error.BadSafetensors;
         const o = kv.value_ptr.object;
@@ -74,11 +84,8 @@ pub fn parseHeaderPrefix(arena: std.mem.Allocator, json: []const u8, data_len: u
         const shape = list(o.get("shape")) orelse return error.BadSafetensors;
         if (shape.len > max_rank) return error.RankTooHigh;
         var e: Entry = .{ .dtype = dtype, .rank = @intCast(shape.len), .shape = @splat(1), .begin = 0, .end = 0 };
-        var n: usize = dtype.size();
-        for (shape, 0..) |d, i| {
-            e.shape[i] = uint(d) orelse return error.BadSafetensors;
-            n = std.math.mul(usize, n, e.shape[i]) catch return error.BadSafetensors;
-        }
+        for (shape, 0..) |d, i| e.shape[i] = uint(d) orelse return error.BadSafetensors;
+        const n = byteCount(dtype.size(), e.shape[0..shape.len]) orelse return error.BadSafetensors;
         const offs = list(o.get("data_offsets")) orelse return error.BadSafetensors;
         if (offs.len != 2) return error.BadSafetensors;
         e.begin = uint(offs[0]) orelse return error.BadSafetensors;
@@ -87,6 +94,22 @@ pub fn parseHeaderPrefix(arena: std.mem.Allocator, json: []const u8, data_len: u
         try out.put(arena, kv.key_ptr.*, e);
     }
     return out;
+}
+
+/// `__metadata__` is a JSON object whose values are all strings.
+fn checkMetadata(v: std.json.Value) !void {
+    if (v != .object) return error.BadSafetensors;
+    var it = v.object.iterator();
+    while (it.next()) |kv| if (kv.value_ptr.* != .string) return error.BadSafetensors;
+}
+
+/// The byte count of `dims` at `size` bytes each, or null on overflow. A zero dimension makes it 0 before any
+/// multiplication, so an empty tensor never overflows on its other dimensions.
+fn byteCount(size: usize, dims: []const usize) ?usize {
+    if (std.mem.indexOfScalar(usize, dims, 0) != null) return 0;
+    var n = size;
+    for (dims) |d| n = std.math.mul(usize, n, d) catch return null;
+    return n;
 }
 
 fn str(v: ?std.json.Value) ?[]const u8 {
@@ -289,4 +312,28 @@ test "text namespace filtering skips rank-six vision metadata without hiding inv
     try std.testing.expectEqual(@as(usize, 1), h.count());
     try std.testing.expect(h.contains("language_model.lm_head.weight"));
     try std.testing.expectError(error.BadSafetensors, parseHeaderPrefix(arena.allocator(), json, 25, "language_model."));
+}
+
+test "an empty tensor whose other dimensions overflow takes zero bytes; a non-empty one is refused" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const empty = "{\"t\": {\"dtype\": \"BF16\", \"shape\": [4611686018427387904, 2, 0], \"data_offsets\": [0, 0]}, " ++
+        "\"f\": {\"dtype\": \"BF16\", \"shape\": [4611686018427387904, 2, 2, 2, 0], \"data_offsets\": [0, 0]}}";
+    const h = try parseHeader(arena.allocator(), empty, 0);
+    const t = h.get("t").?;
+    try std.testing.expectEqual(@as(u8, 3), t.rank);
+    try std.testing.expectEqual(t.begin, t.end);
+    const f = h.get("f").?;
+    try std.testing.expectEqual(@as(u8, 5), f.rank);
+    try std.testing.expectEqual(@as(usize, 0), f.shape[4]);
+    try std.testing.expectError(error.BadSafetensors, parseHeader(arena.allocator(), "{\"t\": {\"dtype\": \"BF16\", \"shape\": [4611686018427387904, 2, 2, 2, 1], \"data_offsets\": [0, 0]}}", 0));
+}
+
+test "__metadata__ is an object of strings, and anything else is refused" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const ok = "{\"__metadata__\": {\"format\": \"pt\"}, \"t\": {\"dtype\": \"U8\", \"shape\": [1], \"data_offsets\": [0, 1]}}";
+    try std.testing.expectEqual(@as(usize, 1), (try parseHeader(arena.allocator(), ok, 1)).count());
+    const bad = [_][]const u8{ "{\"__metadata__\": 5}", "{\"__metadata__\": [\"pt\"]}", "{\"__metadata__\": {\"format\": 1}}" };
+    for (bad) |json| try std.testing.expectError(error.BadSafetensors, parseHeader(arena.allocator(), json, 0));
 }
