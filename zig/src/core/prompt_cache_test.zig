@@ -391,3 +391,20 @@ test "a kept state grows only into what the budget leaves, and evicts nothing to
     var stranger: u8 = 0;
     try std.testing.expect(!s.grow(&stranger, 0)); // a state the store doesn't hold
 }
+
+test "marks the lookup plans that fit the budget one by one but not together: the reserve cannot cover them, and the later one never evicts the earlier" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .min_prompt = 0, .min_gap = 1 }, 400); // bytes 100 + at: 200 and 350 each fit, not both
+    defer s.deinit();
+    var prompt: [300]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast((i * 29 + 4) % 41);
+    const l = try s.lookup(arena.allocator(), &prompt, 100, &.{250}, &.{}, &.{}); // the history's mark at 100, the shared cut at 250
+    try std.testing.expectEqualSlices(u32, &.{ 100, 250 }, l.marks);
+    _ = f.pass(&s, &prompt, .{ .from = 0, .marks = l.marks });
+    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
+    try std.testing.expectEqual(@as(u32, 100), s.entries.items[0].at);
+    try std.testing.expect(s.held <= s.budget);
+}
