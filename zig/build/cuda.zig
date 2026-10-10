@@ -106,7 +106,7 @@ fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
 }
 
 /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
-pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, draft_ids: *std.Build.Module, build_options: *std.Build.Step.Options) void {
+pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, draft_ids: *std.Build.Module, build_options: *std.Build.Step.Options) *std.Build.Step.Compile {
     const nvcc = b.option([]const u8, "nvcc", "nvcc (or a wrapper) that builds the CUDA kernel fatbins");
     const prebuilt = b.option([]const u8, "fatbins", "absolute directory of prebuilt <name>.fatbin files to embed");
     const sms = b.option([]const u8, "sm", "SASS targets, comma separated (default 121; 80, 86, 89, 120 and 121 build)") orelse "121";
@@ -158,7 +158,9 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     b.installArtifact(runner_exe);
     const controls = if (nvcc) |tool| fatbin(b, tool, version.?, .{ .name = "contract_controls", .flags = &.{"-O3"} }, sms) else null;
     @import("kernel_contract.zig").cuda(b, runner_exe, controls);
-    nativeServer(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.tokenizer, build_options, true).root_module.strip = strip;
+    const server = nativeServer(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.tokenizer, build_options, true);
+    server.root_module.strip = strip;
+    return server;
 }
 
 /// The GLM-5.3-Flash CUDA family over the runtime, the core, the lane core, canon's shares and core/heat.zig.
@@ -246,6 +248,8 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     // the HTTP server's unit tests (zig/src/server/root.zig), which the macOS build runs, on Linux hosts too
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = host, .optimize = .debug, .link_libc = true });
     const platform = b.createModule(.{ .root_source_file = b.path("zig/src/core/platform.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    // -Dtest-filter=TEXT runs only the server tests whose names contain TEXT (the stall and half-close tests by name)
+    const filters: []const []const u8 = if (b.option([]const u8, "test-filter", "Run only the server tests whose names contain this text")) |f| b.allocator.dupe([]const u8, &.{f}) catch @panic("OOM") else &.{};
     const server_tests = b.createModule(.{
         .root_source_file = b.path("zig/src/server/root.zig"),
         .target = host,
@@ -254,7 +258,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
         .imports = &.{ .{ .name = "engine_api", .module = native_modules.api }, .{ .name = "tokenizer", .module = mods.tokenizer }, .{ .name = "template", .module = template }, .{ .name = "platform", .module = platform } },
     });
     const server_json = @import("server.zig").addTo(b, server_tests, host, .debug);
-    const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
+    const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = filters }));
     const json_test = b.addRunArtifact(b.addTest(.{ .root_module = server_json }));
     const server_step = b.step(
         "test-server-cpu",

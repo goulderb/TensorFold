@@ -1,14 +1,18 @@
 //! Lane test fixtures from TF_LANES_FIXTURES: JSON lines, floats as IEEE bits, u64 past i64 as number strings.
 const std = @import("std");
+const env = @import("env");
 const lanes = @import("lanes");
 const json = std.json;
 const Allocator = std.mem.Allocator;
 
 pub const Value = json.Value;
 
+var dir_buf: [4096]u8 = undefined;
+
 /// The fixtures directory, or null when the environment does not name one (the tests then skip).
+
 pub fn dir() ?[]const u8 {
-    return std.testing.environ.getPosix("TF_LANES_FIXTURES");
+    return env.getInto(&dir_buf, "TF_LANES_FIXTURES") catch null;
 }
 
 pub fn read(gpa: Allocator, name: []const u8) ![]u8 {

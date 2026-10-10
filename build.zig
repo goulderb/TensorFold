@@ -18,6 +18,7 @@ const server_build = @import("zig/build/server.zig");
 const golden_build = @import("zig/build/golden.zig");
 const contract_build = @import("zig/build/kernel_contract.zig");
 const video_build = @import("zig/build/video.zig");
+const windows_tests = @import("zig/build/windows_tests.zig");
 
 comptime {
     const required = std.mem.trim(u8, @embedFile(".zig-version"), "\r\n");
@@ -163,7 +164,8 @@ pub fn build(b: *std.Build) void {
     merge_build.targets(b, target, optimize); // tf-merge-check and test-merge, host only on every OS
     switch (target.result.os.tag) {
         .macos => metalTargets(b, target, optimize, draft_ids, build_options, test_step),
-        .linux, .windows => cuda_build.targets(b, target, optimize, draft_ids, build_options),
+        .linux => _ = cuda_build.targets(b, target, optimize, draft_ids, build_options),
+        .windows => windows_tests.steps(b, target, test_step, cuda_build.targets(b, target, optimize, draft_ids, build_options)),
         else => {},
     }
     const xgrammar = grammar_build.option(b);
@@ -176,7 +178,7 @@ pub fn build(b: *std.Build) void {
         const api_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes_mod }} });
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api_mod })).step);
     }
-    hip_build.steps(b, target, optimize, build_options, test_step);
+    if (target.result.os.tag != .windows) hip_build.steps(b, target, optimize, build_options, test_step);
     exlr8_build.hostTests(b, target, test_step);
     xpu_build.steps(b, target, optimize, build_options);
     video_build.steps(b, target);
@@ -357,12 +359,13 @@ fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     // The cluster layer: inventory, membership, planner, loading and converged rounds over the lane core.
     const lanes = mods.lanes;
     const fabric = mods.fabric;
+    const env_mod = b.createModule(.{ .root_source_file = b.path("zig/src/core/env.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const cluster = b.createModule(.{
         .root_source_file = b.path("zig/src/cluster/cluster.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{ .{ .name = "lanes", .module = lanes }, .{ .name = "fabric", .module = fabric } },
+        .imports = &.{ .{ .name = "lanes", .module = lanes }, .{ .name = "fabric", .module = fabric }, .{ .name = "env", .module = env_mod } },
     });
     // The engine: kernel sources compiled at run time (MLX's options), the families, the lane core.
     const sources = mods.sources;

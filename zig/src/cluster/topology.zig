@@ -1,5 +1,6 @@
 //! The cluster's wiring from every node's ports: which port reaches which node, at what rate, and the graph's shape.
 const std = @import("std");
+const env = @import("env");
 const node = @import("node.zig");
 
 /// One cable: node `a`'s port to node `b`'s port (indices into the node list and their port lists).
@@ -134,7 +135,8 @@ test "four Macs with six cables form a mesh; three cables a chain or a star; a c
 }
 
 test "the lent cluster's real probes (TF_CLUSTER_PROBES): four M3 Ultras in a full mesh at 80 Gb/s" {
-    const root = std.testing.environ.getPosix("TF_CLUSTER_PROBES") orelse return error.SkipZigTest;
+    var env_buf: [4096]u8 = undefined;
+    const root = (try env.getInto(&env_buf, "TF_CLUSTER_PROBES")) orelse return error.SkipZigTest;
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
