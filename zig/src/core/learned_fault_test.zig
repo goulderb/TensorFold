@@ -3,6 +3,7 @@ const pc = @import("prompt_cache.zig");
 const Imprint = @import("prompt_imprint.zig").Imprint;
 const Fake = @import("prompt_cache_fake.zig").Fake;
 const dirs = @import("lanes").learned_dirs;
+const fsys = @import("lanes").learned_fs;
 const Admission = @import("lanes").learned_disk.Admission;
 const Disk = struct {
     var tick: ?u64 = 100;
@@ -14,14 +15,13 @@ const Disk = struct {
     }
 };
 fn root(buf: []u8, suffix: []const u8) ![]const u8 {
-    return std.fmt.bufPrint(buf, "/tmp/tf-learn-fault-{s}-{d}", .{ suffix, std.c.getpid() });
+    return fsys.tempRoot(buf, suffix);
 }
 fn put(dir: []const u8, name: []const u8, count: usize) !void {
     var buf: [1200]u8 = undefined;
-    const fd = std.c.open(try std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0), .{ .ACCMODE = .WRONLY, .CREAT = true }, @as(std.c.mode_t, 0o600));
-    if (fd < 0) return error.Create;
-    defer _ = std.c.close(fd);
-    if (std.c.ftruncate(fd, @intCast(count)) != 0) return error.Create;
+    const fd = fsys.open(try std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0), .{ .access = .write, .create = true }) catch return error.Create;
+    defer fsys.close(fd);
+    if (!fsys.truncate(fd, count)) return error.Create;
 }
 
 pub fn learnOne(im: *Imprint, prompt: []const u32) !void {
@@ -272,16 +272,15 @@ test "an index replacement failure retains its metadata and removes its partial 
     var idx_buf: [1200]u8 = undefined;
     const idx = try std.fmt.bufPrintSentinel(&idx_buf, "{s}/index", .{im.dir}, 0);
     try dirs.unlink(idx);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdir(idx, 0o700));
-    defer _ = std.c.rmdir(idx); // the tree removal goes two levels down
+    try fsys.mkdir(idx);
+    defer fsys.rmdir(idx) catch {}; // the tree removal goes two levels down
     try std.testing.expectError(error.ImprintWrite, im.remove(Imprint.keyOf(&.{ 1, 2 })));
     try std.testing.expect(im.has(Imprint.keyOf(&.{ 1, 2 })));
     const part = try std.fmt.bufPrintSentinel(&path, "{s}/index.part", .{im.dir}, 0);
-    const fd = std.c.open(part, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd >= 0) {
-        _ = std.c.close(fd);
+    if (fsys.open(part, .{})) |fd| {
+        fsys.close(fd);
         return error.PartRemains;
-    }
+    } else |_| {}
 }
 test "other-identity cap pressure is planned before a current-identity write" {
     const a = std.testing.allocator;
@@ -315,8 +314,8 @@ test "unlink failure is observable and missing files are idempotently removed" {
     const r = try root(&buf, "unlink");
     var path: [150]u8 = undefined;
     const dir = try std.fmt.bufPrintSentinel(&path, "{s}", .{r}, 0);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdir(dir, 0o700));
-    defer _ = std.c.rmdir(dir);
+    try fsys.mkdir(dir);
+    defer fsys.rmdir(dir) catch {};
     try std.testing.expectError(error.LearnedUnlink, dirs.unlink(dir));
     var absent: [180]u8 = undefined;
     try dirs.unlink(try std.fmt.bufPrintSentinel(&absent, "{s}/absent", .{dir}, 0));

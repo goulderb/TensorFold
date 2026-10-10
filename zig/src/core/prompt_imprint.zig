@@ -1,6 +1,8 @@
 //! Prompt-cache states on disk (Imprint): a learned harness state outlives the server and serves later fresh sessions.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
+const fsys = @import("lanes").learned_fs;
 
 /// One state on disk: the tokens it read (position plus lookahead), the chunk starts below it, and its bytes.
 pub const Meta = struct { key: u64, at: u32, tokens: []u32, starts: []u32, bytes: u64, used: u64 = 0 };
@@ -22,7 +24,6 @@ pub const Imprint = struct {
 
     /// The states learned under `identity` in `root` (made when missing); other identities past `cap` go, oldest first.
     pub fn open(gpa: Allocator, root: []const u8, identity: u64, cap: u64) !Imprint {
-        if (comptime @import("builtin").os.tag == .windows) return error.ImprintUnsupported; // the file layer is POSIX-only (W2-fs)
         var m: Imprint = paths: {
             const r = try gpa.dupe(u8, root);
             errdefer gpa.free(r);
@@ -41,7 +42,6 @@ pub const Imprint = struct {
     }
 
     pub fn deinit(m: *Imprint) void {
-        if (comptime @import("builtin").os.tag == .windows) return; // the file layer is POSIX-only (W2-fs)
         for (m.metas.items) |x| free(m.gpa, x);
         m.metas.deinit(m.gpa);
         m.gpa.free(m.dir);
@@ -75,14 +75,10 @@ pub const Imprint = struct {
 
     /// Reserve the current index's size too: LRU eviction rewrites it through a temporary file.
     pub fn indexScratchBytes(m: *const Imprint) !u64 {
-        if (comptime @import("builtin").os.tag == .windows) return error.ImprintUnsupported; // the file layer is POSIX-only (W2-fs)
         var path: [1100]u8 = undefined;
-        const fd = std.c.open(try std.fmt.bufPrintSentinel(&path, "{s}/index", .{m.dir}, 0), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd < 0) return if (std.c.errno(fd) == .NOENT) 0 else error.ImprintRead;
-        defer _ = std.c.close(fd);
-        const end = std.c.lseek(fd, 0, std.c.SEEK.END);
-        if (end < 0) return error.ImprintRead;
-        return @intCast(end);
+        const fd = fsys.open(try std.fmt.bufPrintSentinel(&path, "{s}/index", .{m.dir}, 0), .{}) catch |err| return if (err == error.Missing) 0 else error.ImprintRead;
+        defer fsys.close(fd);
+        return fsys.size(fd) catch error.ImprintRead;
     }
 
     /// Whether `bytes` more fit under the cap; other identities give room first, least recently opened first.
@@ -115,19 +111,16 @@ pub const Imprint = struct {
 
     /// State `key` was read: the most recently used now.
     pub fn touch(m: *Imprint, key: u64) void {
-        if (comptime @import("builtin").os.tag == .windows) return; // the file layer is POSIX-only (W2-fs)
         const i = m.find(key) orelse return;
         m.clock += 1;
         m.metas.items[i].used = m.clock;
     }
 
     pub fn pendingWrite(m: *const Imprint) !?u64 {
-        if (comptime @import("builtin").os.tag == .windows) return error.ImprintUnsupported; // the file layer is POSIX-only (W2-fs)
         var buf: [1100]u8 = undefined;
-        const fd = std.c.open(try std.fmt.bufPrintSentinel(&buf, "{s}/pending", .{m.dir}, 0), .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
-        if (fd < 0) return if (std.c.errno(fd) == .NOENT) null else error.ImprintRead;
-        defer _ = std.c.close(fd);
-        if (std.c.lseek(fd, 0, std.c.SEEK.END) != 48) return error.ImprintRead;
+        const fd = fsys.open(try std.fmt.bufPrintSentinel(&buf, "{s}/pending", .{m.dir}, 0), .{ .nofollow = true }) catch |err| return if (err == error.Missing) null else error.ImprintRead;
+        defer fsys.close(fd);
+        if ((fsys.size(fd) catch return error.ImprintRead) != 48) return error.ImprintRead;
         var data: [48]u8 = undefined;
         if (!readAt(fd, &data, 0)) return error.ImprintRead;
         var digest: [32]u8 = undefined;
@@ -136,78 +129,70 @@ pub const Imprint = struct {
         return std.mem.readInt(u64, data[8..16], .little);
     }
     pub fn beginWrite(m: *const Imprint, key: u64) !void {
-        if (comptime @import("builtin").os.tag == .windows) return error.ImprintUnsupported; // the file layer is POSIX-only (W2-fs)
         if (try m.pendingWrite() != null) return error.ImprintPending;
         var buf: [1100]u8 = undefined;
         var dest: [1100]u8 = undefined;
         const tmp = try std.fmt.bufPrintSentinel(&buf, "{s}/pending.part", .{m.dir}, 0);
-        const fd = std.c.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true }, @as(std.c.mode_t, 0o600));
-        if (fd < 0) return error.ImprintWrite;
-        errdefer _ = std.c.unlink(tmp);
+        const fd = fsys.open(tmp, .{ .access = .write, .create = true, .trunc = true, .nofollow = true }) catch return error.ImprintWrite;
+        errdefer fsys.unlink(tmp) catch {};
         {
-            defer _ = std.c.close(fd);
+            defer fsys.close(fd);
             var data: [48]u8 = undefined;
             std.mem.writeInt(u64, data[0..8], 0x494d5052494e5431, .little);
             std.mem.writeInt(u64, data[8..16], key, .little);
             std.crypto.hash.sha2.Sha256.hash(data[0..16], data[16..48], .{});
             try writeAll(fd, &data);
-            if (std.c.fsync(fd) != 0) return error.ImprintWrite;
+            if (!fsys.sync(fd)) return error.ImprintWrite;
         }
-        if (std.c.rename(tmp, try std.fmt.bufPrintSentinel(&dest, "{s}/pending", .{m.dir}, 0)) != 0) return error.ImprintWrite;
+        fsys.rename(tmp, try std.fmt.bufPrintSentinel(&dest, "{s}/pending", .{m.dir}, 0)) catch return error.ImprintWrite;
     }
     pub fn clearPending(m: *const Imprint) !void {
-        if (comptime @import("builtin").os.tag == .windows) return error.ImprintUnsupported; // the file layer is POSIX-only (W2-fs)
         var buf: [1100]u8 = undefined;
         try @import("lanes").learned_dirs.unlink(try std.fmt.bufPrintSentinel(&buf, "{s}/pending", .{m.dir}, 0));
     }
     /// Record a state its family has written (`bytes` on this Mac): an index record, fsynced, then the entry.
     pub fn add(m: *Imprint, key: u64, at: u32, tokens: []const u32, starts: []const u32, bytes: u64) !void {
-        if (comptime @import("builtin").os.tag == .windows) return error.ImprintUnsupported; // the file layer is POSIX-only (W2-fs)
         if (tokens.len > 1 << 22 or at == 0 or at > tokens.len or key != keyOf(tokens) or !ordered(starts)) return error.ImprintWrite;
         if (m.has(key)) return;
         const below = cut(starts, at);
         var path: [1100]u8 = undefined;
-        const fd = std.c.open(try std.fmt.bufPrintSentinel(&path, "{s}/index", .{m.dir}, 0), .{ .ACCMODE = .RDWR, .APPEND = true, .CREAT = true, .NOFOLLOW = true, .NONBLOCK = true }, @as(std.c.mode_t, 0o600));
-        if (fd < 0) return error.ImprintWrite;
-        defer _ = std.c.close(fd);
+        const fd = fsys.open(try std.fmt.bufPrintSentinel(&path, "{s}/index", .{m.dir}, 0), .{ .access = .read_write, .create = true, .append = true, .nofollow = true }) catch return error.ImprintWrite;
+        defer fsys.close(fd);
         _ = indexSize(fd) catch return error.ImprintWrite;
-        var end = std.c.lseek(fd, 0, std.c.SEEK.END);
-        if (end < 0) return error.ImprintWrite;
+        var end = fsys.size(fd) catch return error.ImprintWrite;
         if (end != m.index_end) {
             try m.reload(fd);
             if (m.has(key)) return;
-            end = std.c.lseek(fd, 0, std.c.SEEK.END);
-            if (end < 0 or end != m.index_end) return error.ImprintWrite;
+            end = fsys.size(fd) catch return error.ImprintWrite;
+            if (end != m.index_end) return error.ImprintWrite;
         }
         const t = try m.gpa.dupe(u32, tokens);
         errdefer m.gpa.free(t);
         const s = try m.gpa.dupe(u32, below);
         errdefer m.gpa.free(s);
         try m.metas.ensureUnusedCapacity(m.gpa, 1);
-        errdefer _ = std.c.ftruncate(fd, end);
+        errdefer _ = fsys.truncate(fd, end);
         try record(fd, key, at, tokens, below, bytes);
-        if (std.c.fsync(fd) != 0) return error.ImprintWrite;
-        m.index_end = @as(u64, @intCast(end)) + HEAD * 4 + 4 * (tokens.len + below.len);
+        if (!fsys.sync(fd)) return error.ImprintWrite;
+        m.index_end = end + HEAD * 4 + 4 * (tokens.len + below.len);
         m.clock += 1;
         m.metas.appendAssumeCapacity(.{ .key = key, .at = at, .tokens = t, .starts = s, .bytes = bytes, .used = m.clock });
     }
 
     /// Forget state `key`: the index is rewritten without it (its family removes the files).
     pub fn remove(m: *Imprint, key: u64) !void {
-        if (comptime @import("builtin").os.tag == .windows) return error.ImprintUnsupported; // the file layer is POSIX-only (W2-fs)
         const i = m.find(key) orelse return;
         var path: [1100]u8 = undefined;
         var part: [1100]u8 = undefined;
         const tmp = try std.fmt.bufPrintSentinel(&part, "{s}/index.part", .{m.dir}, 0);
-        const fd = std.c.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
-        if (fd < 0) return error.ImprintWrite;
-        errdefer _ = std.c.unlink(tmp);
+        const fd = fsys.open(tmp, .{ .access = .write, .create = true, .trunc = true }) catch return error.ImprintWrite;
+        errdefer fsys.unlink(tmp) catch {};
         {
-            defer _ = std.c.close(fd);
+            defer fsys.close(fd);
             for (m.metas.items, 0..) |x, j| if (j != i) try record(fd, x.key, x.at, x.tokens, x.starts, x.bytes);
-            if (std.c.fsync(fd) != 0) return error.ImprintWrite;
+            if (!fsys.sync(fd)) return error.ImprintWrite;
         }
-        if (std.c.rename(tmp, try std.fmt.bufPrintSentinel(&path, "{s}/index", .{m.dir}, 0)) != 0) return error.ImprintWrite;
+        fsys.rename(tmp, try std.fmt.bufPrintSentinel(&path, "{s}/index", .{m.dir}, 0)) catch return error.ImprintWrite;
         free(m.gpa, m.metas.orderedRemove(i));
         m.index_end = 0;
         for (m.metas.items) |x| m.index_end += HEAD * 4 + 4 * (x.tokens.len + x.starts.len);
@@ -215,15 +200,13 @@ pub const Imprint = struct {
 
     /// Keep a valid prefix across torn or invalid suffixes; unknown versions and I/O errors refuse learning.
     fn load(m: *Imprint) !void {
-        if (comptime @import("builtin").os.tag == .windows) return error.ImprintUnsupported; // the file layer is POSIX-only (W2-fs)
         var path: [1100]u8 = undefined;
-        const fd = std.c.open(try std.fmt.bufPrintSentinel(&path, "{s}/index", .{m.dir}, 0), .{ .ACCMODE = .RDWR, .NOFOLLOW = true, .NONBLOCK = true }, @as(std.c.mode_t, 0));
-        if (fd < 0) return if (std.c.errno(fd) == .NOENT) {} else error.ImprintRead;
-        defer _ = std.c.close(fd);
+        const fd = fsys.open(try std.fmt.bufPrintSentinel(&path, "{s}/index", .{m.dir}, 0), .{ .access = .read_write, .nofollow = true }) catch |err| return if (err == error.Missing) {} else error.ImprintRead;
+        defer fsys.close(fd);
         try m.readIndex(fd);
     }
 
-    fn reload(m: *Imprint, fd: c_int) !void {
+    fn reload(m: *Imprint, fd: fsys.Fd) !void {
         var fresh: Imprint = .{ .gpa = m.gpa, .root = m.root, .dir = m.dir, .cap = m.cap };
         defer {
             for (fresh.metas.items) |x| free(m.gpa, x);
@@ -240,12 +223,12 @@ pub const Imprint = struct {
         m.index_end = fresh.index_end;
     }
 
-    fn torn(m: *Imprint, fd: c_int, whole: u64, observed: u64) !void {
+    fn torn(m: *Imprint, fd: fsys.Fd, whole: u64, observed: u64) !void {
         try repairTail(fd, whole, observed);
         m.index_end = whole;
     }
 
-    fn readIndex(m: *Imprint, fd: c_int) !void {
+    fn readIndex(m: *Imprint, fd: fsys.Fd) !void {
         const end = try indexSize(fd);
         var off: u64 = 0;
         while (off < end) {
@@ -297,7 +280,6 @@ pub const Imprint = struct {
 
     /// This identity was opened: the newest under `root` for the sweep (root/clock counts opens).
     fn stamp(m: *const Imprint) void {
-        if (comptime @import("builtin").os.tag == .windows) return; // the file layer is POSIX-only (W2-fs)
         var path: [1100]u8 = undefined;
         const clock = std.fmt.bufPrintSentinel(&path, "{s}/clock", .{m.root}, 0) catch return;
         const now = readWord(clock) +| 1;
@@ -307,24 +289,13 @@ pub const Imprint = struct {
     }
 };
 
-fn indexSize(fd: c_int) !u64 {
-    if (@import("builtin").os.tag == .linux) {
-        const linux = std.os.linux;
-        var sx: linux.Statx = undefined;
-        if (std.c.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true, .SIZE = true }, &sx) != 0) return error.ImprintRead;
-        if (!sx.mask.TYPE or !sx.mask.SIZE or @as(u32, sx.mode) & std.c.S.IFMT != std.c.S.IFREG) return error.ImprintRead;
-        if (sx.size > @as(u64, std.math.maxInt(i64))) return error.ImprintRead;
-        return sx.size;
-    } else {
-        var stat: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &stat) != 0 or stat.mode & std.c.S.IFMT != std.c.S.IFREG or stat.size < 0) return error.ImprintRead;
-        return @intCast(stat.size);
-    }
+fn indexSize(fd: fsys.Fd) !u64 {
+    return fsys.size(fd) catch error.ImprintRead;
 }
 
-fn repairTail(fd: c_int, whole: u64, observed: u64) !void {
-    if (std.c.lseek(fd, 0, std.c.SEEK.END) != observed) return error.ImprintRead;
-    if (std.c.ftruncate(fd, @intCast(whole)) != 0 or std.c.fsync(fd) != 0) return error.ImprintWrite;
+fn repairTail(fd: fsys.Fd, whole: u64, observed: u64) !void {
+    if ((fsys.size(fd) catch return error.ImprintRead) != observed) return error.ImprintRead;
+    if (!fsys.truncate(fd, whole) or !fsys.sync(fd)) return error.ImprintWrite;
 }
 
 fn ordered(starts: []const u32) bool {
@@ -333,8 +304,7 @@ fn ordered(starts: []const u32) bool {
 }
 
 /// One index record: its head, its tokens, then the chunk starts below its position.
-fn record(fd: c_int, key: u64, at: u32, tokens: []const u32, starts: []const u32, bytes: u64) !void {
-    if (comptime @import("builtin").os.tag == .windows) return error.ImprintUnsupported; // the file layer is POSIX-only (W2-fs)
+fn record(fd: fsys.Fd, key: u64, at: u32, tokens: []const u32, starts: []const u32, bytes: u64) !void {
     const head = [HEAD]u32{ MAGIC, VERSION, @truncate(key), @truncate(key >> 32), at, @intCast(tokens.len), @intCast(starts.len), @truncate(bytes), @truncate(bytes >> 32) };
     try writeAll(fd, std.mem.sliceAsBytes(&head));
     try writeAll(fd, std.mem.sliceAsBytes(tokens));
@@ -366,24 +336,23 @@ fn identityName(name: []const u8) bool {
 
 /// Other identities' directories (16 hex digits, their files only) deleted, oldest first, down to `room` bytes.
 fn sweep(gpa: Allocator, root: []const u8, keep: []const u8, room: u64) u64 {
-    if (comptime @import("builtin").os.tag == .windows) return 0; // the file layer is POSIX-only (W2-fs)
     const Dir = struct { name: [16]u8, bytes: u64, used: u64 };
     var dirs: std.ArrayList(Dir) = .empty;
     defer dirs.deinit(gpa);
-    var buf: [1100]u8 = undefined;
-    const d = std.c.opendir(std.fmt.bufPrintSentinel(&buf, "{s}", .{root}, 0) catch return 0) orelse return 0;
+    var d = fsys.openDir(root) catch return 0;
     var held: u64 = 0;
-    while (std.c.readdir(d)) |ent| {
-        const name = std.mem.sliceTo(&ent.name, 0);
-        if (!identityName(name) or std.mem.endsWith(u8, keep, name)) continue;
+    while (fsys.next(&d)) |ent| {
+        const name = ent.name;
+        if (ent.kind != .dir or !identityName(name) or std.mem.endsWith(u8, keep, name)) continue;
         var sub: [1100]u8 = undefined;
         const path = std.fmt.bufPrint(&sub, "{s}/{s}", .{ root, name }) catch continue;
+        var buf: [1100]u8 = undefined;
         const used = readWord(std.fmt.bufPrintSentinel(&buf, "{s}/used", .{path}, 0) catch continue);
         const x: Dir = .{ .name = name[0..16].*, .bytes = files(path, false), .used = used };
         held += x.bytes;
         dirs.append(gpa, x) catch break;
     }
-    _ = std.c.closedir(d);
+    fsys.closeDir(&d);
     std.mem.sort(Dir, dirs.items, {}, struct {
         fn older(_: void, a: Dir, b: Dir) bool {
             return a.used < b.used;
@@ -394,102 +363,83 @@ fn sweep(gpa: Allocator, root: []const u8, keep: []const u8, room: u64) u64 {
         var sub: [1100]u8 = undefined;
         const path = std.fmt.bufPrintSentinel(&sub, "{s}/{s}", .{ root, &x.name }, 0) catch continue;
         _ = files(path, true);
-        if (std.c.rmdir(path) == 0) held -|= x.bytes;
+        fsys.rmdir(path) catch continue;
+        held -|= x.bytes;
     }
     return held;
 }
 
-/// The bytes of the regular files directly in `dir`, each unlinked when `remove`.
 fn files(dir: []const u8, remove: bool) u64 {
-    if (comptime @import("builtin").os.tag == .windows) return 0; // the file layer is POSIX-only (W2-fs)
-    var buf: [1100]u8 = undefined;
-    const d = std.c.opendir(std.fmt.bufPrintSentinel(&buf, "{s}", .{dir}, 0) catch return 0) orelse return 0;
-    defer _ = std.c.closedir(d);
+    var d = fsys.openDir(dir) catch return 0;
+    defer fsys.closeDir(&d);
     var n: u64 = 0;
-    while (std.c.readdir(d)) |ent| {
-        if (ent.type != std.c.DT.REG) continue;
+    while (fsys.next(&d)) |ent| {
+        if (ent.kind != .file) continue;
         var p: [1400]u8 = undefined;
-        const f = std.fmt.bufPrintSentinel(&p, "{s}/{s}", .{ dir, std.mem.sliceTo(&ent.name, 0) }, 0) catch continue;
-        const fd = std.c.open(f, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd < 0) continue;
-        const end = std.c.lseek(fd, 0, std.c.SEEK.END);
-        _ = std.c.close(fd);
-        if (end > 0) n += @intCast(end);
-        if (remove) _ = std.c.unlink(f);
+        const f = std.fmt.bufPrintSentinel(&p, "{s}/{s}", .{ dir, ent.name }, 0) catch continue;
+        const fd = fsys.open(f, .{}) catch continue;
+        const end = fsys.size(fd) catch 0;
+        fsys.close(fd);
+        n += end;
+        if (remove) fsys.unlink(f) catch {};
     }
     return n;
 }
 
 fn readWord(path: [:0]const u8) u64 {
-    if (comptime @import("builtin").os.tag == .windows) return 0; // the file layer is POSIX-only (W2-fs)
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return 0;
-    defer _ = std.c.close(fd);
+    const fd = fsys.open(path, .{}) catch return 0;
+    defer fsys.close(fd);
     var w: u64 = 0;
     return if (readAt(fd, std.mem.asBytes(&w), 0)) w else 0;
 }
 
 fn writeWord(path: [:0]const u8, w: u64) void {
-    if (comptime @import("builtin").os.tag == .windows) return; // the file layer is POSIX-only (W2-fs)
     var buf: [1200]u8 = undefined;
     const part = std.fmt.bufPrintSentinel(&buf, "{s}.part", .{path}, 0) catch return;
-    const fd = std.c.open(part, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true }, @as(std.c.mode_t, 0o600));
-    if (fd < 0) return;
-    defer _ = std.c.close(fd);
-    defer _ = std.c.unlink(part);
+    const fd = fsys.open(part, .{ .access = .write, .create = true, .trunc = true, .nofollow = true }) catch return;
+    defer fsys.close(fd);
+    defer fsys.unlink(part) catch {};
     writeAll(fd, std.mem.asBytes(&w)) catch return;
-    if (std.c.fsync(fd) != 0) return;
-    _ = std.c.rename(part, path);
+    if (!fsys.sync(fd)) return;
+    fsys.rename(part, path) catch {};
 }
 
-pub fn writeAll(fd: c_int, bytes: []const u8) !void {
-    if (comptime @import("builtin").os.tag == .windows) return error.ImprintUnsupported; // the file layer is POSIX-only (W2-fs)
-    var done: usize = 0;
-    while (done < bytes.len) {
-        const n = std.c.write(fd, bytes.ptr + done, bytes.len - done);
-        if (n <= 0) return error.ImprintWrite;
-        done += @intCast(n);
-    }
+pub fn writeAll(fd: fsys.Fd, bytes: []const u8) !void {
+    fsys.write(fd, bytes) catch return error.ImprintWrite;
 }
 
-pub fn readAt(fd: c_int, dest: []u8, at: u64) bool {
-    if (comptime @import("builtin").os.tag == .windows) return false; // the file layer is POSIX-only (W2-fs)
-    var done: usize = 0;
-    while (done < dest.len) {
-        const n = std.c.pread(fd, dest.ptr + done, dest.len - done, @intCast(at + done));
-        if (n <= 0) return false;
-        done += @intCast(n);
-    }
-    return true;
+pub fn readAt(fd: fsys.Fd, dest: []u8, at: u64) bool {
+    return fsys.readAt(fd, dest, at);
 }
 
 /// This Mac's OS build (sysctl kern.osversion): its Metal compiler can change a kernel's bits.
 pub fn osBuild(buf: []u8) []const u8 {
-    if (comptime @import("builtin").os.tag == .windows) return ""; // the file layer is POSIX-only (W2-fs)
+    if (comptime builtin.os.tag == .windows) return "";
     var n: usize = buf.len;
     if (std.c.sysctlbyname("kern.osversion", buf.ptr, &n, null, 0) != 0) return "";
     return std.mem.sliceTo(buf[0..n], 0);
 }
 
-/// Where learned states live unless --learn-dir says: $HOME/.cache/tensorfold/learned.
 pub fn defaultRoot(a: Allocator) ![]const u8 {
-    if (comptime @import("builtin").os.tag == .windows) return error.ImprintUnsupported; // the file layer is POSIX-only (W2-fs)
+    if (comptime builtin.os.tag == .windows) {
+        var base: [900]u8 = undefined;
+        const local = fsys.localAppData(&base) orelse return error.ImprintDir;
+        return std.fmt.allocPrint(a, "{s}\\tensorfold\\learned", .{local});
+    }
     const home = std.c.getenv("HOME") orelse return error.ImprintDir;
     return std.fmt.allocPrint(a, "{s}/.cache/tensorfold/learned", .{std.mem.span(home)});
 }
 
-/// `dir` and its parents (mode 0700).
 fn makePath(gpa: Allocator, dir: [:0]const u8) !void {
-    if (comptime @import("builtin").os.tag == .windows) return error.ImprintUnsupported; // the file layer is POSIX-only (W2-fs)
     const tmp = try gpa.dupeSentinel(u8, dir, 0);
     defer gpa.free(tmp);
-    for (tmp[1..], 1..) |ch, i| if (ch == '/') {
+    for (tmp[1..], 1..) |ch, i| if (ch == '/' or (builtin.os.tag == .windows and ch == '\\')) {
+        const sep = tmp[i];
         tmp[i] = 0;
-        _ = std.c.mkdir(tmp.ptr, 0o700);
-        tmp[i] = '/';
+        fsys.mkdir(tmp[0..i :0]) catch {};
+        tmp[i] = sep;
     };
-    const rc = std.c.mkdir(tmp.ptr, 0o700);
-    if (rc != 0 and std.c.errno(rc) != .EXIST) return error.ImprintDir;
+    fsys.mkdir(tmp) catch |err| if (err != error.Exists) return error.ImprintDir;
 }
 
 /// A learned state's file under `imprint.dir`, read whole into a count (the single-rank reclaim).
@@ -512,19 +462,15 @@ test {
 
 test "a failed tail truncation keeps the bytes and refuses repair" {
     var buf: [128]u8 = undefined;
-    const path = try std.fmt.bufPrintSentinel(&buf, "/tmp/tf-index-repair-{d}", .{std.c.getpid()}, 0);
-    defer _ = std.c.unlink(path);
-    const writer = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
-    if (writer < 0) return error.TestFile;
-    {
-        defer _ = std.c.close(writer);
-        try writeAll(writer, "record");
-    }
-    const reader = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (reader < 0) return error.TestFile;
-    defer _ = std.c.close(reader);
+    const path = try fsys.tempRoot(&buf, "index-repair");
+    defer fsys.unlink(path) catch {};
+    const writer = try fsys.open(path, .{ .access = .write, .create = true, .trunc = true });
+    try writeAll(writer, "record");
+    fsys.close(writer);
+    const reader = try fsys.open(path, .{});
+    defer fsys.close(reader);
     try std.testing.expectError(error.ImprintWrite, repairTail(reader, 0, 6));
-    try std.testing.expectEqual(@as(i64, 6), std.c.lseek(reader, 0, std.c.SEEK.END));
+    try std.testing.expectEqual(@as(u64, 6), try fsys.size(reader));
     var actual: [6]u8 = undefined;
     try std.testing.expect(readAt(reader, &actual, 0));
     try std.testing.expectEqualStrings("record", &actual);

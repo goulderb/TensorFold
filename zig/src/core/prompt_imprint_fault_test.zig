@@ -2,6 +2,7 @@ const std = @import("std");
 const Imprint = @import("prompt_imprint.zig").Imprint;
 const imp = @import("prompt_imprint.zig");
 const dirs = @import("lanes").learned_dirs;
+const fsys = @import("lanes").learned_fs;
 const Allocator = std.mem.Allocator;
 
 const Tracked = struct {
@@ -40,13 +41,12 @@ const Tracked = struct {
         return n;
     }
 };
-fn scratch(buf: []u8, suffix: []const u8) ![]const u8 {
-    return std.fmt.bufPrint(buf, "/tmp/tf-imprint-fault-{s}-{d}", .{ suffix, std.c.getpid() });
+fn scratch(buf: []u8, suffix: []const u8) ![:0]const u8 {
+    return fsys.tempRoot(buf, suffix);
 }
 fn word(path: [:0]const u8, n: u64) !void {
-    const fd = std.c.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
-    if (fd < 0) return error.TestFile;
-    defer _ = std.c.close(fd);
+    const fd = fsys.open(path, .{ .access = .write, .create = true, .trunc = true }) catch return error.TestFile;
+    defer fsys.close(fd);
     try imp.writeAll(fd, std.mem.asBytes(&n));
 }
 test "Imprint failed open releases each allocation once after another identity scan" {
@@ -58,8 +58,8 @@ test "Imprint failed open releases each allocation once after another identity s
     defer old.deinit();
     var path: [256]u8 = undefined;
     const unreadable = try std.fmt.bufPrintSentinel(&path, "{s}/unreadable", .{old.dir}, 0);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdir(unreadable, 0o700));
-    defer _ = std.c.rmdir(unreadable);
+    try fsys.mkdir(unreadable);
+    defer fsys.rmdir(unreadable) catch {};
     var tracked: Tracked = .{};
     try std.testing.expectError(error.ImprintRead, Imprint.open(tracked.allocator(), root, 2, 1 << 20));
     try std.testing.expectEqual(@as(usize, 0), tracked.duplicate_frees);
@@ -92,8 +92,8 @@ test "failed atomic stamp replacement preserves the previous complete used word"
     var path: [256]u8 = undefined;
     try word(try std.fmt.bufPrintSentinel(&path, "{s}/used", .{m.dir}, 0), 42);
     const part = try std.fmt.bufPrintSentinel(&path, "{s}/used.part", .{m.dir}, 0);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdir(part, 0o700));
-    defer _ = std.c.rmdir(part);
+    try fsys.mkdir(part);
+    defer fsys.rmdir(part) catch {};
     var reopened = try Imprint.open(a, root, 1, 1 << 20);
     defer reopened.deinit();
     try std.testing.expectEqual(@as(u64, 42), try dirs.used(root, 1));
@@ -108,7 +108,7 @@ test "used stamp reads still refuse an actual I/O error" {
     var path: [256]u8 = undefined;
     const used = try std.fmt.bufPrintSentinel(&path, "{s}/used", .{m.dir}, 0);
     try dirs.unlink(used);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.mkdir(used, 0o700));
-    defer _ = std.c.rmdir(used);
+    try fsys.mkdir(used);
+    defer fsys.rmdir(used) catch {};
     try std.testing.expectError(error.LearnedDirectoryRead, dirs.used(root, 1));
 }

@@ -1,6 +1,7 @@
 //! Replaced tensors written into a checkpoint's own shards, index and config: in place when sizes hold, else by rename.
 const std = @import("std");
 const st = @import("safetensors.zig");
+const fsys = @import("lanes").learned_fs;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Value = std.json.Value;
@@ -181,7 +182,7 @@ pub fn create(gpa: Allocator, path: []const u8, metadata: []const [2][]const u8,
     pieces.items[0] = head;
     pieces.items[1] = text;
     pieces.items[2] = spaces;
-    try writeFile(arena, path, pieces.items);
+    try commitFile(arena, try stageFile(arena, path, pieces.items), path);
 }
 
 /// `edits` written over their tensors where they lie, if each keeps its dtype and size (else false, nothing written).
@@ -200,18 +201,12 @@ fn inPlace(gpa: Allocator, io: Io, path: []const u8, edits: []const Replacement)
     }
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const fd = std.c.open(try arena_state.allocator().dupeSentinel(u8, path, 0), .{ .ACCMODE = .WRONLY });
-    if (fd < 0) return error.ShardWrite;
-    defer _ = std.c.close(fd);
+    const fd = fsys.open(try arena_state.allocator().dupeSentinel(u8, path, 0), .{ .access = .write }) catch return error.ShardWrite;
+    defer fsys.close(fd);
     for (edits, places[0..edits.len]) |r, at| {
-        var done: usize = 0;
-        while (done < r.bytes.len) {
-            const n = std.c.pwrite(fd, r.bytes.ptr + done, @min(r.bytes.len - done, 1 << 30), @intCast(at + done));
-            if (n <= 0) return error.ShardWrite;
-            done += @intCast(n);
-        }
+        if (!fsys.writeAt(fd, r.bytes, @intCast(at))) return error.ShardWrite;
     }
-    if (std.c.fsync(fd) != 0) return error.ShardWrite;
+    if (!fsys.sync(fd)) return error.ShardWrite;
     return true;
 }
 
@@ -221,7 +216,8 @@ pub fn rewrite(gpa: Allocator, io: Io, path: []const u8, edits: []const Replacem
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var file = try st.File.open(gpa, io, path);
-    defer file.close(io);
+    var file_open = true;
+    defer if (file_open) file.close(io);
     for (edits) |r| if (!file.names.contains(r.name)) return error.MissingTensor;
     const raw = file.map.memory;
     const original = try std.json.parseFromSliceLeaky(Value, arena, raw[8..file.data], .{});
@@ -257,7 +253,10 @@ pub fn rewrite(gpa: Allocator, io: Io, path: []const u8, edits: []const Replacem
     const spaces = try arena.alloc(u8, padded - text.len);
     @memset(spaces, ' ');
     try pieces.insertSlice(arena, 0, &.{ &head, text, spaces });
-    try writeFile(arena, path, pieces.items);
+    const tmp = try stageFile(arena, path, pieces.items);
+    file_open = false;
+    file.close(io); // the pieces point into this map: staged first, unmapped before the rename (Windows refuses a mapped file)
+    try commitFile(arena, tmp, path);
     return @as(i64, @intCast(offset)) - @as(i64, @intCast(before));
 }
 
@@ -320,31 +319,32 @@ fn readJson(arena: Allocator, io: Io, path: []const u8) !Value {
 
 fn writeJson(arena: Allocator, path: []const u8, v: Value) !void {
     const text = try std.json.Stringify.valueAlloc(arena, v, .{ .whitespace = .indent_2 });
-    try writeFile(arena, path, &.{ text, "\n" });
+    try commitFile(arena, try stageFile(arena, path, &.{ text, "\n" }), path);
 }
 
 /// `parts` to `path` through `path`.tmp, synced, then renamed over it; a reader sees the old file or the new one.
-fn writeFile(arena: Allocator, path: []const u8, parts: []const []const u8) !void {
+/// `parts` to `path`.tmp, synced; `commitFile` then renames it over `path`.
+fn stageFile(arena: Allocator, path: []const u8, parts: []const []const u8) ![:0]const u8 {
     const tmp = try std.fmt.allocPrintSentinel(arena, "{s}.tmp", .{path}, 0);
-    const dest = try arena.dupeSentinel(u8, path, 0);
-    const fd = std.c.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    if (fd < 0) return error.ShardWrite;
-    errdefer _ = std.c.unlink(tmp);
-    {
-        defer _ = std.c.close(fd);
-        for (parts) |p| try put(fd, p);
-        if (std.c.fsync(fd) != 0) return error.ShardWrite;
-    }
-    if (std.c.rename(tmp, dest) != 0) return error.ShardWrite;
+    const fd = fsys.open(tmp, .{ .access = .write, .create = true, .trunc = true, .mode = 0o644 }) catch return error.ShardWrite;
+    errdefer fsys.unlink(tmp) catch {};
+    defer fsys.close(fd);
+    for (parts) |p| try put(fd, p);
+    if (!fsys.sync(fd)) return error.ShardWrite;
+    return tmp;
 }
 
-fn put(fd: c_int, b: []const u8) !void {
-    var done: usize = 0;
-    while (done < b.len) {
-        const n = std.c.write(fd, b.ptr + done, @min(b.len - done, 1 << 30));
-        if (n <= 0) return error.ShardWrite;
-        done += @intCast(n);
-    }
+/// The staged `tmp` over `path`: a reader sees the old file or the new one.
+fn commitFile(arena: Allocator, tmp: [:0]const u8, path: []const u8) !void {
+    const dest = try arena.dupeSentinel(u8, path, 0);
+    fsys.rename(tmp, dest) catch {
+        fsys.unlink(tmp) catch {};
+        return error.ShardWrite;
+    };
+}
+
+fn put(fd: fsys.Fd, b: []const u8) !void {
+    fsys.write(fd, b) catch return error.ShardWrite;
 }
 
 test "a whole file written with its metadata reads back tensor for tensor" {
@@ -518,7 +518,8 @@ test "a folder whose shard is a symlink or a hard link is refused for learning; 
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "blobs");
     for ([_][]const u8{ "config.json", index_name, "model-00001-of-00002.safetensors", "blobs/b2", "notes.txt" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "x" });
-    try tmp.dir.symLink(io, "model-00001-of-00002.safetensors", "readme-link", .{});
+    // Windows creates symlinks only with Developer Mode or the symlink privilege; without it there is no link to test.
+    tmp.dir.symLink(io, "model-00001-of-00002.safetensors", "readme-link", .{}) catch |e| return if (e == error.PermissionDenied) error.SkipZigTest else e;
     const dir = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
     try std.testing.expect((try linked(arena, io, dir)) == null);
     try tmp.dir.symLink(io, "blobs/b2", "model-00002-of-00002.safetensors", .{});

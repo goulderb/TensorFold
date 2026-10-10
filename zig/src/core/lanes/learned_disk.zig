@@ -1,6 +1,7 @@
 //! Reserve learned-state writes above a free-disk floor, with bounded backoff after refusals or write failures.
 const std = @import("std");
 const builtin = @import("builtin");
+const win_fs = @import("win_fs.zig");
 const Count = if (builtin.os.tag == .linux) u64 else u32;
 const Stat = extern struct {
     bsize: u64,
@@ -20,7 +21,7 @@ extern "c" fn statvfs(path: [*:0]const u8, result: *Stat) c_int;
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 
 pub fn available(dir: [:0]const u8) ?u64 {
-    if (comptime builtin.os.tag == .windows) return null; // no statvfs on Windows: learned writes stay refused (W2-fs)
+    if (comptime builtin.os.tag == .windows) return win_fs.freeBytes(dir); // GetDiskFreeSpaceExW: bytes this user may use
     var stat: Stat = undefined;
     if (statvfs(dir, &stat) != 0) return null;
     return std.math.mul(u64, stat.frsize, stat.bavail) catch null;
@@ -125,5 +126,5 @@ test "disk floor, unknown space, overflow, reservations and bounded write-failur
 test "real statvfs fails closed for a missing directory" {
     try std.testing.expect(available("/this-directory-does-not-exist") == null);
     try std.testing.expect(available(".") != null);
-    try std.testing.expectEqual(@as(usize, if (builtin.os.tag == .linux) 112 else 64), @sizeOf(Stat));
+    if (builtin.os.tag != .windows) try std.testing.expectEqual(@as(usize, if (builtin.os.tag == .linux) 112 else 64), @sizeOf(Stat));
 }
