@@ -115,7 +115,7 @@ fn complete(backend: *Capture, prompt: []const u8) !?u16 {
     defer arena.deinit();
     const a = arena.allocator();
     const raw = (try json.parse(a, try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"max_tokens\":2,\"prompt\":{s}}}", .{prompt}))).ok;
-    var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
+    var conn: Conn = .{ .fd = @import("platform").sock.none, .peer = "", .buf = &.{}, .gpa = a };
     var reply: Reply = .{};
     openai.run(srv, a, reply.out(), .{ .conn = &conn }, false, raw);
     return reply.status;
@@ -149,4 +149,13 @@ test "a completion prompt's boolean ids get a 400, nested or not" {
         try std.testing.expectEqual(@as(?u16, 400), try complete(&backend, prompt));
     }
     try std.testing.expectEqual(@as(usize, 0), backend.prompt.len);
+}
+
+test "a completion prompt's nested ids past u32 decode as unknown ids" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var backend: Capture = .{};
+    defer std.testing.allocator.free(backend.prompt);
+    const prompt = "[[104,4294967295,4294967296,105,9223372036854775807]]";
+    try std.testing.expectEqual(@as(?u16, 200), try complete(&backend, prompt));
+    try std.testing.expectEqualSlices(u32, &.{ 'h', 'i' }, backend.prompt);
 }
