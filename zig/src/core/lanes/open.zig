@@ -50,7 +50,7 @@ pub fn opened(e: *Engine, s: *Stream) !void {
         if (e.backend.vtable.tree) |tree| if (try tree(e.backend.ptr, s, e.gpa)) |held| {
             s.next = held; // a tree head's first drafts as host tokens, as every later round's
         };
-    } else if (e.cfg.pipelined and s.logprobs == null and s.grammar == null and s.gate == null) {
+    } else if (e.cfg.pipelined and s.logprobs == null and s.grammar == null) {
         try e.queueNext(s, feed);
     }
     const value = try e.readFeed(feed);
