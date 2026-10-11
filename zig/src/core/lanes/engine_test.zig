@@ -460,3 +460,37 @@ test "a family that keeps copies to shared rounds proposes none for a lone strea
         try std.testing.expectEqual(lone_copies, (try win.copyProposal(&engine, &s)).tokens.len >= 2);
     }
 }
+
+const CallLex = struct {
+    fn blank(_: *anyopaque, _: u32) bool {
+        return false;
+    }
+    fn text(_: *anyopaque, _: std.mem.Allocator, _: u32) anyerror![]const u8 {
+        return "";
+    }
+    fn encode(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror![]const u32 {
+        return &.{};
+    }
+};
+
+test "a required call stays pipelined beyond its corrected first token" {
+    var cfg = try model();
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer engine.deinit();
+    var lex_ctx: u8 = 0;
+    var s = try sm.Stream.init(gpa, .{
+        .id = "call",
+        .prompt = &.{ 1, 2, 3 },
+        .max_new = 3,
+        .drafts = false,
+        .call = .{ .opener = 9, .lex = .{ .ctx = &lex_ctx, .blank = CallLex.blank, .text = CallLex.text, .encode = CallLex.encode } },
+    });
+    defer s.deinit(gpa);
+    try engine.addStream(&s);
+    while (engine.activeCount() > 0) try engine.step();
+    try std.testing.expectEqualSlices(u32, &.{ 9, 20, 66 }, s.emitted());
+}
