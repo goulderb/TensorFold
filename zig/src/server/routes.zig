@@ -21,7 +21,13 @@ pub fn dispatch(srv: *Server, conn: *Conn, a: Allocator) void {
     if (std.mem.eql(u8, m, "GET")) return get(srv, conn, a);
     if (std.mem.eql(u8, m, "POST")) return post(srv, conn, a);
     if (std.mem.eql(u8, m, "DELETE")) {
-        if (std.mem.eql(u8, auth.routePath(conn.path), "/v1/slide/graph")) return slide.forget(srv, conn, a);
+        if (std.mem.eql(u8, auth.routePath(conn.path), "/v1/slide/graph")) {
+            if (!srv.config.slide) {
+                discardBody(conn, a);
+                return unknown(conn, a);
+            }
+            return slide.forget(srv, conn, a);
+        }
         return responses.delete(srv, conn, a, responses.route(auth.routePath(conn.path)));
     }
     const message = std.fmt.allocPrint(a, "Unsupported method ({s})", .{http_conn.pyRepr(a, m) catch m}) catch return;
@@ -48,9 +54,13 @@ fn get(srv: *Server, conn: *Conn, a: Allocator) void {
     if (std.mem.eql(u8, route, "/metrics") or std.mem.eql(u8, route, "/v1/metrics")) return status.metrics(srv, conn, a);
     if (std.mem.eql(u8, route, "/dashboard")) return status.dashboard(srv, conn, a);
     if (std.mem.eql(u8, route, "/stats")) return status.stats(srv, conn, a);
-    if (std.mem.eql(u8, route, "/slide")) return slide.view(srv, conn, a);
-    if (std.mem.startsWith(u8, route, "/slide/")) return slide.script(srv, conn, a, route["/slide/".len..]);
-    if (std.mem.eql(u8, route, "/v1/slide/graph")) return slide.graph(srv, conn, a);
+    if (std.mem.eql(u8, route, "/slide") or std.mem.startsWith(u8, route, "/slide/") or
+        std.mem.eql(u8, route, "/v1/slide/graph")) {
+        if (!srv.config.slide) return unknown(conn, a);
+        if (std.mem.eql(u8, route, "/slide")) return slide.view(srv, conn, a);
+        if (std.mem.startsWith(u8, route, "/slide/")) return slide.script(srv, conn, a, route["/slide/".len..]);
+        return slide.graph(srv, conn, a);
+    }
     if (route.len == 0 or std.mem.eql(u8, route, "/health")) return status.health(srv, conn, a) catch {};
     if (std.mem.endsWith(u8, route, "/models")) return status.models(srv, conn, a) catch {};
     unknown(conn, a);
@@ -63,7 +73,13 @@ fn discardBody(conn: *Conn, a: Allocator) void {
 
 fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     const route = auth.routePath(conn.path);
-    if (std.mem.eql(u8, route, "/v1/slide/learn")) return slide.learn(srv, conn, a);
+    if (std.mem.eql(u8, route, "/v1/slide/learn")) {
+        if (!srv.config.slide) {
+            discardBody(conn, a);
+            return unknown(conn, a);
+        }
+        return slide.learn(srv, conn, a);
+    }
     if (std.mem.endsWith(u8, route, "/decisions")) return decisions.post(srv, conn, a);
     if (anthropic.route(conn.path)) return anthropic.post(srv, conn, a);
     if (responses.route(route)) |rid| if (rid.len == 0) return responses.post(srv, conn, a);
