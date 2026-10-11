@@ -60,6 +60,8 @@ pub const Config = struct {
     compact_keep: ?u32 = null,
     /// Directory of the stored note, or null when notes are not stored.
     compact_memory: ?[]const u8 = null,
+    /// Whether the server was started with --slide; the HTTP surface is absent otherwise.
+    slide: bool = false,
     /// --slide-graph: the file holding the Sliding Weights fact graph; null keeps the graph in memory.
     slide_graph: ?[]const u8 = null,
     /// A fact whose check a delete fails, to test its put-back (0: none); only -Dslide-test-hooks builds set it.

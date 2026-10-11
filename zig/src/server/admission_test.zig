@@ -81,12 +81,12 @@ const Refusing = struct {
 const Reply = struct { status: u16, retry_after: bool };
 
 /// One request over a socket pair through the routes, as the listener runs it: the status and whether it sent Retry-After.
-fn exchange(srv: *server.Server, path: []const u8, body: []const u8) !Reply {
+fn exchange(srv: *server.Server, method: []const u8, path: []const u8, body: []const u8) !Reply {
     var pair: [2]std.c.fd_t = undefined;
     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
     defer _ = std.c.close(pair[0]);
     defer _ = std.c.close(pair[1]);
-    const head = try std.fmt.allocPrint(std.testing.allocator, "POST {s} HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n", .{ path, body.len });
+    const head = try std.fmt.allocPrint(std.testing.allocator, "{s} {s} HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n", .{ method, path, body.len });
     defer std.testing.allocator.free(head);
     try writeAll(pair[0], head);
     try writeAll(pair[0], body);
@@ -143,7 +143,7 @@ fn chatRefused(refusal: api.SubmitError) !Reply {
         .use_drafts = false,
     }, null);
     defer srv.deinit();
-    return exchange(srv, "/v1/chat/completions", chat_body);
+    return exchange(srv, "POST", "/v1/chat/completions", chat_body);
 }
 
 test "a full admission answers 429 with Retry-After 5 on chat" {
@@ -156,4 +156,91 @@ test "a busy engine keeps its 503 and sends no Retry-After" {
     const busy = try chatRefused(error.Busy);
     try std.testing.expectEqual(@as(u16, 503), busy.status);
     try std.testing.expect(!busy.retry_after);
+}
+
+fn slideServer(backend: *Refusing, text: *Text) !*server.Server {
+    return server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
+        .served_name = "m",
+        .model_ids = &.{"m"},
+        .keep_warm_s = 0,
+    }, null);
+}
+
+test "without slide a learning request is unknown and its body is drained" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var backend: Refusing = .{ .refusal = error.Full };
+    var text: Text = .{};
+    const srv = try slideServer(&backend, &text);
+    defer srv.deinit();
+    const reply = try refusedThenHealth(srv, "POST", "/v1/slide/learn", "{\"text\":\"I like blue.\"}");
+    try std.testing.expectEqual(@as(u16, 404), reply.status);
+}
+
+test "without slide graph reads and deletes are unknown and delete bodies are drained" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var backend: Refusing = .{ .refusal = error.Full };
+    var text: Text = .{};
+    const srv = try slideServer(&backend, &text);
+    defer srv.deinit();
+    const get = try exchange(srv, "GET", "/v1/slide/graph", "");
+    try std.testing.expectEqual(@as(u16, 404), get.status);
+    const delete = try refusedThenHealth(srv, "DELETE", "/v1/slide/graph", "{}");
+    try std.testing.expectEqual(@as(u16, 404), delete.status);
+}
+
+test "without slide its page and scripts are unknown" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var backend: Refusing = .{ .refusal = error.Full };
+    var text: Text = .{};
+    const srv = try slideServer(&backend, &text);
+    defer srv.deinit();
+    for ([_][]const u8{ "/slide", "/slide/data.js", "/slide/scene.js" }) |path| {
+        const reply = try exchange(srv, "GET", path, "");
+        try std.testing.expectEqual(@as(u16, 404), reply.status);
+    }
+}
+
+test "slide enabled exposes its graph and reaches the engine learning refusal" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    var backend: Refusing = .{ .refusal = error.Full };
+    var text: Text = .{};
+    const srv = try slideServer(&backend, &text);
+    defer srv.deinit();
+    srv.config.slide = true;
+    const graph = try exchange(srv, "GET", "/v1/slide/graph", "");
+    try std.testing.expectEqual(@as(u16, 200), graph.status);
+    const delete = try exchange(srv, "DELETE", "/v1/slide/graph", "{}");
+    try std.testing.expectEqual(@as(u16, 200), delete.status);
+    const learn = try exchange(srv, "POST", "/v1/slide/learn", "{\"text\":\"I like blue.\"}");
+    try std.testing.expectEqual(@as(u16, 501), learn.status);
+}
+
+fn refusedThenHealth(srv: *server.Server, method: []const u8, path: []const u8, body: []const u8) !Reply {
+    var pair: [2]std.c.fd_t = undefined;
+    if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
+    defer _ = std.c.close(pair[0]);
+    defer _ = std.c.close(pair[1]);
+    var conn = try Conn.init(std.testing.allocator, pair[1], "test");
+    defer conn.deinit();
+    conn.timeouts = .{ .idle_ms = 2000, .read_ms = 2000, .write_ms = 2000 };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const head = try std.fmt.allocPrint(a, "{s} {s} HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n", .{ method, path, body.len });
+    try writeAll(pair[0], head);
+    try std.testing.expectEqual(@import("http_conn.zig").Outcome.ready, try conn.readRequest(a, false));
+    try writeAll(pair[0], body);
+    try writeAll(pair[0], "GET /health HTTP/1.1\r\nHost: t\r\n\r\n");
+    routes.dispatch(srv, &conn, a);
+    const first = try readReady(std.testing.allocator, pair[0]);
+    defer std.testing.allocator.free(first);
+    const code = try std.fmt.parseInt(u16, first["HTTP/1.1 ".len..][0..3], 10);
+    try std.testing.expectEqual(@import("http_conn.zig").Outcome.ready, try conn.readRequest(a, false));
+    try std.testing.expectEqualStrings("GET", conn.method);
+    try std.testing.expectEqualStrings("/health", conn.path);
+    routes.dispatch(srv, &conn, a);
+    const next = try readReady(std.testing.allocator, pair[0]);
+    defer std.testing.allocator.free(next);
+    try std.testing.expect(std.mem.startsWith(u8, next, "HTTP/1.1 200 OK\r\n"));
+    return .{ .status = code, .retry_after = false };
 }

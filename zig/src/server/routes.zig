@@ -29,6 +29,10 @@ pub fn dispatch(srv: *Server, conn: *Conn, a: Allocator) void {
     if (std.mem.eql(u8, m, "POST")) return post(srv, conn, a);
     if (std.mem.eql(u8, m, "DELETE")) {
         const route = auth.routePath(conn.path);
+        if (!srv.config.slide and (std.mem.eql(u8, route, "/v1/slide/graph") or std.mem.startsWith(u8, route, fact_path))) {
+            discardBody(conn, a);
+            return unknown(conn, a);
+        }
         if (std.mem.eql(u8, route, "/v1/slide/graph")) return slide.forget(srv, conn, a);
         if (std.mem.startsWith(u8, route, fact_path)) return slide_forget.route(srv, conn, a, route[fact_path.len..]);
         if (std.mem.eql(u8, route, recall.path)) return recall.empty(srv, conn, a);
@@ -59,9 +63,13 @@ fn get(srv: *Server, conn: *Conn, a: Allocator) void {
     if (std.mem.eql(u8, route, "/metrics") or std.mem.eql(u8, route, "/v1/metrics")) return status.metrics(srv, conn, a);
     if (std.mem.eql(u8, route, "/dashboard")) return status.dashboard(srv, conn, a);
     if (std.mem.eql(u8, route, "/stats")) return status.stats(srv, conn, a);
-    if (std.mem.eql(u8, route, "/slide")) return slide.view(srv, conn, a);
-    if (std.mem.startsWith(u8, route, "/slide/")) return slide.script(srv, conn, a, route["/slide/".len..]);
-    if (std.mem.eql(u8, route, "/v1/slide/graph")) return slide.graph(srv, conn, a);
+    if (std.mem.eql(u8, route, "/slide") or std.mem.startsWith(u8, route, "/slide/") or
+        std.mem.eql(u8, route, "/v1/slide/graph")) {
+        if (!srv.config.slide) return unknown(conn, a);
+        if (std.mem.eql(u8, route, "/slide")) return slide.view(srv, conn, a);
+        if (std.mem.startsWith(u8, route, "/slide/")) return slide.script(srv, conn, a, route["/slide/".len..]);
+        return slide.graph(srv, conn, a);
+    }
     if (std.mem.eql(u8, route, recall.path)) return recall.get(srv, conn, a);
     if (route.len == 0 or std.mem.eql(u8, route, "/health")) return status.health(srv, conn, a) catch {};
     if (std.mem.endsWith(u8, route, "/models")) return status.models(srv, conn, a) catch {};
@@ -75,7 +83,13 @@ fn discardBody(conn: *Conn, a: Allocator) void {
 
 fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     const route = auth.routePath(conn.path);
-    if (std.mem.eql(u8, route, "/v1/slide/learn")) return slide.learn(srv, conn, a);
+    if (std.mem.eql(u8, route, "/v1/slide/learn")) {
+        if (!srv.config.slide) {
+            discardBody(conn, a);
+            return unknown(conn, a);
+        }
+        return slide.learn(srv, conn, a);
+    }
     if (std.mem.eql(u8, route, "/v1/imprint/resume")) return imprint.post(srv, conn, a, .where);
     if (std.mem.eql(u8, route, "/v1/imprint/load")) return imprint.post(srv, conn, a, .load);
     if (std.mem.endsWith(u8, route, "/decisions")) return decisions.post(srv, conn, a);
