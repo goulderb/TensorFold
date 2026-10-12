@@ -152,6 +152,7 @@ test "a family read failure, a corrupt file and another identity go cold, counte
         s.attach(t);
         const plan = try s.begin(a, turn2, 650, &.{}, &.{}, null, &.{});
         try std.testing.expectEqual(@as(u32, 0), plan.from);
+        try std.testing.expectEqual(@as(usize, 1), f.spill_forgets); // the peers were told to drop their copies
         try std.testing.expectEqual(fresh(turn2), f.pass(&s, turn2, plan));
         try std.testing.expectEqual(@as(u64, 1), s.spill_counts.recall_failed);
         try std.testing.expectEqual(@as(u64, 0), s.spill_counts.recalled);
@@ -228,4 +229,71 @@ test "short states are not written and counted; without spill hooks or a tier no
         try std.testing.expect(s.spillInfo() == null);
     }
     try std.testing.expectEqual(@as(u64, 0), t.info().stats.written);
+}
+
+test "through lookup, avoided prefill counts only when the caller reports a good restore" {
+    var root = try Root.make();
+    defer root.deinit();
+    var buf: [700]u32 = undefined;
+    const turn2 = conversation(&buf, 13);
+    try firstLife(&root, turn2[0..500], 400);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = try root.tier(identity_a);
+    defer t.deinit();
+    var f: Fake = .{ .gpa = gpa };
+    var s = pc.Store.init(gpa, f.spilling(), rules, 1 << 20);
+    defer s.deinit();
+    s.attach(t);
+    var l = try s.lookup(a, turn2, 650, &.{}, &.{}, &.{});
+    try std.testing.expectEqual(@as(u32, 400), l.entry.?.at);
+    try std.testing.expectEqual(@as(u64, 1), s.spill_counts.read_back);
+    try std.testing.expectEqual(@as(u64, 0), s.spill_counts.recalled_tokens); // looked up, not yet restored
+    s.resumed(l.entry.?, turn2, false); // the backend's live restore failed
+    try std.testing.expectEqual(@as(u64, 0), s.spill_counts.recalled_tokens);
+    l = try s.lookup(a, turn2, 650, &.{}, &.{}, &.{}); // dropped from memory; the disk copy reads back again
+    try std.testing.expectEqual(@as(u64, 2), s.spill_counts.read_back);
+    s.resumed(l.entry.?, turn2, true);
+    try std.testing.expectEqual(@as(u64, 1), s.spill_counts.recalled);
+    try std.testing.expectEqual(@as(u64, 400), s.spill_counts.recalled_tokens);
+}
+
+test "a tier outliving its store keeps no hook into it; a later owner's hook survives an earlier store" {
+    var root = try Root.make();
+    defer root.deinit();
+    const t = try spill.Tier.open(gpa, io, .{ .dir = root.path, .cap = 3 * 4096 + 8192, .min_free = 0, .min_tokens = 1 }, label, identity_a, 0, 1);
+    defer t.deinit();
+    var f: Fake = .{ .gpa = gpa };
+    {
+        var first = pc.Store.init(gpa, f.spilling(), rules, 1 << 20);
+        var second = pc.Store.init(gpa, f.spilling(), rules, 1 << 20);
+        first.attach(t);
+        second.attach(t); // second owns the hook now
+        first.deinit();
+        try std.testing.expect(t.hook != null and t.hook.?.ptr == @as(*anyopaque, &second));
+        second.clear(); // a weight change: detached
+        try std.testing.expect(t.hook == null and second.tier == null);
+        second.attach(t);
+        second.deinit();
+        try std.testing.expect(t.hook == null);
+    }
+    // the cap now evicts with no store alive: nothing calls into freed memory
+    var tok: [64]u32 = undefined;
+    for (&tok, 0..) |*x, i| x.* = @intCast(i);
+    const pay: [4096]u8 = @splat(1);
+    const Mem = struct {
+        fn read(p: *anyopaque, offset: u64, out: []u8) anyerror!void {
+            const b: *const [4096]u8 = @ptrCast(@alignCast(p));
+            @memcpy(out, b[@intCast(offset)..][0..out.len]);
+        }
+    };
+    for (1..4) |k| {
+        const at: u32 = @intCast(k * 10);
+        const j = try t.write(spill.Name.of(tok[0..at], at), tok[0..at], "", pay.len, .{ .ptr = @constCast(&pay), .read = Mem.read });
+        j.waitCopied();
+        try std.testing.expect(t.drain(10));
+        j.release();
+    }
+    try std.testing.expect(t.info().stats.disk_evictions >= 1);
 }

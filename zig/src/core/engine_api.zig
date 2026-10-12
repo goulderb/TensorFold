@@ -584,7 +584,9 @@ pub const prompt_cache = @import("prompt_cache.zig");
 /// What /health shows of a prompt cache's spill tier: the tier's own, and the cache's resume outcomes.
 pub const SpillStatus = struct { tier: prompt_cache.spill.Info, cache: prompt_cache.SpillCounts = .{} };
 
-/// A store's spill status, for an engine's `spill` hook (false: no tier attached).
+/// A store's spill status, for an engine's `spill` hook (false: no tier attached). The store's counts are plain
+/// fields: call it on the store's owning thread, or under the engine's own guard of that store (the one its prompt
+/// passes hold), never from another thread unguarded. The tier's part is taken under the tier's lock.
 pub fn spillStatus(store: *const prompt_cache.Store, out: *SpillStatus) bool {
     out.* = .{ .tier = store.spillInfo() orelse return false, .cache = store.spill_counts };
     return true;

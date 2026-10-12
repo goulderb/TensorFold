@@ -162,9 +162,19 @@ pub const Store = struct {
     const SHARED_KEYS = 64;
 
     /// The spill tier evicted states go to and longer ones come back from; its own evictions reach a peer's copy.
+    /// The store must not move while attached; `detach`, `clear` and `deinit` release the tier's hook (the tier may
+    /// outlive the store). Attach, detach and every store call run on the store's one owning thread.
     pub fn attach(s: *Store, tier: *spill.Tier) void {
+        s.detach();
         s.tier = tier;
-        tier.hook = .{ .ptr = s, .forgot = forgotFn };
+        tier.setHook(.{ .ptr = s, .forgot = forgotFn });
+    }
+
+    /// The tier stops reaching this store (its hook released when this store set it); spilling stops.
+    pub fn detach(s: *Store) void {
+        const t = s.tier orelse return;
+        t.releaseHook(s);
+        s.tier = null;
     }
 
     fn forgotFn(ptr: *anyopaque, name: spill.Name) void {
@@ -254,7 +264,9 @@ pub const Store = struct {
         e.saved = read(s.family.ptr, t, name) catch |err| {
             note("reading {d} spilled tokens failed ({s}); forgotten, prefilled instead", .{ name.at, @errorName(err) });
             s.spill_counts.recall_failed += 1;
+            // every rank's copy goes: this rank's file here (Tier.forget fires no hook), the peers' through the family
             t.forget(name);
+            if (s.family.vtable.spill_forget) |f| f(s.family.ptr, name);
             return s.drop(e, have, false);
         };
         t.touch(name);
@@ -269,6 +281,7 @@ pub const Store = struct {
     }
 
     pub fn deinit(s: *Store) void {
+        s.detach();
         for (s.entries.items) |e| s.free(e);
         s.entries.deinit(s.gpa);
         s.shared_keys.deinit(s.gpa);
@@ -439,7 +452,7 @@ pub const Store = struct {
         s.shared_keys.clearRetainingCapacity();
         s.imprint = null;
         s.disk = null;
-        s.tier = null; // the stored states hold the old arithmetic too: a new identity attaches a new tier
+        s.detach(); // the stored states hold the old arithmetic too: a new identity attaches a new tier
         s.active_rewind_at = 0;
     }
 
