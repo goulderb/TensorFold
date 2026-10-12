@@ -102,7 +102,11 @@ const Toy = struct {
 
     fn restore(ptr: *anyopaque, rank: u32, reading: *spill.Reading) anyerror!void {
         const t: *Toy = @ptrCast(@alignCast(ptr));
-        if (t.fail_rank == rank) return error.ToyRestoreFailed;
+        if (t.fail_rank == rank) { // the failing rank half-overwrote its live state first
+            try t.live[rank].appendSlice(gpa, "partial");
+            t.restored[rank] = true;
+            return error.ToyRestoreFailed;
+        }
         t.live[rank].clearRetainingCapacity();
         try reading.pump(.{ .ptr = &t.live[rank], .write = sink });
         t.restored[rank] = true;
@@ -239,7 +243,11 @@ test "a rank whose family restore fails leaves no rank restored and the pair for
     try std.testing.expectEqual(@as(u64, 1), why.restore_failed);
     try std.testing.expectEqual(@as(u64, 0), why.resumed);
     try std.testing.expect(!toy.restored[0] and !toy.restored[1]);
-    try std.testing.expectEqual(@as(usize, 0), toy.live[0].items.len);
+    try std.testing.expectEqual(@as(u32, 2), toy.discards); // rank 0's whole restore and rank 1's partial one
+    for (toy.live) |l| try std.testing.expectEqual(@as(usize, 0), l.items.len);
+    // rank 0 read its file (I/O counted) but no prefill was avoided: the pair never committed
+    try std.testing.expectEqual(@as(u64, 250), p.tiers[0].info().stats.loaded_tokens);
+    try std.testing.expectEqual(@as(u64, 0), why.resumed_tokens);
     for (p.tiers) |t| try std.testing.expect(!t.has(Name.of(tokens[0..250], 250)));
 }
 
@@ -257,4 +265,120 @@ test "persistence stays off unless TENSORFOLD_SPILL_GIB configures a tier" {
     const on = (try spill.Settings.fromEnv(gpa, Env{ .gib = "2" })).?;
     defer gpa.free(on.dir);
     try std.testing.expectEqual(@as(u64, 2 << 30), on.cap);
+}
+
+/// A payload whose bytes the writer cannot take until `open`: its write stays pending.
+const Gate = struct {
+    bytes: []const u8,
+    open: std.atomic.Value(bool) = .init(false),
+
+    fn read(ptr: *anyopaque, offset: u64, out: []u8) anyerror!void {
+        const g: *Gate = @ptrCast(@alignCast(ptr));
+        while (!g.open.load(.acquire)) std.Thread.yield() catch {};
+        @memcpy(out, g.bytes[@intCast(offset)..][0..out.len]);
+    }
+};
+
+test "a longest state whose peer copy is still being written yields the shorter pair and both files survive" {
+    var root = try Root.make();
+    defer root.deinit();
+    var tok: [900]u32 = undefined;
+    const tokens = tokensOf(&tok);
+    var p = try Pair.open(&root, identity_a);
+    defer p.deinit();
+    try putAll(&p, tokens, 400);
+    try put(p.tiers[0], tokens, 700, 0);
+    var pay: [3000]u8 = undefined;
+    var gate: Gate = .{ .bytes = payload(&pay, 1, 700) };
+    const long = Name.of(tokens[0..700], 700);
+    const j = try p.tiers[1].write(long, tokens[0..700], "", gate.bytes.len, .{ .ptr = &gate, .read = Gate.read });
+    try std.testing.expect(p.tiers[1].pending(long));
+    var toy: Toy = .{};
+    defer toy.deinit();
+    var why: resume_.Refusals = .{};
+    const got = resume_.resumeLongest(&p.tiers, tokens, 0, 0, toy.family(), &why);
+    gate.open.store(true, .release);
+    j.waitCopied();
+    try std.testing.expect(p.tiers[1].drain(10));
+    try std.testing.expect(j.ok);
+    j.release();
+    try std.testing.expectEqual(resume_.Outcome{ .resumed = 400 }, got);
+    try std.testing.expect(why.missing_rank >= 1);
+    try std.testing.expectEqual(@as(u64, 0), why.read_failed);
+    for (p.tiers) |t| try std.testing.expect(t.stored(long, tokens[0..700])); // neither rank's long copy was deleted
+}
+
+test "a peer file under the same name but other tokens is not a pair" {
+    var root = try Root.make();
+    defer root.deinit();
+    var tok: [900]u32 = undefined;
+    const tokens = tokensOf(&tok);
+    var other: [900]u32 = undefined;
+    for (&other, 0..) |*t, i| t.* = @intCast(i + 3);
+    var p = try Pair.open(&root, identity_a);
+    defer p.deinit();
+    try putAll(&p, tokens, 200);
+    try put(p.tiers[0], tokens, 600, 0);
+    var pay: [3000]u8 = undefined;
+    var m: Mem = .{ .bytes = payload(&pay, 1, 600) };
+    const name = Name.of(tokens[0..600], 600); // rank 1 files other tokens under rank 0's name
+    const j = try p.tiers[1].write(name, other[0..600], "", m.bytes.len, .{ .ptr = &m, .read = Mem.read });
+    j.waitCopied();
+    try std.testing.expect(p.tiers[1].drain(10));
+    j.release();
+    try std.testing.expect(p.tiers[1].has(name) and !p.tiers[1].stored(name, tokens[0..600]));
+    var toy: Toy = .{};
+    defer toy.deinit();
+    var why: resume_.Refusals = .{};
+    try std.testing.expectEqual(resume_.Outcome{ .resumed = 200 }, resume_.resumeLongest(&p.tiers, tokens, 0, 0, toy.family(), &why));
+    try std.testing.expectEqual(@as(u64, 1), why.missing_rank);
+}
+
+test "a tier of another world size reads none of a pair's files" {
+    var root = try Root.make();
+    defer root.deinit();
+    var tok: [500]u32 = undefined;
+    const tokens = tokensOf(&tok);
+    {
+        var p = try Pair.open(&root, identity_a);
+        defer p.deinit();
+        try putAll(&p, tokens, 400);
+    }
+    const t = try Tier.open(gpa, io, root.settings(), family_label, identity_a, 0, 4);
+    defer t.deinit();
+    try std.testing.expect(t.best(tokens, 0, {}, struct {
+        fn any(_: void, _: u32) bool {
+            return true;
+        }
+    }.any) == null);
+}
+
+test "a spill identity changes with each of weights, runtime, layout, dtype and TP, and refuses empty fields" {
+    const base: resume_.Identity = .{ .weights = @splat(7), .runtime = "tf-1.0.7+k1", .layout = "kv-paged-256,la1", .dtype = "kv=fp8", .tp = 2 };
+    const d = try base.digest();
+    try std.testing.expectEqualSlices(u8, &d, &(try base.digest()));
+    var changed = [_]resume_.Identity{ base, base, base, base, base };
+    changed[0].weights[31] = 8;
+    changed[1].runtime = "tf-1.0.7+k2";
+    changed[2].layout = "kv-paged-128,la1";
+    changed[3].dtype = "kv=bf16";
+    changed[4].tp = 1;
+    for (changed) |c| try std.testing.expect(!std.mem.eql(u8, &d, &(try c.digest())));
+    // field boundaries are length-prefixed: moving text between fields is a different identity
+    var shifted = base;
+    shifted.runtime = "tf-1.0.7+k1kv-paged-256";
+    shifted.layout = ",la1";
+    try std.testing.expect(!std.mem.eql(u8, &d, &(try shifted.digest())));
+    var bad = base;
+    bad.dtype = "";
+    try std.testing.expectError(error.BadSpillIdentity, bad.digest());
+    bad = base;
+    bad.tp = 0;
+    try std.testing.expectError(error.BadSpillIdentity, bad.digest());
+    bad = base;
+    bad.weights = @splat(0);
+    try std.testing.expectError(error.BadSpillIdentity, bad.digest());
+    bad = base;
+    bad.layout = &[_]u8{ 'a', 0, 'b' };
+    try std.testing.expectError(error.BadSpillIdentity, bad.digest());
 }
