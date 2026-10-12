@@ -40,6 +40,7 @@ pub const Fake = struct {
     fail_write: bool = false,
     writes: usize = 0,
     fail_restore: bool = false,
+    fail_spill_read: bool = false,
     live: usize = 0,
     spare_bytes: u64 = 0,
     peer: ?*Peer = null, // speed-up mode's rank 1: it keeps the same states and drops them only when a request names them
@@ -119,6 +120,42 @@ pub const Fake = struct {
         const st = try f.gpa.create(State);
         errdefer f.gpa.destroy(st);
         if (!imprint.readAt(fd, std.mem.asBytes(st), 0) or st.at != at) return error.ReadFailed;
+        f.live += 1;
+        return st;
+    }
+    /// With a spill tier: a state's position and sum as one payload (one rank; spill_resume.zig pairs ranks).
+    pub fn spilling(f: *Fake) Snapshots {
+        return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .spill_write = spillWriteFn, .spill_read = spillReadFn } };
+    }
+    fn stateBytes(p: *anyopaque) []u8 {
+        return std.mem.asBytes(@as(*State, @ptrCast(@alignCast(p))));
+    }
+    fn spillWriteFn(_: *anyopaque, saved: Saved, tier: *pc.spill.Tier, name: pc.spill.Name, tokens: []const u32) anyerror!void {
+        var copy: State = @as(*State, @ptrCast(@alignCast(saved))).*;
+        const Src = struct {
+            fn read(p: *anyopaque, offset: u64, out: []u8) anyerror!void {
+                @memcpy(out, stateBytes(p)[@intCast(offset)..][0..out.len]);
+            }
+        };
+        const j = try tier.write(name, tokens, "", @sizeOf(State), .{ .ptr = &copy, .read = Src.read });
+        defer j.release();
+        j.waitCopied(); // `copy` lives on this stack
+    }
+    fn spillReadFn(ptr: *anyopaque, tier: *pc.spill.Tier, name: pc.spill.Name) anyerror!Saved {
+        const f = of(ptr);
+        if (f.fail_spill_read) return error.ToySpillReadFailed;
+        var r = try tier.read(name);
+        defer r.close();
+        if (r.payloadLen() != @sizeOf(State)) return error.ReadFailed;
+        const st = try f.gpa.create(State);
+        errdefer f.gpa.destroy(st);
+        const Dst = struct {
+            fn write(p: *anyopaque, offset: u64, bytes: []const u8) anyerror!void {
+                @memcpy(stateBytes(p)[@intCast(offset)..][0..bytes.len], bytes);
+            }
+        };
+        try r.pump(.{ .ptr = st, .write = Dst.write });
+        if (st.at != name.at) return error.ReadFailed;
         f.live += 1;
         return st;
     }
