@@ -1055,6 +1055,7 @@ test "digest cache rejects a store directory without private mode" {
 }
 
 test "digest cache rejects an ancestor owned by another uid" {
+    if (std.c.geteuid() != 0) return error.SkipZigTest; // only root can give a directory to another uid
     var f = try Fixture.open();
     defer f.close();
     const owned = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/owned", .{f.base}, 0);
