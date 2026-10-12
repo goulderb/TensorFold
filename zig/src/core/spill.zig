@@ -411,6 +411,29 @@ pub const Tier = struct {
         return t.find(name) != null;
     }
 
+    /// The owner's hook for names the cap or floor removes (null: none). The hook runs on the thread that calls `write`,
+    /// never under the tier's lock; one owner at a time.
+    pub fn setHook(t: *Tier, h: ?Hook) void {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        t.hook = h;
+    }
+
+    /// Clears the hook only when `owner` set it: a later owner's hook stays.
+    pub fn releaseHook(t: *Tier, owner: *anyopaque) void {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        if (t.hook) |h| if (h.ptr == owner) {
+            t.hook = null;
+        };
+    }
+
+    fn currentHook(t: *Tier) ?Hook {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        return t.hook;
+    }
+
     /// Whether `name` is on disk (not on its way) with exactly `tokens`: a copy `read` can return now.
     pub fn stored(t: *Tier, name: Name, tokens: []const u32) bool {
         t.mutex.lockUncancelable(t.io);
@@ -513,7 +536,7 @@ pub const Tier = struct {
         const bytes = Header.payloadOffset(tokens.len) + payload_len;
         var gone: std.ArrayList(Name) = .empty;
         defer gone.deinit(t.gpa);
-        defer if (t.hook) |h| for (gone.items) |n| h.forgot(h.ptr, n);
+        defer if (t.currentHook()) |h| for (gone.items) |n| h.forgot(h.ptr, n); // read under the lock, called outside it
         const j = try t.gpa.create(Job);
         errdefer t.gpa.destroy(j);
         j.* = .{ .tier = t, .name = name, .tokens = try t.gpa.dupe(u32, tokens), .meta = undefined, .payload_len = payload_len, .source = source };
@@ -1025,6 +1048,13 @@ fn makePath(gpa: Allocator, dir: [:0]const u8) !void {
     };
     const rc = std.c.mkdir(tmp.ptr, 0o700);
     if (rc != 0 and std.c.errno(rc) != .EXIST) return error.SpillDir;
+}
+
+/// Whether an existing `dir` passes the tier's own private-directory check (no link, this user's or root's, not group
+/// or world writable), without creating, opening a tier in, or pruning anything.
+pub fn checkRoot(dir: [:0]const u8) !void {
+    if (dir.len == 0 or dir[0] != '/') return error.SpillDirNotAbsolute;
+    _ = std.c.close(try openPrivate(std.c.AT.FDCWD, dir));
 }
 
 /// Directory `name` in directory `at`, opened (not through a link) when only this process's user or root can change

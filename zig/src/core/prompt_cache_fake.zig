@@ -41,6 +41,7 @@ pub const Fake = struct {
     writes: usize = 0,
     fail_restore: bool = false,
     fail_spill_read: bool = false,
+    spill_forgets: usize = 0, // names the store asked every rank to drop (a pass from 0 resets it)
     live: usize = 0,
     spare_bytes: u64 = 0,
     peer: ?*Peer = null, // speed-up mode's rank 1: it keeps the same states and drops them only when a request names them
@@ -125,7 +126,10 @@ pub const Fake = struct {
     }
     /// With a spill tier: a state's position and sum as one payload (one rank; spill_resume.zig pairs ranks).
     pub fn spilling(f: *Fake) Snapshots {
-        return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .spill_write = spillWriteFn, .spill_read = spillReadFn } };
+        return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .spill_write = spillWriteFn, .spill_read = spillReadFn, .spill_forget = spillForgetFn } };
+    }
+    fn spillForgetFn(ptr: *anyopaque, _: pc.spill.Name) void {
+        of(ptr).spill_forgets += 1;
     }
     fn stateBytes(p: *anyopaque) []u8 {
         return std.mem.asBytes(@as(*State, @ptrCast(@alignCast(p))));
