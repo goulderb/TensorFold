@@ -1,4 +1,7 @@
 //! Exact prompt reuse: states are keyed by tokens and canonical decoded intervals through their position.
+//! With a spill tier attached (spill.zig, docs/spill-tier.md) a prefill-only state leaving the budget goes to local
+//! disk and comes back for a prompt that extends it, also after a restart. Without a tier, or for a family with no
+//! spill hooks, nothing is written. Learned states (`write`/`read`, prompt_learn.zig) are a separate path.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const imprint = @import("prompt_imprint.zig");
@@ -8,6 +11,7 @@ const lifetime = @import("prompt_cache_lifetime.zig");
 const policy = @import("prompt_cache_policy.zig");
 const cuts = @import("prompt_cuts.zig");
 pub const rows = @import("rows_store.zig");
+pub const spill = @import("spill.zig");
 
 /// A family's copy of one state.
 pub const Saved = *anyopaque;
@@ -55,7 +59,24 @@ pub const Snapshots = struct {
         forget: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, key: u64) void = null,
         /// --learn-conversations: the state's image as rows and parts, and copies out of and into kept states.
         rows: ?*const rows.Image = null,
+        /// Write `saved` (its `tokens`) to the spill tier as `name`, every rank's part or none; error.Incomplete when it
+        /// cannot be written yet (null: the family spills nothing and the stale-session tier stays off).
+        spill_write: ?*const fn (ptr: *anyopaque, saved: Saved, tier: *spill.Tier, name: spill.Name, tokens: []const u32) anyerror!void = null,
+        /// Stored state `name` read back into new storage on every rank, or an error with no rank changed
+        /// (spill_resume.zig restores all ranks or none).
+        spill_read: ?*const fn (ptr: *anyopaque, tier: *spill.Tier, name: spill.Name) anyerror!Saved = null,
+        /// `name` left this rank's tier: a peer deletes its own copy (null: one rank).
+        spill_forget: ?*const fn (ptr: *anyopaque, name: spill.Name) void = null,
     };
+};
+
+/// The prompt cache's spill-tier outcomes; the tier's own Stats count bytes, files, hits and load failures.
+pub const SpillCounts = struct {
+    recalled: u64 = 0, // states read back from disk and resumed from
+    recalled_tokens: u64 = 0, // prompt tokens those states held: prefill a recall avoided
+    recall_failed: u64 = 0, // a stored state that would not read back: forgotten, the pass ran from what memory held
+    write_failed: u64 = 0, // a spill write the family refused or failed
+    ineligible: u64 = 0, // a leaving state not written: decoded rows, or shorter than the tier's min_tokens
 };
 
 /// What a paged store asks of the backend's pages: who holds each, and how many are free.
@@ -133,8 +154,114 @@ pub const Store = struct {
     imprint: ?*imprint.Imprint = null, // --learn: shared cuts' states on disk, read back by later sessions and servers
     disk: ?*rows.Rows = null, // --learn-conversations: every kept state written behind to disk, read back where it pays
     active_rewind_at: u32 = 0, // the last lookup's rewind state (0: none); hosts keep a pass's states before the next lookup
+    tier: ?*spill.Tier = null, // attach: evicted prefill-only states go to disk, longer ones come back (null: off)
+    spill_counts: SpillCounts = .{},
 
     const SHARED_KEYS = 64;
+
+    /// The spill tier evicted states go to and longer ones come back from; its own evictions reach a peer's copy.
+    pub fn attach(s: *Store, tier: *spill.Tier) void {
+        s.tier = tier;
+        tier.hook = .{ .ptr = s, .forgot = forgotFn };
+    }
+
+    fn forgotFn(ptr: *anyopaque, name: spill.Name) void {
+        const s: *Store = @ptrCast(@alignCast(ptr));
+        if (s.family.vtable.spill_forget) |f| f(s.family.ptr, name);
+    }
+
+    /// The tier's files and stats for /health and /metrics (null: no tier attached).
+    pub fn spillInfo(s: *const Store) ?spill.Info {
+        return if (s.tier) |t| t.info() else null;
+    }
+
+    /// Entry i leaves the budget: to the spill tier when it is worth a file, then out of memory.
+    fn evict(s: *Store, i: usize) void {
+        s.spillOut(s.entries.items[i]);
+        s.remove(i);
+        s.counts.evicted += 1;
+    }
+
+    /// `e` written to the tier unless it is there, holds decoded rows (their arithmetic is not the prompt's), or is
+    /// shorter than the tier's min_tokens.
+    fn spillOut(s: *Store, e: *const Entry) void {
+        const t = s.tier orelse return;
+        const write = s.family.vtable.spill_write orelse return;
+        if (e.decode_spans.len > 0 or e.at < t.settings.min_tokens) {
+            s.spill_counts.ineligible += 1;
+            return;
+        }
+        const name = spill.Name.of(e.tokens, e.at);
+        if (t.has(name)) return;
+        write(s.family.ptr, e.saved, t, name, e.tokens) catch |err| {
+            s.spill_counts.write_failed += 1;
+            note("spilling {d} tokens failed ({s})", .{ e.at, @errorName(err) });
+        };
+    }
+
+    /// A clean stop: kept states not on disk are written, most recently used first; the writers get `seconds`.
+    pub fn flushSpill(s: *Store, seconds: f64) bool {
+        const t = s.tier orelse return true;
+        if (s.family.vtable.spill_write == null) return true;
+        const order = s.gpa.dupe(*Entry, s.entries.items) catch return t.drain(seconds);
+        defer s.gpa.free(order);
+        std.mem.sort(*Entry, order, {}, struct {
+            fn newer(_: void, a: *Entry, b: *Entry) bool {
+                return a.used > b.used;
+            }
+        }.newer);
+        for (order) |e| s.spillOut(e);
+        return t.drain(seconds);
+    }
+
+    /// A stored state longer than `have` that this prompt extends, read back as an entry; else `have`.
+    fn recallSpill(s: *Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, have: ?*Entry) ?*Entry {
+        const t = s.tier orelse return have;
+        const read = s.family.vtable.spill_read orelse return have;
+        const Ctx = struct {
+            s: *const Store,
+            starts: []const u32,
+            spans: []const modes.Span,
+            fn ok(c: *const @This(), at: u32) bool {
+                return c.s.usable(at, c.starts) and modes.equal(&.{}, c.spans, at);
+            }
+        };
+        const ctx: Ctx = .{ .s = s, .starts = starts, .spans = spans };
+        const hit = t.best(prompt, if (have) |x| x.at else 0, &ctx, Ctx.ok) orelse return have;
+        const name = hit.name;
+        const bytes = s.family.vtable.bytes(s.family.ptr, name.at);
+        if (bytes > s.budget) return have;
+        const tokens = s.gpa.dupe(u32, hit.tokens) catch return have; // room-making writes may evict the hit from disk
+        while (s.held + s.spare() + bytes > s.budget) {
+            const v = s.victimBut(have, prompt, false) orelse {
+                s.gpa.free(tokens);
+                return have;
+            };
+            s.evict(v);
+        }
+        if (!t.has(name)) {
+            s.gpa.free(tokens);
+            return have;
+        }
+        const e = s.gpa.create(Entry) catch {
+            s.gpa.free(tokens);
+            return have;
+        };
+        e.* = .{ .tokens = tokens, .at = name.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{} };
+        e.last = s.gpa.dupe(u32, prompt) catch return s.drop(e, have, false);
+        e.saved = read(s.family.ptr, t, name) catch |err| {
+            note("reading {d} spilled tokens failed ({s}); forgotten, prefilled instead", .{ name.at, @errorName(err) });
+            s.spill_counts.recall_failed += 1;
+            t.forget(name);
+            return s.drop(e, have, false);
+        };
+        t.touch(name);
+        s.entries.append(s.gpa, e) catch return s.drop(e, have, true);
+        s.held += bytes;
+        s.spill_counts.recalled += 1;
+        s.spill_counts.recalled_tokens += name.at;
+        return e;
+    }
 
     pub fn init(gpa: Allocator, family: Snapshots, rules: Rules, budget: u64) Store {
         return .{ .gpa = gpa, .family = family, .rules = rules, .budget = budget };
@@ -273,7 +400,7 @@ pub const Store = struct {
         if (s.active_rewind_at > 0) if (s.keptNear(prompt, starts, spans, s.active_rewind_at)) |at| {
             s.active_rewind_at = at; // a state kept under min_gap before it is the rewind state: no new copy
         };
-        const e = rows.read.recall(s, prompt, born, starts, spans, s.recall(prompt, born, starts, spans, s.find(prompt, starts, spans)));
+        const e = s.recallSpill(prompt, starts, spans, rows.read.recall(s, prompt, born, starts, spans, s.recall(prompt, born, starts, spans, s.find(prompt, starts, spans))));
         if (e == null) s.counts.misses += 1;
         const from = if (e) |x| x.at else 0;
         const marks_ = if (s.active_rewind_at == 0)
@@ -300,9 +427,7 @@ pub const Store = struct {
             if (!exists) need += s.family.vtable.bytes(s.family.ptr, at);
         }
         while (s.held + need > s.budget) {
-            const i = s.victimBut(from, prompt, born, false) orelse return;
-            s.remove(i);
-            s.counts.evicted += 1;
+            s.evict(s.victimBut(from, prompt, born, false) orelse return);
         }
     }
 
@@ -313,6 +438,7 @@ pub const Store = struct {
         s.shared_keys.clearRetainingCapacity();
         s.imprint = null;
         s.disk = null;
+        s.tier = null; // the stored states hold the old arithmetic too: a new identity attaches a new tier
         s.active_rewind_at = 0;
     }
 
@@ -465,8 +591,7 @@ pub const Store = struct {
                 if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
                 if (s.spare() < free_) continue;
             }
-            s.remove(s.victimForMark(null, prompt, born) orelse return s.fail(at, error.CacheBorrowed)); // its storage may come back spare and take this state
-            s.counts.evicted += 1;
+            s.evict(s.victimForMark(null, prompt, born) orelse return s.fail(at, error.CacheBorrowed)); // its storage may come back spare and take this state
         }
         if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
         const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
@@ -508,8 +633,7 @@ pub const Store = struct {
         if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
         while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
-            s.remove(s.victimBut(have, prompt, born, false) orelse return have);
-            s.counts.evicted += 1;
+            s.evict(s.victimBut(have, prompt, born, false) orelse return have);
         }
         if (bytes > s.budget) return have;
         const e = s.gpa.create(Entry) catch return have;
@@ -570,6 +694,7 @@ test {
     _ = @import("prompt_cache_give_test.zig");
     _ = @import("prompt_cache_lifetime_test.zig");
     _ = @import("learned_fault_test.zig");
+    _ = @import("prompt_cache_spill_test.zig");
     _ = modes;
     _ = rows;
 }
