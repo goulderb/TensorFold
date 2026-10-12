@@ -541,22 +541,23 @@ test "settings come from TENSORFOLD_SPILL_*: off without a size, GLM's defaults,
     try std.testing.expectError(error.BadSpillSetting, spill.Settings.fromEnv(gpa, Env{ .vars = &.{ .{ "TENSORFOLD_SPILL_GIB", "lots" }, .{ "HOME", "/h" } } }));
 }
 
-test "a header round-trips and refuses a flipped byte, another version, identity or rank" {
+test "a header round-trips and refuses a flipped byte, another version, identity, rank or world" {
     const h: spill.Header = .{ .identity = identity_a, .family = @splat(0), .rank = 1, .world = 2, .name = .{ .key = 0x1234, .at = 99 }, .tokens = 100, .payload_len = 777, .tokens_hash = 5, .payload_hash = 6, .saved = 1_760_000_000, .meta_len = 3 };
     var buf: [spill.header_bytes]u8 = undefined;
     h.encode("abc", &buf);
-    const back = try spill.Header.decode(&buf, identity_a, 1);
+    const back = try spill.Header.decode(&buf, identity_a, 1, 2);
     try std.testing.expectEqual(@as(u64, 777), back.payload_len);
     try std.testing.expectEqual(@as(u32, 99), back.name.at);
     try std.testing.expectEqualStrings("abc", spill.Header.meta(&buf, back));
     try std.testing.expectEqual(@as(u64, 4096 + 4096 + 777), back.fileBytes());
-    try std.testing.expectError(error.OtherIdentity, spill.Header.decode(&buf, identity_b, 1));
-    try std.testing.expectError(error.OtherRank, spill.Header.decode(&buf, identity_a, 0));
+    try std.testing.expectError(error.OtherIdentity, spill.Header.decode(&buf, identity_b, 1, 2));
+    try std.testing.expectError(error.OtherRank, spill.Header.decode(&buf, identity_a, 0, 2));
+    try std.testing.expectError(error.OtherWorld, spill.Header.decode(&buf, identity_a, 1, 4)); // a TP=4 tier never reads TP=2 shards
     buf[100] ^= 1;
-    try std.testing.expectError(error.HeaderHash, spill.Header.decode(&buf, identity_a, 1));
+    try std.testing.expectError(error.HeaderHash, spill.Header.decode(&buf, identity_a, 1, 2));
     buf[100] ^= 1;
     buf[8] = 2;
-    try std.testing.expectError(error.OtherVersion, spill.Header.decode(&buf, identity_a, 1));
+    try std.testing.expectError(error.OtherVersion, spill.Header.decode(&buf, identity_a, 1, 2));
 }
 
 test "a hurried write goes before the ones queued ahead of it" {

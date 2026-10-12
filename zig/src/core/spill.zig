@@ -135,7 +135,7 @@ pub const Stats = struct {
     pruned: u64 = 0,
     written_bytes: u64 = 0,
     loaded_bytes: u64 = 0,
-    loaded_tokens: u64 = 0,
+    loaded_tokens: u64 = 0, // I/O: tokens of files this rank read back, before any pair commits; not avoided prefill
     write_ns: u64 = 0,
     load_ns: u64 = 0,
     copy_wait_ns: u64 = 0,
@@ -189,8 +189,8 @@ pub const Header = struct {
         put(u64, out, header_bytes - 8, std.hash.XxHash3.hash(0, out[0 .. header_bytes - 8]));
     }
 
-    /// A header's fields when it is one this tier wrote (`identity`, `rank`): else why not.
-    pub fn decode(in: *const [header_bytes]u8, identity: [32]u8, rank: u32) !Header {
+    /// A header's fields when it is one this tier wrote (`identity`, `rank` of `world`): else why not.
+    pub fn decode(in: *const [header_bytes]u8, identity: [32]u8, rank: u32, world: u32) !Header {
         if (!std.mem.eql(u8, in[0..8], magic)) return error.NotASpillFile;
         if (get(u32, in, 8) != version or get(u32, in, 12) != header_bytes) return error.OtherVersion;
         if (get(u64, in, header_bytes - 8) != std.hash.XxHash3.hash(0, in[0 .. header_bytes - 8])) return error.HeaderHash;
@@ -209,6 +209,7 @@ pub const Header = struct {
             .meta_len = get(u32, in, 128),
         };
         if (h.rank != rank) return error.OtherRank;
+        if (h.world != world) return error.OtherWorld; // another TP size's rank files hold other shards
         if (h.meta_len > meta_most or get(u64, in, 88) != payloadOffset(h.tokens)) return error.BadHeader;
         return h;
     }
@@ -408,6 +409,15 @@ pub const Tier = struct {
         t.mutex.lockUncancelable(t.io);
         defer t.mutex.unlock(t.io);
         return t.find(name) != null;
+    }
+
+    /// Whether `name` is on disk (not on its way) with exactly `tokens`: a copy `read` can return now.
+    pub fn stored(t: *Tier, name: Name, tokens: []const u32) bool {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        const i = t.find(name) orelse return false;
+        const e = t.entries.items[i];
+        return e.job == null and std.mem.eql(u32, e.tokens, tokens);
     }
 
     /// Whether the existing copy is still being written (never waits for that writer).
@@ -725,7 +735,7 @@ pub const Tier = struct {
     }
 
     /// Reads stored state `name` back: its header and tokens checked now (the file goes when they fail), its payload
-    /// by `Reading.pump`. A write of it still on its way is waited for.
+    /// by `Reading.pump`. A write of it still on its way is error.NotStored (never waited for; see `stored`).
     pub fn read(t: *Tier, name: Name) !Reading {
         t.mutex.lockUncancelable(t.io);
         const i = t.find(name) orelse {
@@ -815,7 +825,7 @@ pub const Tier = struct {
         defer _ = std.c.close(fd);
         var head: [header_bytes]u8 = undefined;
         if (!preadAll(fd, &head, 0)) return error.ShortFile;
-        const h = try Header.decode(&head, t.identity, t.rank);
+        const h = try Header.decode(&head, t.identity, t.rank, t.world);
         if (!h.name.eql(name)) return error.OtherName;
         if (fileSize(fd) != h.fileBytes()) return error.ShortFile;
         const tokens = try t.gpa.alloc(u32, h.tokens);
@@ -896,7 +906,7 @@ pub const Reading = struct {
         if (r.fd < 0) return error.SpillOpen;
         if (!preadAll(r.fd, &r.head, 0)) return error.ShortFile;
         t.advise_file(r.fd, 0, r.head.len);
-        r.header = try Header.decode(&r.head, t.identity, t.rank);
+        r.header = try Header.decode(&r.head, t.identity, t.rank, t.world);
         if (!r.header.name.eql(r.name)) return error.OtherName;
         if (fileSize(r.fd) != r.header.fileBytes()) return error.ShortFile;
         r.tokens = try t.gpa.alloc(u32, r.header.tokens);
