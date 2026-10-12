@@ -424,6 +424,15 @@ const Run = struct {
     const StreamSink = struct {
         run: *Run,
         tools: bool,
+        opened: bool = false,
+
+        fn accepted(ctx: *anyopaque) error{Closed}!void {
+            const s: *StreamSink = @ptrCast(@alignCast(ctx));
+            const r = s.run;
+            try r.out.vt.open(r.out.ctx);
+            s.opened = true;
+            if (!s.tools and r.is_chat) try r.emit(r.chunk(roleDelta(r.a) catch return error.Closed, null) catch return error.Closed);
+        }
 
         fn call(ctx: *anyopaque, delta: Value) error{Closed}!void {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
@@ -490,14 +499,10 @@ const Run = struct {
             compaction = ready.stamp;
             break :blk ready.prepared;
         };
-        var handed = false; // generate gives the preparing count back from here on
-        defer if (!handed) chat.release(r.srv, prepared.preparing);
-        r.out.vt.open(r.out.ctx, prepared.prompt_len) catch return;
-        if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
         var sink_state: StreamSink = .{ .run = r, .tools = tools };
-        handed = true;
-        const sink: chat.Sink = .{ .ctx = &sink_state, .call = StreamSink.call };
+        const sink: chat.Sink = .{ .ctx = &sink_state, .call = StreamSink.call, .accepted = StreamSink.accepted };
         var reply = (if (r.turn) |t| cortheon.loop.stream(t, r.srv, &cx, &r.plan.input, prepared, sink, gone) else chat.generate(r.srv, &cx, prepared, sink, gone)) catch |e| {
+            if (!sink_state.opened) return r.unsent(&cx, e, field);
             switch (e) {
                 error.Cancelled => return,
                 error.Refused => if (cx.kind != .other and cx.kind != .server) {

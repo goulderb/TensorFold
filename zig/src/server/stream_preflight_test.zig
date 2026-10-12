@@ -303,6 +303,49 @@ test "a stream whose client is gone when it opens gives the preparing count back
     try std.testing.expectEqual(@as(i64, 0), seen.preparing);
 }
 
+/// A 4096-token window whose engine refuses every submit with ``refusal``.
+const RefusingEngine = struct {
+    refusal: api.SubmitError,
+
+    fn engine(e: *@This()) api.Engine {
+        return .{ .ctx = e, .vtable = &.{ .info = CallEngine.info, .submit = submit, .cancel = HiEngine.cancel, .status = HiEngine.status, .memory = HiEngine.memory } };
+    }
+
+    fn submit(ctx: *anyopaque, _: api.Id, _: *const api.Request, _: api.Sink) api.SubmitError!void {
+        const e: *RefusingEngine = @ptrCast(@alignCast(ctx));
+        return e.refusal;
+    }
+};
+
+fn expectRefusedUnopened(route: Route, body: []const u8, refusal: api.SubmitError, status: u16) !void {
+    var backend: RefusingEngine = .{ .refusal = refusal };
+    const seen = try sendWith(backend.engine(), route, body, .{});
+    try std.testing.expect(!seen.opened);
+    try std.testing.expectEqual(@as(usize, 0), seen.events);
+    try std.testing.expectEqual(@as(?u16, status), seen.status);
+    try std.testing.expectEqual(@as(i64, 0), seen.preparing);
+}
+
+const streamed_chat = "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true,\"max_tokens\":2}";
+
+test "a streamed chat a full engine refuses answers 429 before any stream opens" {
+    try expectRefusedUnopened(.chat, streamed_chat, error.Full, 429);
+}
+
+test "a streamed chat with tools a full engine refuses answers 429 before any stream opens" {
+    try expectRefusedUnopened(.chat, "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"stream\":true,\"max_tokens\":2," ++
+        "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\"}}}]}", error.Full, 429);
+}
+
+test "a streamed Messages and Responses request a full engine refuses answers 429 before any stream opens" {
+    try expectRefusedUnopened(.messages, streamed_chat, error.Full, 429);
+    try expectRefusedUnopened(.responses, "{\"model\":\"test-model\",\"input\":\"x\",\"stream\":true,\"max_output_tokens\":2}", error.Full, 429);
+}
+
+test "a streamed chat a busy engine refuses keeps its 503 before any stream opens" {
+    try expectRefusedUnopened(.chat, streamed_chat, error.Busy, 503);
+}
+
 test "a reply labels a greedy request greedy and a sampled one exact" {
     const greedy = try send(.chat, "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":2,\"temperature\":0}");
     try std.testing.expectEqual(@as(?u16, 200), greedy.status);
