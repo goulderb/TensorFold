@@ -82,7 +82,30 @@ test "a stale session after a restart replies as a cold pass and prefills only p
     try std.testing.expectEqual(@as(usize, 300), turn2.len - plan.from); // prefilled 300 of 700
     try std.testing.expectEqual(@as(u64, 1), s.spill_counts.recalled);
     try std.testing.expectEqual(@as(u64, 400), s.spill_counts.recalled_tokens); // the avoided prefill
-    try std.testing.expectEqual(@as(u64, 400), s.spillInfo().?.stats.loaded_tokens);
+    try std.testing.expectEqual(@as(u64, 400), s.spillInfo().?.stats.loaded_tokens); // I/O, separately counted
+}
+
+test "a state read back from disk whose family restore fails avoids no prefill and matches a cold reply" {
+    var root = try Root.make();
+    defer root.deinit();
+    var buf: [700]u32 = undefined;
+    const turn2 = conversation(&buf, 11);
+    try firstLife(&root, turn2[0..500], 400);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const t = try root.tier(identity_a);
+    defer t.deinit();
+    var f: Fake = .{ .gpa = gpa, .fail_restore = true };
+    var s = pc.Store.init(gpa, f.spilling(), rules, 1 << 20);
+    defer s.deinit();
+    s.attach(t);
+    const plan = try s.begin(arena.allocator(), turn2, 650, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 0), plan.from);
+    try std.testing.expectEqual(fresh(turn2), f.pass(&s, turn2, plan));
+    try std.testing.expectEqual(@as(u64, 1), s.spill_counts.read_back);
+    try std.testing.expectEqual(@as(u64, 400), t.info().stats.loaded_tokens); // read from disk
+    try std.testing.expectEqual(@as(u64, 0), s.spill_counts.recalled);
+    try std.testing.expectEqual(@as(u64, 0), s.spill_counts.recalled_tokens); // but no prefill avoided
 }
 
 test "a state the budget evicts goes to disk and a prompt that extends it reads it back" {
