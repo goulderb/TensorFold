@@ -190,6 +190,13 @@ pub fn build(b: *std.Build) void {
     const warning_run = b.addRunArtifact(warning);
     test_step.dependOn(&warning_run.step);
     b.step("test-learn-warning", "CPU production-log refusal, backoff and recovery test").dependOn(&warning_run.step);
+    // the model-neutral spill tier (docs/spill-tier.md): files, private identity digests, paired stale resume
+    const spill_step = b.step("test-spill", "CPU spill tier, identity store and paired stale-resume tests (no model)");
+    for ([_][]const u8{ "zig/src/core/spill.zig", "zig/src/core/spill_identity.zig", "zig/src/core/spill_resume.zig" }) |path| {
+        const run = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path(path), .target = b.graph.host, .optimize = .debug, .link_libc = true }) }));
+        spill_step.dependOn(&run.step);
+        if (b.graph.host.result.os.tag != .windows) test_step.dependOn(&run.step);
+    }
     grammar_build.steps(b, target, xgrammar);
 }
 
