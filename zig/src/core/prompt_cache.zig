@@ -72,8 +72,9 @@ pub const Snapshots = struct {
 
 /// The prompt cache's spill-tier outcomes; the tier's own Stats count bytes, files, hits and load failures.
 pub const SpillCounts = struct {
-    recalled: u64 = 0, // states read back from disk and resumed from
-    recalled_tokens: u64 = 0, // prompt tokens those states held: prefill a recall avoided
+    read_back: u64 = 0, // states read back from disk into memory (I/O; a later restore may still fail)
+    recalled: u64 = 0, // read-back states the family restored and a pass resumed from
+    recalled_tokens: u64 = 0, // their prompt tokens: the prefill disk recall avoided (committed restores only)
     recall_failed: u64 = 0, // a stored state that would not read back: forgotten, the pass ran from what memory held
     write_failed: u64 = 0, // a spill write the family refused or failed
     ineligible: u64 = 0, // a leaving state not written: decoded rows, or shorter than the tier's min_tokens
@@ -129,6 +130,7 @@ pub const Entry = struct {
     last: []u32, // the last prompt that kept or resumed it
     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
     branched: bool = false, // resumed again after a later prompt kept a longer state extending it: never superseded
+    from_disk: bool = false, // read back from the spill tier and not yet resumed: its first good restore counts as recalled
 };
 
 pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
@@ -247,7 +249,7 @@ pub const Store = struct {
             s.gpa.free(tokens);
             return have;
         };
-        e.* = .{ .tokens = tokens, .at = name.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{} };
+        e.* = .{ .tokens = tokens, .at = name.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .from_disk = true };
         e.last = s.gpa.dupe(u32, prompt) catch return s.drop(e, have, false);
         e.saved = read(s.family.ptr, t, name) catch |err| {
             note("reading {d} spilled tokens failed ({s}); forgotten, prefilled instead", .{ name.at, @errorName(err) });
@@ -258,8 +260,7 @@ pub const Store = struct {
         t.touch(name);
         s.entries.append(s.gpa, e) catch return s.drop(e, have, true);
         s.held += bytes;
-        s.spill_counts.recalled += 1;
-        s.spill_counts.recalled_tokens += name.at;
+        s.spill_counts.read_back += 1;
         return e;
     }
 
@@ -498,6 +499,11 @@ pub const Store = struct {
         e.used = s.clock;
         e.branched = e.branched or s.extended(e); // a turn several continuations share (a re-sent, edited or forked one)
         s.counts.hits += 1;
+        if (e.from_disk) { // the restore went through: only now is the recall's prefill avoided
+            e.from_disk = false;
+            s.spill_counts.recalled += 1;
+            s.spill_counts.recalled_tokens += e.at;
+        }
         const last = s.gpa.dupe(u32, prompt) catch return;
         s.gpa.free(e.last);
         e.last = last;
