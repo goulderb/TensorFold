@@ -270,8 +270,10 @@ test "stream commits, thinking cuts and room (stream.jsonl)" {
             const result = fx.get(op, "result");
             if (std.mem.eql(u8, kind, "commit")) {
                 const tokens = try fx.u32s(a, fx.get(op, "tokens"));
-                const landed = try s.commit(gpa, tokens);
+                // these streams ask for no logprobs, so a commit carries no rows and keeps none
+                const landed = try s.commit(gpa, tokens, &.{});
                 try t.expectEqualSlices(u32, try fx.u32s(a, result), tokens[0..landed]);
+                try t.expectEqual(@as(usize, 0), s.rows.items.len);
             } else if (std.mem.eql(u8, kind, "cut")) {
                 const got = s.thinkCut(try fx.i64s(a, fx.get(op, "tokens")));
                 try t.expectEqual(fx.isNull(result), got == null);
