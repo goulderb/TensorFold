@@ -44,7 +44,41 @@ pub fn openHealth(srv: *Server, a: Allocator, reset_peak: bool) !Value {
         .{ "device", ident.device },
     }) |field|
         if (field[1].len > 0) try o.put(a, field[0], .{ .string = field[1] });
+    var sp: api.SpillStatus = undefined;
+    if (srv.engine.spill(&sp)) try o.put(a, "spill", try spillValue(a, sp));
     return .{ .object = o };
+}
+
+/// The spill tier's sizes and stats and the prompt cache's resume outcomes, as /health shows them.
+pub fn spillValue(a: Allocator, sp: api.SpillStatus) !Value {
+    const o = try json.newObject(a);
+    try o.put(a, "entries", try json.intValue(a, sp.tier.entries));
+    try o.put(a, "pending", try json.intValue(a, sp.tier.pending));
+    try o.put(a, "stored_bytes", try json.intValue(a, sp.tier.stored_bytes));
+    try o.put(a, "queued_bytes", try json.intValue(a, sp.tier.queued_bytes));
+    try o.put(a, "cap_bytes", try json.intValue(a, sp.tier.cap));
+    try o.put(a, "disk_free_bytes", try json.intValue(a, sp.tier.disk_free));
+    inline for (@typeInfo(@TypeOf(sp.tier.stats)).@"struct".field_names) |name| try o.put(a, name, try json.intValue(a, @field(sp.tier.stats, name)));
+    const c = try json.newObject(a);
+    inline for (@typeInfo(@TypeOf(sp.cache)).@"struct".field_names) |name| try c.put(a, name, try json.intValue(a, @field(sp.cache, name)));
+    try o.put(a, "resume", .{ .object = c });
+    return .{ .object = o };
+}
+
+test "the spill status names the tier's stats and the cache's resume outcomes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sp: api.SpillStatus = .{ .tier = .{ .stats = .{ .loaded_tokens = 400, .load_failed = 1 }, .entries = 2, .pending = 0, .stored_bytes = 9000, .queued_bytes = 0, .disk_free = 1 << 30, .cap = 1 << 31 } };
+    sp.cache.recalled_tokens = 400;
+    sp.cache.recall_failed = 1;
+    const v = try spillValue(a, sp);
+    try std.testing.expectEqual(@as(?i64, 400), v.get("loaded_tokens").?.int64());
+    try std.testing.expectEqual(@as(?i64, 1), v.get("load_failed").?.int64());
+    try std.testing.expectEqual(@as(?i64, 2), v.get("entries").?.int64());
+    const r = v.get("resume").?;
+    try std.testing.expectEqual(@as(?i64, 400), r.get("recalled_tokens").?.int64());
+    try std.testing.expectEqual(@as(?i64, 1), r.get("recall_failed").?.int64());
 }
 
 pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {

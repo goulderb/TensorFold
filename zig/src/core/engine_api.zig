@@ -488,6 +488,8 @@ pub const Engine = struct {
         imprint: ?*const fn (ctx: *anyopaque, ask: *ImprintAsk) bool = null,
         /// A planned stop's first half: no more work, disk writes finished under a deadline, the engine thread joined.
         drain: ?*const fn (ctx: *anyopaque) void = null,
+        /// The prompt cache's spill tier (docs/spill-tier.md); false when the engine attached none.
+        spill: ?*const fn (ctx: *anyopaque, out: *SpillStatus) bool = null,
     };
 
     pub fn info(e: Engine) Info {
@@ -505,6 +507,11 @@ pub const Engine = struct {
     }
     pub fn memory(e: Engine, reset_peak: bool) ?Memory {
         return e.vtable.memory(e.ctx, reset_peak);
+    }
+    /// The spill tier's files and stats with the prompt cache's spill outcomes; false: no tier (stale resume off).
+    pub fn spill(e: Engine, out: *SpillStatus) bool {
+        const f = e.vtable.spill orelse return false;
+        return f(e.ctx, out);
     }
     /// The engine's queue as a keepalive target, or null when the backend is not Metal.
     pub fn keepaliveTarget(e: Engine) ?keepalive.Target {
@@ -573,6 +580,15 @@ pub const LaneHost = @import("lane_host.zig").LaneHost;
 
 /// Exact prompt reuse between requests, for any family (prompt_cache.zig).
 pub const prompt_cache = @import("prompt_cache.zig");
+
+/// What /health shows of a prompt cache's spill tier: the tier's own, and the cache's resume outcomes.
+pub const SpillStatus = struct { tier: prompt_cache.spill.Info, cache: prompt_cache.SpillCounts = .{} };
+
+/// A store's spill status, for an engine's `spill` hook (false: no tier attached).
+pub fn spillStatus(store: *const prompt_cache.Store, out: *SpillStatus) bool {
+    out.* = .{ .tier = store.spillInfo() orelse return false, .cache = store.spill_counts };
+    return true;
+}
 
 /// The same for a paged cache over the backend's own KV pages (prompt_radix.zig).
 pub const prompt_radix = @import("prompt_radix.zig");
