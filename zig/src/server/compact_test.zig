@@ -487,6 +487,7 @@ test "a stream compacts before it opens" {
     openai.run(srv, a, watch.out(), .{ .conn = &conn }, true, raw);
     try std.testing.expect(watch.opened);
     try std.testing.expect(watch.saw);
-    try std.testing.expect(eng.early >= 1);
-    try std.testing.expect(eng.late >= 1);
+    // the compaction pass and the reply are both submitted before the stream opens, which waits for acceptance
+    try std.testing.expect(eng.early >= 2);
+    try std.testing.expectEqual(@as(usize, 0), eng.late);
 }
