@@ -297,3 +297,55 @@ test "a tier outliving its store keeps no hook into it; a later owner's hook sur
     }
     try std.testing.expect(t.info().stats.disk_evictions >= 1);
 }
+
+test "a pair whose rank-1 copy is still being written reads nothing, forgets nothing, and resumes once it lands" {
+    var root = try Root.make();
+    defer root.deinit();
+    var peer_root = try Root.make();
+    defer peer_root.deinit();
+    var buf: [700]u32 = undefined;
+    const turn2 = conversation(&buf, 17);
+    try firstLife(&root, turn2[0..500], 400); // rank 0's copy is on disk
+    const peer = try peer_root.tier(identity_a);
+    defer peer.deinit();
+    const name = spill.Name.of(turn2[0..400], 400);
+    const Gate = struct {
+        open: std.atomic.Value(bool) = .init(false),
+        state: Fake.State,
+        fn read(p: *anyopaque, offset: u64, out: []u8) anyerror!void {
+            const g: *@This() = @ptrCast(@alignCast(p));
+            while (!g.open.load(.acquire)) std.Thread.yield() catch {};
+            @memcpy(out, std.mem.asBytes(&g.state)[@intCast(offset)..][0..out.len]);
+        }
+    };
+    var gate: Gate = .{ .state = .{ .at = 400, .sum = fresh(turn2[0..400]) } };
+    const j = try peer.write(name, turn2[0..400], "", @sizeOf(Fake.State), .{ .ptr = &gate, .read = Gate.read });
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const t = try root.tier(identity_a);
+    defer t.deinit();
+    var f: Fake = .{ .gpa = gpa, .peer_tier = peer };
+    var s = pc.Store.init(gpa, f.spilling(), rules, 1 << 20);
+    defer s.deinit();
+    s.attach(t);
+    const plan = try s.begin(a, turn2, 650, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 0), plan.from);
+    try std.testing.expectEqual(@as(u64, 1), s.spill_counts.unavailable);
+    try std.testing.expectEqual(@as(u64, 0), s.spill_counts.recall_failed);
+    try std.testing.expectEqual(@as(usize, 0), f.spill_forgets); // no rank told to drop anything
+    try std.testing.expect(t.has(name) and !t.pending(name)); // rank 0's file kept
+    try std.testing.expect(peer.pending(name)); // rank 1's write not cut
+    try std.testing.expectEqual(fresh(turn2), f.pass(&s, turn2, plan));
+    gate.open.store(true, .release);
+    j.waitCopied();
+    try std.testing.expect(peer.drain(10));
+    try std.testing.expect(j.ok);
+    j.release();
+    s.clear(); // memory holds the cold pass's states: start the next turn from disk alone
+    s.attach(t);
+    const again = try s.begin(a, turn2, 650, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 400), again.from);
+    try std.testing.expectEqual(fresh(turn2), f.pass(&s, turn2, again));
+    try std.testing.expectEqual(@as(u64, 400), s.spill_counts.recalled_tokens);
+}

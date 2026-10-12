@@ -412,7 +412,7 @@ pub const Tier = struct {
     }
 
     /// The owner's hook for names the cap or floor removes (null: none). The hook runs on the thread that calls `write`,
-    /// never under the tier's lock; one owner at a time.
+    /// never under the tier's lock; one owner at a time, and every `write` while it is set runs on that owner's thread.
     pub fn setHook(t: *Tier, h: ?Hook) void {
         t.mutex.lockUncancelable(t.io);
         defer t.mutex.unlock(t.io);
