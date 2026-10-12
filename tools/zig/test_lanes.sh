@@ -6,5 +6,5 @@ root="$(cd "$(dirname "$0")/../.." && pwd)"
 lanes="$root/zig/src/core/lanes/lanes.zig"
 "$zig" test -lc "$lanes"
 for name in lanes_units lanes_replay; do
-  "$zig" test -lc --dep lanes "-Mroot=$root/zig/tests/$name.zig" "-Mlanes=$lanes"
+  "$zig" test -lc --dep lanes --dep env "-Mroot=$root/zig/tests/$name.zig" "-Mlanes=$lanes" "-Menv=$root/zig/src/core/env.zig"
 done
