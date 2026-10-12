@@ -42,6 +42,7 @@ pub const Fake = struct {
     fail_restore: bool = false,
     fail_spill_read: bool = false,
     spill_forgets: usize = 0, // names the store asked every rank to drop (a pass from 0 resets it)
+    peer_tier: ?*pc.spill.Tier = null, // a toy rank 1: a read needs its copy stored, else error.NotStored
     live: usize = 0,
     spare_bytes: u64 = 0,
     peer: ?*Peer = null, // speed-up mode's rank 1: it keeps the same states and drops them only when a request names them
@@ -148,6 +149,7 @@ pub const Fake = struct {
     fn spillReadFn(ptr: *anyopaque, tier: *pc.spill.Tier, name: pc.spill.Name) anyerror!Saved {
         const f = of(ptr);
         if (f.fail_spill_read) return error.ToySpillReadFailed;
+        if (f.peer_tier) |p| if (!p.has(name) or p.pending(name)) return error.NotStored; // rank 1 first: no rank changed
         var r = try tier.read(name);
         defer r.close();
         if (r.payloadLen() != @sizeOf(State)) return error.ReadFailed;
@@ -229,7 +231,7 @@ pub const Fake = struct {
 
     /// A prompt pass from `plan.from`, keeping at each mark; returns the sum a fresh pass would give.
     pub fn pass(f: *Fake, s: *Store, prompt: []const u32, plan: Plan) u64 {
-        if (plan.from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .fail_write = f.fail_write, .writes = f.writes, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer };
+        if (plan.from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .fail_write = f.fail_write, .writes = f.writes, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer, .peer_tier = f.peer_tier };
         if (f.peer) |p| p.in_pass = true;
         defer if (f.peer) |p| {
             p.in_pass = false;

@@ -63,7 +63,8 @@ pub const Snapshots = struct {
         /// cannot be written yet (null: the family spills nothing and the stale-session tier stays off).
         spill_write: ?*const fn (ptr: *anyopaque, saved: Saved, tier: *spill.Tier, name: spill.Name, tokens: []const u32) anyerror!void = null,
         /// Stored state `name` read back into new storage on every rank, or an error with no rank changed
-        /// (spill_resume.zig restores all ranks or none).
+        /// (spill_resume.zig restores all ranks or none). error.NotStored: some rank's copy is on its way or gone, and
+        /// every copy stays; any other error: the state is bad and the store forgets it on every rank.
         spill_read: ?*const fn (ptr: *anyopaque, tier: *spill.Tier, name: spill.Name) anyerror!Saved = null,
         /// `name` left this rank's tier: a peer deletes its own copy (null: one rank).
         spill_forget: ?*const fn (ptr: *anyopaque, name: spill.Name) void = null,
@@ -75,7 +76,8 @@ pub const SpillCounts = struct {
     read_back: u64 = 0, // states read back from disk into memory (I/O; a later restore may still fail)
     recalled: u64 = 0, // read-back states the family restored and a pass resumed from
     recalled_tokens: u64 = 0, // their prompt tokens: the prefill disk recall avoided (committed restores only)
-    recall_failed: u64 = 0, // a stored state that would not read back: forgotten, the pass ran from what memory held
+    recall_failed: u64 = 0, // a stored state that would not read back: forgotten on every rank, the pass ran from memory
+    unavailable: u64 = 0, // a rank's copy still on its way or gone (error.NotStored): left alone, the pass ran from memory
     write_failed: u64 = 0, // a spill write the family refused or failed
     ineligible: u64 = 0, // a leaving state not written: decoded rows, or shorter than the tier's min_tokens
 };
@@ -162,8 +164,9 @@ pub const Store = struct {
     const SHARED_KEYS = 64;
 
     /// The spill tier evicted states go to and longer ones come back from; its own evictions reach a peer's copy.
-    /// The store must not move while attached; `detach`, `clear` and `deinit` release the tier's hook (the tier may
-    /// outlive the store). Attach, detach and every store call run on the store's one owning thread.
+    /// Contract: the store must not move while attached; `detach`, `clear` and `deinit` release the tier's hook (the
+    /// tier may outlive the store). Attach, detach, every store call and every `Tier.write` on an attached tier run on
+    /// the store's one owning thread, because the tier calls the hook on the thread that writes.
     pub fn attach(s: *Store, tier: *spill.Tier) void {
         s.detach();
         s.tier = tier;
@@ -262,6 +265,10 @@ pub const Store = struct {
         e.* = .{ .tokens = tokens, .at = name.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .from_disk = true };
         e.last = s.gpa.dupe(u32, prompt) catch return s.drop(e, have, false);
         e.saved = read(s.family.ptr, t, name) catch |err| {
+            if (err == error.NotStored) { // a peer's write is on its way: not corrupt, another writer's state stays
+                s.spill_counts.unavailable += 1;
+                return s.drop(e, have, false);
+            }
             note("reading {d} spilled tokens failed ({s}); forgotten, prefilled instead", .{ name.at, @errorName(err) });
             s.spill_counts.recall_failed += 1;
             // every rank's copy goes: this rank's file here (Tier.forget fires no hook), the peers' through the family
