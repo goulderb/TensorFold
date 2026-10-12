@@ -197,6 +197,8 @@ pub fn build(b: *std.Build) void {
         spill_step.dependOn(&run.step);
         if (b.graph.host.result.os.tag != .windows) test_step.dependOn(&run.step);
     }
+    const spill_probe = b.addExecutable(.{ .name = "spill-probe", .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/core/spill_probe.zig"), .target = b.graph.host, .optimize = .debug, .link_libc = true }) });
+    b.step("spill-probe", "Model-neutral CPU spill startup probe into zig-out/probe/bin").dependOn(&b.addInstallArtifact(spill_probe, .{ .dest_dir = .{ .override = .{ .custom = "probe/bin" } } }).step);
     grammar_build.steps(b, target, xgrammar);
 }
 
