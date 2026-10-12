@@ -37,6 +37,7 @@ pub const Outcome = union(enum) {
 const Probe = struct {
     tiers: []const *spill.Tier,
     prompt: []const u32,
+    lookahead: u32,
     family: Family,
     refusals: *Refusals,
 
@@ -45,7 +46,8 @@ const Probe = struct {
             p.refusals.ineligible += 1;
             return false;
         };
-        const name = spill.Name.of(p.prompt[0..at], at);
+        // best() compared the stored tokens (at + lookahead of them) with the prompt before asking
+        const name = spill.Name.of(p.prompt[0 .. at + p.lookahead], at);
         // tiers[0]'s lock is held while best() calls this; the peers' locks are their own
         for (p.tiers[1..]) |t| if (!t.has(name)) {
             p.refusals.missing_rank += 1;
@@ -56,10 +58,11 @@ const Probe = struct {
 };
 
 /// Resume `prompt` past `beyond` tokens from the longest state every tier (one per rank, rank order) holds and the
-/// family accepts. All ranks restore or none stays restored; a failed state is forgotten on every rank.
-pub fn resumeLongest(tiers: []const *spill.Tier, prompt: []const u32, beyond: u32, family: Family, refusals: *Refusals) Outcome {
+/// family accepts; `lookahead` is the tokens a state read past its position (prompt_cache Rules.lookahead). All ranks
+/// restore or none stays restored; a failed state is forgotten on every rank.
+pub fn resumeLongest(tiers: []const *spill.Tier, prompt: []const u32, beyond: u32, lookahead: u32, family: Family, refusals: *Refusals) Outcome {
     std.debug.assert(tiers.len > 0);
-    const probe: Probe = .{ .tiers = tiers, .prompt = prompt, .family = family, .refusals = refusals };
+    const probe: Probe = .{ .tiers = tiers, .prompt = prompt, .lookahead = lookahead, .family = family, .refusals = refusals };
     const hit = tiers[0].best(prompt, beyond, &probe, Probe.usable) orelse {
         refusals.no_prefix += 1;
         return .cold;

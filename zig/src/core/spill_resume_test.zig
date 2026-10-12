@@ -143,7 +143,7 @@ test "after an isolated restart the longest prefix both ranks hold resumes on bo
     var toy: Toy = .{};
     defer toy.deinit();
     var why: resume_.Refusals = .{};
-    const got = resume_.resumeLongest(&p.tiers, tokens, 0, toy.family(), &why);
+    const got = resume_.resumeLongest(&p.tiers, tokens, 0, 0, toy.family(), &why);
     try std.testing.expectEqual(resume_.Outcome{ .resumed = 600 }, got);
     var want: [3000]u8 = undefined;
     for (0..2) |r| {
@@ -154,7 +154,7 @@ test "after an isolated restart the longest prefix both ranks hold resumes on bo
     // avoided prefill is the tier's own count on every rank
     for (p.tiers) |t| try std.testing.expectEqual(@as(u64, 600), t.info().stats.loaded_tokens);
     // a prompt that does not extend a stored state is cold
-    try std.testing.expectEqual(resume_.Outcome.cold, resume_.resumeLongest(&p.tiers, tokens[0..300], 0, toy.family(), &why));
+    try std.testing.expectEqual(resume_.Outcome.cold, resume_.resumeLongest(&p.tiers, tokens[0..300], 0, 0, toy.family(), &why));
     try std.testing.expectEqual(@as(u64, 1), why.no_prefix);
 }
 
@@ -171,10 +171,10 @@ test "a longer state one rank lacks is skipped for the longest pair; a family's 
     var toy: Toy = .{};
     defer toy.deinit();
     var why: resume_.Refusals = .{};
-    try std.testing.expectEqual(resume_.Outcome{ .resumed = 400 }, resume_.resumeLongest(&p.tiers, tokens, 0, toy.family(), &why));
+    try std.testing.expectEqual(resume_.Outcome{ .resumed = 400 }, resume_.resumeLongest(&p.tiers, tokens, 0, 0, toy.family(), &why));
     try std.testing.expectEqual(@as(u64, 1), why.missing_rank);
     toy.refuse_above = 300;
-    try std.testing.expectEqual(resume_.Outcome{ .resumed = 200 }, resume_.resumeLongest(&p.tiers, tokens, 0, toy.family(), &why));
+    try std.testing.expectEqual(resume_.Outcome{ .resumed = 200 }, resume_.resumeLongest(&p.tiers, tokens, 0, 0, toy.family(), &why));
     try std.testing.expect(why.ineligible >= 1);
 }
 
@@ -193,7 +193,7 @@ test "a different model, runtime or layout identity never reads another's states
     var toy: Toy = .{};
     defer toy.deinit();
     var why: resume_.Refusals = .{};
-    try std.testing.expectEqual(resume_.Outcome.cold, resume_.resumeLongest(&p.tiers, tokens, 0, toy.family(), &why));
+    try std.testing.expectEqual(resume_.Outcome.cold, resume_.resumeLongest(&p.tiers, tokens, 0, 0, toy.family(), &why));
     try std.testing.expect(!toy.restored[0] and !toy.restored[1]);
     try std.testing.expectEqual(@as(u64, 1), why.no_prefix);
 }
@@ -216,7 +216,7 @@ test "a corrupt rank-1 header goes cold, discards rank 0, and forgets the state 
     var toy: Toy = .{};
     defer toy.deinit();
     var why: resume_.Refusals = .{};
-    try std.testing.expectEqual(resume_.Outcome.cold, resume_.resumeLongest(&p.tiers, tokens, 0, toy.family(), &why));
+    try std.testing.expectEqual(resume_.Outcome.cold, resume_.resumeLongest(&p.tiers, tokens, 0, 0, toy.family(), &why));
     try std.testing.expectEqual(@as(u64, 1), why.read_failed);
     try std.testing.expect(!toy.restored[0] and !toy.restored[1]);
     try std.testing.expectEqual(@as(u32, 1), toy.discards);
@@ -235,7 +235,7 @@ test "a rank whose family restore fails leaves no rank restored and the pair for
     var toy: Toy = .{ .fail_rank = 1 };
     defer toy.deinit();
     var why: resume_.Refusals = .{};
-    try std.testing.expectEqual(resume_.Outcome.cold, resume_.resumeLongest(&p.tiers, tokens, 0, toy.family(), &why));
+    try std.testing.expectEqual(resume_.Outcome.cold, resume_.resumeLongest(&p.tiers, tokens, 0, 0, toy.family(), &why));
     try std.testing.expectEqual(@as(u64, 1), why.restore_failed);
     try std.testing.expectEqual(@as(u64, 0), why.resumed);
     try std.testing.expect(!toy.restored[0] and !toy.restored[1]);
