@@ -24,6 +24,7 @@ pub const Copy = struct {
 pub const Target = struct {
     e: *Engine,
     head: ?*Head,
+    disk: ?*anyopaque = null,
     ctx: ?*const cuda.Context = null, // made current before a disk copy, which may run before any backend call
 };
 
@@ -305,4 +306,21 @@ test "a state's parts start at each layer's row 0 and add up to its bytes" {
     p2.head = null;
     for (parts(c, max_len, p2, 2100, &store)) |x| total += x.len;
     try std.testing.expectEqual(stateBytes(c, 2100, false), total);
+}
+
+test "a restored state's rows, stored as 0, is never trusted before a window sets it: commit refuses until then" {
+    // Readers of Engine.rows: Engine.tokens and Engine.commit, both after a verify window wrote it (cuda_drafts,
+    // the serial decode step, cuda_lanes' pending_rows). A state restored with rows 0 (native/nemotron_spill.zig)
+    // that reached a commit first would fail here, not keep another request's rows.
+    var e: Engine = undefined;
+    e.pos = 2048;
+    e.parity = 0;
+    e.prev_keep = 0;
+    e.rows = 0;
+    try std.testing.expectError(error.BadKeep, e.commit(1));
+    try std.testing.expectEqual(@as(usize, 2048), e.pos);
+    e.rows = 3; // a three-row verify window ran
+    try e.commit(2);
+    try std.testing.expectEqual(@as(usize, 2050), e.pos);
+    try std.testing.expectEqual(@as(usize, 2), e.prev_keep);
 }

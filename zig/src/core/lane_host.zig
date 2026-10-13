@@ -49,6 +49,10 @@ pub const LaneHost = struct {
     recall: ?*lanes.recall_store.Store = null, // Recall's record: drafts from earlier requests (lane_host_recall.zig)
     decoded_rows: bool = false, // the backend prefills Request.decode_spans with decoded rows' arithmetic, cache or not
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
+    observe: ?Observe = null, // family counts the engine thread reads and publishes (status.publish)
+    published_spill: ?api.SpillStatus = null, // the last owner snapshot, read under `mutex`
+    published_prefill: ?api.PrefillCounts = null,
+    published_at: i96 = 0,
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
     learner: ?api.Learner = null, // the family's Sliding Weights learner; null: learn requests are refused
     lessons: std.ArrayList(Lesson) = .empty, // learn requests waiting for an idle engine
@@ -126,6 +130,13 @@ pub const LaneHost = struct {
         h.live_tokens.deinit(h.gpa);
     }
 
+    /// Family counts read on the engine thread only (it owns the store and the backend); published by value.
+    pub const Observe = struct {
+        ctx: *anyopaque,
+        spill: ?*const fn (ctx: *anyopaque, out: *api.SpillStatus) bool = null,
+        prefill: ?*const fn (ctx: *anyopaque) api.PrefillCounts = null,
+    };
+
     pub fn engine(h: *LaneHost) Engine {
         return .{ .ctx = h, .vtable = &.{
             .info = infoFn,
@@ -135,6 +146,7 @@ pub const LaneHost = struct {
             .memory = memoryFn,
             .keepalive = keepaliveFn,
             .learn = learn.submit,
+            .spill = status.spill,
             .recall = recalls.attach,
             .imprint = rows_host.ask,
             .drain = rows_host.drain,
@@ -518,6 +530,7 @@ pub const LaneHost = struct {
             while (h.admitOne()) {}
             h.fillOne();
             status.noteLive(h);
+            status.publish(h);
             h.lock();
             if (h.closing) {
                 const left = h.queued.items.len + h.admitted.items.len;

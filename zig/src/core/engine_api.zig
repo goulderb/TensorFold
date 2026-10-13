@@ -391,6 +391,8 @@ pub const Status = struct {
     fill_unknown: bool = false,
     /// Changes whenever the filling set does: a reader pairs its drain samples with one fill.
     fill_run: u64 = 0,
+    /// The primary model's executed prompt rows, as its owner thread last published them; null: not counted.
+    prefill: ?PrefillCounts = null,
 };
 
 pub const SubmitError = error{ Closed, Busy, Full, InvalidSpans, Stale }; // Stale: a learner's put-back has not reached the device
@@ -580,9 +582,32 @@ pub const LaneHost = @import("lane_host.zig").LaneHost;
 
 /// Exact prompt reuse between requests, for any family (prompt_cache.zig).
 pub const prompt_cache = @import("prompt_cache.zig");
+/// Spill identity and paired stale resume over the cache's tier (spill_resume.zig).
+pub const spill_resume = @import("spill_resume.zig");
 
 /// What /health shows of a prompt cache's spill tier: the tier's own, and the cache's resume outcomes.
-pub const SpillStatus = struct { tier: prompt_cache.spill.Info, cache: prompt_cache.SpillCounts = .{} };
+pub const SpillStatus = struct {
+    tier: prompt_cache.spill.Info,
+    cache: prompt_cache.SpillCounts = .{},
+    writes: SpillWrites = .{},
+    /// Milliseconds since the owner thread took this snapshot (a long prompt chunk or capture delays the next one).
+    age_ms: u64 = 0,
+};
+
+/// A family adapter's own spill counts: submissions are not persistence; `written`/`lost` are writes' final outcomes.
+pub const SpillWrites = struct {
+    submitted: u64 = 0,
+    written: u64 = 0,
+    lost: u64 = 0,
+    skipped_busy: u64 = 0,
+    capture_ns: u64 = 0,
+    read_ok: u64 = 0,
+    read_failed: u64 = 0,
+};
+
+/// Prompt rows the primary model computed, counted where its prompt pass runs: `submitted` when a chunk is queued on
+/// the device, `completed` when a whole pass finished; resumed rows are never in them.
+pub const PrefillCounts = struct { submitted_rows: u64 = 0, completed_rows: u64 = 0, passes: u64 = 0 };
 
 /// A store's spill status, for an engine's `spill` hook (false: no tier attached). The store's counts are plain
 /// fields: call it on the store's owning thread, or under the engine's own guard of that store (the one its prompt

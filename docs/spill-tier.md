@@ -597,3 +597,35 @@ ssh bgoulder@192.0.2.11 'docker run --rm --network none --user "$(id -u):$(id -g
 ```
 
 Record the results as a manifest in `fleet/trials/` of local-ai-server.
+
+## Nemotron CUDA adapter (preparation, not qualified)
+
+`zig/src/native/nemotron_spill.zig` binds the shared tier to native Nemotron CUDA (TP1). It is off unless
+`TENSORFOLD_SPILL_GIB` is set; an enabled tier also needs `TENSORFOLD_SPILL_HOST_GIB`, the host bytes its slot (one
+whole-window state and MTP head), the tier's two 64 MiB transfer buffers and a 64 MiB index allowance may use. That
+reservation is charged inside the prompt cache's budget (the family's `spare`), which must also hold one state.
+Any other `TENSORFOLD_SPILL_*` setting without GIB, NaN, infinite, negative or oversized values, `--slide` or loaded
+Living Weights refuse startup.
+
+- Writes: on the engine thread the adapter binds the context, synchronizes the engine's non-blocking stream, downloads
+  the state and head into its one host slot and queues it; the tier's writer reads only that slot. A busy slot is a
+  counted skip (`Tier.unwritten(.incomplete)`), never a failed write. A write's outcome is read once it is `done`.
+- Reads: the private metadata (`NEMOCU01`) must match the loaded layout exactly (seven planes, head, window, grid,
+  lookahead 1, a grid position equal to the name's, canonical zero parity/prev_keep/rows) before anything is
+  allocated; uploads are blocking (`DeviceBuffer.upload`); a Copy returns only after the payload hash checked.
+- Identity: config, index, every shard and the MTP file are stat'ed before the load and hashed whole after it (a file
+  changed in between refuses the tier); the executable and any captured AOT set likewise; driver version, compute
+  capability, kernels, segments, format and the layout are hashed in.
+- Close: after the lane thread joins, one flush pass offers every kept state not on disk, most recently used first;
+  each write waits for the slot (no busy skips while stopping), none is submitted after `TENSORFOLD_SPILL_FLUSH_S` or
+  after a write was lost or refused. Every submitted write is settled to `done`, and only then do the tier, the
+  store's device copies and the context go. One log line gives the stop's outcome: states written, lost, refused and
+  left unwritten. The flush deadline limits new submissions, not the wait for ones already queued.
+- Status: the engine thread publishes the store's, tier's and adapter's counts and the engine's executed prefill rows
+  by value; `/health` (`spill`, `prefill`) and `/metrics` (`spill_*`, `prefill_rows_*`) read that copy with its age.
+- `TENSORFOLD_QUAL_IDS_DIR` (opt-in, a private 0700 directory outside the model) records each completed non-streamed
+  reply's committed generated ids for cold/RAM/disk comparison.
+
+CPU tests cover the codec, ownership, failure and close paths with a fake driver. GPU restore parity, NVMe timing and
+reboot durability are not qualified by them. A qualification compares generated ids only after two cold runs of the
+same prompt agree, and its equality claim covers greedy decoding on the prompts it tested, nothing wider.

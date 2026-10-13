@@ -116,11 +116,18 @@ pub const Server = struct {
     cortheon: ?*cortheon.State = null,
     /// Recall's record (--recall), which GET and DELETE /v1/recall read and empty; main opens and closes it.
     recall: ?*api.recall_store.Store = null,
+    /// TENSORFOLD_QUAL_IDS_DIR: each completed non-streamed reply's generated ids, recorded for qualification.
+    qual_ids: ?*@import("qual_ids.zig").QualIds = null,
 
     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
-        const srv = try gpa.create(Server);
-        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
+        const qual_ids = try @import("qual_ids.zig").QualIds.fromEnv(gpa, config.model_dir);
+        if (qual_ids) |q| log.line("qualification: generated ids of completed non-streamed replies go to {s}", .{q.path});
+        const srv = gpa.create(Server) catch |err| {
+            if (qual_ids) |q| q.deinit(gpa);
+            return err;
+        };
+        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa), .qual_ids = qual_ids };
         errdefer srv.deinit(); // a later step's failure stops the keepalive before the caller closes the engine
         if (config.cortheon) srv.cortheon = try cortheon.State.init(gpa, io, "TensorFold-Cortheon (+https://github.com/ashhart/TensorFold)", config.cortheon_search_key);
         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
@@ -161,6 +168,7 @@ pub const Server = struct {
         srv.slide.deinit();
         srv.teacher.deinit();
         if (srv.cortheon) |c| c.deinit();
+        if (srv.qual_ids) |q| q.deinit(srv.gpa);
         srv.gpa.destroy(srv);
     }
 

@@ -31,7 +31,7 @@ test "a learned harness state outlives its store: a fresh session on a new one r
             const first = harness ++ [_]u32{ 1, 2, 9 };
             try std.testing.expectEqual(fresh(&first), f.pass(&s, &first, try s.begin(a, &first, 8, &.{5}, &.{}, null, &.{})));
             try std.testing.expect(im.has(key));
-        } else |_| {}
+        }
         var again = try imprint.Imprint.open(gpa, root, 3, 1 << 30); // a new server reads the index back
         defer again.deinit();
         var f: Fake = .{ .gpa = gpa };
@@ -246,6 +246,8 @@ test "actual Store learn writes neither half on peer refusal, backs off, and rem
     if (fsys.open(file, .{})) |fd| {
         fsys.close(fd);
         return error.OrphanedHalf;
+    } else |err| {
+        if (err != error.Missing) return err;
     }
 }
 test "under-cap disk pressure selects the same LRU victim before either half is persisted" {

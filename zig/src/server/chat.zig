@@ -503,6 +503,8 @@ const Generation = struct {
         };
         if (std.mem.eql(u8, reason, "length") and thinking and reply_text.pyStrip(content).len == 0)
             log.line("warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {{\"enable_thinking\": false}} (server: --no-thinking)", .{});
+        if (g.sink == null) if (g.srv.qual_ids) |q| q.record(g.srv.gpa, g.reply_id, reason, g.collected.items) catch |e|
+            log.line("error: qualification ids of {s} not recorded ({s}); this reply is no evidence", .{ g.reply_id, @errorName(e) });
         var cycle_text: [32]u8 = undefined;
         const cycle = if (s.loop_period) |period| std.fmt.bufPrint(&cycle_text, " loop=period:{d}", .{period}) catch "" else "";
         log.line("done {s} prompt={d} cached={d} thinking={s} effort={s} tokens={d} sha={s} finish={s}{s} rounds={d} accepted={d}/{d}", .{ g.reply_id, prompt_len, reply.cached_tokens, if (thinking) "True" else "False", if (thinking) effort orelse "none" else "none", g.collected.items.len, sha, reason, cycle, s.rounds, s.accepted, s.drafted });

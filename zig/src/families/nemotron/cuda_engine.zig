@@ -86,6 +86,9 @@ const masked_ids = 4000;
 /// One stream's part of a shared window: its sequence, the ids its first rows take from the host, and its rows.
 pub const Shared = struct { seq: *state.Seq, ids: []const u32, rows: usize, mask: Mask = .{} };
 
+/// Prompt rows the engine ran: `submitted` as each chunk is queued, `completed` and `passes` when a pass returns.
+pub const PrefillCounts = struct { submitted_rows: u64 = 0, completed_rows: u64 = 0, passes: u64 = 0 };
+
 pub const Engine = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -113,6 +116,8 @@ pub const Engine = struct {
     parity: usize = 0,
     prev_keep: usize = 0,
     rows: usize = 0,
+    /// Prompt rows this engine computed: queued chunk by chunk, completed per whole pass (the owner thread's only).
+    prefill_counts: PrefillCounts = .{},
     sampling: ?sampler.Sampling = null,
     own: state.Seq = undefined, // the engine's own buffers, which the graphs were captured on
     slots: u64 = 1 | (@as(u64, 1) << lesson_route.trainer_slot), // lesson latch slots in use: the own sequence's, the trainer's

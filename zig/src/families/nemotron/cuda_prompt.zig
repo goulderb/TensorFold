@@ -40,12 +40,15 @@ pub fn prefillFrom(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, h
     } else if (e.pos != from) return error.BadReuse;
     const waited = e.heat_gate.waited_s;
     if (from == 0 and keep == null and e.segments > 1 and dump == null and e.prompt_rows == null and e.taps == null and prompt.len > state.prefill_rows and e.decide == lesson_route.none and !Cancel.background(cancel)) {
+        e.prefill_counts.submitted_rows += prompt.len;
         try segs.prefill(e, try e.segmentSet(), prompt, head, e.segments, cancel);
     } else try e.serialChunks(prompt, from, dump, head, cancel, keep);
     if (e.heat_gate.waited_s > waited) heat.note(e.heat_gate.waited_s - waited);
     const host = e.pinned.slice(u32)[pin_sampled..][0..1];
     try e.ops().download(std.mem.sliceAsBytes(host), e.b.p_sampled);
     try e.stream.synchronize();
+    e.prefill_counts.completed_rows += prompt.len - from;
+    e.prefill_counts.passes += 1;
     if (e.trace) e.traceLessons();
     return host[0];
 }
@@ -98,6 +101,7 @@ pub fn serialChunks(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, 
         @memcpy(host, chunk);
         try e.ops().upload(e.b.p_ids, std.mem.sliceAsBytes(host));
         try e.copied.record(e.stream);
+        e.prefill_counts.submitted_rows += chunk.len;
         try f.chunk(@intCast(chunk.len), e.pos);
         if (shared) |ad| if (f.route.decision(0) != null) try e.trainOps().latch(ad.score, ad.need, ad.latch, e.slot, true);
         e.pos += @intCast(chunk.len);

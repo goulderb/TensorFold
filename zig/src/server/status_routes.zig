@@ -44,6 +44,13 @@ pub fn openHealth(srv: *Server, a: Allocator, reset_peak: bool) !Value {
         .{ "device", ident.device },
     }) |field|
         if (field[1].len > 0) try o.put(a, field[0], .{ .string = field[1] });
+    if (status.prefill) |pf| {
+        const p = try json.newObject(a);
+        try p.put(a, "submitted_rows", try json.intValue(a, pf.submitted_rows));
+        try p.put(a, "completed_rows", try json.intValue(a, pf.completed_rows));
+        try p.put(a, "passes", try json.intValue(a, pf.passes));
+        try o.put(a, "prefill", .{ .object = p });
+    }
     var sp: api.SpillStatus = undefined;
     if (srv.engine.spill(&sp)) try o.put(a, "spill", try spillValue(a, sp));
     return .{ .object = o };
@@ -62,6 +69,10 @@ pub fn spillValue(a: Allocator, sp: api.SpillStatus) !Value {
     const c = try json.newObject(a);
     inline for (@typeInfo(@TypeOf(sp.cache)).@"struct".field_names) |name| try c.put(a, name, try json.intValue(a, @field(sp.cache, name)));
     try o.put(a, "resume", .{ .object = c });
+    const w = try json.newObject(a);
+    inline for (@typeInfo(@TypeOf(sp.writes)).@"struct".field_names) |name| try w.put(a, name, try json.intValue(a, @field(sp.writes, name)));
+    try o.put(a, "writes", .{ .object = w });
+    try o.put(a, "age_ms", try json.intValue(a, sp.age_ms));
     return .{ .object = o };
 }
 
@@ -79,6 +90,11 @@ test "the spill status names the tier's stats and the cache's resume outcomes" {
     const r = v.get("resume").?;
     try std.testing.expectEqual(@as(?i64, 400), r.get("recalled_tokens").?.int64());
     try std.testing.expectEqual(@as(?i64, 1), r.get("recall_failed").?.int64());
+    sp.writes.skipped_busy = 4;
+    sp.age_ms = 12;
+    const v2 = try spillValue(a, sp);
+    try std.testing.expectEqual(@as(?i64, 4), v2.get("writes").?.get("skipped_busy").?.int64());
+    try std.testing.expectEqual(@as(?i64, 12), v2.get("age_ms").?.int64());
 }
 
 pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {

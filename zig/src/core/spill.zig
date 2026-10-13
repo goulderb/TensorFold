@@ -28,15 +28,20 @@ pub const Settings = struct {
     keep_builds: u32 = 1,
 
     /// The tier's settings from `env.get(name)`, null when TENSORFOLD_SPILL_GIB is unset or 0; `dir` is allocated.
+    /// Every number is finite and in range before it is converted: NaN, infinities, negatives and sizes past
+    /// `most_gib` are refused, never clamped or truncated.
     pub fn fromEnv(a: Allocator, env: anytype) !?Settings {
-        const gib = try float(env.get("TENSORFOLD_SPILL_GIB") orelse return null);
-        if (gib <= 0) return null;
+        const gib = try gibs(env.get("TENSORFOLD_SPILL_GIB") orelse return null);
+        if (gib == 0) return null;
         var s: Settings = .{ .dir = undefined, .cap = @intFromFloat(gib * (1 << 30)) };
         if (env.get("TENSORFOLD_SPILL_HIGHWATER")) |v| s.highwater = try float(v);
         if (!(s.highwater > 0 and s.highwater <= 1)) return error.BadSpillHighwater;
         if (env.get("TENSORFOLD_SPILL_MIN_TOKENS")) |v| s.min_tokens = std.fmt.parseInt(u32, trim(v), 10) catch return error.BadSpillSetting;
-        if (env.get("TENSORFOLD_SPILL_MIN_FREE_GIB")) |v| s.min_free = @intFromFloat(@max(0, try float(v)) * (1 << 30));
-        if (env.get("TENSORFOLD_SPILL_FLUSH_S")) |v| s.flush_s = @max(0, try float(v));
+        if (env.get("TENSORFOLD_SPILL_MIN_FREE_GIB")) |v| s.min_free = @intFromFloat(try gibs(v) * (1 << 30));
+        if (env.get("TENSORFOLD_SPILL_FLUSH_S")) |v| {
+            s.flush_s = try float(v);
+            if (s.flush_s < 0 or s.flush_s > most_flush_s) return error.BadSpillSetting;
+        }
         if (env.get("TENSORFOLD_SPILL_KEEP_BUILDS")) |v| s.keep_builds = std.fmt.parseInt(u32, trim(v), 10) catch return error.BadSpillSetting;
         s.dir = if (env.get("TENSORFOLD_SPILL_DIR")) |d| try a.dupe(u8, trim(d)) else blk: {
             const home = env.get("HOME") orelse return error.NoSpillDir;
@@ -54,8 +59,19 @@ pub const Settings = struct {
         return std.fmt.bufPrint(buf, "spill={d}/{d}/{d}/{d}/{d}/{d}", .{ s.cap >> 20, s.highwater, s.min_tokens, s.min_free >> 20, s.flush_s, s.keep_builds });
     }
 
+    /// The largest GiB count a setting takes (1 PiB): its byte count fits u64 with room to spare.
+    pub const most_gib: f64 = 1 << 20;
+    /// The longest clean-stop flush (a week).
+    pub const most_flush_s: f64 = 7 * 24 * 3600;
+
     fn float(v: []const u8) !f64 {
-        return std.fmt.parseFloat(f64, trim(v)) catch error.BadSpillSetting;
+        const x = std.fmt.parseFloat(f64, trim(v)) catch return error.BadSpillSetting;
+        return if (std.math.isFinite(x)) x else error.BadSpillSetting;
+    }
+
+    fn gibs(v: []const u8) !f64 {
+        const g = try float(v);
+        return if (g >= 0 and g <= most_gib) g else error.BadSpillSetting;
     }
 
     fn trim(v: []const u8) []const u8 {
@@ -261,6 +277,16 @@ pub const Job = struct {
         t.mutex.lockUncancelable(t.io);
         while (!j.copied()) t.cond.waitUncancelable(t.io, &t.mutex);
         t.stats.copy_wait_ns += @intCast(@max(0, t.now() - t0));
+        t.mutex.unlock(t.io);
+    }
+
+    /// Blocks until the write is on disk or given up (`ok` is then final). Call it before `Tier.shutdown`: shutdown
+    /// ends queued writes only as far as its own bookkeeping allocation allows.
+    pub fn waitDone(j: *Job) void {
+        if (j.done()) return;
+        const t = j.tier;
+        t.mutex.lockUncancelable(t.io);
+        while (!j.done()) t.cond.waitUncancelable(t.io, &t.mutex);
         t.mutex.unlock(t.io);
     }
 

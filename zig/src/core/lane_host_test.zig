@@ -621,3 +621,56 @@ test "without max_queued every foreground submit queues behind the lanes, none i
     for (1..4) |id| try eng.submit(@intCast(id), &fg, sink);
     try std.testing.expectEqual(@as(usize, 3), host.queued.items.len);
 }
+
+test "spill and prefill counts are read on the engine thread only and published by value with their age" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{}, 1, 0);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1 });
+    const Owner = struct {
+        reads: std.atomic.Value(u32) = .init(0),
+        thread: std.atomic.Value(std.Thread.Id) = .init(0),
+        foreign: std.atomic.Value(bool) = .init(false),
+        fn note(o: *@This()) void {
+            const me = std.Thread.getCurrentId();
+            const first = o.thread.cmpxchgStrong(0, me, .acq_rel, .acquire);
+            if (first != null and first.? != me) o.foreign.store(true, .release);
+            _ = o.reads.fetchAdd(1, .acq_rel);
+        }
+        fn spill(ctx: *anyopaque, out: *api.SpillStatus) bool {
+            const o: *@This() = @ptrCast(@alignCast(ctx));
+            o.note();
+            out.* = .{ .tier = .{ .stats = .{ .loaded_tokens = 4096 }, .entries = 1, .pending = 0, .stored_bytes = 10, .queued_bytes = 0, .disk_free = 1, .cap = 2 } };
+            out.writes.skipped_busy = 3;
+            return true;
+        }
+        fn prefill(ctx: *anyopaque) api.PrefillCounts {
+            @as(*@This(), @ptrCast(@alignCast(ctx))).note();
+            return .{ .submitted_rows = 2048, .completed_rows = 2048, .passes = 1 };
+        }
+    };
+    var owner: Owner = .{};
+    host.observe = .{ .ctx = &owner, .spill = Owner.spill, .prefill = Owner.prefill };
+    var sp: api.SpillStatus = undefined;
+    try std.testing.expect(!host.engine().spill(&sp)); // nothing published before the engine thread runs
+    try host.start();
+    defer host.stop();
+    while (owner.reads.load(.acquire) < 4) std.Thread.yield() catch {};
+    const reads = owner.reads.load(.acquire);
+    try std.testing.expect(host.engine().spill(&sp)); // a copy: the reader calls no observer
+    var status: api.Status = .{};
+    var streams: [4]u32 = undefined;
+    host.engine().status(&status, &streams);
+    try std.testing.expect(owner.reads.load(.acquire) - reads <= 4); // only the engine thread's loop reads on
+    try std.testing.expect(!owner.foreign.load(.acquire));
+    try std.testing.expect(owner.thread.load(.acquire) != std.Thread.getCurrentId());
+    try std.testing.expectEqual(@as(u64, 4096), sp.tier.stats.loaded_tokens);
+    try std.testing.expectEqual(@as(u64, 3), sp.writes.skipped_busy);
+    try std.testing.expect(sp.age_ms < 60_000);
+    try std.testing.expectEqual(@as(u64, 2048), status.prefill.?.completed_rows);
+}

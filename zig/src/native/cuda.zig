@@ -13,12 +13,27 @@ const snaps = @import("cuda_snaps.zig");
 const nemotron_slide = @import("nemotron_slide.zig");
 const cuda_disk = @import("cuda_disk.zig");
 const vision_offer = @import("cuda_vision_offer.zig");
+const nspill = @import("nemotron_spill.zig");
+const spill_facts = @import("nemotron_spill_facts.zig");
+const Pool = budget.Pool;
 
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
 const registry = .{ nemotron.native, nemotron.omni, glm.native };
 
 /// --record opens here (engines.zig refuses it for a backend without this).
 pub const records = true;
+
+/// The same copies with a spill tier (TENSORFOLD_SPILL_*): evicted states go to local disk through an owned host slot.
+const nemotron_spill_snaps: api.prompt_cache.Snapshots.VTable = .{
+    .bytes = nemotron.native.snap_bytes,
+    .save = nemotron.native.snap_save,
+    .restore = nemotron.native.snap_restore,
+    .drop = nemotron.native.snap_drop,
+    .spill_write = nspill.spillWrite,
+    .spill_read = nspill.spillRead,
+    .spare = nspill.spare,
+    .trim = nspill.trim,
+};
 
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = blk: {
@@ -107,6 +122,8 @@ const Host = struct {
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
     store: ?*api.prompt_cache.Store = null, // kept Nemotron states; null when the budget is 0
+    disk: ?*nspill.Disk = null, // the store's spill tier (TENSORFOLD_SPILL_*); null when none is configured
+    target: ?*nemotron.native.Target = null, // the loaded engine the observers read (engine thread only)
     learn: ?api.Learner = null, // the family's Sliding Weights learner (--slide), called with the context current
     slide: ?*anyopaque = null, // that learner's adapter, freed by slide_free before the family
     slide_free: ?*const fn (Allocator, *anyopaque) void = null,
@@ -120,6 +137,17 @@ const Host = struct {
         h.cfg.deinit(h.gpa);
         if (h.recording) |r| r.free(h.gpa);
         if (h.gpu) |g| g.ctx.makeCurrent() catch {};
+        // the lane thread is joined: this thread owns the store and the tier. Every spill write settles before the
+        // tier stops; only then may the store free its device copies and the family its context.
+        if (h.disk) |d| {
+            h.disk = null; // freed by its close, whatever it returns
+            const f = d.close(h.store.?) catch |e| {
+                std.log.err("spill tier: closing without a bound CUDA context ({s}); device memory is left to the process exit", .{@errorName(e)});
+                return; // freeing device memory against an unbound context is not safe
+            };
+            // the stop's real outcome, once: a state left here is not on disk for the next start
+            std.log.info("spill tier: stopped; {d} kept state{s} written now, {d} lost, {d} refused, {d} left unwritten (flush time or a failure); serving wrote {d}, skipped {d} while busy", .{ f.written, if (f.written == 1) "" else "s", f.lost, f.failed, f.left, f.counts.written - f.written, f.counts.skipped_busy });
+        }
         if (h.store) |s| {
             const rows = s.disk;
             s.deinit();
@@ -136,6 +164,22 @@ const Host = struct {
         }
         h.gpa.free(h.startup);
         h.gpa.destroy(h);
+    }
+
+    /// The store's and the tier's counts with the adapter's, on the engine thread.
+    fn observeSpill(p: *anyopaque, out: *api.SpillStatus) bool {
+        const h: *Host = @ptrCast(@alignCast(p));
+        const store = h.store orelse return false;
+        if (!api.spillStatus(store, out)) return false;
+        if (h.disk) |d| out.writes = .{ .submitted = d.counts.submitted, .written = d.counts.written, .lost = d.counts.lost, .skipped_busy = d.counts.skipped_busy, .capture_ns = d.counts.capture_ns, .read_ok = d.counts.read_ok, .read_failed = d.counts.read_failed };
+        return true;
+    }
+
+    fn observePrefill(p: *anyopaque) api.PrefillCounts {
+        const h: *Host = @ptrCast(@alignCast(p));
+        const t = h.target orelse return .{};
+        const c = nemotron.native.prefillCounts(t);
+        return .{ .submitted_rows = c.submitted_rows, .completed_rows = c.completed_rows, .passes = c.passes };
     }
 
     pub fn bind(p: *anyopaque) *Host {
@@ -160,6 +204,7 @@ const Host = struct {
         h.host.cache = h.store;
         h.host.warm_quiet = if (info.warm_turns) nemotron.native.warm_quiet else 0;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
+        h.host.observe = .{ .ctx = h, .spill = observeSpill, .prefill = observePrefill };
         if (h.learn != null) h.host.learner = h.learner();
         try h.host.start();
     }
@@ -246,6 +291,21 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         };
         return null;
     };
+    // the spill tier: off unless TENSORFOLD_SPILL_GIB asks for it, read before any CUDA work
+    var disk_config = spill_facts.Config.fromEnv(gpa, api.prompt_cache.spill.ProcessEnv{}) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_SPILL_*: {s} (an enabled tier needs TENSORFOLD_SPILL_GIB and TENSORFOLD_SPILL_HOST_GIB; docs/spill-tier.md)", .{@errorName(e)});
+        return null;
+    };
+    defer if (disk_config) |c| if (c.tier.dir.len > 0) gpa.free(c.tier.dir);
+    if (disk_config != null and (F != nemotron.native or o.learn_conversations)) {
+        problem.* = "TENSORFOLD_SPILL_GIB: this adapter serves Nemotron without --learn-conversations; choose one disk store";
+        return null;
+    }
+
+    if (disk_config != null and o.slide) {
+        problem.* = "TENSORFOLD_SPILL_GIB with --slide: stored states hold the checkpoint's arithmetic, and Living Weights change it; serve one or the other";
+        return null;
+    }
     if (o.slide) {
         if (!@hasDecl(F, "slide")) {
             problem.* = try std.fmt.allocPrint(a, "--slide: {s} checkpoints do not learn on CUDA yet", .{o.model_type});
@@ -302,6 +362,25 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
             problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_CUDA_KERNELS={s} holds no aot.json: give a captured set's folder, or native for our own kernels", .{dir});
             return null;
         },
+    };
+    // the spill tier's identity: the files the load reads, stat'ed before it and hashed whole after it
+    var model_files: ?spill_facts.Artifacts = null;
+    defer if (model_files) |*m| m.deinit(gpa);
+    var exe_files: ?spill_facts.Artifacts = null;
+    defer if (exe_files) |*m| m.deinit(gpa);
+    if (F == nemotron.native) if (disk_config != null) {
+        const paths = F.artifacts(gpa, io, o.dir, o.drafts) catch |e| {
+            problem.* = try std.fmt.allocPrint(a, "spill tier: the checkpoint's files in {s} cannot be listed ({s})", .{ o.dir, @errorName(e) });
+            return null;
+        };
+        model_files = spill_facts.Artifacts.take(gpa, paths) catch |e| { // takes `paths`, freed on failure too
+            problem.* = try std.fmt.allocPrint(a, "spill tier: the checkpoint's files in {s} cannot be identified ({s})", .{ o.dir, @errorName(e) });
+            return null;
+        };
+        exe_files = spill_facts.executable(gpa, io, kernels) catch |e| {
+            problem.* = try std.fmt.allocPrint(a, "spill tier: this executable or its kernel set cannot be identified ({s})", .{@errorName(e)});
+            return null;
+        };
     };
     const before = try pool(a, io, &g.ctx, problem) orelse return null;
     // a family split over hosts holds only its rank's share (GLM-5.3-Flash's TP)
@@ -374,6 +453,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         problem.* = why;
         return null;
     };
+    if (F == nemotron.native) if (disk_config != null and loaded.living) {
+        problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_SPILL_GIB: {s} holds Living Weights, which change the arithmetic stored states would keep; serve without the tier", .{o.dir});
+        return null;
+    };
     const model = cuda.usage(false).device - held0;
     const after = try pool(a, io, &g.ctx, problem) orelse return null;
     var room = after.room(model) -| loaded.learn_bytes;
@@ -404,11 +487,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         };
         return null;
     };
+    const cache = budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free));
+    const store_cache = if (@hasDecl(F, "snap_save")) try snaps.cacheBudget(F, loaded.target, cache) else 0;
+    // Mamba spares are prepaid; the tier reservation is charged once inside the remaining Store budget.
+    const disk: ?*nspill.Disk = if (F != nemotron.native) null else if (disk_config) |*c| (try openDisk(F, a, gpa, io, g, loaded, c, &model_files.?, &exe_files.?, kernels, segments, store_cache, problem)) orelse return null else null;
+    defer if (!opened) if (disk) |d| d.abandon(null); // after the store's own unwind, which detaches it
+    if (disk != null) disk_config.?.tier.dir = ""; // the tier owns it now
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
-    const held = loaded.stream_bytes * (streams -| free);
-    const cache = if (@hasDecl(F, "snap_save")) budget.cacheBytes(o.prompt_cache_gib, room, held) else 0;
     h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB{s}; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in passes of up to {d} rows{s}{s}; {s}", .{
         capability,                                                                                                        device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (loaded.learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(loaded.learn_bytes)}) else "", streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
         if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(cache)}) else ", no prompt cache", if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
@@ -419,15 +506,21 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         const store = try gpa.create(pc.Store);
         // rules and budget from the family's snap_* declarations (cuda_snaps.zig)
         const image: ?*const pc.rows.Image = if (F == nemotron.native) &cuda_disk.image else null; // its disk rows
-        const copies: pc.Snapshots = .{ .ptr = loaded.target, .vtable = &snaps.Snaps(F, image).vtable };
-        store.* = pc.Store.init(gpa, copies, snaps.cacheRules(F), try snaps.cacheBudget(F, loaded.target, cache));
+        const copies: pc.Snapshots = .{ .ptr = loaded.target, .vtable = if (F == nemotron.native and disk != null) &nemotron_spill_snaps else &snaps.Snaps(F, image).vtable };
+        var rules = snaps.cacheRules(F);
+        if (disk != null) {
+            rules.planned = true;
+            rules.grid = F.prompt_rows;
+        }
+        store.* = pc.Store.init(gpa, copies, rules, store_cache);
         h.store = store;
         if (F == nemotron.native and o.learn_conversations) {
             if (o.learn) |root| try cuda_disk.attach(a, io, &g.ctx, o, root, kernels, loaded, store);
         }
+        if (F == nemotron.native) if (disk) |d| d.attach(loaded.target, store);
     }
     errdefer if (h.store) |store| {
-        store.deinit();
+        store.deinit(); // detaches the tier; the disk itself goes in the deferred abandon below this frame's start
         gpa.destroy(store);
     };
     if (@hasDecl(F, "slide")) if (loaded.learns != null) {
@@ -458,6 +551,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     }
     errdefer if (h.recording) |r| r.free(gpa);
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
+    h.disk = disk;
+    h.target = if (F == nemotron.native) loaded.target else null;
     try h.serve(io, loaded.facts, loaded.rows, .{
         .lanes = streams,
         .max_queued = o.max_queued,
@@ -485,6 +580,8 @@ test {
     _ = lane_backend;
     _ = snaps;
     _ = cuda_device; // the device and variable tests
+    _ = nspill;
+    _ = spill_facts;
 }
 
 test "the lane core sees a family's prefill_step through the lane backend, so a served prompt can step" {
@@ -586,4 +683,48 @@ test "a cancel during a long prompt stops it, and the next request's reply is un
         try history.append(gpa, t);
     }
     try std.testing.expectEqual(@as(usize, 40), restored.tokens.items.len);
+}
+
+/// The spill tier for a loaded family, or null with `problem` set: the layout from the engine, the reservation inside
+/// the cache, the identity from the files the load read and the facts it ran with.
+fn openDisk(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, g: *Gpu, loaded: F.Loaded, c: *spill_facts.Config, model_files: *const spill_facts.Artifacts, exe_files: *const spill_facts.Artifacts, kernels: ?[]const u8, segments: u32, cache: u64, problem: *[]const u8) !?*nspill.Disk {
+    const t = loaded.target;
+    const layout = nspill.Layout.of(F.planes(t), F.prompt_rows) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "spill tier: the engine's state layout is not one the tier stores ({s})", .{@errorName(e)});
+        return null;
+    };
+    const payload = try layout.payload();
+    const reservation = try nspill.Disk.reservationFor(payload, 64 << 20);
+    const device_bytes = F.snap_bytes(t, @intCast(layout.max_len));
+    _ = nspill.Disk.admit(payload, device_bytes, c.host_bytes, cache) catch |e| {
+        problem.* = switch (e) {
+            error.SpillHostCeiling => try std.fmt.allocPrint(a, "TENSORFOLD_SPILL_HOST_GIB={d:.2} is below the tier's {d:.2} GiB host reservation (one {d:.2} GiB state, two transfer buffers, its index): raise it or lower --context", .{ toGib(c.host_bytes), toGib(reservation), toGib(payload) }),
+            error.SpillCacheTooSmall => try std.fmt.allocPrint(a, "the {d:.2} GiB prompt cache cannot hold the spill tier's {d:.2} GiB host reservation and one {d:.2} GiB kept state: raise --prompt-cache-gib or lower --context", .{ toGib(cache), toGib(reservation), toGib(device_bytes) }),
+            else => try std.fmt.allocPrint(a, "spill tier: {s}", .{@errorName(e)}),
+        };
+        return null;
+    };
+    var driver: c_int = 0;
+    g.driver.check(g.driver.api.cuDriverGetVersion(&driver), "cuDriverGetVersion") catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "spill tier: no driver version ({s})", .{@errorName(e)});
+        return null;
+    };
+    const weights = model_files.digest(gpa) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "spill tier: the checkpoint's files changed or failed to read while loading ({s})", .{@errorName(e)});
+        return null;
+    };
+    const exe = exe_files.digest(gpa) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "spill tier: the executable or its kernel set changed or failed to read ({s})", .{@errorName(e)});
+        return null;
+    };
+    const capability = g.ctx.capability() catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "spill tier: no compute capability ({s})", .{@errorName(e)});
+        return null;
+    };
+    const facts: spill_facts.Facts = .{ .weights = weights, .executable = exe, .kernels = kernels orelse "embedded", .driver = driver, .capability = capability, .format = F.formatName(t), .planes = .{ layout.kv_row, layout.mamba, 0, 0, 0, 0, 0 }, .head = @intFromBool(layout.head), .max_len = layout.max_len, .grid = layout.grid, .lookahead = nspill.lookahead, .segments = @intCast(segments) };
+    const identity = try facts.identity();
+    return nspill.Disk.open(gpa, io, gpa, .{ .ctx = &g.ctx, .stream = t.e.stream }, layout, c.tier, identity, c.host_bytes) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "spill tier at {s}: {s}", .{ c.tier.dir, @errorName(e) });
+        return null;
+    };
 }

@@ -10,7 +10,7 @@ const errors = @import("errors.zig");
 const Conn = @import("http_conn.zig").Conn;
 
 const think_end: u32 = 300;
-const eos: u32 = 301;
+pub const eos: u32 = 301;
 const all_bytes = blk: {
     var all: [256]u8 = undefined;
     for (&all, 0..) |*b, i| b.* = i;
@@ -18,8 +18,8 @@ const all_bytes = blk: {
 };
 
 /// Bytes as tokens, `</think>` as token 300 and an end token 301; every prompt renders as "prompt".
-const Text = struct {
-    fn text(t: *@This()) model_text.Text {
+pub const Text = struct {
+    pub fn text(t: *@This()) model_text.Text {
         return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource, .token_bytes = tokenBytes } };
     }
 
@@ -71,12 +71,12 @@ const Text = struct {
 };
 
 /// Answers `reply` in two rounds; token i at -(i + 1) / 4, best itself then 'z'; even prompt rows rank their token 1.
-const Script = struct {
+pub const Script = struct {
     reply: []const u32,
     asked: ?u8 = null,
     prompt_rows: bool = true,
 
-    fn engine(e: *@This()) api.Engine {
+    pub fn engine(e: *@This()) api.Engine {
         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
     }
 
@@ -131,16 +131,16 @@ const Script = struct {
 };
 
 /// The reply the route wrote: its status and body, or a stream's events, as JSON text (testing-allocator owned).
-const Got = struct {
+pub const Got = struct {
     status: u16 = 0,
     body: []u8 = &.{},
     events: std.ArrayList([]u8) = .empty,
 
-    fn out(g: *Got) openai.Out {
+    pub fn out(g: *Got) openai.Out {
         return .{ .ctx = g, .vt = &.{ .open = open, .event = event, .reply = reply } };
     }
 
-    fn deinit(g: *Got) void {
+    pub fn deinit(g: *Got) void {
         std.testing.allocator.free(g.body);
         for (g.events.items) |e| std.testing.allocator.free(e);
         g.events.deinit(std.testing.allocator);
@@ -202,7 +202,7 @@ const NoHistory = struct {
 
 const ask = "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":32,\"logprobs\":true,\"top_logprobs\":2";
 
-fn tokensOf(comptime s: []const u8) [s.len]u32 {
+pub fn tokensOf(comptime s: []const u8) [s.len]u32 {
     var out: [s.len]u32 = undefined;
     for (s, &out) |c, *o| o.* = c;
     return out;

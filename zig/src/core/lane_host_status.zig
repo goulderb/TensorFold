@@ -27,6 +27,7 @@ pub fn read(ctx: *anyopaque, out: *api.Status, stream_tokens: []u32) void {
         .preemptions = 0,
         .streams = n,
         .generation_tokens = h.live_generated,
+        .prefill = h.published_prefill,
     };
     fillTotals(h, out);
 }
@@ -57,6 +58,32 @@ fn fillTotals(h: *LaneHost, out: *api.Status) void {
     } else out.fill_unknown = true;
     run &= (1 << 53) - 1; // JSON numbers stay exact to 2^53: a wider marker loses bits in the page's JavaScript
     out.fill_run = if (run == 0) 1 else run;
+}
+
+/// Engine.spill: the owner thread's last snapshot, copied under the host's lock, with its age.
+pub fn spill(ctx: *anyopaque, out: *api.SpillStatus) bool {
+    const h: *LaneHost = @ptrCast(@alignCast(ctx));
+    h.mutex.lockUncancelable(h.io);
+    defer h.mutex.unlock(h.io);
+    const s = h.published_spill orelse return false;
+    out.* = s;
+    const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+    out.age_ms = @intCast(@divTrunc(@max(0, now - h.published_at), std.time.ns_per_ms));
+    return true;
+}
+
+/// On the engine thread: the family's counts read outside the lock (they may take the tier's), then published.
+pub fn publish(h: *LaneHost) void {
+    const o = h.observe orelse return;
+    var sp: api.SpillStatus = undefined;
+    const has_spill = if (o.spill) |f| f(o.ctx, &sp) else false;
+    const pre: ?api.PrefillCounts = if (o.prefill) |f| f(o.ctx) else null;
+    const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+    h.mutex.lockUncancelable(h.io);
+    defer h.mutex.unlock(h.io);
+    h.published_spill = if (has_spill) sp else null;
+    h.published_prefill = pre;
+    h.published_at = now;
 }
 
 /// `n` tokens delivered now; marks older than the window drop.

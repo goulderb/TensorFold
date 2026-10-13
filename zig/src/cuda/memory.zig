@@ -259,7 +259,7 @@ test "peak reset preserves an allocation between its read and store" {
     try std.testing.expectEqual(before.device + 400, after.peak);
 }
 
-const Call = enum { htod, dtod, dtod_async, memset8, memset8_async, memset32, memset32_async, sync };
+const Call = enum { htod, dtoh, dtod, dtod_async, memset8, memset8_async, memset32, memset32_async, sync };
 
 const Recorder = struct {
     var seen: [8]Call = undefined;
@@ -274,6 +274,9 @@ const Recorder = struct {
     }
     fn dtod(_: abi.DevicePtr, _: abi.DevicePtr, _: usize) callconv(.c) abi.Result {
         return put(.dtod);
+    }
+    fn dtoh(_: ?*anyopaque, _: abi.DevicePtr, _: usize) callconv(.c) abi.Result {
+        return put(.dtoh);
     }
     fn dtodAsync(_: abi.DevicePtr, _: abi.DevicePtr, _: usize, _: abi.Stream) callconv(.c) abi.Result {
         return put(.dtod_async);
@@ -329,4 +332,14 @@ test "a blocking write returns after the legacy stream is synchronized; the stre
     try Recorder.expect(&.{ .dtod, .sync });
     try b.copyFrom(0, 8192, 16, s);
     try Recorder.expect(&.{.dtod_async});
+}
+
+test "a blocking download synchronizes no stream: a reader of a non-blocking stream's output fences it first" {
+    var d: Driver = .{ .lib = undefined, .api = undefined };
+    d.api.cuMemcpyDtoH_v2 = Recorder.dtoh;
+    d.api.cuStreamSynchronize = Recorder.sync;
+    const b: DeviceBuffer = .{ .d = &d, .ptr = 4096, .len = 64, .borrowed = true };
+    var out: [16]u8 = undefined;
+    try b.download(0, &out);
+    try Recorder.expect(&.{.dtoh}); // the copy alone: no stream waited for (native/nemotron_spill.zig fences before it)
 }

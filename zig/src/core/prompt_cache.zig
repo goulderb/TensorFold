@@ -248,7 +248,7 @@ pub const Store = struct {
         if (bytes > s.budget) return have;
         const tokens = s.gpa.dupe(u32, hit.tokens) catch return have; // room-making writes may evict the hit from disk
         while (s.held + s.spare() + bytes > s.budget) {
-            const v = s.victimBut(have, prompt, false) orelse {
+            const v = s.victimBut(have, prompt, @intCast(prompt.len)) orelse {
                 s.gpa.free(tokens);
                 return have;
             };
@@ -343,7 +343,7 @@ pub const Store = struct {
             const skip = for (s.entries.items) |e| {
                 if (restoring != null and e.saved == restoring.?) break e;
             } else null;
-            s.remove(s.victimBut(skip, prompt, @intCast(prompt.len), false) orelse return false);
+            s.remove(s.victimBut(skip, prompt, @intCast(prompt.len)) orelse return false);
             s.counts.evicted += 1;
         }
         return true;
@@ -448,7 +448,7 @@ pub const Store = struct {
             if (!exists) need += s.family.vtable.bytes(s.family.ptr, at);
         }
         while (s.held + need > s.budget) {
-            s.evict(s.victimBut(from, prompt, born, false) orelse return);
+            s.evict(s.victimBut(from, prompt, born) orelse return);
         }
     }
 
@@ -659,7 +659,7 @@ pub const Store = struct {
         if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
         while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
-            s.evict(s.victimBut(have, prompt, born, false) orelse return have);
+            s.evict(s.victimBut(have, prompt, born) orelse return have);
         }
         if (bytes > s.budget) return have;
         const e = s.gpa.create(Entry) catch return have;
