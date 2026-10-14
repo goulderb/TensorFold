@@ -40,9 +40,10 @@ pub fn run(gpu: check.Gpu, model: []const u8) !void {
         return;
     };
 
-    // Two seam points whose entering delta differs: block 27 is MoE, so a seam at 28 carries a MoE delta into the
-    // seam norm, and block 28 is Mamba, so a seam at 29 carries a dense one. The two exercise both forms.
-    const seams = [_]usize{ 28, 29 };
+    // Four seam points, alternating in the form of the delta entering the seam norm: block 26 is attention and
+    // block 28 mamba, so seams 27 and 29 carry a dense delta; block 27 is MoE and block 29 MoE, so seams 28 and 30
+    // carry a MoE one. Every later seam is compared against the first, so a seam that mishandles either form shows.
+    const seams = [_]usize{ 27, 28, 29, 30 };
     var results: [seams.len][]u8 = undefined;
     var made: usize = 0;
     defer for (results[0..made]) |r| gpa.free(r);
@@ -50,9 +51,9 @@ pub fn run(gpu: check.Gpu, model: []const u8) !void {
         results[i] = try split(gpu, model, cfg, prompt, mid, pick);
         made += 1;
         check.pass("split-forward seam {d}: {d} logits bytes, {d} distinct tokens in the top row", .{ mid, results[i].len, distinct(results[i]) });
+        if (i > 0) try check.sameBytes("split-forward logits at seam", results[i], results[0]);
     }
-    try check.sameBytes("split-forward logits across seams", results[1], results[0]);
-    check.pass("split-forward: the logits are identical at seam {d} and seam {d}", .{ seams[0], seams[1] });
+    check.pass("split-forward: the logits are identical at seams {d}, {d}, {d} and {d}", .{ seams[0], seams[1], seams[2], seams[3] });
 }
 
 /// How many distinct bf16 values the first row of logits holds: a degenerate output (all zero, all one value) is a
