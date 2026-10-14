@@ -9,6 +9,8 @@ pub const Context = struct {
     d: *const Driver,
     device: abi.Device,
     handle: abi.Context,
+    /// The ordinal this context was opened on, so a caller can tell which device it holds.
+    device_ordinal: c_int = 0,
 
     pub fn init(d: *const Driver, ordinal: c_int) Error!Context {
         var dev: abi.Device = 0;
@@ -17,7 +19,7 @@ pub const Context = struct {
         try d.check(d.api.cuDevicePrimaryCtxRetain(&ctx, dev), "cuDevicePrimaryCtxRetain");
         errdefer _ = d.api.cuDevicePrimaryCtxRelease_v2(dev);
         try d.check(d.api.cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
-        return .{ .d = d, .device = dev, .handle = ctx };
+        return .{ .d = d, .device = dev, .handle = ctx, .device_ordinal = ordinal };
     }
 
     /// Waits for all work, then drops this retain; resources made in it must be released first.

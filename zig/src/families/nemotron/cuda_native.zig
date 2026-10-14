@@ -71,7 +71,7 @@ pub const default_context: i64 = engine.default_context;
 pub const max_segments: u32 = @import("cuda_segments.zig").MAX;
 pub const prompt_rows: u32 = state.pass_rows;
 
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, precision: ?@import("config.zig").Precision = null };
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, precision: ?@import("config.zig").Precision = null, split: bool = false };
 pub const vision = @import("cuda_vision.zig");
 
 /// Thinking budgets the lone driver takes (cuda_lone.zig): above it, the stream goes to the lane core before its cut.
@@ -113,7 +113,49 @@ pub fn plainShared(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !?[]co
     return core.shard_edit.plainShared(arena, io, dir);
 }
 
-const Owned = struct { gpa: std.mem.Allocator, e: *engine.Engine, head: ?*Head, lanes: Lanes, target: reuse.Target, carve: ?*cuda.Carveout, living: ?@import("cuda_sites.zig").Sites = null, taps: [1]u32 = undefined };
+const Owned = struct { gpa: std.mem.Allocator, e: *engine.Engine, head: ?*Head, lanes: Lanes, target: reuse.Target, carve: ?*cuda.Carveout, living: ?@import("cuda_sites.zig").Sites = null, taps: [1]u32 = undefined, peer: ?*Peer = null };
+
+/// The second rank of a layer split: its own device, context, engine and seam staging. The lane backend drives rank
+/// 0 only, so the peer is invisible above the seam.
+const Peer = struct {
+    gpa: std.mem.Allocator,
+    ctx: cuda.Context,
+    e: *engine.Engine,
+    stage: [1]cuda.HostBuffer,
+
+    fn deinit(p: *Peer) void {
+        p.stage[0].free();
+        p.e.deinit();
+        p.ctx.deinit();
+        p.gpa.destroy(p);
+    }
+};
+
+/// The two internal devices, by shared compute capability: the eGPU enumerates first and is a different class.
+pub fn splitPair(d: *const cuda.Driver) !?[2]c_int {
+    const count = try d.deviceCount();
+    var caps: [8]u32 = undefined;
+    var n: usize = 0;
+    var i: c_int = 0;
+    while (i < count and n < caps.len) : (i += 1) {
+        var dev: cuda.abi.Device = 0;
+        try d.check(d.api.cuDeviceGet(&dev, i), "cuDeviceGet");
+        var major: c_int = 0;
+        var minor: c_int = 0;
+        try d.check(d.api.cuDeviceGetAttribute(&major, .compute_capability_major, dev), "cuDeviceGetAttribute");
+        try d.check(d.api.cuDeviceGetAttribute(&minor, .compute_capability_minor, dev), "cuDeviceGetAttribute");
+        caps[n] = @intCast(10 * major + minor);
+        n += 1;
+    }
+    for (0..n) |a| for (a + 1..n) |b| if (caps[a] == caps[b]) return .{ @intCast(a), @intCast(b) };
+    return null;
+}
+
+/// The layer each rank owns, by the model's own layer count. Not the midpoint: rank 0 also carries the embedding,
+/// the final norm, the head and the MTP head, so the balance point sits past the middle.
+pub fn splitAt(layers: usize) usize {
+    return layers / 2 + 2;
+}
 
 /// Own-sequence graphs support both draw modes; drafting also captures the head.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
@@ -144,6 +186,39 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer own.lanes.deinit();
     own.living = try slide.loadLiving(gpa, io, e, dir); // before the lanes' costs are measured: they decode through it
     errdefer if (own.living) |*s| s.deinit();
+    // A layer split: rank 1 on the other internal device, with its own context and engine. Rank 0 keeps the
+    // embedding, the final norm, the head and the MTP head, so the lane backend above the seam is unchanged.
+    if (o.split) {
+        const pair = (try splitPair(ctx.d)) orelse return error.SplitNeedsTwoDevices;
+        if (pair[0] != ctx.device_ordinal) return error.SplitRankZeroNotFirst;
+        const mid = splitAt(e.c.layers);
+        const p = try gpa.create(Peer);
+        errdefer gpa.destroy(p);
+        p.gpa = gpa;
+        p.ctx = try cuda.Context.init(ctx.d, pair[1]);
+        errdefer p.ctx.deinit();
+        p.e = try engine.Engine.init(gpa, io, &p.ctx, dir, kernels, .{
+            .context = o.context,
+            .mtp = false, // the head stays on rank 0
+            .graphs = false, // a graph captures one device's kernels and cannot span the seam
+            .sampling = null,
+            .segments = 1,
+            .range = .{ .first = mid, .last = e.c.layers, .embed = false, .head = false },
+            .norm_done = true,
+        });
+        errdefer p.e.deinit();
+        // The seam's staging: h and y are rows*hidden*2 bf16, xs is rows*(hidden/64)*4 fp32.
+        const rows = state.max_rows;
+        const need = 2 * rows * e.c.hidden * 2 + rows * (e.c.hidden / 64) * 4;
+        p.stage[0] = try cuda.HostBuffer.allocMapped(ctx.d, need);
+        errdefer p.stage[0].free();
+        // Rank 0's own range and seam: the embedding, its blocks, and the receiving block's norm.
+        e.range = .{ .first = 0, .last = mid, .embed = true, .head = true, .seam_norm = mid };
+        e.tail = true;
+        e.peer = p.e;
+        e.stage = p.stage;
+        own.peer = p;
+    }
     try own.lanes.measure(io, dir);
     own.taps = .{@import("cuda_lanes.zig").finalTap(e.c)};
     e.prefill_counts = .{}; // requests' prompt rows only: the cost measurement's passes are not counted
@@ -193,6 +268,8 @@ fn release(p: *anyopaque) void {
     own.lanes.deinit();
     if (own.living) |*s| s.deinit();
     if (own.head) |h| h.deinit();
+    // The peer first: rank 0's engine holds a pointer to it and its staging.
+    if (own.peer) |peer| peer.deinit();
     own.e.deinit();
     if (own.carve) |c| closeCarveout(own.gpa, c);
     own.gpa.destroy(own);
