@@ -440,9 +440,29 @@ pub fn made(dtype: core.checkpoint.DType, d0: usize, d1: usize, bytes: []const u
     return t;
 }
 
+/// Which layers a rank loads, and whether it holds the embedding and the head. A single-device load is `all`.
+pub const Range = struct {
+    first: usize = 0, // inclusive
+    last: usize = std.math.maxInt(usize), // exclusive
+    embed: bool = true,
+    head: bool = true,
+
+    /// Every layer, the embedding and the head: the single-device load.
+    pub const all: Range = .{};
+};
+
 /// weights.load: the model folder's checkpoint (and its MTP head when `with_mtp`) on the GPU, leftovers refused.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, c: Config, with_mtp: bool) !Weights {
+    return loadRange(gpa, io, ops, dir, c, with_mtp, .all);
+}
+
+/// `load` for one rank of a layer split: only `range`'s layers are read, and the rest are marked used so the
+/// leftover check still means something. `w.blocks` is indexed by the global layer number, so a caller reads a
+/// block by its model index; the entries outside `range` are zero and must not be run.
+pub fn loadRange(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, c: Config, with_mtp: bool, range: Range) !Weights {
     if (c.format == .mlx) try c.fourOnly("CUDA");
+    const last = @min(range.last, c.layers);
+    if (range.first > last) return error.BadLayerRange;
     var w: Weights = .{ .gpa = gpa, .config = c };
     errdefer w.deinit();
     var src = try Source.init(gpa, ops);
@@ -463,6 +483,13 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
     const pre = c.prefix();
     w.blocks = try gpa.alloc(Block, c.layers);
     for (c.kinds[0..c.layers], 0..) |kind, i| {
+        if (i < range.first or i >= last) {
+            // not this rank's: marked used so the leftover check still catches a genuinely unread tensor
+            var pb: [128]u8 = undefined;
+            try ck.skip(try std.fmt.bufPrint(&pb, "{s}backbone.layers.{d}.", .{ pre, i }));
+            w.blocks[i] = .{ .kind = kind, .norm = 0 };
+            continue;
+        }
         var nm: [128]u8 = undefined;
         var nb: [128]u8 = undefined;
         var pb: [128]u8 = undefined;
@@ -477,7 +504,9 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
         }
         w.blocks[i] = b;
     }
-    if (c.format == .modelopt) w.embed = try modelopt.embed(&L, &ck, c) else {
+    if (!range.embed) {
+        try ck.skip("backbone.embeddings.");
+    } else if (c.format == .modelopt) w.embed = try modelopt.embed(&L, &ck, c) else {
         const emb = try ck.get("backbone.embeddings.weight");
         w.embed = .{
             .w = try L.raw("embed.weight", emb),
@@ -488,15 +517,22 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
         };
     }
     var tail: [96]u8 = undefined;
-    w.norm_f = try L.raw("norm_f", try ck.expect(try std.fmt.bufPrint(&tail, "{s}backbone.norm_f.weight", .{pre}), .bf16, &.{c.hidden}));
-    w.head = try L.dense(&ck, "head", &.{try std.fmt.bufPrint(&tail, "{s}lm_head", .{pre})});
+    if (!range.head) {
+        try ck.skip(try std.fmt.bufPrint(&tail, "{s}backbone.norm_f.", .{pre}));
+        try ck.skip(try std.fmt.bufPrint(&tail, "{s}lm_head", .{pre}));
+    } else {
+        w.norm_f = try L.raw("norm_f", try ck.expect(try std.fmt.bufPrint(&tail, "{s}backbone.norm_f.weight", .{pre}), .bf16, &.{c.hidden}));
+        w.head = try L.dense(&ck, "head", &.{try std.fmt.bufPrint(&tail, "{s}lm_head", .{pre})});
+    }
     // a ModelOpt checkpoint keeps its MTP head in its own shards
-    if (c.format == .modelopt) if (!with_mtp) try ck.skip(try std.fmt.bufPrint(&tail, "{s}mtp.", .{pre})) else if (c.latent > 0) try latent.mtp(&L, &ck, c) else try modelopt.mtp(&L, &ck, c);
+    if (c.format == .modelopt) if (with_mtp and range.head) {
+        if (c.latent > 0) try latent.mtp(&L, &ck, c) else try modelopt.mtp(&L, &ck, c);
+    } else try ck.skip(try std.fmt.bufPrint(&tail, "{s}mtp.", .{pre}));
     // the picture tower and its projector load with the image path (an omni checkpoint's other parts)
     if (c.omni) for ([_][]const u8{ "vision_model.", "mlp1.", "vision_projector." }) |part| try ck.skip(part);
     if (ck.unused() != 0) return error.UnusedCheckpointTensors;
     if (L.learned > 0) std.log.info("{d} output projections carry what lessons taught this model", .{L.learned});
-    if (with_mtp and c.format == .mlx) try loadMtp(gpa, io, &L, &ck, dir, c);
+    if (with_mtp and range.head and c.format == .mlx) try loadMtp(gpa, io, &L, &ck, dir, c);
     try src.flush();
     try ops.s.synchronize();
     return w;
