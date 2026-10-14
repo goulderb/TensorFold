@@ -55,6 +55,9 @@ pub const Weights = struct {
     draft_head: ?QLinear = null,
     draft_ids: u64 = 0,
     draft_count: usize = 0,
+    /// A layer split's sender holds the receiving rank's first block norm: it runs that norm so the handoff can
+    /// carry the residual h alone, and the receiver starts with its first norm already done. 0: no seam.
+    seam_norm: u64 = 0,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     named: std.ArrayList(Named) = .empty,
 
@@ -446,6 +449,8 @@ pub const Range = struct {
     last: usize = std.math.maxInt(usize), // exclusive
     embed: bool = true,
     head: bool = true,
+    /// The receiving rank's first block, whose norm this rank runs at the seam. null: no seam.
+    seam_norm: ?usize = null,
 
     /// Every layer, the embedding and the head: the single-device load.
     pub const all: Range = .{};
@@ -503,6 +508,15 @@ pub fn loadRange(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const
             .moe => b.moe = if (c.latent > 0) try latent.load(&L, &ck, try join(&nb, name, ".moe"), mixer, c, @intCast(i)) else try L.moe(&ck, try join(&nb, name, ".moe"), mixer, c),
         }
         w.blocks[i] = b;
+    }
+    // A sender also holds the receiving rank's first block norm, so it can run that norm at the seam. The receiver
+    // marks it used instead, since its own first block skips the norm.
+    if (range.seam_norm) |at| {
+        // The seam norm is the receiving rank's first block norm, so it sits at the sender's `last`, outside the
+        // sender's own range. Only the sender sets `seam_norm`; the receiver loads that block's norm as its own and
+        // skips running it.
+        var pb: [128]u8 = undefined;
+        w.seam_norm = try L.raw("seam.norm", try ck.expect(try std.fmt.bufPrint(&pb, "backbone.layers.{d}.norm.weight", .{at}), .bf16, &.{c.hidden}));
     }
     if (!range.embed) {
         try ck.skip("backbone.embeddings.");

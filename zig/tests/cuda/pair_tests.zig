@@ -69,17 +69,23 @@ pub const Pair = struct {
 /// the pair of internal cards. The eGPU enumerates first but is sm_89, so picking by ordinal would put a layer split
 /// across a Thunderbolt link.
 pub fn internalPair(d: *const cuda.Driver, gpa: std.mem.Allocator) !?[2]c_int {
+    _ = gpa;
     const count = try d.deviceCount();
     var caps: [8]u32 = undefined;
     var n: usize = 0;
     var i: c_int = 0;
+    // The capability comes from the device, not a context: opening one per device would leave the last current
+    // after its release, and the caller's own binding would then be stale.
     while (i < count and n < caps.len) : (i += 1) {
-        var ctx = try cuda.Context.init(d, i);
-        defer ctx.deinit();
-        caps[n] = try ctx.capability();
+        var dev: cuda.abi.Device = 0;
+        try d.check(d.api.cuDeviceGet(&dev, i), "cuDeviceGet");
+        var v: c_int = 0;
+        try d.check(d.api.cuDeviceGetAttribute(&v, .compute_capability_major, dev), "cuDeviceGetAttribute");
+        var minor: c_int = 0;
+        try d.check(d.api.cuDeviceGetAttribute(&minor, .compute_capability_minor, dev), "cuDeviceGetAttribute");
+        caps[n] = @intCast(10 * v + minor);
         n += 1;
     }
-    _ = gpa;
     for (0..n) |a| for (a + 1..n) |b| if (caps[a] == caps[b]) return .{ @intCast(a), @intCast(b) };
     return null;
 }

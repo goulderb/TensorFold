@@ -15,6 +15,10 @@ const latent = @import("cuda_latent.zig");
 
 pub const Delta = enum { none, dense, moe };
 
+/// The blocks one rank of a layer split runs: the weight loader's Range, so the loader, the state and the forward
+/// agree on one type.
+pub const Range = @import("cuda_weights.zig").Range;
+
 /// A second stream the shared expert runs on while the routed experts are chosen; fork and join are events.
 pub const Side = struct { s: cuda.Stream, fork: cuda.Event, join: cuda.Event };
 
@@ -63,6 +67,17 @@ pub const Forward = struct {
     captures: []const kept.Mark = &.{}, // marks inside the prompt chunk: their Mamba states are copied out as it runs
     tp: ?*const cuda.tp_group.Group = null, // a latent MoE's ranks: their expert rows meet every MoE layer
     vision: ?*const @import("cuda_vision.zig").Vision = null, // a prompt pass's image rows, spliced after its embeds
+    /// The blocks this rank runs, as a half-open range of global layer numbers. A single device runs `all`.
+    range: Range = .all,
+    /// The receiving rank's first block skips its norm: the sender ran it, so the handoff already carries h, y and xs.
+    norm_done: bool = false,
+    /// Whether this rank runs the embedding. A receiving rank does not: its rows arrive in the handoff.
+    embed_rows: bool = true,
+    /// Whether this rank runs the final norm, the head and the sample. A sending rank does not.
+    tail: bool = true,
+    /// Where a sending rank leaves the seam residual h: the buffer the seam norm wrote, for the caller to hand off.
+    /// A receiving rank reads it as its starting x. 0: not a split.
+    seam_h: u64 = 0,
 
     pub fn init(c: Config, w: *const weights.Weights, b: *const state.Buffers, ops: kern.Ops, max_len: usize, nch: usize, sampled: bool) Forward {
         return .{
@@ -81,6 +96,14 @@ pub const Forward = struct {
             .nch = nch,
             .sampled = sampled,
         };
+    }
+
+    /// The mamba and attention layers this rank has already run: its state planes are sized for its own layers and
+    /// indexed from zero, so the counters are rank-local and start at zero. They are here, not in the caller, so the
+    /// window and chunk paths agree.
+    pub fn counters(f: *const Forward) struct { mj: usize, aj: usize } {
+        _ = f;
+        return .{ .mj = 0, .aj = 0 };
     }
 
     /// Rows of logits draw their next tokens into `out`, row r at position META[0] + r + 1, by `rule` when sampled.
@@ -149,14 +172,18 @@ pub const Forward = struct {
         var rows: usize = 0;
         for (segs) |s| rows += s.rows;
         if (rows > state.max_rows) return error.WindowTooWide;
-        for (segs) |s| try f.embed(s.b.ids, b.emb + s.row0 * D * 2, s.rows);
+        if (f.embed_rows) for (segs) |s| try f.embed(s.b.ids, b.emb + s.row0 * D * 2, s.rows);
         try f.mark(.embed);
-        var x = b.emb;
+        // A receiving rank starts from the handed-off residual; a single device or a sender starts at the embedding.
+        var x = if (!f.embed_rows and f.seam_h != 0) f.seam_h else b.emb;
         var delta: Delta = .none;
-        var mj: usize = 0;
-        var aj: usize = 0;
-        for (f.w.blocks) |blk| {
-            try f.norm(&x, delta, blk.norm, rows, true);
+        const start = f.counters();
+        var mj: usize = start.mj;
+        var aj: usize = start.aj;
+        const last = @min(f.range.last, f.c.layers);
+        for (f.w.blocks[f.range.first..last], f.range.first..) |blk, li| {
+            // the first block of a receiving rank: the sender already ran its norm and handed over h, y and xs
+            if (!(f.norm_done and li == f.range.first)) try f.norm(&x, delta, blk.norm, rows, true);
             switch (blk.kind) {
                 .mamba => {
                     const m = blk.mamba;
@@ -221,6 +248,13 @@ pub const Forward = struct {
                     delta = .moe;
                 },
             }
+        }
+        if (!f.tail) {
+            // A sending rank runs the receiving rank's first block norm here, so the handoff carries the residual
+            // h alone and the receiver starts with its norm already done. The seam norm is the receiver's first
+            // block's norm weight, which this rank loaded as w.seam_norm.
+            try f.norm(&x, delta, f.w.seam_norm, rows, true);
+            return;
         }
         try f.norm(&x, delta, f.w.norm_f, rows, true);
         for (segs) |s| try o.copy(s.b.hidden, b.y + s.row0 * D * 2, s.rows * c.hidden * 2);
@@ -355,7 +389,8 @@ pub const Forward = struct {
     pub fn chunkPre(f: *const Forward, w: *Walk, i: usize) !void {
         const blk = f.w.blocks[i];
         const b = f.b;
-        try f.norm(&w.x, w.delta, blk.norm, w.rows, false);
+        // the receiving rank's first block: the sender already ran this norm and handed over the residual
+        if (!(f.norm_done and i == f.range.first)) try f.norm(&w.x, w.delta, blk.norm, w.rows, false);
         switch (blk.kind) {
             .mamba => try f.ops.prefillDense(b.y, blk.mamba.in_proj, b.proj, w.rows),
             .attention => {
@@ -443,7 +478,11 @@ pub const Forward = struct {
     }
 
     /// The chunk's last norm alone: w.x then holds the residual it read, b.y every row's normed hidden state.
+    ///
+    /// A sending rank runs the receiving rank's first block norm here instead, so the handoff carries the residual
+    /// and the receiver starts with its norm already done. The seam norm is that block's norm weight.
     pub fn finalNorm(f: *const Forward, w: *Walk) !void {
+        if (!f.tail) return f.norm(&w.x, w.delta, f.w.seam_norm, w.rows, false);
         try f.norm(&w.x, w.delta, f.w.norm_f, w.rows, false);
     }
 

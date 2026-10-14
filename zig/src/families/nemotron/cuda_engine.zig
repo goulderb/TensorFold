@@ -38,6 +38,13 @@ pub const Options = struct {
     slide: bool = false, // Sliding Weights asked for: refused for a checkpoint the learner cannot read
     vision: ?@import("cuda_vision.zig").Limits = null, // --vision: the checkpoint's image tower (an omni checkpoint's)
     precision: ?@import("config.zig").Precision = null, // --precision; null: the checkpoint's math where it is built
+    /// A layer split's rank: which blocks this engine loads and runs, and which of the embedding, the seam norm and
+    /// the tail. `all` is a single device.
+    range: weights.Range = .all,
+    /// The receiving rank's first block skips its norm: the sender ran it and handed over the residual.
+    norm_done: bool = false,
+    /// Where a receiving rank reads the handed-off residual. 0: it runs the embedding instead.
+    seam_h: u64 = 0,
 };
 
 /// Asked before each prompt chunk (or segmented call): true stops the prompt with error.Cancelled.
@@ -138,6 +145,12 @@ pub const Engine = struct {
     last_chunk: usize = 0, // where the last prompt pass's last chunk started (the prompt's last row: len - 1 - this)
     tp: ?cuda.tp_group.Group = null, // a latent MoE over ranks (TF_NEMOTRON_RANK of TF_NEMOTRON_WORLD)
     vision: ?*@import("cuda_vision.zig").Vision = null, // --vision: the tower and a prompt pass's image rows
+    /// A layer split's rank: which blocks this engine runs, and which of the embedding, the seam norm and the tail.
+    range: @import("cuda_forward.zig").Range = .all,
+    norm_done: bool = false,
+    embed_rows: bool = true,
+    tail: bool = true,
+    seam_h: u64 = 0,
 
     /// Loads the checkpoint into the Python engine's layouts and sizes the caches; `triton_dir` null: our own glue.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, model_dir: []const u8, triton_dir: ?[]const u8, opts: Options) !*Engine {
@@ -145,6 +158,9 @@ pub const Engine = struct {
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
         e.* = .{ .gpa = gpa, .io = io, .ctx = ctx, .stream = undefined, .k = undefined, .w = undefined, .b = undefined, .c = undefined, .max_len = 0, .pinned = undefined, .history = undefined };
+        // Every allocation below lands in this context, so bind it first: a layer split's second engine would
+        // otherwise allocate on whichever device the first one left current.
+        try ctx.makeCurrent();
         e.trace = std.c.getenv("TF_SLIDE_TRACE") != null;
         e.c = try Config.read(gpa, io, model_dir);
         try latent.place(&e.c);
@@ -185,7 +201,12 @@ pub const Engine = struct {
             std.log.err("no captured attention kernel covers {d} chunks of 512 keys; capture one for this context", .{chunks});
             return error.ContextUnsupported;
         }) else chunks;
-        e.w = try weights.load(gpa, io, e.ops(), model_dir, e.c, opts.mtp);
+        e.w = try weights.loadRange(gpa, io, e.ops(), model_dir, e.c, opts.mtp, opts.range);
+        e.range = .{ .first = opts.range.first, .last = opts.range.last };
+        e.norm_done = opts.norm_done;
+        e.embed_rows = opts.range.embed;
+        e.tail = opts.range.head;
+        e.seam_h = opts.seam_h;
         errdefer e.w.deinit();
         if (opts.vision) |lim| {
             var problem: []const u8 = "";
@@ -195,7 +216,7 @@ pub const Engine = struct {
             };
         }
         errdefer if (e.vision) |v| v.deinit();
-        e.b = try state.Buffers.init(ctx.d, e.c, e.max_len, e.nch, e.carve);
+        e.b = try state.Buffers.initRange(ctx.d, e.c, e.max_len, e.nch, e.carve, opts.range);
         errdefer e.b.deinit();
         try e.b.initShared(e.ops(), e.c);
         if (e.segments > 1) e.seg = try segs.Segments.init(e, e.segments);
@@ -338,7 +359,7 @@ pub const Engine = struct {
         errdefer e.gpa.destroy(s);
         var head: [head_fields.len]usize = undefined;
         if (e.head) |h| head = h.seqSizes();
-        s.* = try state.Seq.init(e.ctx.d, e.c, e.max_len, if (e.head != null) &head else &.{}, e.stream, e.carve);
+        s.* = try state.Seq.initRange(e.ctx.d, e.c, e.max_len, if (e.head != null) &head else &.{}, e.stream, e.carve, e.range);
         const free = @ctz(~e.slots);
         if (free >= lesson_route.max_slots) return error.TooManySequences;
         e.slots |= @as(u64, 1) << @intCast(free);
@@ -350,7 +371,7 @@ pub const Engine = struct {
     pub fn seqBytes(e: *const Engine) usize {
         var head: [head_fields.len]usize = undefined;
         if (e.head) |h| head = h.seqSizes();
-        return state.Seq.bytes(e.c, e.max_len, if (e.head != null) &head else &.{});
+        return state.Seq.bytesRange(e.c, e.max_len, if (e.head != null) &head else &.{}, e.range);
     }
 
     pub fn freeSeq(e: *Engine, s: *state.Seq) void {
@@ -388,6 +409,11 @@ pub const Engine = struct {
         f.untaught = e.bound.untaught;
         f.tp = if (e.tp) |*g| g else null;
         f.vision = e.vision;
+        f.range = e.range;
+        f.norm_done = e.norm_done;
+        f.embed_rows = e.embed_rows;
+        f.tail = e.tail;
+        f.seam_h = e.seam_h;
         if (dump == null and e.c.experts <= 128 and e.c.slots() <= 8) f.side = e.side; // tf_plan_routed's bounds
         return f;
     }

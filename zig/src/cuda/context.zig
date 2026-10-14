@@ -58,6 +58,9 @@ pub const Context = struct {
     pub const MemInfo = struct { free: usize, total: usize };
 
     pub fn memInfo(self: *const Context) Error!MemInfo {
+        // cuMemGetInfo reports the current context's device, so bind this one first: a caller asking about a device
+        // other than the current one would otherwise read the wrong card's numbers.
+        try self.makeCurrent();
         var m: MemInfo = .{ .free = 0, .total = 0 };
         try self.d.check(self.d.api.cuMemGetInfo_v2(&m.free, &m.total), "cuMemGetInfo");
         return m;

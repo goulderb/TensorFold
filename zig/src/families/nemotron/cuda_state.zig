@@ -10,6 +10,10 @@ const seq_graphs = @import("cuda_seq_graphs.zig");
 const latent = @import("cuda_latent.zig");
 const worker = @import("cuda_worker.zig");
 
+/// The blocks one rank of a layer split owns: the weight loader's Range, so the loader and the state agree on one
+/// type. `all` is one device.
+pub const Range = @import("cuda_weights.zig").Range;
+
 pub const max_rows = 16; // a verify window's rows (the row tile of the row-parallel kernels)
 pub const prefill_rows = 2048; // rows of a staggered segment's chunk, and of a pass under dumps or lessons
 pub const pass_rows = 2 * prefill_rows; // rows a serial prompt pass runs at most (a row's bits are the same at any cut)
@@ -75,9 +79,23 @@ pub fn mambaPlanes(c: Config) [2]usize {
 }
 
 fn seqSizes(c: Config, max_len: usize) [seq_fields.len]usize {
+    return seqSizesRange(c, max_len, .all);
+}
+
+/// `seqSizes` for one rank of a layer split: the KV planes and the Mamba state cover only the layers this rank
+/// owns, so each rank's sequence state is sized for its own half. The layer indices stay global, so a rank's planes
+/// are indexed from its first owned layer.
+fn seqSizesRange(c: Config, max_len: usize, range: Range) [seq_fields.len]usize {
     const W: usize = max_rows;
-    const nm: usize = c.count(.mamba);
-    const kv = c.count(.attention) * max_len * kvRowBytes(c);
+    const last = @min(range.last, c.layers);
+    var nm: usize = 0;
+    var na: usize = 0;
+    for (c.kinds[range.first..last]) |k| switch (k) {
+        .mamba => nm += 1,
+        .attention => na += 1,
+        .moe => {},
+    };
+    const kv = na * max_len * kvRowBytes(c);
     const cd: usize = c.convDim();
     const m = mambaPlanes(c);
     return .{ kv, kv, m[0], m[1], nm * 2 * W * cd * 2, nm * 2 * W * cd * 2, nm * 2 * W * c.mamba_heads * 4, 16, W * 4, W * c.hidden * 2, W * 4, @sizeOf(sampler.Rule) };
@@ -145,15 +163,25 @@ pub const Seq = struct {
 
     /// The device bytes one sequence takes: its buffers for `max_len` cache rows and a head's `head` buffers.
     pub fn bytes(c: Config, max_len: usize, head: []const usize) usize {
+        return bytesRange(c, max_len, head, .all);
+    }
+
+    /// `bytes` for one rank of a layer split: only `range`'s layers' planes are counted.
+    pub fn bytesRange(c: Config, max_len: usize, head: []const usize, range: Range) usize {
         var total: usize = 0;
-        for (seqSizes(c, max_len)) |n| total += n + 256;
+        for (seqSizesRange(c, max_len, range)) |n| total += n + 256;
         for (head) |n| total += n + 256;
         return total;
     }
 
     /// Cache and head buffers are zeroed on their owning stream; the KV pair goes to `carve` while it holds both.
     pub fn init(d: *const cuda.Driver, c: Config, max_len: usize, head: []const usize, stream: cuda.Stream, carve: ?*cuda.Carveout) !Seq {
-        const sizes = seqSizes(c, max_len);
+        return initRange(d, c, max_len, head, stream, carve, .all);
+    }
+
+    /// `init` for one rank of a layer split: the sequence planes cover only `range`'s layers.
+    pub fn initRange(d: *const cuda.Driver, c: Config, max_len: usize, head: []const usize, stream: cuda.Stream, carve: ?*cuda.Carveout, range: Range) !Seq {
+        const sizes = seqSizesRange(c, max_len, range);
         const carved = try Carved.take(carve, sizes[0]);
         errdefer if (carved) |x| x.give();
         var total = Carved.arenaBytes(carved, &sizes);
@@ -243,7 +271,12 @@ pub const Buffers = struct {
 
     /// Sizes every buffer for `max_len` cache rows and `nch` attention chunk partials a row; the own sequence's first.
     pub fn init(d: *const cuda.Driver, c: Config, max_len: usize, nch: usize, carve: ?*cuda.Carveout) !Buffers {
-        const own = seqSizes(c, max_len);
+        return initRange(d, c, max_len, nch, carve, .all);
+    }
+
+    /// `init` for one rank of a layer split: the sequence planes cover only `range`'s layers.
+    pub fn initRange(d: *const cuda.Driver, c: Config, max_len: usize, nch: usize, carve: ?*cuda.Carveout, range: Range) !Buffers {
+        const own = seqSizesRange(c, max_len, range);
         const scratch = scratchSizes(c, nch);
         const carved = try Carved.take(carve, own[0]);
         errdefer if (carved) |x| x.give();
