@@ -54,6 +54,12 @@ pub const deviceName = cuda_device.deviceName;
 const getenv = cuda_device.getenv;
 const setting = cuda_device.setting;
 
+/// TENSORFOLD_SPLIT=1 asks for the two-GPU layer split. Unset or 0: one device, the existing path.
+fn splitRequested() bool {
+    const t = std.mem.trim(u8, getenv("TENSORFOLD_SPLIT") orelse return false, " ");
+    return t.len > 0 and !std.mem.eql(u8, t, "0");
+}
+
 /// The model's window (config.json's max_position_embeddings, text_config's first), 0 when it names none.
 fn modelContext(a: Allocator, io: std.Io, dir: []const u8) i64 {
     const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return 0;
@@ -409,7 +415,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         }
     };
     var probe: Probe = .{ .a = a, .io = io, .ctx = &g.ctx, .held = held0, .problem = problem };
+    const split = splitRequested();
     var opts: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments, .slide = o.slide };
+    if (@hasField(F.Options, "split")) opts.split = split;
     if (o.vision) |vo| {
         if (!@hasField(F.Options, "vision")) {
             problem.* = "--vision: this CUDA family reads no images; serve it without --vision";
@@ -432,8 +440,12 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         spill_owner = try glm_spill.Adapter.prepare(gpa, io, o.dir);
         if (spill_owner) |owner| opts.persistence = .{ .ctx = owner, .attach = glm_spill.Adapter.attach };
     }
-    if (weights > before.room(held0)) {
-        problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
+    // A layer split admits rank 0's share against this device, not the whole checkpoint: rank 1's share lands on the
+    // other card, which the peer's own open checks. The layer count is not read yet, so the share is the same
+    // fraction the split uses, over the checkpoint's bytes.
+    const share = if (split) weights * 54 / 100 else weights;
+    if (share > before.room(held0)) {
+        problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights{s} do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), if (split) " (this rank's share)" else "", toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
         return null;
     }
     const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, opts) catch |e| {
