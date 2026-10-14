@@ -50,6 +50,9 @@ pub const Marks = struct {
 
 pub const Forward = struct {
     c: Config,
+    /// The context this rank's buffers and stream belong to. A layer split binds it before each copy, since the
+    /// driver's copy calls address the current context's device.
+    ctx: *const cuda.Context = undefined,
     w: *const weights.Weights,
     b: *const state.Buffers,
     ops: kern.Ops,
@@ -98,6 +101,13 @@ pub const Forward = struct {
             .nch = nch,
             .sampled = sampled,
         };
+    }
+
+    /// `init` for an engine whose buffers belong to `ctx`: a layer split binds it before each seam copy.
+    pub fn initWith(c: Config, w: *const weights.Weights, b: *const state.Buffers, ops: kern.Ops, max_len: usize, nch: usize, sampled: bool, ctx: *const cuda.Context) Forward {
+        var f = init(c, w, b, ops, max_len, nch, sampled);
+        f.ctx = ctx;
+        return f;
     }
 
     /// The mamba and attention layers this rank has already run: its state planes are sized for its own layers and
@@ -161,6 +171,45 @@ pub const Forward = struct {
         } else false;
         if (routed.route.count == 0) for (segs[0..@min(segs.len, lesson_route.max_segments)]) |s| routed.route.later(s.row0, s.rows, s.slot);
         try routed.windowRows(segs);
+    }
+
+    /// The layer split's window: this rank runs its blocks, the residual crosses to the peer, and the peer runs the
+    /// rest and the tail. `peer` is the other rank's Forward, built over its own weights, buffers and stream.
+    ///
+    /// The seam carries three buffers. The sender runs the receiving block's norm, so it hands over the residual h
+    /// (which the receiver's next norm would otherwise re-derive), the normed rows y and their 64-group sums xs
+    /// (which the receiving block's projections read, since its norm is skipped).
+    pub fn windowSplit(f: *const Forward, peer: *const Forward, segs: []const Seg, stage: []cuda.HostBuffer) !void {
+        const c = f.c;
+        const rows = segs[0].rows;
+        const h_bytes = rows * c.hidden * 2;
+        const xs_bytes = rows * (c.hidden / 64) * 4;
+        const need = 2 * h_bytes + xs_bytes;
+        if (stage.len < 3 or stage[0].bytes.len < need) return error.SeamStageTooSmall;
+
+        // This rank's blocks, then the receiving block's norm, which leaves h where seam_out names it.
+        var h: u64 = 0;
+        var sender = f.*;
+        sender.seam_out = &h;
+        try sender.windowSegs(segs);
+        if (h == 0) return error.SeamNoResidual;
+        try f.ops.s.synchronize();
+
+        // h, y and xs to the peer's device. Each copy runs under the context that owns its buffer: the driver's
+        // copy calls address the current context's device.
+        const st = stage[0].bytes;
+        try f.ctx.makeCurrent();
+        try f.ops.k.d.check(f.ops.k.d.api.cuMemcpyDtoH_v2(st.ptr, h, h_bytes), "cuMemcpyDtoH");
+        try f.ops.k.d.check(f.ops.k.d.api.cuMemcpyDtoH_v2(st.ptr + h_bytes, f.b.y, h_bytes), "cuMemcpyDtoH");
+        try f.ops.k.d.check(f.ops.k.d.api.cuMemcpyDtoH_v2(st.ptr + 2 * h_bytes, f.b.xs, xs_bytes), "cuMemcpyDtoH");
+        try peer.ctx.makeCurrent();
+        try peer.ops.k.d.check(peer.ops.k.d.api.cuMemcpyHtoD_v2(peer.seam_h, st.ptr, h_bytes), "cuMemcpyHtoD");
+        try peer.ops.k.d.check(peer.ops.k.d.api.cuMemcpyHtoD_v2(peer.b.y, st.ptr + h_bytes, h_bytes), "cuMemcpyHtoD");
+        try peer.ops.k.d.check(peer.ops.k.d.api.cuMemcpyHtoD_v2(peer.b.xs, st.ptr + 2 * h_bytes, xs_bytes), "cuMemcpyHtoD");
+
+        // The peer's blocks and the tail. Its Forward already carries range, norm_done, embed_rows and tail.
+        var receiver = peer.*;
+        try receiver.windowSegs(segs);
     }
 
     fn windowRows(f: *const Forward, segs: []const Seg) !void {

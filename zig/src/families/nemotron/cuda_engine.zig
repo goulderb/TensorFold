@@ -151,6 +151,10 @@ pub const Engine = struct {
     embed_rows: bool = true,
     tail: bool = true,
     seam_h: u64 = 0,
+    /// The other rank of a layer split, when this engine is one. null: a single device.
+    peer: ?*Engine = null,
+    /// The seam's host staging: one pinned buffer, sized for the widest window's h, y and xs.
+    stage: [1]cuda.HostBuffer = undefined,
 
     /// Loads the checkpoint into the Python engine's layouts and sizes the caches; `triton_dir` null: our own glue.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, model_dir: []const u8, triton_dir: ?[]const u8, opts: Options) !*Engine {
@@ -287,11 +291,18 @@ pub const Engine = struct {
         return exec;
     }
 
+    /// One window over this engine, crossing to the peer when this is a layer split. Every window call goes through
+    /// here, so the seam is in one place.
+    pub fn runWindow(e: *Engine, parts: []const @import("cuda_forward.zig").Seg) !void {
+        const f = e.forward(null);
+        if (e.peer) |p| return f.windowSplit(&p.forward(null), parts, &e.stage);
+        return f.windowSegs(parts);
+    }
+
     fn recordBody(e: *Engine, body: Body) !void {
         switch (body) {
             .window => |w| {
-                const f = e.forward(null);
-                try f.windowSegs(&.{.{ .b = f.b, .row0 = 0, .rows = w.rows, .sampled = f.sampled, .mask = w.mask, .slot = f.slot, .untaught = f.untaught }});
+                try e.runWindow(&.{.{ .b = &e.b, .row0 = 0, .rows = w.rows, .sampled = e.sampling != null, .mask = w.mask, .slot = e.slot, .untaught = e.bound.untaught }});
                 if (w.feed) return e.ops().serialFeed(e.b.sampled, e.b.ids, e.b.meta, e.history_dev);
                 try e.ops().download(std.mem.sliceAsBytes(e.pinned.slice(u32)[pin_sampled..][0..w.rows]), e.b.sampled);
             },
@@ -403,7 +414,7 @@ pub const Engine = struct {
     }
 
     pub fn forward(e: *const Engine, dump: ?*Dump) Forward {
-        var f = Forward.init(e.c, &e.w, &e.b, e.ops(), e.max_len, e.nch, e.sampling != null);
+        var f = Forward.initWith(e.c, &e.w, &e.b, e.ops(), e.max_len, e.nch, e.sampling != null, e.ctx);
         f.dump = dump;
         f.slot = e.slot;
         f.untaught = e.bound.untaught;
@@ -493,8 +504,7 @@ pub const Engine = struct {
             try e.launchCaptured(@intCast(masked_ids + m * (state.max_rows + 1) + rows), .{ .window = .{ .rows = rows, .feed = false, .mask = mask } });
         } else {
             e.stats.eager += 1;
-            const f = e.forward(dump);
-            try f.windowSegs(&.{.{ .b = f.b, .row0 = 0, .rows = rows, .sampled = f.sampled, .mask = mask, .slot = f.slot, .untaught = f.untaught }});
+            try e.runWindow(&.{.{ .b = &e.b, .row0 = 0, .rows = rows, .sampled = e.sampling != null, .mask = mask, .slot = e.slot, .untaught = e.bound.untaught }});
             try e.ops().download(std.mem.sliceAsBytes(host[pin_sampled..][0..rows]), e.b.sampled);
         }
         try e.sampled_ready.record(e.stream);
@@ -535,7 +545,7 @@ pub const Engine = struct {
             row0 += p.rows;
         }
         try e.copied.record(e.stream);
-        try e.forward(null).windowSegs(parts_f[0..parts.len]);
+        try e.runWindow(parts_f[0..parts.len]);
         for (parts, 0..) |p, k| try e.ops().download(std.mem.sliceAsBytes(host[k * 64 + 32 ..][0..p.rows]), views[k].sampled);
         try e.sampled_ready.record(e.stream);
         for (parts) |p| {
