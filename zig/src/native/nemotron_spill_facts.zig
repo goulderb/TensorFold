@@ -9,9 +9,13 @@
 //! the tier); the executable (its embedded kernels and draft vocabulary) and any captured AOT kernel set the engine
 //! loaded are hashed the same way; runtime and layout facts are hashed into the identity's text fields.
 const std = @import("std");
+const builtin = @import("builtin");
 const api = @import("engine_api");
 const spill = api.prompt_cache.spill;
 const Identity = api.spill_resume.Identity;
+
+/// The file identity below is Linux's: statx, pread and a raw fd. Elsewhere the tier refuses, as `openRead` says.
+const is_linux = builtin.os.tag == .linux;
 
 pub const Config = struct {
     tier: spill.Settings, // `dir` allocated
@@ -44,7 +48,7 @@ const Meta = struct {
     ctime: [2]i64,
 
     fn of(fd: c_int) !Meta {
-        if (@import("builtin").os.tag != .linux) return error.Unsupported;
+        if (!is_linux) return error.Unsupported;
         const linux = std.os.linux;
         var sx: linux.Statx = undefined;
         if (std.c.statx(fd, "", 0x1000, .{ .INO = true, .SIZE = true, .MTIME = true, .CTIME = true }, &sx) != 0) return error.SpillArtifactStat; // AT_EMPTY_PATH
@@ -57,13 +61,25 @@ const Meta = struct {
 };
 
 fn openRead(path: [:0]const u8) !c_int {
+    if (!is_linux) return error.Unsupported;
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
     return if (fd < 0) error.SpillArtifactOpen else fd;
 }
 
+/// `std.c.close` takes a pointer on Windows, so the Linux-only callers close through here.
+fn closeRead(fd: c_int) void {
+    if (is_linux) _ = std.c.close(fd);
+}
+
+/// A positional read of `buf` at `off`; only the Linux tier reaches this.
+fn preadRead(fd: c_int, buf: []u8, off: u64) isize {
+    if (!is_linux) return -1;
+    return std.c.pread(fd, buf.ptr, buf.len, @intCast(off));
+}
+
 fn metaOf(path: [:0]const u8) !Meta {
     const fd = try openRead(path);
-    defer _ = std.c.close(fd);
+    defer closeRead(fd);
     return Meta.of(fd);
 }
 
@@ -118,12 +134,12 @@ pub const Artifacts = struct {
         defer gpa.free(buf);
         for (a.paths, a.before) |p, m| {
             const fd = try openRead(p);
-            defer _ = std.c.close(fd);
+            defer closeRead(fd);
             if (!Meta.eql(try Meta.of(fd), m)) return error.SpillArtifactChanged;
             var h = std.crypto.hash.sha2.Sha256.init(.{});
             var off: u64 = 0;
             while (true) {
-                const n = std.c.pread(fd, buf.ptr, buf.len, @intCast(off));
+                const n = preadRead(fd, buf, off);
                 if (n < 0) return error.SpillArtifactRead;
                 if (n == 0) break;
                 h.update(buf[0..@intCast(n)]);

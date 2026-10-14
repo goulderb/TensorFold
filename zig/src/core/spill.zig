@@ -10,6 +10,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
+/// The tier's files are POSIX: openat with NOFOLLOW, statx, the private-directory check, statvfs. On Windows it
+/// compiles but refuses to open, the way the vision helper is compiled out (docs/windows-port.md). Nothing else
+/// changes: an engine that never opens a tier behaves as if none were configured.
+pub const supported = builtin.os.tag != .windows;
+
 pub const version: u32 = 1;
 pub const header_bytes = 4096;
 const magic = "TFSPILL1";
@@ -341,6 +346,7 @@ pub const Tier = struct {
     /// The tier under `settings.dir` for `family` at `identity` and `rank`: made when missing, its partial and foreign
     /// files deleted, other identities past `keep_builds` deleted, its states indexed oldest first.
     pub fn open(gpa: Allocator, io: std.Io, settings: Settings, family: []const u8, identity: [32]u8, rank: u32, world: u32) !*Tier {
+        if (!supported) return error.SpillUnsupported;
         if (family.len == 0 or family.len > 16) return error.BadFamilyName;
         const t = try gpa.create(Tier);
         errdefer gpa.destroy(t);
@@ -378,7 +384,7 @@ pub const Tier = struct {
         t.queue.deinit(t.gpa);
         t.gpa.free(t.wbuf);
         t.gpa.free(t.rbuf);
-        _ = std.c.close(t.dfd);
+        if (supported) _ = std.c.close(t.dfd);
         t.gpa.free(t.dir);
         t.gpa.free(t.top);
         t.gpa.destroy(t);
@@ -528,6 +534,7 @@ pub const Tier = struct {
     }
 
     fn unlink(t: *Tier, name: Name, bytes: u64) void {
+        if (!supported) return;
         var buf: [32]u8 = undefined;
         const before = t.free_space(t.dir);
         if (std.c.unlinkat(t.dfd, name.file(&buf), 0) == 0) {
@@ -558,6 +565,7 @@ pub const Tier = struct {
     /// recently used stored states go first until it fits the cap and leaves the free-disk floor; the hook hears of
     /// each. The caller holds a reference to the job until `release`.
     pub fn write(t: *Tier, name: Name, tokens: []const u32, meta: []const u8, payload_len: u64, source: Source) !*Job {
+        if (!supported) return error.SpillUnsupported;
         if (meta.len > meta_most) return error.MetaTooLong;
         const bytes = Header.payloadOffset(tokens.len) + payload_len;
         var gone: std.ArrayList(Name) = .empty;
@@ -662,6 +670,7 @@ pub const Tier = struct {
     }
 
     fn run(t: *Tier) void {
+        if (!supported) return;
         while (true) {
             t.mutex.lockUncancelable(t.io);
             while (t.queue.items.len == 0 and !t.closing) t.cond.waitUncancelable(t.io, &t.mutex);
@@ -763,7 +772,7 @@ pub const Tier = struct {
         } else null;
         if (wrote and i != null and !j.cancel.load(.acquire)) {
             var nb: [32]u8 = undefined;
-            if (std.c.renameat(t.dfd, partial.?, t.dfd, j.name.file(&nb)) == 0) {
+            if (supported and std.c.renameat(t.dfd, partial.?, t.dfd, j.name.file(&nb)) == 0) {
                 renamed = true;
                 t.entries.items[i.?].job = null;
                 t.stats.written += 1;
@@ -771,7 +780,9 @@ pub const Tier = struct {
             }
         }
         if (!renamed) {
-            if (partial) |p| _ = std.c.unlinkat(t.dfd, p, 0);
+            if (supported) {
+                if (partial) |p| _ = std.c.unlinkat(t.dfd, p, 0);
+            }
             if (i) |k| t.freeEntry(t.entries.orderedRemove(k));
             if (!j.cancel.load(.acquire)) t.stats.write_failed += 1;
         }
@@ -786,6 +797,7 @@ pub const Tier = struct {
     /// Reads stored state `name` back: its header and tokens checked now (the file goes when they fail), its payload
     /// by `Reading.pump`. A write of it still on its way is error.NotStored (never waited for; see `stored`).
     pub fn read(t: *Tier, name: Name) !Reading {
+        if (!supported) return error.SpillUnsupported;
         t.mutex.lockUncancelable(t.io);
         const i = t.find(name) orelse {
             t.mutex.unlock(t.io);
@@ -1030,7 +1042,9 @@ pub const Reading = struct {
     }
 
     pub fn close(r: *Reading) void {
-        if (r.fd >= 0) _ = std.c.close(r.fd);
+        if (supported) {
+            if (r.fd >= 0) _ = std.c.close(r.fd);
+        }
         r.fd = -1;
         r.tier.gpa.free(r.tokens);
         r.tokens = &.{};
@@ -1040,6 +1054,7 @@ pub const Reading = struct {
 // -- files ----------------------------------------------------------------------------------------------------------
 
 fn pwriteAll(fd: c_int, bytes: []const u8, at: u64) !void {
+    if (!supported) return error.SpillUnsupported;
     var done: usize = 0;
     while (done < bytes.len) {
         const n = std.c.pwrite(fd, bytes.ptr + done, bytes.len - done, @intCast(at + done));
@@ -1049,6 +1064,7 @@ fn pwriteAll(fd: c_int, bytes: []const u8, at: u64) !void {
 }
 
 fn preadAll(fd: c_int, dest: []u8, at: u64) bool {
+    if (!supported) return false;
     var done: usize = 0;
     while (done < dest.len) {
         const n = std.c.pread(fd, dest.ptr + done, dest.len - done, @intCast(at + done));
@@ -1059,6 +1075,7 @@ fn preadAll(fd: c_int, dest: []u8, at: u64) bool {
 }
 
 fn fileSize(fd: c_int) u64 {
+    if (!supported) return 0;
     const end = std.c.lseek(fd, 0, std.c.SEEK.END);
     return if (end > 0) @intCast(end) else 0;
 }
@@ -1079,6 +1096,7 @@ fn makePath(gpa: Allocator, dir: [:0]const u8) !void {
 /// Whether an existing `dir` passes the tier's own private-directory check (no link, this user's or root's, not group
 /// or world writable), without creating, opening a tier in, or pruning anything.
 pub fn checkRoot(dir: [:0]const u8) !void {
+    if (!supported) return error.SpillUnsupported;
     if (dir.len == 0 or dir[0] != '/') return error.SpillDirNotAbsolute;
     _ = std.c.close(try openPrivate(std.c.AT.FDCWD, dir));
 }
