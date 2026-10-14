@@ -78,6 +78,8 @@ pub const Forward = struct {
     /// Where a sending rank leaves the seam residual h: the buffer the seam norm wrote, for the caller to hand off.
     /// A receiving rank reads it as its starting x. 0: not a split.
     seam_h: u64 = 0,
+    /// A sending rank writes the buffer holding the seam residual here, so the caller knows what to hand off.
+    seam_out: ?*u64 = null,
 
     pub fn init(c: Config, w: *const weights.Weights, b: *const state.Buffers, ops: kern.Ops, max_len: usize, nch: usize, sampled: bool) Forward {
         return .{
@@ -165,9 +167,6 @@ pub const Forward = struct {
         const c = f.c;
         const b = f.b;
         const o = f.ops;
-        const t = f.glue;
-        const ms = f.mshape(state.max_rows);
-        const at = f.ashape();
         const D: u64 = c.hidden;
         var rows: usize = 0;
         for (segs) |s| rows += s.rows;
@@ -181,9 +180,36 @@ pub const Forward = struct {
         var mj: usize = start.mj;
         var aj: usize = start.aj;
         const last = @min(f.range.last, f.c.layers);
-        for (f.w.blocks[f.range.first..last], f.range.first..) |blk, li| {
-            // the first block of a receiving rank: the sender already ran its norm and handed over h, y and xs
-            if (!(f.norm_done and li == f.range.first)) try f.norm(&x, delta, blk.norm, rows, true);
+        try f.runBlocks(segs, rows, &x, &delta, &mj, &aj, f.range.first, last, f.norm_done);
+        if (!f.tail) {
+            // A sending rank runs the receiving rank's first block norm here, so the handoff carries the residual
+            // h alone and the receiver starts with its norm already done. The seam norm is the receiver's first
+            // block's norm weight, which this rank loaded as w.seam_norm.
+            try f.norm(&x, delta, f.w.seam_norm, rows, true);
+            if (f.seam_out) |out| out.* = x; // the norm moved x to the buffer holding h
+            return;
+        }
+        try f.norm(&x, delta, f.w.norm_f, rows, true);
+        for (segs) |s| try o.copy(s.b.hidden, b.y + s.row0 * D * 2, s.rows * c.hidden * 2);
+        try o.dense(b.y, b.xs, f.w.head, b.logits, rows);
+        try f.mark(.head);
+        for (segs) |s| if (s.mask.bits != 0) try o.grammarMask(b.logits + s.row0 * @as(u64, c.vocab) * 2, c.vocab, s.mask.bits, s.mask.words, s.rows);
+        for (segs) |s| try f.sample(b.logits + s.row0 * @as(u64, c.vocab) * 2, s.rows, s.b.meta, s.b.sampled, s.sampled, s.b.rule);
+        try f.mark(.sample);
+        if (f.dump) |d| try d.tail(f.ops, b.logits, b.sampled, rows, c.vocab);
+    }
+
+    /// Blocks `from`..`to` over `rows`, carrying the residual `x`, its pending `delta` and the mixer counters.
+    /// `skip_first_norm`: the caller already ran that block's norm (a layer split's receiving rank).
+    fn runBlocks(f: *const Forward, segs: []const Seg, rows: usize, x: *u64, delta: *Delta, mj: *usize, aj: *usize, from: usize, to: usize, skip_first_norm: bool) !void {
+        const c = f.c;
+        const b = f.b;
+        const o = f.ops;
+        const t = f.glue;
+        const ms = f.mshape(state.max_rows);
+        const at = f.ashape();
+        for (f.w.blocks[from..to], from..) |blk, li| {
+            if (!(skip_first_norm and li == from)) try f.norm(x, delta.*, blk.norm, rows, true);
             switch (blk.kind) {
                 .mamba => {
                     const m = blk.mamba;
@@ -198,11 +224,11 @@ pub const Forward = struct {
                             const sb = s.b;
                             out.* = .{
                                 .proj = b.proj + s.row0 * c.projDim() * 2,
-                                .base = sb.conv_base + @as(u64, mj) * 3 * c.convDim() * 2,
-                                .raw = sb.raw + mj * 2 * W * c.convDim() * 2,
-                                .xc = sb.xc + mj * 2 * W * c.convDim() * 2,
-                                .dt = sb.dt + mj * 2 * W * c.mamba_heads * 4,
-                                .state = sb.ssm + @as(u64, mj) * c.mamba_heads * c.mamba_head_dim * c.state * 4,
+                                .base = sb.conv_base + @as(u64, mj.*) * 3 * c.convDim() * 2,
+                                .raw = sb.raw + mj.* * 2 * W * c.convDim() * 2,
+                                .xc = sb.xc + mj.* * 2 * W * c.convDim() * 2,
+                                .dt = sb.dt + mj.* * 2 * W * c.mamba_heads * 4,
+                                .state = sb.ssm + @as(u64, mj.*) * c.mamba_heads * c.mamba_head_dim * c.state * 4,
                                 .meta = sb.meta,
                                 .y = b.sy + s.row0 * c.inner() * 2,
                                 .rows = s.rows,
@@ -217,8 +243,8 @@ pub const Forward = struct {
                     if (m.out_rest != 0) try o.restRows(b.g, c.inner(), m.out_rest, b.delta, c.hidden, false, rows, 1, 0, c.hidden, c.inner());
                     if (m.adapter) |ad| try adapt(o, ad, b.g, c.inner(), b.delta, c.hidden, false, rows, &f.route);
                     try f.mark(.mamba_out);
-                    delta = .dense;
-                    mj += 1;
+                    delta.* = .dense;
+                    mj.* += 1;
                 },
                 .attention => {
                     const a = blk.attn;
@@ -229,7 +255,7 @@ pub const Forward = struct {
                     while (k0 < segs.len) : (k0 += glue.max_segs) {
                         const part = segs[k0..@min(segs.len, k0 + glue.max_segs)];
                         var at_segs: [glue.max_segs]glue.AttnSeg = undefined;
-                        for (part, at_segs[0..part.len]) |s, *out| out.* = .{ .kc = f.cache(s.b.k_cache, aj), .vc = f.cache(s.b.v_cache, aj), .meta = s.b.meta, .row0 = s.row0, .rows = s.rows };
+                        for (part, at_segs[0..part.len]) |s, *out| out.* = .{ .kc = f.cache(s.b.k_cache, aj.*), .vc = f.cache(s.b.v_cache, aj.*), .meta = s.b.meta, .row0 = s.row0, .rows = s.rows };
                         try t.attentionSegs(at_segs[0..part.len], b.qkv, b.po, b.pm, b.pl, b.att, b.axs, at);
                     }
                     try f.mark(.attention);
@@ -237,33 +263,18 @@ pub const Forward = struct {
                     if (a.o_rest != 0) try o.restRows(b.att, qd, a.o_rest, b.delta, c.hidden, false, rows, 1, 0, c.hidden, qd);
                     if (a.adapter) |ad| try adapt(o, ad, b.att, qd, b.delta, c.hidden, false, rows, &f.route);
                     try f.mark(.attn_o);
-                    delta = .dense;
-                    aj += 1;
+                    delta.* = .dense;
+                    aj.* += 1;
                 },
                 .moe => if (blk.moe.latent != null) {
                     try latent.run(f, blk.moe, rows);
                     delta = .dense;
                 } else {
                     try f.experts(blk.moe, rows, false);
-                    delta = .moe;
+                    delta.* = .moe;
                 },
             }
         }
-        if (!f.tail) {
-            // A sending rank runs the receiving rank's first block norm here, so the handoff carries the residual
-            // h alone and the receiver starts with its norm already done. The seam norm is the receiver's first
-            // block's norm weight, which this rank loaded as w.seam_norm.
-            try f.norm(&x, delta, f.w.seam_norm, rows, true);
-            return;
-        }
-        try f.norm(&x, delta, f.w.norm_f, rows, true);
-        for (segs) |s| try o.copy(s.b.hidden, b.y + s.row0 * D * 2, s.rows * c.hidden * 2);
-        try o.dense(b.y, b.xs, f.w.head, b.logits, rows);
-        try f.mark(.head);
-        for (segs) |s| if (s.mask.bits != 0) try o.grammarMask(b.logits + s.row0 * @as(u64, c.vocab) * 2, c.vocab, s.mask.bits, s.mask.words, s.rows);
-        for (segs) |s| try f.sample(b.logits + s.row0 * @as(u64, c.vocab) * 2, s.rows, s.b.meta, s.b.sampled, s.sampled, s.b.rule);
-        try f.mark(.sample);
-        if (f.dump) |d| try d.tail(f.ops, b.logits, b.sampled, rows, c.vocab);
     }
 
     /// Token rows of the embedding table as the checkpoint stores it: MLX 4-bit words, or bf16.
