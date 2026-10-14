@@ -284,6 +284,9 @@ pub const Buffers = struct {
         for (scratch) |n| total += n + 256;
         var a: Arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, total) };
         errdefer a.buf.free();
+        // Zeroed: the Mamba convolution and recurrent planes are read before they are first written, so a fresh
+        // allocation's contents would otherwise change the first forward's output.
+        try a.buf.fill8(0, null);
         var b: Buffers = undefined;
         b.carved = carved;
         b.state_bytes = own[0..7].*;

@@ -56,9 +56,13 @@ pub const Pair = struct {
 
     /// Copies `bytes` from `src` (a device pointer on rank `from`) to `dst` (a device pointer on rank `to`), staged
     /// through pinned host memory. `src` is downloaded under the source context, then uploaded under the target's.
+    ///
+    /// The source context is synchronized first: a kernel queued on the source's stream can still be writing `src`
+    /// when the download runs, and the download would then move stale bytes.
     pub fn handoff(p: *Pair, from: usize, to: usize, src: u64, dst: u64, bytes: usize) !void {
         if (bytes > p.stage_len) return error.StageTooSmall;
         try p.ctx[from].makeCurrent();
+        try p.ctx[from].synchronize();
         try p.d.check(p.d.api.cuMemcpyDtoH_v2(p.stage[from].bytes.ptr, src, bytes), "cuMemcpyDtoH");
         try p.ctx[to].makeCurrent();
         try p.d.check(p.d.api.cuMemcpyHtoD_v2(dst, p.stage[from].bytes.ptr, bytes), "cuMemcpyHtoD");
@@ -132,8 +136,8 @@ pub fn pair(gpu: check.Gpu) !void {
     try check.sameBytes("pair 0 -> 1", got, want);
     check.pass("pair 0 -> 1: {d} bytes staged through host memory, 0 wrong", .{n});
 
-    // And back, so a reply can cross too.
-    try p.ctx[1].makeCurrent();
+    // And back, so a reply can cross too. The destination belongs to rank 0, the receiving side.
+    try p.ctx[0].makeCurrent();
     const c = try cuda.DeviceBuffer.alloc(gpu.d, n);
     defer {
         var x = c;

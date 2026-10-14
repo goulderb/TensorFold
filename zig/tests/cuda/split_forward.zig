@@ -50,19 +50,25 @@ pub fn run(gpu: check.Gpu, model: []const u8) !void {
     for (seams, 0..) |mid, i| {
         results[i] = try split(gpu, model, cfg, prompt, mid, pick);
         made += 1;
-        check.pass("split-forward seam {d}: {d} logits bytes, {d} distinct tokens in the top row", .{ mid, results[i].len, distinct(results[i]) });
+        // A degenerate output (all zero, all one value, a NaN) would satisfy byte equality between seams, so it is
+        // refused before the comparison: the forward must have produced real logits.
+        const d = distinct(results[i]);
+        try check.expect(d >= 32, "split-forward seam {d}: only {d} distinct values in the top row: the forward did not run", .{ mid, d });
+        try check.expect(finite(results[i]), "split-forward seam {d}: the logits hold a non-finite value", .{mid});
+        check.pass("split-forward seam {d}: {d} logits bytes, {d} distinct values in the top row", .{ mid, results[i].len, d });
         if (i > 0) try check.sameBytes("split-forward logits at seam", results[i], results[0]);
     }
     check.pass("split-forward: the logits are identical at seams {d}, {d}, {d} and {d}", .{ seams[0], seams[1], seams[2], seams[3] });
 }
 
-/// How many distinct bf16 values the first row of logits holds: a degenerate output (all zero, all one value) is a
+/// How many distinct bf16 values the logits hold, up to `cap`: a degenerate output (all zero, all one value) is a
 /// forward that did not run, not a match.
 fn distinct(bytes: []const u8) usize {
-    var seen: [64]u16 = undefined;
+    const cap = 64;
+    var seen: [cap]u16 = undefined;
     var n: usize = 0;
     var i: usize = 0;
-    while (i + 2 <= bytes.len and n < seen.len) : (i += 2) {
+    while (i + 2 <= bytes.len and n < cap) : (i += 2) {
         const v = std.mem.readInt(u16, bytes[i..][0..2], .little);
         var dup = false;
         for (seen[0..n]) |s| if (s == v) {
@@ -74,6 +80,16 @@ fn distinct(bytes: []const u8) usize {
         }
     }
     return n;
+}
+
+/// Whether every bf16 value is finite: an exponent of all ones is an infinity or a NaN.
+fn finite(bytes: []const u8) bool {
+    var i: usize = 0;
+    while (i + 2 <= bytes.len) : (i += 2) {
+        const v = std.mem.readInt(u16, bytes[i..][0..2], .little);
+        if ((v >> 7) & 0xff == 0xff) return false;
+    }
+    return true;
 }
 
 /// The two ranks, each on its own device, driven through the chunk phases with the seam handed across.
@@ -126,6 +142,9 @@ fn split(gpu: check.Gpu, model: []const u8, cfg: nemotron.Config, prompt: []cons
     const r0 = engines[0];
     var w0: fwd.Walk = .{ .rows = rows, .pos = 0 };
     try r0.ctx.makeCurrent();
+    // Zeroed state on both ranks before the chunk: the Mamba planes are read before they are first written, so a
+    // reused allocation would otherwise change the output independently of the seam.
+    try r0.reset();
     // The chunk reads its ids from p_ids, which the engine's own prefill uploads; the direct phase calls must too.
     try gpu.d.check(gpu.d.api.cuMemcpyHtoD_v2(r0.b.p_ids, prompt.ptr, rows * 4), "cuMemcpyHtoD");
     try r0.forward(null).chunkBegin(&w0);
@@ -145,6 +164,7 @@ fn split(gpu: check.Gpu, model: []const u8, cfg: nemotron.Config, prompt: []cons
     // Rank 1: the seam in, then its blocks and the tail.
     const r1 = engines[1];
     try r1.ctx.makeCurrent();
+    try r1.reset();
     try gpu.d.check(gpu.d.api.cuMemcpyHtoD_v2(r1.b.h[0], stage.bytes.ptr, h_bytes), "cuMemcpyHtoD");
     try gpu.d.check(gpu.d.api.cuMemcpyHtoD_v2(r1.b.y, stage.bytes.ptr + h_bytes, h_bytes), "cuMemcpyHtoD");
     try gpu.d.check(gpu.d.api.cuMemcpyHtoD_v2(r1.b.xs, stage.bytes.ptr + 2 * h_bytes, xs_bytes), "cuMemcpyHtoD");
