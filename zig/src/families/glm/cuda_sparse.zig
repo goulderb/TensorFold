@@ -20,13 +20,14 @@ fn cdiv(a: usize, b: usize) usize {
 }
 
 /// sparse.index_update: the window's LayerNormed index keys and gates into ik and ig at pos, completed pools into pk.
-pub fn indexUpdate(set: glue.Set, stream: cuda.Stream, k_raw: u64, k_stride: usize, gate: u64, ln_w: u64, ln_b: u64, ape: u64, ik: u64, ig: u64, pk: cache_rows.Cache, pos: u64, rows: usize) !void {
+pub fn indexUpdate(set: glue.Set, stream: cuda.Stream, k_raw: u64, k_stride: usize, gate: u64, ln_w: u64, ln_b: u64, ape: u64, index: cache_rows.Index, pk: cache_rows.Cache, pos: u64, rows: usize) !void {
+    if (index.rows == 0 or rows > index.rows or index.rows - rows < 3) return error.IndexRingTooSmall;
     var a: cuda.Args = .{};
-    inline for (.{ k_raw, @as(i64, @intCast(k_stride)), gate, ln_w, ln_b, ik, ig, pos, @as(f32, 1e-6) }) |v| a.add(v);
-    try cuda.launch.launch(set.glue.index_write, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &a);
+    inline for (.{ k_raw, @as(i64, @intCast(k_stride)), gate, ln_w, ln_b, index.keys, index.gates, pos, @as(f32, 1e-6), @as(i64, @intCast(index.rows)) }) |v| a.add(v);
+    try cuda.launch.launch(set.glue.index_write_ring, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &a);
     var b: cuda.Args = .{};
-    inline for (.{ ik, ig, ape, pk.ptr, pos, @as(i64, @intCast(rows)) }) |v| b.add(v);
-    const f = if (pk.format == .fp8) set.glue.pool_keys_fp8 else set.glue.pool_keys;
+    inline for (.{ index.keys, index.gates, ape, pk.ptr, pos, @as(i64, @intCast(rows)), @as(i64, @intCast(index.rows)) }) |v| b.add(v);
+    const f = if (pk.format == .fp8) set.glue.pool_keys_fp8_ring else set.glue.pool_keys_ring;
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows / 4 + 2) }, .block = .{ .x = 32 } }, stream, &b);
 }
 

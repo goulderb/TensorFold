@@ -45,7 +45,7 @@ const Seq = struct {
     rows_at: u64 = 0, // its last verify's final-norm rows (bf16 [rows][hidden]), which the next draft reads
 };
 
-/// One rank's copy of a kept prompt state: the state arena's bytes and the host fields beside them.
+/// One rank's copy of a kept prompt state: visible cache prefixes, raw index tails and fixed recurrent state.
 const Snap = struct { buf: cuda.DeviceBuffer, pos: usize, mtp_len: usize, cur: []u1 };
 
 /// Where a prompt pass resumes: a kept state (every rank holds `id`) at `at`, a multiple of the chunk rows.
@@ -236,6 +236,8 @@ pub const Engine = struct {
         if (len == 0 or len + fw.window_rows >= e.cur.st.capacity) return error.PromptTooLong;
         const r = from orelse return 0;
         if (r.at == 0 or r.at >= len or r.at % fw.prefill_rows != 0) return error.BadResume;
+        const kept = e.snaps.get(r.id) orelse return error.NoKeptState;
+        if (kept.pos != r.at) return error.BadResume;
         try e.restoreState(r.id);
         return r.at;
     }
@@ -285,9 +287,10 @@ pub const Engine = struct {
         if (try e.shared(if (cancel) |c| @floatFromInt(@intFromBool(c.check(c.ptr))) else 0) > 0) return error.Cancelled;
     }
 
-    /// Bytes one kept state takes on this rank: the whole state arena (its caches are sized for the window, not `at`).
-    pub fn stateBytes(e: *const Engine) u64 {
-        return e.cur.st.arena.buf.len;
+    /// Device bytes retained at a prompt mark; MTP has absorbed the same prefix at these marks.
+    pub fn snapshotBytes(e: *const Engine, at: usize) u64 {
+        const plan = e.cur.st.layout.snapshot(.{ .main = at, .mtp = if (e.mtp) at else 0 }) catch return std.math.maxInt(u64);
+        return plan.byteCount();
     }
 
     /// Rank 0, at a mark in a prompt pass: a copy of the state under a new id, named to the other ranks at the gate.
@@ -301,9 +304,13 @@ pub const Engine = struct {
 
     fn keepAs(e: *Engine, id: u64) !void {
         if (e.snaps.contains(id)) return error.StateKept;
-        var buf = try cuda.DeviceBuffer.alloc(e.d, e.cur.st.arena.buf.len);
+        const st = &e.cur.st;
+        if (st.pending != 0 or e.cur.in_head != 0 or st.mtp_len != (if (e.mtp) st.pos else 0)) return error.NotAtMark;
+        const plan = try st.layout.snapshot(.{ .main = st.pos, .mtp = st.mtp_len });
+        var buf = try cuda.DeviceBuffer.alloc(e.d, plan.byteCount());
         errdefer buf.free();
-        try e.copy(buf.ptr, e.cur.st.arena.buf.ptr, buf.len);
+        var it = plan.ranges();
+        while (it.next()) |r| try e.copy(buf.ptr + r.saved, st.arena.buf.ptr + r.live, r.bytes);
         try e.stream.synchronize();
         const cur = try e.gpa.dupe(u1, e.cur.st.cur);
         errdefer e.gpa.free(cur);
@@ -313,7 +320,10 @@ pub const Engine = struct {
     /// The live state made kept state `id`'s; a rank without it refuses rather than prefill from another position.
     fn restoreState(e: *Engine, id: u64) !void {
         const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
-        try e.copy(e.cur.st.arena.buf.ptr, s.buf.ptr, s.buf.len);
+        const plan = try e.cur.st.layout.snapshot(.{ .main = s.pos, .mtp = s.mtp_len });
+        if (plan.byteCount() != s.buf.len) return error.BadKeptState;
+        var it = plan.ranges();
+        while (it.next()) |r| try e.copy(e.cur.st.arena.buf.ptr + r.live, s.buf.ptr + r.saved, r.bytes);
         try e.cur.st.restoreHost(e.stream, s.pos, s.mtp_len, s.cur);
         e.cur.in_head = 0;
         try e.stream.synchronize();
@@ -486,3 +496,142 @@ pub const Engine = struct {
         try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, e.stream.handle), "cuMemcpyDtoDAsync");
     }
 };
+
+test "prompt snapshot estimates follow the requested mark and MTP setting" {
+    var seq: Seq = undefined;
+    seq.st.layout = try @import("cuda_layout.zig").Layout.init(.{ 4, 512, 512, 0, 0, 0, 0, 0 }, 8192, fw.prefill_rows, 2, .fp8, 512, 128);
+    seq.st.pos = 0;
+    seq.st.mtp_len = 0;
+    var e: Engine = undefined;
+    e.cur = &seq;
+    e.mtp = true;
+    const at = 2048;
+    const plan = try seq.st.layout.snapshot(.{ .main = at, .mtp = at });
+    try std.testing.expectEqual(plan.byteCount(), e.snapshotBytes(at));
+    try std.testing.expect(e.snapshotBytes(4096) > e.snapshotBytes(at));
+    try std.testing.expect(e.snapshotBytes(at) < seq.st.layout.total_bytes);
+    e.mtp = false;
+    const no_mtp = try seq.st.layout.snapshot(.{ .main = at, .mtp = 0 });
+    try std.testing.expectEqual(no_mtp.byteCount(), e.snapshotBytes(at));
+    try std.testing.expectEqual(std.math.maxInt(u64), e.snapshotBytes(8193));
+}
+
+test "snapshot capture refuses uncommitted windows and mismatched MTP marks before allocation" {
+    var seq: Seq = undefined;
+    seq.st.pos = 2048;
+    seq.st.pending = 1;
+    seq.st.mtp_len = 2048;
+    seq.in_head = 0;
+    var e: Engine = undefined;
+    e.snaps = .empty;
+    e.cur = &seq;
+    e.mtp = true;
+    try std.testing.expectError(error.NotAtMark, e.keepAs(1));
+    seq.st.pending = 0;
+    seq.in_head = 1;
+    try std.testing.expectError(error.NotAtMark, e.keepAs(1));
+    seq.in_head = 0;
+    seq.st.mtp_len = 2047;
+    try std.testing.expectError(error.NotAtMark, e.keepAs(1));
+    e.mtp = false;
+    try std.testing.expectError(error.NotAtMark, e.keepAs(1));
+}
+
+test "prompt resume refuses a saved position that differs from its requested mark" {
+    var seq: Seq = undefined;
+    seq.st.capacity = 8192;
+    var e: Engine = undefined;
+    e.cur = &seq;
+    e.snaps = .empty;
+    defer e.snaps.deinit(std.testing.allocator);
+    var snap: Snap = undefined;
+    snap.pos = 4096;
+    try e.snaps.put(std.testing.allocator, 1, snap);
+    try std.testing.expectError(error.BadResume, e.prefillStart(6144, .{ .id = 1, .at = 2048 }));
+    try std.testing.expectError(error.NoKeptState, e.prefillStart(6144, .{ .id = 2, .at = 2048 }));
+}
+
+test "engine snapshot save and restore preserve visible state through reused storage without a GPU" {
+    const Mock = struct {
+        var bytes: ?[]align(256) u8 = null;
+        fn alloc(ptr: *u64, n: usize) callconv(.c) cuda.abi.Result {
+            std.debug.assert(bytes == null);
+            bytes = std.testing.allocator.alignedAlloc(u8, .fromByteUnits(256), n) catch return 2;
+            ptr.* = @intFromPtr(bytes.?.ptr);
+            return 0;
+        }
+        fn free(ptr: u64) callconv(.c) cuda.abi.Result {
+            std.debug.assert(ptr == @intFromPtr(bytes.?.ptr));
+            std.testing.allocator.free(bytes.?);
+            bytes = null;
+            return 0;
+        }
+        fn copy(dst: u64, src: u64, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            const to: [*]u8 = @ptrFromInt(dst);
+            const from: [*]const u8 = @ptrFromInt(src);
+            @memcpy(to[0..n], from[0..n]);
+            return 0;
+        }
+        fn fill(dst: u64, value: c_uint, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            const to: [*]u32 = @ptrFromInt(dst);
+            @memset(to[0..n], value);
+            return 0;
+        }
+        fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+    };
+    var d: cuda.Driver = .{ .lib = undefined, .api = undefined };
+    d.api.cuMemAlloc_v2 = Mock.alloc;
+    d.api.cuMemFree_v2 = Mock.free;
+    d.api.cuMemcpyDtoDAsync_v2 = Mock.copy;
+    d.api.cuMemsetD32Async = Mock.fill;
+    d.api.cuStreamSynchronize = Mock.sync;
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    for ([_]@import("cuda_cache.zig").Format{ .bf16, .fp8 }) |format| for ([_]bool{ false, true }) |mtp| {
+        const layout = try @import("cuda_layout.zig").Layout.init(.{ 4, 256, 256, 256, 256, 256, 256, 256 }, 4096, fw.prefill_rows, 2, format, 512, 128);
+        const live = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(256), layout.total_bytes);
+        defer std.testing.allocator.free(live);
+        for (live, 0..) |*v, i| v.* = @truncate(i *% 37);
+        var parity = [_]u1{ 1, 0 };
+        var seq: Seq = undefined;
+        seq.in_head = 0;
+        seq.st.arena = .{ .buf = .{ .d = &d, .ptr = @intFromPtr(live.ptr), .len = live.len, .borrowed = true } };
+        seq.st.layout = layout;
+        seq.st.cur = &parity;
+        seq.st.pos_dev = seq.st.arena.buf.ptr + layout.fixed[0];
+        seq.st.mtp_pos_dev = seq.st.arena.buf.ptr + layout.mtp_pos;
+        seq.st.pending = 0;
+        try seq.st.setPos(stream, 2115);
+        try seq.st.setMtpLen(stream, if (mtp) 2115 else 0);
+        var e: Engine = undefined;
+        e.d = &d;
+        e.gpa = std.testing.allocator;
+        e.stream = stream;
+        e.cur = &seq;
+        e.mtp = mtp;
+        e.snaps = .empty;
+        defer e.snaps.deinit(e.gpa);
+        try e.keepAs(1);
+        defer e.freeSnap(e.snaps.getPtr(1).?);
+        const saved = e.snaps.get(1).?;
+        try std.testing.expectEqual(e.snapshotBytes(2115), saved.buf.len);
+        try std.testing.expect(saved.buf.len < live.len);
+        @memset(live, 0xa5);
+        parity = .{ 0, 1 };
+        seq.st.pending = 7;
+        seq.in_head = 2;
+        try e.restoreState(1);
+        try std.testing.expectEqual(@as(usize, 2115), seq.st.pos);
+        try std.testing.expectEqual(@as(usize, if (mtp) 2115 else 0), seq.st.mtp_len);
+        try std.testing.expectEqualSlices(u1, &.{ 1, 0 }, &parity);
+        try std.testing.expectEqual(@as(usize, 0), seq.st.pending);
+        try std.testing.expectEqual(@as(usize, 0), seq.in_head);
+        const plan = try layout.snapshot(.{ .main = seq.st.pos, .mtp = seq.st.mtp_len });
+        const kept: [*]const u8 = @ptrFromInt(saved.buf.ptr);
+        var it = plan.ranges();
+        while (it.next()) |range| try std.testing.expectEqualSlices(u8, kept[range.saved..][0..range.bytes], live[range.live..][0..range.bytes]);
+        try std.testing.expectEqual(@as(u32, if (mtp) 2115 else 0), std.mem.bytesToValue(u32, live[layout.mtp_pos..][0..4]));
+        try std.testing.expectEqual(@as(u8, 0xa5), live[layout.cacheOffsets(0)[0] + 2115 * layout.latent_stride]);
+    };
+}

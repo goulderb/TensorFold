@@ -143,11 +143,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
 
 // Each rank keeps a copy under rank 0's id, in the room rank 0 admitted by (the smallest over the ranks).
 
-/// Bytes a state takes at any position: the whole state arena on each rank.
+/// Device bytes retained for the visible prefix at this prompt mark.
 pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
-    _ = at;
     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
-    return e.stateBytes();
+    return e.snapshotBytes(at);
 }
 
 /// The prompt pass stands at `at` (a mark at a chunk start): copy the state there under a new id.

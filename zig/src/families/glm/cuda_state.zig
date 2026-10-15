@@ -3,6 +3,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const weights = @import("cuda_weights.zig");
+const layout_mod = @import("cuda_layout.zig");
 const cache_rows = @import("cuda_cache.zig");
 const kda = @import("cuda_kda.zig");
 const b16 = @import("cuda_b16.zig");
@@ -229,6 +230,7 @@ pub const Buffers = struct {
 /// A sequence's committed caches on a rank (the Python family's State): KDA conv and states, saved rows, DSA caches.
 pub const State = struct {
     arena: Arena,
+    layout: layout_mod.Layout,
     gpa: std.mem.Allocator,
     capacity: usize,
     pos: usize = 0,
@@ -266,22 +268,26 @@ pub const State = struct {
         const n = s.kda.len() * c.kda_dim;
         const kw = 3 * n + 2 * c.kda_dim + s.kda.len();
         const pk_rows = capacity / sparse.pool + 2;
-        var sizes: std.ArrayList(usize) = .empty;
-        defer sizes.deinit(gpa);
-        try sizes.appendSlice(gpa, &.{ 4, nk * 3 * 3 * n * 2, 2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * window_rows * kw * 2 });
-        try sizes.appendSlice(gpa, &.{ nk * window_rows * n * 4, nk * window_rows * n * 2, nk * window_rows * n * 4, nk * window_rows * s.kda.len() * 4 });
-        for (0..nd + 1) |_| try sizes.appendSlice(gpa, &.{ capacity * format.rowBytes(c.kv_lora), capacity * c.i_dim * 2, capacity * c.i_dim * 2, pk_rows * format.rowBytes(c.i_dim) });
-        try sizes.append(gpa, 4); // the MTP head's position
-        const p = try gpa.alloc(u64, sizes.items.len);
-        defer gpa.free(p);
-        var a = try arena(d, sizes.items, p);
+        const layout = try layout_mod.Layout.init(.{
+            4,                        nk * 3 * 3 * n * 2,       2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * window_rows * kw * 2,
+            nk * window_rows * n * 4, nk * window_rows * n * 2, nk * window_rows * n * 4,                   nk * window_rows * s.kda.len() * 4,
+        }, capacity, @max(prefill_rows, window_rows), nd, format, c.kv_lora, c.i_dim);
+        var a: Arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, layout.total_bytes), .used = layout.total_bytes };
         errdefer a.buf.free();
+        try a.buf.fill8(0, null);
+        var p: [8]u64 = undefined;
+        for (layout.fixed, &p) |offset, *ptr| ptr.* = a.buf.ptr + offset;
         const cur = try gpa.alloc(u1, nk);
         errdefer gpa.free(cur);
         @memset(cur, 0);
         const caches = try gpa.alloc(dsa_block.Caches, nd);
-        for (caches, 0..) |*x, j| x.* = .{ .lc = .{ .ptr = p[8 + 4 * j], .format = format }, .ik = p[9 + 4 * j], .ig = p[10 + 4 * j], .pk = .{ .ptr = p[11 + 4 * j], .format = format }, .pk_rows = pk_rows };
-        return .{ .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = .{ .ptr = p[8 + 4 * nd], .format = format }, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = .{ .ptr = p[11 + 4 * nd], .format = format }, .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw };
+        for (caches, 0..) |*x, j| x.* = bindCaches(layout, a.buf.ptr, j, format, pk_rows);
+        return .{ .arena = a, .layout = layout, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = bindCaches(layout, a.buf.ptr, nd, format, pk_rows), .mtp_pos_dev = a.buf.ptr + layout.mtp_pos, .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw };
+    }
+
+    fn bindCaches(layout: layout_mod.Layout, base: u64, layer: usize, format: cache_rows.Format, pk_rows: usize) dsa_block.Caches {
+        const p = layout.cacheOffsets(layer);
+        return .{ .lc = .{ .ptr = base + p[0], .format = format }, .index = .{ .keys = base + p[1], .gates = base + p[2], .rows = layout.ring_rows }, .pk = .{ .ptr = base + p[3], .format = format }, .pk_rows = pk_rows };
     }
 
     pub fn deinit(st: *State) void {

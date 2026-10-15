@@ -7,11 +7,11 @@
 using namespace glm_triton;
 
 // sparse._index_write, a warp a row (D 128): LayerNorm of k_raw (div.full, sqrt.approx) into ik, gate row into ig.
-extern "C" __global__ void __launch_bounds__(32)
-    tf_glm_index_write(const __nv_bfloat16* kr, int64_t k_stride, const float* gr, const __nv_bfloat16* lnw,
-                       const __nv_bfloat16* lnb, __nv_bfloat16* ik, __nv_bfloat16* ig, const int* pos, float eps) {
+__device__ void glm_index_write(const __nv_bfloat16* kr, int64_t k_stride, const float* gr, const __nv_bfloat16* lnw,
+                       const __nv_bfloat16* lnb, __nv_bfloat16* ik, __nv_bfloat16* ig, const int* pos, float eps, int64_t ring) {
   constexpr int D = 128;
-  const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
+  const int64_t r = blockIdx.x, absolute = (int64_t)pos[0] + r;
+  const int64_t at = ring ? absolute % ring : absolute;
   const int d0 = threadIdx.x * 4;
   float x[4];
   for (int j = 0; j < 4; ++j) x[j] = bf(kr[r * k_stride + d0 + j]);
@@ -35,10 +35,23 @@ extern "C" __global__ void __launch_bounds__(32)
   }
 }
 
+extern "C" __global__ void __launch_bounds__(32)
+    tf_glm_index_write(const __nv_bfloat16* kr, int64_t k_stride, const float* gr, const __nv_bfloat16* lnw,
+                       const __nv_bfloat16* lnb, __nv_bfloat16* ik, __nv_bfloat16* ig, const int* pos, float eps) {
+  glm_index_write(kr, k_stride, gr, lnw, lnb, ik, ig, pos, eps, 0);
+}
+
+extern "C" __global__ void __launch_bounds__(32)
+    tf_glm_index_write_ring(const __nv_bfloat16* kr, int64_t k_stride, const float* gr, const __nv_bfloat16* lnw,
+                            const __nv_bfloat16* lnb, __nv_bfloat16* ik, __nv_bfloat16* ig, const int* pos,
+                            float eps, int64_t ring) {
+  glm_index_write(kr, k_stride, gr, lnw, lnb, ik, ig, pos, eps, ring);
+}
+
 // sparse._pool_keys, a warp a completed pool: softmax of its 4 gate rows (+ ape) times bf16 keys, summed in order.
 template <bool FP8>
 __device__ void glm_pool_keys(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape, void* pk,
-                     const int* pos, int64_t rows) {
+                     const int* pos, int64_t rows, int64_t ring) {
   constexpr int D = 128;
   const int64_t P = pos[0], p = P / 4 + blockIdx.x;
   if (4 * p + 3 > P + rows - 1) return;
@@ -46,13 +59,13 @@ __device__ void glm_pool_keys(const __nv_bfloat16* ik, const __nv_bfloat16* ig, 
   for (int j = 0; j < 4; ++j) {
     const int d = threadIdx.x * 4 + j;
     float l[4], e[4];
-    for (int q = 0; q < 4; ++q) l[q] = bf(ig[(4 * p + q) * D + d]) + bf(ape[q * D + d]);
+    for (int q = 0; q < 4; ++q) l[q] = bf(ig[(ring ? (4 * p + q) % ring : 4 * p + q) * D + d]) + bf(ape[q * D + d]);
     const float m = fmaxf(fmaxf(l[0], l[1]), fmaxf(l[2], l[3]));
     for (int q = 0; q < 4; ++q) e[q] = exp_approx(l[q] - m);
     const float s = ((e[0] + e[1]) + e[2]) + e[3];
     float t = 0.0f;
     for (int q = 0; q < 4; ++q) {
-      const float tq = rbf(__fmul_rn(rbf(div_full(e[q], s)), bf(ik[(4 * p + q) * D + d])));
+      const float tq = rbf(__fmul_rn(rbf(div_full(e[q], s)), bf(ik[(ring ? (4 * p + q) % ring : 4 * p + q) * D + d])));
       t = q == 0 ? tq : t + tq;
     }
     pooled[j] = t;
@@ -63,13 +76,25 @@ __device__ void glm_pool_keys(const __nv_bfloat16* ik, const __nv_bfloat16* ig, 
 extern "C" __global__ void __launch_bounds__(32)
     tf_glm_pool_keys(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape,
                      __nv_bfloat16* pk, const int* pos, int64_t rows) {
-  glm_pool_keys<false>(ik, ig, ape, pk, pos, rows);
+  glm_pool_keys<false>(ik, ig, ape, pk, pos, rows, 0);
 }
 
 extern "C" __global__ void __launch_bounds__(32)
     tf_glm_pool_keys_fp8(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape,
                          void* pk, const int* pos, int64_t rows) {
-  glm_pool_keys<true>(ik, ig, ape, pk, pos, rows);
+  glm_pool_keys<true>(ik, ig, ape, pk, pos, rows, 0);
+}
+
+extern "C" __global__ void __launch_bounds__(32)
+    tf_glm_pool_keys_ring(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape,
+                          __nv_bfloat16* pk, const int* pos, int64_t rows, int64_t ring) {
+  glm_pool_keys<false>(ik, ig, ape, pk, pos, rows, ring);
+}
+
+extern "C" __global__ void __launch_bounds__(32)
+    tf_glm_pool_keys_fp8_ring(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape,
+                              void* pk, const int* pos, int64_t rows, int64_t ring) {
+  glm_pool_keys<true>(ik, ig, ape, pk, pos, rows, ring);
 }
 
 namespace glm_index {

@@ -13,6 +13,8 @@ pub const Format = enum(u32) {
     }
 };
 
+pub const Index = struct { keys: u64, gates: u64, rows: usize };
+
 pub const Cache = struct { ptr: u64, format: Format = .bf16 };
 
 test "production cache row strides include scales and alignment" {

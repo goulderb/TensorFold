@@ -200,6 +200,7 @@ pub fn run(gpu: Gpu) !void {
         try @import("glm_ref_attn.zig").dense(&r, set, format);
         try @import("glm_ref_attn.zig").sparse(&r, set, format);
     }
+    for ([_]glm.cache.Format{ .bf16, .fp8 }) |format| try @import("glm_ref_ring.zig").run(&r, set, format);
     try @import("glm_ref_hc.zig").mixing(&r, set);
     try @import("glm_ref_kda.zig").chains(&r);
     var ops = try cuda.Module.load(gpu.d, cuda.kernels.glm_ops);

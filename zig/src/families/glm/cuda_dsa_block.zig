@@ -37,7 +37,7 @@ pub const Layer = struct {
 };
 
 /// Latent and pooled keys share a format; individual index keys and gates stay BF16.
-pub const Caches = struct { lc: cache.Cache, ik: u64, ig: u64, pk: cache.Cache, pk_rows: usize };
+pub const Caches = struct { lc: cache.Cache, index: cache.Index, pk: cache.Cache, pk_rows: usize };
 
 /// The block's scratch for up to `rows` rows.
 pub const Scratch = struct {
@@ -126,7 +126,7 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
     v.ol += r0 * l.heads * l.lw * 2;
     v.qi += r0 * ix.heads * ix.d * 2;
     try latent.latentWrite(set, stream, v.lat, l.lw, c.lc, pos, rows, l.lw);
-    try sparse.indexUpdate(set, stream, v.ikr, kw_rows, v.igr, ix.ln_w, ix.ln_b, ix.ape, c.ik, c.ig, c.pk, pos, rows);
+    try sparse.indexUpdate(set, stream, v.ikr, kw_rows, v.igr, ix.ln_w, ix.ln_b, ix.ape, c.index, c.pk, pos, rows);
     const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
     if (host_pos < l.dense_limit) try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale);
     if (sparseRows(l, host_pos, rows)) {
