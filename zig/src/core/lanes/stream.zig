@@ -85,6 +85,15 @@ pub const Reuse = struct {
     hook: ?MarkHook = null,
 };
 
+/// Encoded still pictures live with the request until its stream finishes.
+/// The backend may decode them only on rank 0; every rank receives feature rows.
+pub const Vision = struct {
+    encoded: []const []const u8,
+    positions: []const u32,
+    image_token: u32,
+    replica: u64,
+};
+
 /// Called between prompt chunks, the pass standing at `at` (the GPU done with the chunk that ends there).
 pub const MarkHook = struct {
     ptr: *anyopaque,
@@ -101,6 +110,7 @@ pub const Held = struct {
 pub const Spec = struct {
     id: []const u8,
     prompt: []const u32,
+    vision: ?Vision = null,
     max_new: u32,
     eos: []const u32 = &.{},
     sampling: ?Sampling = null,
@@ -130,6 +140,7 @@ pub const Spec = struct {
 pub const Stream = struct {
     id: []const u8,
     prompt_len: usize,
+    vision: ?Vision = null,
     max_new: u32,
     eos: []const u32,
     sampling: ?Sampling,
@@ -196,6 +207,7 @@ pub const Stream = struct {
         var s: Stream = .{
             .id = spec.id,
             .prompt_len = spec.prompt.len,
+            .vision = spec.vision,
             .max_new = spec.max_new,
             .eos = spec.eos,
             .sampling = spec.sampling,

@@ -133,7 +133,9 @@ pub const Engine = struct {
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
         e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .hold = undefined, .pairs = undefined, .smp = undefined, .mtp = o.mtp };
-        e.w = try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, o.mtp);
+        var wt = e.m.tools();
+        wt.precision = .{ .dense = o.settings.weight_dense, .head = o.settings.weight_head };
+        e.w = try weights.load(gpa, io, d, stream, wt, checkpoint, c, share, layers, o.mtp);
         errdefer e.w.deinit();
         try e.bind(0);
         errdefer {

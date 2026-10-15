@@ -54,6 +54,7 @@ pub const grammar = lanes.grammar;
 /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
 pub const Request = struct {
     prompt: []const u32,
+    vision: ?lanes.stream.Vision = null,
     max_tokens: u32,
     sampling: ?Sampling = null,
     /// Tokens that end the reply as ``stop`` (the token is delivered); empty when the request ignores EOS.
@@ -136,6 +137,12 @@ pub const Sink = struct {
 /// What the engine serves, fixed once it has loaded.
 pub const Info = struct {
     name: []const u8 = "lanes",
+    /// A native family's CPU image probe. It determines the exact number of
+    /// visual token rows before prompt rendering; its context lives with Engine.
+    vision: ?struct {
+        ctx: *anyopaque,
+        rows: *const fn (*anyopaque, []const u8, usize) anyerror!u32,
+    } = null,
     lanes: u32 = 1,
     /// Prompt plus reply tokens one request may use (0: no limit).
     context_window: u32 = 0,

@@ -6,6 +6,8 @@ const engine = @import("cuda_engine.zig");
 const sampler = @import("cuda_sampler.zig");
 const Engine = engine.Engine;
 
+test { _ = @import("cuda_spill_order_test.zig"); }
+
 pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve, spill_write, spill_read, spill_forget };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.

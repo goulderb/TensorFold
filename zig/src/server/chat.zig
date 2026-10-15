@@ -20,11 +20,17 @@ const Allocator = std.mem.Allocator;
 
 pub const Prompt = union(enum) { text: []const u8, ids: []const u32 };
 
+pub const VisionInput = struct {
+    encoded: []const []const u8,
+    rows: []const u32,
+};
+
 /// What a route hands the reply: Python's chat() arguments.
 pub const Input = struct {
     messages: Value = .{ .array = &.{} },
     tools: []const Value = &.{},
     prompt: ?Prompt = null,
+    vision: ?VisionInput = null,
     max_tokens: ?i64 = null,
     temperature: f64 = 0,
     /// The sampling fields: the request's own (``k in body``), its thinking switches and ``tool_call_required``.
@@ -144,6 +150,29 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
         .decide = if (input.prompt == null and !background) prompt_mod.decideOf(srv, rendered.ids) else null,
     };
+    if (input.vision) |v| {
+        const image_token = srv.text.tokenId("<|image|>") orelse return cx.refuse("this tokenizer has no GLM image token");
+        const count = std.mem.count(u32, rendered.ids, &.{image_token});
+        var expected: usize = 0;
+        for (v.rows) |rows| expected = std.math.add(usize, expected, rows) catch return cx.refuse("too many image rows");
+        if (count != expected) return cx.refuse("the rendered image token count differs from the decoded image rows");
+        const positions = try a.alloc(u32, count);
+        var at: usize = 0;
+        for (rendered.ids, 0..) |id, i| if (id == image_token) {
+            positions[at] = @intCast(i);
+            at += 1;
+        };
+        var digest = std.crypto.hash.sha2.Sha256.init(.{});
+        digest.update(std.mem.sliceAsBytes(rendered.ids));
+        for (v.encoded) |bytes| digest.update(bytes);
+        var hash: [32]u8 = undefined;
+        digest.final(&hash);
+        request.vision = .{ .encoded = v.encoded, .positions = positions, .image_token = image_token, .replica = std.mem.readInt(u64, hash[0..8], .little) };
+        request.untaught = true;
+        request.history_len = 0;
+        request.rewind_len = 0;
+        request.shared_prefixes = &.{};
+    }
     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
     if (thinking) {
         const budget_field = f.get("thinking_budget");
@@ -225,7 +254,7 @@ fn logEnded(id: []const u8, e: Failure, message: []const u8, prompt: usize, toke
 
 /// The reply to ``input``; ``sink`` hears the stream (null: not streamed). ``gone`` says the client left.
 pub fn run(srv: *Server, cx: *Cx, input: Input, sink: ?Sink, gone: anytype) Failure!Reply {
-    if (srv.config.compact_at == null) return generate(srv, cx, try prepare(srv, cx, input, gone), sink, gone);
+    if (srv.config.compact_at == null or input.vision != null) return generate(srv, cx, try prepare(srv, cx, input, gone), sink, gone);
     return @import("compact.zig").run(srv, cx, input, sink, gone);
 }
 

@@ -346,6 +346,7 @@ pub const LaneHost = struct {
         job.stream = lanes.Stream.init(h.gpa, .{
             .id = "request",
             .prompt = r.prompt,
+            .vision = r.vision,
             .max_new = r.max_tokens,
             .eos = r.eos,
             .sampling = r.sampling,

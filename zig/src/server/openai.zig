@@ -7,6 +7,7 @@ const chat = @import("chat.zig");
 const compact = @import("compact.zig");
 const grammar = @import("grammar.zig");
 const messages = @import("messages.zig");
+const glm_image_parts = @import("glm_image_parts.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_parse = @import("tool_parse.zig");
 const tool_stream = @import("tool_stream.zig");
@@ -127,7 +128,13 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
     var input: chat.Input = .{ .fields = undefined };
     if (is_chat) {
-        input.messages = try messages.normalize(cx, body.get("messages"), "system", srv.needs_user_after_tool);
+        var source = body.get("messages");
+        if (srv.info.vision) |probe| {
+            const prepared = try glm_image_parts.prepare(cx, source orelse .null, .{ .ctx = probe.ctx, .rows = probe.rows });
+            source = prepared.messages;
+            if (prepared.hasImages()) input.vision = .{ .encoded = prepared.encoded, .rows = prepared.rows };
+        }
+        input.messages = try messages.normalize(cx, source, "system", srv.needs_user_after_tool);
         input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
         input.messages = try messages.normalize(cx, m, "system", srv.needs_user_after_tool);
