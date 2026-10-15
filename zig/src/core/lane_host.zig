@@ -70,12 +70,14 @@ pub const LaneHost = struct {
         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
         kept0: u64 = 0, // the store's kept count when the job looked it up
+        kept_through: u32 = 0,
         seq: u64 = 0, // its admission's number
         waits_since: ?u64 = null, // the admissions count when it first waited at the head for pool room
 
         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
+            job.kept_through = at;
             job.reported(); // before a keep can evict the entry the pass restored
             if (job.host.cache) |store| _ = store.keepBorn(job.request.prompt, born(job.request), at, s, job.request.chunks, job.host.spans(job.request));
         }
@@ -466,6 +468,7 @@ pub const LaneHost = struct {
         job.proposer.deinit();
         job.started = false;
         job.fill_began = false;
+        job.kept_through = 0;
         job.entry = null; // looked up again at its next admission
         h.gpa.free(job.marks);
         job.marks = &.{};

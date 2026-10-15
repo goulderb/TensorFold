@@ -19,6 +19,9 @@ pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = fw.prefill_rows;
 /// Prompt kernels change arithmetic with a chunk's rows: states keep and resume only on chunk starts.
 pub const snap_grid: u32 = prompt_rows;
+pub fn snap_shared_wait() bool {
+    return if (std.c.getenv("TF_GLM_SHARED_PREFIX_WAIT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+}
 /// `explain` words this family's open refusals too (where to set the rank and the id).
 pub const explains_open = true;
 

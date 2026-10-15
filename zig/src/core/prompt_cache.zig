@@ -101,6 +101,7 @@ pub const Pages = struct {
 
 /// What a family's states depend on beyond their position.
 pub const Rules = struct {
+    shared_wait: bool = false,
     /// Tokens past the position a state read (Flash Next's MTP head keys row at-1 with token at: 1).
     lookahead: u32 = 0,
     /// Prompt kernels that change arithmetic with a chunk's rows: resume and keep only at the request's chunk starts.

@@ -57,6 +57,44 @@ const Pool = struct {
 const short_prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
 const long_prompt: [64]u32 = @splat(7);
 
+test "shared prefix admission lets unrelated work pass and releases attempted or cancelled producers" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{}, 1, 0);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 3 });
+    defer host.queued.deinit(gpa);
+    defer host.filling.deinit(gpa);
+    var snapshot: @import("prompt_cache_fake.zig").Fake = .{ .gpa = gpa };
+    var store = api.prompt_cache.Store.init(gpa, snapshot.snapshots(), .{ .shared_wait = true, .planned = true, .grid = 4, .lookahead = 1 }, 1 << 20);
+    defer store.deinit();
+    host.cache = &store;
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    const request: Request = .{ .prompt = &prompt, .max_tokens = 2 };
+    const other: Request = .{ .prompt = &short_prompt, .max_tokens = 2 };
+    var producer: LaneHost.Job = .{ .host = &host, .id = 1, .request = &request, .sink = undefined, .marks = &.{8} };
+    var waiter: LaneHost.Job = .{ .host = &host, .id = 2, .request = &request, .sink = undefined };
+    var unrelated: LaneHost.Job = .{ .host = &host, .id = 3, .request = &other, .sink = undefined };
+    try host.filling.append(gpa, &producer);
+    try host.queued.appendSlice(gpa, &.{ &waiter, &unrelated });
+    const pick = @import("lane_host_admit.zig").pick;
+    try std.testing.expectEqual(@as(?usize, 1), pick(&host));
+    _ = host.queued.pop();
+    try std.testing.expectEqual(@as(?usize, null), pick(&host));
+    producer.kept_through = 8;
+    try std.testing.expectEqual(@as(?usize, 0), pick(&host));
+    producer.kept_through = 0;
+    store.rules.shared_wait = false;
+    try std.testing.expectEqual(@as(?usize, 0), pick(&host));
+    store.rules.shared_wait = true;
+    host.filling.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(?usize, 0), pick(&host));
+}
+
 test "a short request behind one that waits for pool room runs beside the running stream" {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);

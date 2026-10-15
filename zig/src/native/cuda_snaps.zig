@@ -6,6 +6,7 @@ const api = @import("engine_api");
 pub fn cacheRules(comptime F: type) api.prompt_cache.Rules {
     var rules: api.prompt_cache.Rules = .{ .lookahead = 1, .min_prompt = 0 };
     if (@hasDecl(F, "warm_quiet")) rules.warm = .waits;
+    if (@hasDecl(F, "snap_shared_wait")) rules.shared_wait = F.snap_shared_wait();
     if (@hasDecl(F, "snap_grid")) {
         rules.planned = true;
         rules.grid = F.snap_grid;
