@@ -125,3 +125,66 @@ extern "C" __global__ void tf_glm_quantize4(const __nv_bfloat16* __restrict__ w,
     scales[i] = sb;
     biases[i] = bb;
 }
+
+
+extern "C" __global__ void tf_glm_quantize4_mse(const __nv_bfloat16* __restrict__ w, long long groups,
+        int32_t* __restrict__ words, __nv_bfloat16* __restrict__ scales, __nv_bfloat16* __restrict__ biases) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= groups) return;
+    float x[64];
+    const uint4* src = reinterpret_cast<const uint4*>(w) + 8 * i;
+    for (int t = 0; t < 8; ++t) widen8(src[t], x + 8 * t);
+    float lo = x[0], hi = x[0];
+    for (int j = 1; j < 64; ++j) lo = fminf(lo, x[j]), hi = fmaxf(hi, x[j]);
+    float best = CUDART_INF_F;
+    __nv_bfloat16 best_s, best_b;
+    for (int candidate = 0; candidate < 16; ++candidate) {
+        const float a = static_cast<float>(1.0 - 0.45 * candidate / 15.0);
+        const float low = lo * a, high = hi * a;
+        const __nv_bfloat16 sb = __float2bfloat16_rn(fmaxf((high - low) * (1.0f / 15.0f), 1e-8f));
+        const __nv_bfloat16 bb = __float2bfloat16_rn(low);
+        const float scale = __bfloat162float(sb), bias = __bfloat162float(bb);
+        float errors[64];
+        for (int j = 0; j < 64; ++j) {
+            const float q = fminf(fmaxf(rintf(__fdiv_rn(x[j] - bias, scale)), 0.0f), 15.0f);
+            const float diff = (q * scale + bias) - x[j];
+            errors[j] = diff * diff;
+        }
+        for (int half = 32; half > 0; half /= 2)
+            for (int j = 0; j < half; ++j) errors[j] = errors[j] + errors[j + half];
+        if (candidate == 0 || errors[0] < best) best = errors[0], best_s = sb, best_b = bb;
+    }
+    const float scale = __bfloat162float(best_s), bias = __bfloat162float(best_b);
+    for (int t = 0; t < 8; ++t) {
+        uint32_t word = 0;
+        for (int j = 0; j < 8; ++j) {
+            const float q = fminf(fmaxf(rintf(__fdiv_rn(x[8 * t + j] - bias, scale)), 0.0f), 15.0f);
+            word |= static_cast<uint32_t>(q) << (4 * j);
+        }
+        words[i * 8 + t] = word;
+    }
+    scales[i] = best_s;
+    biases[i] = best_b;
+}
+
+extern "C" __global__ void tf_glm_quantize_fp8_rows(const __nv_bfloat16* __restrict__ w, int n, int k,
+        uint8_t* __restrict__ codes, float* __restrict__ scales) {
+    const int row = blockIdx.x;
+    const int g = blockIdx.y;
+    const int col = g * 128 + threadIdx.x;
+    const float value = row < n ? __bfloat162float(w[static_cast<long long>(row) * k + col]) : 0.0f;
+    float maximum = fabsf(value);
+    for (int o = 16; o > 0; o >>= 1) maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, o));
+    __shared__ float maxima[4];
+    if ((threadIdx.x & 31) == 0) maxima[threadIdx.x / 32] = maximum;
+    __syncthreads();
+    const float amax = fmaxf(fmaxf(maxima[0], maxima[1]), fmaxf(maxima[2], maxima[3]));
+    const float scale = fmaxf(amax * (1.0f / 448.0f), 1e-30f);
+    const uint8_t code = __nv_cvt_float_to_fp8(__fdiv_rn(value, scale), __NV_SATFINITE, __NV_E4M3);
+    const int local = col % 64;
+    const int lane = (row % 8) * 4 + (local % 8) / 2;
+    const int byte = ((local % 16) / 8) * 2 + local % 2 + (local % 32) / 16 * 4;
+    const long long offset = (((((static_cast<long long>(row / 64) * (k / 64) + col / 64) * 8 + (row % 64) / 8) * 32 + lane) * 2 + local / 32) * 8 + byte);
+    codes[offset] = code;
+    if (threadIdx.x < 2) scales[((static_cast<long long>(row / 64) * (k / 64) + g * 2 + threadIdx.x) * 64) + row % 64] = row < n ? scale : 1.0f;
+}

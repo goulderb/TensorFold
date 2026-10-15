@@ -92,6 +92,7 @@ fn loadTiles(mod: Module, comptime mode: Mode, comptime wide: bool) ![7]Function
 pub const Lane = struct {
     mod: Module,
     fns: [modes.len][7]Function, // per mode: lane16, lane16c, lane32, lane32c, lane64, lane64c, fused
+    fp8g_f32: [7]Function,
     fp4_f32: [7]Function, // FP4's tiles writing fp32
     reduce: [2]Function, // by Out
     clusters: bool, // sm_90 on: slices meet in a cluster's shared memory
@@ -100,7 +101,7 @@ pub const Lane = struct {
         if (!kernels.available) return error.BuiltWithoutKernels;
         var mod = try Module.load(d, kernels.qmmf);
         errdefer mod.unload();
-        var l: Lane = .{ .mod = mod, .fns = undefined, .fp4_f32 = try loadTiles(mod, .fp4, true), .reduce = undefined, .clusters = capability_major >= 9 };
+        var l: Lane = .{ .mod = mod, .fns = undefined, .fp4_f32 = try loadTiles(mod, .fp4, true), .fp8g_f32 = try loadTiles(mod, .fp8g, true), .reduce = undefined, .clusters = capability_major >= 9 };
         inline for (modes, 0..) |mode, mi| l.fns[mi] = try loadTiles(mod, mode, false);
         for (&l.reduce, reduce_symbols) |*f, name| f.* = try mod.function(name);
         return l;
@@ -123,9 +124,9 @@ pub const Lane = struct {
 
     /// matmul() writing y as `out` says: bf16, or fp32 (FP4 only).
     pub fn matmulOut(l: Lane, s: Stream, x: u64, ldx: usize, m: usize, w: Weight, y: u64, out: Out, part: u64) !void {
-        if (out == .f32 and w.mode != .fp4) return error.EpilogueNotBuilt;
+        if (out == .f32 and w.mode != .fp4 and w.mode != .fp8g) return error.EpilogueNotBuilt;
         const p = plan(m, w.n, w.k, l.clusters);
-        const set = if (out == .f32) l.fp4_f32 else l.fns[modeIndex(w.mode)];
+        const set = if (out == .f32) (if (w.mode == .fp8g) l.fp8g_f32 else l.fp4_f32) else l.fns[modeIndex(w.mode)];
         const ti: usize = if (p.bm == 16) 0 else if (p.bm == 32) 1 else 2;
         const f = if (p.fused) set[6] else set[ti * 2 + @intFromBool(p.cluster)];
         const rows_t = (m + p.bm - 1) / p.bm;

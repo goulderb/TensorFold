@@ -71,7 +71,7 @@ pub const Linear = struct {
         switch (w) {
             .affine4 => |q| {
                 const a = l.affine4 orelse return error.FormatNotLoaded;
-                if (in.ldx != 0 and in.ldx != q.k) return error.RowStride;
+                if (rows > 16 or (in.ldx != 0 and in.ldx != q.k)) return a.clusterAs(s, in.x, in.ldx, in.sums, q, out, rows, splitK(q.n, q.k), false);
                 return a.decode(s, in.x, in.sums, q, out, rows);
             },
             .fp8g => |q| return l.onLane(s, q, .fp8g, in, out, rows),
@@ -87,8 +87,7 @@ pub const Linear = struct {
         switch (w) {
             .affine4 => |q| {
                 const a = l.affine4 orelse return error.FormatNotLoaded;
-                if (in.ldx != 0 and in.ldx != q.k) return error.RowStride;
-                return a.prompt(s, in.x, q, out, rows);
+                return a.promptAs(s, in.x, in.ldx, q, out, rows, false);
             },
             .fp8g => |q| return l.onLane(s, q, .fp8g, in, out, rows),
             .nvfp4 => |q| return l.onPrompt(s, q, .fp4, in, out, rows),
@@ -100,6 +99,8 @@ pub const Linear = struct {
 
     /// Decode rows as decode(), out (rows, n) fp32 unrounded: a tensor-parallel rank's partial rows (nvfp4, exl3).
     pub fn decodeF32(l: Linear, s: Stream, w: Weight, in: Rows, out: u64, rows: usize) !void {
+        if (w == .affine4) return (l.affine4 orelse return error.FormatNotLoaded).clusterAs(s, in.x, in.ldx, in.sums, w.affine4, out, rows, splitK(w.affine4.n, w.affine4.k), true);
+        if (w == .fp8g) return l.onLaneAs(s, w.fp8g, .fp8g, in, out, .f32, rows);
         const q = switch (w) {
             .nvfp4 => |q| q,
             .exl3 => |q| return (l.exl3 orelse return error.FormatNotLoaded).rows(s, in.x, if (in.ldx == 0) q.k else in.ldx, q, out, rows, true),
@@ -110,6 +111,8 @@ pub const Linear = struct {
 
     /// Prompt rows as prompt(), out (rows, n) fp32 unrounded (nvfp4, exl3).
     pub fn promptF32(l: Linear, s: Stream, w: Weight, in: Rows, out: u64, rows: usize) !void {
+        if (w == .affine4) return (l.affine4 orelse return error.FormatNotLoaded).promptAs(s, in.x, in.ldx, w.affine4, out, rows, true);
+        if (w == .fp8g) return l.onLaneAs(s, w.fp8g, .fp8g, in, out, .f32, rows);
         const q = switch (w) {
             .nvfp4 => |q| q,
             .exl3 => |q| return (l.exl3 orelse return error.FormatNotLoaded).prompt(s, in.x, if (in.ldx == 0) q.k else in.ldx, q, out, rows, true),
@@ -212,6 +215,8 @@ fn u(x: usize) u32 {
 /// The affine-4 kernels: qmm_group's cluster tile, lane_gemv and its split-K form, qmm_prefill's prompt GEMM.
 pub const Affine4Kernels = struct {
     group_fn: Function,
+    group_f32: ?Function = null,
+    prefill_f32: ?Function = null,
     gemv_fn: Function,
     split_fn: Function,
     prefill_fn: Function,
@@ -226,6 +231,10 @@ pub const Affine4Kernels = struct {
         var a: Affine4Kernels = undefined;
         a.group_fn = try group_mod.function(symbols.group);
         a.prefill_fn = try prefill_mod.function(symbols.prefill);
+        a.group_f32 = try group_mod.function("_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii");
+        a.prefill_f32 = try prefill_mod.function("_ZN14tf_qmm_prefill14prefill_kernelILi64ELi128ELi128ELi2ELi4ELi3ELb1EEEvPK13__nv_bfloat16PKjS3_S3_Pviiiiii");
+        try a.group_f32.?.allowDynamicShared(group_smem);
+        try a.prefill_f32.?.allowDynamicShared(prefill_smem);
         a.gemv_fn = try gemv_mod.function(symbols.gemv);
         a.split_fn = try gemv_mod.function(symbols.gemv_split);
         a.words_fn = try pack_mod.function(symbols.pack_words);
@@ -300,6 +309,10 @@ pub const Affine4Kernels = struct {
 
     /// qmm_group's tile 2: a cluster of `sk` CTAs a column tile, its K slices summed over distributed shared memory.
     pub fn cluster(a: *const Affine4Kernels, s: Stream, x: u64, xs: u64, q: Affine4, out: u64, rows: usize, sk: usize) !void {
+        return a.clusterAs(s, x, q.k, xs, q, out, rows, sk, false);
+    }
+
+    pub fn clusterAs(a: *const Affine4Kernels, s: Stream, x: u64, ldx: usize, xs: u64, q: Affine4, out: u64, rows: usize, sk: usize, wide: bool) !void {
         const tiles = (q.n + 63) / 64;
         var parts: Parts = std.mem.zeroes(Parts);
         parts.count = 1;
@@ -310,7 +323,7 @@ pub const Affine4Kernels = struct {
         g.add(x);
         g.add(xs);
         g.add(parts);
-        for ([_]usize{ rows, q.k, q.k, rows_t, sk }) |v| g.add(int(v));
+        for ([_]usize{ rows, q.k, if (ldx == 0) q.k else ldx, rows_t, sk }) |v| g.add(int(v));
         const cfg: launch_.Config = .{
             .grid = .{ .x = u(clusters * sk) },
             .block = .{ .x = 128 },
@@ -318,19 +331,25 @@ pub const Affine4Kernels = struct {
             .cluster = if (sk > 1) .{ .x = u(sk) } else null,
             .pdl = a.pdl,
         };
-        try launch_.launch(a.group_fn, cfg, s, &g);
+        const f = if (wide) a.group_f32 orelse return error.EpilogueNotBuilt else a.group_fn;
+        try launch_.launch(f, cfg, s, &g);
     }
 
     /// qmm.prefill_matmul (tile 0): weights rounded once to bf16, one fp32 chain over K; bf16 out.
     pub fn prompt(a: *const Affine4Kernels, s: Stream, x: u64, q: Affine4, out: u64, rows: usize) !void {
+        return a.promptAs(s, x, q.k, q, out, rows, false);
+    }
+
+    pub fn promptAs(a: *const Affine4Kernels, s: Stream, x: u64, ldx: usize, q: Affine4, out: u64, rows: usize, wide: bool) !void {
         const rows_t = (rows + 127) / 128;
         const band = (12 << 20) / (128 * q.k * 2);
         const group = @max(1, @min(rows_t, band));
         var g: launch_.Args = .{};
         for ([_]u64{ x, q.w, q.s, q.b, out }) |v| g.add(v);
-        for ([_]usize{ rows, q.n, q.k, q.npad, q.k, group }) |v| g.add(int(v));
+        for ([_]usize{ rows, q.n, q.k, q.npad, if (ldx == 0) q.k else ldx, group }) |v| g.add(int(v));
         const grid = rows_t * ((q.n + 127) / 128);
-        try launch_.launch(a.prefill_fn, .{ .grid = .{ .x = u(grid), .y = 1, .z = 1 }, .block = .{ .x = 256 }, .shared = prefill_smem }, s, &g);
+        const f = if (wide) a.prefill_f32 orelse return error.EpilogueNotBuilt else a.prefill_fn;
+        try launch_.launch(f, .{ .grid = .{ .x = u(grid), .y = 1, .z = 1 }, .block = .{ .x = 256 }, .shared = prefill_smem }, s, &g);
     }
 };
 
@@ -375,6 +394,6 @@ test "a lane weight whose mode is not its format's is refused before any launch"
     try std.testing.expectError(error.FormatMismatch, l.decode(s, .{ .fp8g = fp4 }, .{ .x = 0 }, 0, 1));
     try std.testing.expectError(error.FormatNotLoaded, l.prompt(s, .{ .nvfp4 = fp4 }, .{ .x = 0 }, 0, 1));
     const f8: qmmf.Weight = .{ .mode = .fp8g, .codes = 0, .scales = 0, .n = 64, .k = 64, .npad = 128 };
-    try std.testing.expectError(error.EpilogueNotBuilt, l.decodeF32(s, .{ .fp8g = f8 }, .{ .x = 0 }, 0, 1));
+    try std.testing.expectError(error.FormatMismatch, l.decodeF32(s, .{ .fp8g = fp4 }, .{ .x = 0 }, 0, 1));
     try std.testing.expectError(error.EpilogueNotBuilt, l.promptF32(s, .{ .bf16 = f8 }, .{ .x = 0 }, 0, 1));
 }

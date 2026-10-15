@@ -30,7 +30,7 @@ pub const Layer = struct { index: u32, attn_hc: Hc, ffn_hc: Hc, in_norm: u64, po
 pub const Mtp = struct { enorm: u64, hnorm: u64, eh: b16.Proj, norm: u64, layer: Layer, draft: ?q4.Q4 };
 
 /// The kernels a load runs: affine4_pack's tf_pack_dense, and for the MTP head the quantizers and the 4-bit tiling.
-pub const Tools = struct { pack_dense: cuda.Function, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null };
+pub const Tools = struct { pack_dense: cuda.Function, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null, affine4: ?*const cuda.qlinear.Affine4Kernels = null, precision: @import("cuda_weight_precision.zig").Settings = .{} };
 
 /// A loaded tensor by the Python family's attribute path, for digests against its weights.
 pub const Named = struct { name: []u8, ptr: u64, len: usize };

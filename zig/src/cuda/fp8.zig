@@ -1,4 +1,4 @@
-//! Block-FP8 checkpoints (128 x 128 e4m3 blocks, fp32 scale_inv) repacked for qmmf.zig as linear.py does.
+//! Block-FP8 checkpoints (128 x 128 e4m3 blocks, fp32 scale_inv) retiled for qmmf.zig as linear.py does.
 const std = @import("std");
 const qmmf = @import("qmmf.zig");
 
@@ -40,7 +40,7 @@ pub fn packScales(out: []f32, scale_inv: []const f32, n: usize, k: usize) void {
     };
 }
 
-/// The lane matmul's view of a packed block-FP8 projection.
+/// The lane matmul's view of a tiled block-FP8 projection.
 pub fn weight(codes: u64, scales: u64, n: usize, k: usize) qmmf.Weight {
     return .{ .mode = .fp8g, .codes = codes, .scales = scales, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(padded(n)) };
 }
@@ -76,4 +76,25 @@ test "scale tiles: each 64-input group takes its 128 x 128 block's scale, padded
     try std.testing.expectEqual(@as(f32, 2), out[(0 * 4 + 3) * 64 + 5]); // row 5, group 3 -> block (0, 1)
     try std.testing.expectEqual(@as(f32, 3), out[(2 * 4 + 0) * 64 + 1]); // row 129 -> block (1, 0)
     try std.testing.expectEqual(@as(f32, 1), out[(2 * 4 + 1) * 64 + 2]); // row 130: padding
+}
+
+pub fn packRowScales(out: []f32, scales: []const f32, n: usize, k: usize) void {
+    const npad = padded(n);
+    const kg = k / group;
+    std.debug.assert(k % block == 0 and out.len == npad * kg and scales.len == n * (k / block));
+    for (0..npad / 64) |t| for (0..kg) |g| for (0..64) |c| {
+        const row = t * 64 + c;
+        out[(t * kg + g) * 64 + c] = if (row < n) scales[row * (k / block) + g / 2] else 1.0;
+    };
+}
+
+test "per-row FP8 scales preserve adjacent rows and duplicate each 128-column scale across two stages" {
+    var scales: [3 * 2]f32 = .{ 1, 2, 3, 4, 5, 6 };
+    var tiled: [128 * 4]f32 = undefined;
+    packRowScales(&tiled, &scales, 3, 256);
+    try std.testing.expectEqual(@as(f32, 1), tiled[0]);
+    try std.testing.expectEqual(@as(f32, 3), tiled[1]);
+    try std.testing.expectEqual(@as(f32, 3), tiled[64 + 1]);
+    try std.testing.expectEqual(@as(f32, 6), tiled[128 + 2]);
+    try std.testing.expectEqual(@as(f32, 1), tiled[192 + 3]);
 }

@@ -27,7 +27,7 @@ pub const Buffers = state.Buffers;
 /// The modules a forward launches from: our fatbins.
 pub const Modules = struct {
     glue: glue.Kernels,
-    mods: [7]cuda.Module,
+    mods: [9]cuda.Module,
     kda: kda.Kernels,
     lane: cuda.qmmf.Lane, // the NVFP4 linears' decode rows (qlinear)
     prompt: cuda.nvfp4.Prompt, // and their prompt rows
@@ -39,13 +39,14 @@ pub const Modules = struct {
     pack_dense: cuda.Function,
     quant: quant.Kernels,
     q4: q4.Kernels,
+    affine4: cuda.qlinear.Affine4Kernels,
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
         var m: Modules = undefined;
         var n: usize = 0;
         errdefer for (m.mods[0..n]) |*x| x.unload();
-        for (&m.mods, [_][]const u8{ k.glm_kda, k.glm_ops, k.experts, k.affine4_pack, k.glm_quant, k.qmm_group, k.glm_glue }) |*x, image| {
+        for (&m.mods, [_][]const u8{ k.glm_kda, k.glm_ops, k.experts, k.affine4_pack, k.glm_quant, k.qmm_group, k.glm_glue, k.qmm_prefill, k.lane_gemv }) |*x, image| {
             x.* = try cuda.Module.load(d, image);
             n += 1;
         }
@@ -66,12 +67,13 @@ pub const Modules = struct {
         m.quant = try quant.Kernels.load(m.mods[4]);
         m.q4 = try q4.Kernels.load(m.mods[5], m.mods[3], ctx);
         m.glue = try glue.Kernels.load(m.mods[6]);
+        m.affine4 = try cuda.qlinear.Affine4Kernels.resolve(d, m.mods[5], m.mods[7], m.mods[8], m.mods[3], @intCast(try ctx.attribute(.multiprocessor_count)), try ctx.attribute(.compute_capability_major) == 12 and try ctx.attribute(.compute_capability_minor) == 1);
         return m;
     }
 
     /// What weights.load runs: the dense packing, and for the MTP head the quantizers and the 4-bit tiling.
     pub fn tools(m: *const Modules) weights.Tools {
-        return .{ .pack_dense = m.pack_dense, .quant = &m.quant, .q4 = &m.q4 };
+        return .{ .pack_dense = m.pack_dense, .quant = &m.quant, .q4 = &m.q4, .affine4 = &m.affine4 };
     }
 
     pub fn ops(m: *const Modules) cuda.Module {
@@ -80,6 +82,7 @@ pub const Modules = struct {
 
     pub fn deinit(m: *Modules) void {
         for (&m.mods) |*x| x.unload();
+        m.affine4.deinit();
         m.lane.unload();
         m.prompt.unload();
         m.exl3.deinit();
@@ -173,7 +176,7 @@ pub const Forward = struct {
 
     /// qlinear over every format a GLM checkpoint brings: NVFP4 (lane and prompt GEMM) and EXL3.
     pub fn linear(f: *const Forward) cuda.qlinear.Linear {
-        return .{ .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt, .exl3 = &f.m.exl3 };
+        return .{ .affine4 = &f.m.affine4, .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt, .exl3 = &f.m.exl3 };
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.

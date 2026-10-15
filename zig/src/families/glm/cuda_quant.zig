@@ -7,12 +7,16 @@ pub const Kernels = struct {
     amax: cuda.Function,
     nvfp4: cuda.Function,
     q4: cuda.Function,
+    q4_mse: cuda.Function,
+    fp8_rows: cuda.Function,
 
     pub fn load(m: cuda.Module) !Kernels {
         return .{
             .amax = try m.function("tf_glm_nvfp4_amax"),
             .nvfp4 = try m.function("tf_glm_nvfp4_quantize"),
             .q4 = try m.function("tf_glm_quantize4"),
+            .q4_mse = try m.function("tf_glm_quantize4_mse"),
+            .fp8_rows = try m.function("tf_glm_quantize_fp8_rows"),
         };
     }
 };
@@ -54,4 +58,21 @@ pub fn q4(ks: *const Kernels, stream: cuda.Stream, w: u64, n: usize, k: usize, w
     a.add(scales);
     a.add(biases);
     try cuda.launch.launch(ks.q4, .{ .grid = .{ .x = blocks(groups) }, .block = .{ .x = 256 } }, stream, &a);
+}
+
+pub fn q4Mse(ks: *const Kernels, stream: cuda.Stream, w: u64, n: usize, k: usize, words: u64, scales: u64, biases: u64) !void {
+    var copy = ks.*;
+    copy.q4 = ks.q4_mse;
+    return q4(&copy, stream, w, n, k, words, scales, biases);
+}
+
+pub fn fp8Rows(ks: *const Kernels, stream: cuda.Stream, w: u64, n: usize, k: usize, codes: u64, scales: u64) !void {
+    if (k == 0 or k % 128 != 0 or n == 0) return error.InvalidFp8Shape;
+    var a: cuda.Args = .{};
+    a.add(w);
+    a.add(@as(c_int, @intCast(n)));
+    a.add(@as(c_int, @intCast(k)));
+    a.add(codes);
+    a.add(scales);
+    try cuda.launch.launch(ks.fp8_rows, .{ .grid = .{ .x = @intCast(cuda.fp8.padded(n)), .y = @intCast(k / 128) }, .block = .{ .x = 128 } }, stream, &a);
 }
