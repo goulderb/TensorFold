@@ -129,14 +129,17 @@ extern "C" __global__ void tf_glm_quantize4(const __nv_bfloat16* __restrict__ w,
 
 extern "C" __global__ void tf_glm_quantize4_mse(const __nv_bfloat16* __restrict__ w, long long groups,
         int32_t* __restrict__ words, __nv_bfloat16* __restrict__ scales, __nv_bfloat16* __restrict__ biases) {
-    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const long long i = static_cast<long long>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
     if (i >= groups) return;
-    float x[64];
-    const uint4* src = reinterpret_cast<const uint4*>(w) + 8 * i;
-    for (int t = 0; t < 8; ++t) widen8(src[t], x + 8 * t);
-    float lo = x[0], hi = x[0];
-    for (int j = 1; j < 64; ++j) lo = fminf(lo, x[j]), hi = fmaxf(hi, x[j]);
-    float best = CUDART_INF_F;
+    const int lane = threadIdx.x & 31;
+    const float x0 = __bfloat162float(w[i * 64 + lane]);
+    const float x1 = __bfloat162float(w[i * 64 + lane + 32]);
+    float lo = fminf(x0, x1), hi = fmaxf(x0, x1);
+    for (int offset = 16; offset > 0; offset /= 2) {
+        lo = fminf(lo, __shfl_xor_sync(0xffffffffu, lo, offset));
+        hi = fmaxf(hi, __shfl_xor_sync(0xffffffffu, hi, offset));
+    }
+    float best = __int_as_float(0x7f800000);
     __nv_bfloat16 best_s, best_b;
     for (int candidate = 0; candidate < 16; ++candidate) {
         const float a = static_cast<float>(1.0 - 0.45 * candidate / 15.0);
@@ -144,27 +147,31 @@ extern "C" __global__ void tf_glm_quantize4_mse(const __nv_bfloat16* __restrict_
         const __nv_bfloat16 sb = __float2bfloat16_rn(fmaxf((high - low) * (1.0f / 15.0f), 1e-8f));
         const __nv_bfloat16 bb = __float2bfloat16_rn(low);
         const float scale = __bfloat162float(sb), bias = __bfloat162float(bb);
-        float errors[64];
-        for (int j = 0; j < 64; ++j) {
-            const float q = fminf(fmaxf(rintf(__fdiv_rn(x[j] - bias, scale)), 0.0f), 15.0f);
-            const float diff = (q * scale + bias) - x[j];
-            errors[j] = diff * diff;
-        }
-        for (int half = 32; half > 0; half /= 2)
-            for (int j = 0; j < half; ++j) errors[j] = errors[j] + errors[j + half];
-        if (candidate == 0 || errors[0] < best) best = errors[0], best_s = sb, best_b = bb;
+        const float q0 = fminf(fmaxf(rintf(__fdiv_rn(x0 - bias, scale)), 0.0f), 15.0f);
+        const float q1 = fminf(fmaxf(rintf(__fdiv_rn(x1 - bias, scale)), 0.0f), 15.0f);
+        const float diff0 = (q0 * scale + bias) - x0;
+        const float diff1 = (q1 * scale + bias) - x1;
+        float error = diff0 * diff0 + diff1 * diff1;
+        for (int offset = 16; offset > 0; offset /= 2) error = error + __shfl_down_sync(0xffffffffu, error, offset);
+        error = __shfl_sync(0xffffffffu, error, 0);
+        if (candidate == 0 || error < best) best = error, best_s = sb, best_b = bb;
     }
     const float scale = __bfloat162float(best_s), bias = __bfloat162float(best_b);
-    for (int t = 0; t < 8; ++t) {
-        uint32_t word = 0;
-        for (int j = 0; j < 8; ++j) {
-            const float q = fminf(fmaxf(rintf(__fdiv_rn(x[8 * t + j] - bias, scale)), 0.0f), 15.0f);
-            word |= static_cast<uint32_t>(q) << (4 * j);
-        }
-        words[i * 8 + t] = word;
+    const uint32_t q0 = static_cast<uint32_t>(fminf(fmaxf(rintf(__fdiv_rn(x0 - bias, scale)), 0.0f), 15.0f));
+    const uint32_t q1 = static_cast<uint32_t>(fminf(fmaxf(rintf(__fdiv_rn(x1 - bias, scale)), 0.0f), 15.0f));
+    uint32_t word0 = q0 << (4 * (lane & 7)), word1 = q1 << (4 * (lane & 7));
+    for (int offset = 1; offset < 8; offset *= 2) {
+        word0 |= __shfl_down_sync(0xffffffffu, word0, offset);
+        word1 |= __shfl_down_sync(0xffffffffu, word1, offset);
     }
-    scales[i] = best_s;
-    biases[i] = best_b;
+    if ((lane & 7) == 0) {
+        words[i * 8 + lane / 8] = word0;
+        words[i * 8 + 4 + lane / 8] = word1;
+    }
+    if (lane == 0) {
+        scales[i] = best_s;
+        biases[i] = best_b;
+    }
 }
 
 extern "C" __global__ void tf_glm_quantize_fp8_rows(const __nv_bfloat16* __restrict__ w, int n, int k,

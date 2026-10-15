@@ -61,9 +61,16 @@ pub fn q4(ks: *const Kernels, stream: cuda.Stream, w: u64, n: usize, k: usize, w
 }
 
 pub fn q4Mse(ks: *const Kernels, stream: cuda.Stream, w: u64, n: usize, k: usize, words: u64, scales: u64, biases: u64) !void {
-    var copy = ks.*;
-    copy.q4 = ks.q4_mse;
-    return q4(&copy, stream, w, n, k, words, scales, biases);
+    if (k == 0 or k % 64 != 0) return error.KNotMultipleOf64;
+    const groups = n * k / 64;
+    if (groups == 0) return;
+    var a: cuda.Args = .{};
+    a.add(w);
+    a.add(@as(c_longlong, @intCast(groups)));
+    a.add(words);
+    a.add(scales);
+    a.add(biases);
+    try cuda.launch.launch(ks.q4_mse, .{ .grid = .{ .x = blocks(groups * 32) }, .block = .{ .x = 256 } }, stream, &a);
 }
 
 pub fn fp8Rows(ks: *const Kernels, stream: cuda.Stream, w: u64, n: usize, k: usize, codes: u64, scales: u64) !void {
@@ -75,4 +82,14 @@ pub fn fp8Rows(ks: *const Kernels, stream: cuda.Stream, w: u64, n: usize, k: usi
     a.add(codes);
     a.add(scales);
     try cuda.launch.launch(ks.fp8_rows, .{ .grid = .{ .x = @intCast(cuda.fp8.padded(n)), .y = @intCast(k / 128) }, .block = .{ .x = 128 } }, stream, &a);
+}
+
+test "weight conversion refuses invalid groups before driver access" {
+    const testing = @import("std").testing;
+    const kernels: Kernels = undefined;
+    const stream: cuda.Stream = undefined;
+    try testing.expectError(error.KNotMultipleOf64, q4Mse(&kernels, stream, 0, 1, 63, 0, 0, 0));
+    try testing.expectError(error.KNotMultipleOf64, q4Mse(&kernels, stream, 0, 1, 0, 0, 0, 0));
+    try testing.expectError(error.InvalidFp8Shape, fp8Rows(&kernels, stream, 0, 1, 64, 0, 0));
+    try testing.expectError(error.InvalidFp8Shape, fp8Rows(&kernels, stream, 0, 0, 128, 0, 0));
 }
