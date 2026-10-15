@@ -398,6 +398,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         const store = try gpa.create(pc.Store);
         // rules and budget from the family's snap_* declarations (cuda_snaps.zig)
         store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = &snaps.Snaps(F).vtable }, snaps.cacheRules(F), try snaps.cacheBudget(F, loaded.target, cache));
+        if (spill_owner) |owner| store.rules.spill_timing = owner.timing;
         h.store = store;
         if (@hasDecl(F, "snap_tier")) if (F.snap_tier(loaded.target)) |tier| store.attach(@ptrCast(@alignCast(tier)));
     }
@@ -425,7 +426,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         gpa.free(h.dir);
     };
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
-    try h.serve(io, loaded.facts, loaded.rows, .{ .admit = if (@hasField(@TypeOf(loaded), "admit")) if (loaded.admit) |ad| .{ .ctx = ad.ctx, .fits = ad.fits } else null else null, .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .warm_turns = h.store != null and @hasDecl(F, "warm_quiet"), .logprobs = loaded.backend.vtable.first_row != null, .prompt_logprobs = loaded.backend.vtable.prompt_rows, .structures = loaded.backend.vtable.first_masked != null, .max_queued = o.max_queued, .call_gates = true }, .{ .ctx = loaded.ctx, .text = F.explain });
+    try h.serve(io, loaded.facts, loaded.rows, .{ .admit = if (@hasField(@TypeOf(loaded), "admit")) if (loaded.admit) |ad| .{ .ctx = ad.ctx, .fits = ad.fits } else null else null, .vision = if (@hasField(@TypeOf(loaded), "vision_probe")) if (loaded.vision_probe) |p| .{ .ctx = p.ctx, .rows = p.rows } else null else null, .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .warm_turns = h.store != null and @hasDecl(F, "warm_quiet"), .logprobs = loaded.backend.vtable.first_row != null, .prompt_logprobs = loaded.backend.vtable.prompt_rows, .structures = loaded.backend.vtable.first_masked != null, .max_queued = o.max_queued, .call_gates = true }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }

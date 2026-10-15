@@ -101,6 +101,7 @@ pub const Pages = struct {
 
 /// What a family's states depend on beyond their position.
 pub const Rules = struct {
+    spill_timing: enum { eviction, retention } = .eviction,
     shared_wait: bool = false,
     /// Tokens past the position a state read (Flash Next's MTP head keys row at-1 with token at: 1).
     lookahead: u32 = 0,
@@ -635,6 +636,7 @@ pub const Store = struct {
         };
         s.held += charged;
         s.counts.kept += 1;
+        if (s.rules.spill_timing == .retention) s.spillOut(e);
         if (shared) learned.learn(s, e, starts);
         if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
         return true;

@@ -134,6 +134,62 @@ test "a state the budget evicts goes to disk and a prompt that extends it reads 
     try std.testing.expectEqual(@as(u64, 1), s.spill_counts.recalled);
 }
 
+test "retention spill writes an eligible kept state without eviction or shutdown" {
+    var root = try Root.make();
+    defer root.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const t = try root.tier(identity_a);
+    defer t.deinit();
+    var f: Fake = .{ .gpa = gpa };
+    var policy = rules;
+    policy.spill_timing = .retention;
+    var s = pc.Store.init(gpa, f.spilling(), policy, 1 << 20);
+    defer s.deinit();
+    s.attach(t);
+    var buf: [500]u32 = undefined;
+    const prompt = conversation(&buf, 19);
+    const plan = try s.begin(arena.allocator(), prompt, 400, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(fresh(prompt), f.pass(&s, prompt, plan));
+    try std.testing.expect(t.drain(10));
+    try std.testing.expectEqual(@as(u64, 1), t.info().stats.written);
+    try std.testing.expectEqual(@as(u64, 0), s.counts.evicted);
+    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
+    try std.testing.expectEqual(@as(u32, 400), s.find(prompt, &.{}, &.{}).?.at);
+}
+
+test "a refused eager capture keeps the retained state usable and counts the refusal" {
+    const Refused = struct {
+        fn write(_: *anyopaque, _: pc.Saved, _: *spill.Tier, _: spill.Name, _: []const u32) !void {
+            return error.Incomplete;
+        }
+    };
+    var root = try Root.make();
+    defer root.deinit();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const t = try root.tier(identity_a);
+    defer t.deinit();
+    var f: Fake = .{ .gpa = gpa };
+    var hooks = f.spilling().vtable.*;
+    hooks.spill_write = Refused.write;
+    var policy = rules;
+    policy.spill_timing = .retention;
+    var s = pc.Store.init(gpa, .{ .ptr = &f, .vtable = &hooks }, policy, 1 << 20);
+    defer s.deinit();
+    s.attach(t);
+    var buf: [500]u32 = undefined;
+    const prompt = conversation(&buf, 23);
+    const first = try s.begin(arena.allocator(), prompt, 400, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(fresh(prompt), f.pass(&s, prompt, first));
+    try std.testing.expectEqual(@as(u64, 1), s.spill_counts.write_failed);
+    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
+    const second = try s.begin(arena.allocator(), prompt, 400, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 400), second.from);
+    try std.testing.expectEqual(fresh(prompt), f.pass(&s, prompt, second));
+    try std.testing.expectEqual(@as(u64, 0), t.info().stats.written);
+}
+
 test "a family read failure, a corrupt file and another identity go cold, counted, and match a cold reply" {
     var root = try Root.make();
     defer root.deinit();

@@ -40,7 +40,7 @@ pub const Settings = struct {
             }
         }
         var spill_hash = Sha256.init(.{});
-        inline for (.{ "TENSORFOLD_SPILL_GIB", "TENSORFOLD_SPILL_HOST_GIB", "TENSORFOLD_SPILL_HIGHWATER", "TENSORFOLD_SPILL_MIN_TOKENS", "TENSORFOLD_SPILL_MIN_FREE_GIB", "TENSORFOLD_SPILL_FLUSH_S", "TENSORFOLD_SPILL_KEEP_BUILDS" }) |name| {
+        inline for (.{ "TENSORFOLD_SPILL_GIB", "TENSORFOLD_SPILL_HOST_GIB", "TENSORFOLD_SPILL_HIGHWATER", "TENSORFOLD_SPILL_MIN_TOKENS", "TENSORFOLD_SPILL_MIN_FREE_GIB", "TENSORFOLD_SPILL_FLUSH_S", "TENSORFOLD_SPILL_KEEP_BUILDS", "TF_GLM_SPILL_EAGER" }) |name| {
             spill_hash.update(name ++ "=");
             spill_hash.update(get(name) orelse "");
             spill_hash.update("\x00");

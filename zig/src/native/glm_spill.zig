@@ -14,6 +14,7 @@ pub const Adapter = struct {
     io: std.Io,
     settings: spill.Settings,
     host_limit: u64,
+    timing: @FieldType(api.prompt_cache.Rules, "spill_timing") = .eviction,
     artifacts: std.ArrayList(Artifact) = .empty,
     state: union(enum) { prepared, attached: struct { e: *glm.engine.Engine, link: *glm.follow.Link, tier: *spill.Tier } } = .prepared,
     mutex: std.Io.Mutex = .init,
@@ -35,6 +36,10 @@ pub const Adapter = struct {
         errdefer {
             self.freeArtifacts();
             gpa.destroy(self);
+        }
+        if (std.c.getenv("TF_GLM_SPILL_EAGER")) |raw_timing| {
+            const v = std.mem.span(raw_timing);
+            if (std.mem.eql(u8, v, "1")) self.timing = .retention else if (!std.mem.eql(u8, v, "0")) return error.BadSpillTiming;
         }
         var dir = try std.Io.Dir.cwd().openDir(io, checkpoint, .{ .iterate = true });
         defer dir.close(io);
@@ -222,4 +227,29 @@ fn metadata(path: [:0]const u8) !identity.Meta {
     if (fd < 0) return error.SpillArtifactOpen;
     defer _ = std.c.close(fd);
     return identity.metadata(fd);
+}
+
+test "GLM spill queue refuses a second capture and failed capture leaves no queued allocation" {
+    const gpa = std.testing.allocator;
+    var e: glm.engine.Engine = undefined;
+    e.gpa = gpa;
+    e.snaps = .empty;
+    defer e.snaps.deinit(gpa);
+    var link: glm.follow.Link = undefined;
+    var tier: spill.Tier = undefined;
+    tier.io = std.testing.io;
+    tier.mutex = .init;
+    tier.stats = .{};
+    var a: Adapter = .{ .gpa = gpa, .io = std.testing.io, .settings = .{ .dir = "/unused", .cap = 1 << 20 }, .host_limit = 1024, .state = .{ .attached = .{ .e = &e, .link = &link, .tier = &tier } } };
+    const command: persistence.Command = .{ .operation = .write, .id = 1, .key = 7, .at = 1, .tokens = &.{ 5, 9 } };
+    try std.testing.expectError(error.NoKeptState, Adapter.request(&a, command));
+    try std.testing.expect(a.queued == null);
+    const tokens = try gpa.dupe(u32, command.tokens);
+    a.queued = .{ .command = command, .tokens = tokens, .host = .{ .bytes = try gpa.dupe(u8, "owned snapshot"), .meta = undefined, .meta_len = 0 } };
+    defer a.dropQueued();
+    try std.testing.expectError(error.Incomplete, Adapter.request(&a, .{ .operation = .write, .id = 2, .key = 8, .at = 1, .tokens = &.{ 4, 2 } }));
+    try std.testing.expectEqual(@as(u64, 1), tier.stats.unwritten_incomplete);
+    try std.testing.expectEqual(@as(u64, 1), a.queued.?.command.id);
+    try std.testing.expectEqualSlices(u32, &.{ 5, 9 }, a.queued.?.tokens);
+    try std.testing.expectEqualStrings("owned snapshot", a.queued.?.host.bytes);
 }
