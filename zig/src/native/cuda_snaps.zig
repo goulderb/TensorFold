@@ -27,7 +27,19 @@ pub fn Snaps(comptime F: type) type {
             .save = F.snap_save,
             .restore = F.snap_restore,
             .drop = F.snap_drop,
+            .spill_write = if (@hasDecl(F, "snap_spill_write")) spillWrite else null,
+            .spill_read = if (@hasDecl(F, "snap_spill_read")) spillRead else null,
+            .spill_forget = if (@hasDecl(F, "snap_spill_forget")) spillForget else null,
         };
+        fn spillWrite(ptr: *anyopaque, saved: api.prompt_cache.Saved, tier: *api.prompt_cache.spill.Tier, name: api.prompt_cache.spill.Name, tokens: []const u32) anyerror!void {
+            return F.snap_spill_write(ptr, saved, tier, name, tokens);
+        }
+        fn spillRead(ptr: *anyopaque, tier: *api.prompt_cache.spill.Tier, name: api.prompt_cache.spill.Name) anyerror!api.prompt_cache.Saved {
+            return F.snap_spill_read(ptr, tier, name);
+        }
+        fn spillForget(ptr: *anyopaque, name: api.prompt_cache.spill.Name) void {
+            F.snap_spill_forget(ptr, name);
+        }
     };
 }
 

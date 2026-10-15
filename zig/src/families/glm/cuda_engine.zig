@@ -13,6 +13,8 @@ const heat = @import("heat");
 const owner_kv = @import("cuda_kv_owner.zig");
 const cache_pool = @import("cuda_kv_pool.zig");
 const modelopt = @import("core").modelopt;
+pub const persistence = @import("cuda_persistence.zig");
+pub const spill_payload = @import("cuda_spill_payload.zig");
 
 pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
 
@@ -91,6 +93,7 @@ pub const Engine = struct {
     shared_buf: cuda.DeviceBuffer, // one f64 every rank all-reduces to its maximum
     snaps: std.AutoHashMapUnmanaged(u64, Snap) = .empty, // kept prompt states by id (the same ids on every rank)
     next_snap: u64 = 1, // rank 0: the next id
+    disk: ?persistence.Port = null,
     announce: u64 = 0, // rank 0: a state kept at this chunk's mark, for the other ranks to copy at its gate
     dropped: std.ArrayList(u32) = .empty, // rank 0: ids dropped since the other ranks last heard (cuda_follow)
 
@@ -173,6 +176,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        if (e.disk) |p| p.close(p.ctx);
         e.stream.synchronize() catch {};
         var it = e.snaps.valueIterator();
         while (it.next()) |s| e.freeSnap(s);
@@ -383,6 +387,69 @@ pub const Engine = struct {
     pub fn snapshotBytes(e: *const Engine, at: usize) u64 {
         const plan = e.cur.st.layout.snapshot(.{ .main = at, .mtp = if (e.mtp) at else 0 }) catch return std.math.maxInt(u64);
         return plan.byteCount();
+    }
+
+    pub fn spillShape(e: *const Engine) spill_payload.Shape {
+        const st = &e.seqs.items[0].?.st;
+        return .{ .layout = st.layout, .format = e.settings.kv, .mtp = e.mtp, .sharded = e.settings.kv_shard, .rank = @intCast(e.share.rank), .world = @intCast(e.share.world), .grid = prompt_rows, .parities = st.cur.len };
+    }
+
+    pub const HostSnapshot = struct { bytes: []u8, meta: [spill_payload.max_meta]u8, meta_len: usize };
+
+    pub fn exportState(e: *Engine, id: u64, limit: u64) !HostSnapshot {
+        const saved = e.snaps.getPtr(id) orelse return error.NoKeptState;
+        if (saved.buf.len > limit) return error.SpillHostLimit;
+        var host: HostSnapshot = .{ .bytes = undefined, .meta = undefined, .meta_len = 0 };
+        const meta = try spill_payload.encode(e.spillShape(), saved.pos, saved.mtp_len, saved.owner, saved.cur, &host.meta);
+        host.meta_len = meta.len;
+        host.bytes = try e.gpa.alloc(u8, saved.buf.len);
+        errdefer e.gpa.free(host.bytes);
+        try e.stream.synchronize();
+        try saved.buf.download(0, host.bytes);
+        return host;
+    }
+
+    pub fn importState(e: *Engine, id: u64, at: u32, meta: []const u8, bytes: u64, ctx: *anyopaque, pump: *const fn (*anyopaque, *cuda.DeviceBuffer) anyerror!void) !void {
+        if (e.snaps.contains(id)) return error.StateKept;
+        const state = try spill_payload.decode(e.spillShape(), meta, at, bytes);
+        var buf = try cuda.DeviceBuffer.alloc(e.d, @intCast(bytes));
+        errdefer buf.free();
+        const cur = try e.gpa.alloc(u1, state.cur.len);
+        errdefer e.gpa.free(cur);
+        for (cur, state.cur) |*to, from| to.* = @intCast(from);
+        try pump(ctx, &buf);
+        try e.snaps.put(e.gpa, id, .{ .buf = buf, .pos = @intCast(state.pos), .mtp_len = @intCast(state.mtp_len), .cur = cur, .owner = state.owner });
+    }
+
+    pub fn persist(e: *Engine, command: persistence.Command) !void {
+        const port = e.disk orelse return error.SpillDisabled;
+        var status: u32 = 0;
+        port.apply(port.ctx, command) catch |err| {
+            status = if (err == error.NotStored) 1 else 2;
+            if (status == 2) std.log.warn("GLM spill {s} at {d}: {s}", .{ @tagName(command.operation), command.at, @errorName(err) });
+        };
+        if (e.share.world > 1) status = @intFromFloat(e.shared(@floatFromInt(status)) catch |err| {
+            e.pair_failure(err);
+            return err;
+        });
+        if (status == 0 and command.operation == .read and e.share.world > 1) {
+            const saved = e.snaps.get(command.id).?;
+            const owner: u32 = if (saved.owner) |r| r + 1 else 0;
+            const largest = e.shared(@floatFromInt(owner)) catch |err| {
+                e.pair_failure(err);
+                return err;
+            };
+            if (!try e.pairedReady(largest == @as(f64, @floatFromInt(owner)))) status = 2;
+        }
+        if (status == 0) return;
+        if (command.operation == .read) e.discardState(command.id);
+        if (status == 2 or command.operation == .write) port.apply(port.ctx, .{ .operation = .forget, .key = command.key, .at = command.at }) catch {};
+        return if (status == 1) error.NotStored else error.SpillRefused;
+    }
+
+    pub fn discardState(e: *Engine, id: u64) void {
+        var kept = e.snaps.fetchRemove(id) orelse return;
+        e.freeSnap(&kept.value);
     }
 
     /// Rank 0, at a mark in a prompt pass: a copy of the state under a new id, named to the other ranks at the gate.
@@ -800,6 +867,143 @@ test "engine snapshot save and restore preserve visible state through reused sto
         try std.testing.expectEqual(@as(u32, if (mtp) 2115 else 0), std.mem.bytesToValue(u32, live[layout.mtp_pos..][0..4]));
         try std.testing.expectEqual(@as(u8, 0xa5), live[layout.cacheOffsets(0)[0] + 2115 * layout.latent_stride]);
     };
+}
+
+test "spill snapshot roundtrip checks metadata and discards failed imports without publishing an id" {
+    const M = @import("cuda_test_driver.zig").Memory;
+    var d = M.driver();
+    for ([_]@import("cuda_cache.zig").Format{ .bf16, .fp8 }) |format| {
+        var seq: Seq = undefined;
+        seq.st.layout = try (try @import("cuda_layout.zig").Layout.init(.{ 256, 0, 0, 0, 0, 0, 0, 0 }, 4096, prompt_rows, 1, format, 512, 128)).external();
+        var cur = [_]u1{1};
+        seq.st.cur = &cur;
+        var e: Engine = undefined;
+        e.gpa = std.testing.allocator;
+        e.d = &d;
+        e.stream = .{ .d = &d, .handle = null };
+        e.settings = .{ .kv = format, .kv_shard = true };
+        e.share.rank = 1;
+        e.share.world = 2;
+        e.mtp = true;
+        e.seqs = .empty;
+        try e.seqs.append(e.gpa, &seq);
+        defer e.seqs.deinit(e.gpa);
+        e.snaps = .empty;
+        defer e.snaps.deinit(e.gpa);
+        const bytes = (try seq.st.layout.snapshot(.{ .main = 2048, .mtp = 2048 })).byteCount();
+        const buf = try cuda.DeviceBuffer.alloc(&d, bytes);
+        @memset(M.slice(buf.ptr, bytes), 0x5a);
+        try e.snaps.put(e.gpa, 1, .{ .buf = buf, .pos = 2048, .mtp_len = 2048, .owner = 1, .cur = try e.gpa.dupe(u1, &cur) });
+        defer e.discardState(1);
+        try std.testing.expectError(error.SpillHostLimit, e.exportState(1, bytes - 1));
+        var host = try e.exportState(1, bytes);
+        defer e.gpa.free(host.bytes);
+        try std.testing.expect(std.mem.allEqual(u8, host.bytes, 0x5a));
+        const Pump = struct {
+            fn copy(ptr: *anyopaque, buffer: *cuda.DeviceBuffer) !void {
+                const source: *[]u8 = @ptrCast(@alignCast(ptr));
+                @memcpy(M.slice(buffer.ptr, buffer.len), source.*);
+            }
+            fn fail(_: *anyopaque, buffer: *cuda.DeviceBuffer) !void {
+                @memset(M.slice(buffer.ptr, buffer.len), 0x11);
+                return error.PayloadHash;
+            }
+        };
+        try std.testing.expectError(error.PayloadHash, e.importState(2, 2048, host.meta[0..host.meta_len], bytes, @ptrCast(&host.bytes), Pump.fail));
+        try std.testing.expect(!e.holds(2));
+        try e.importState(2, 2048, host.meta[0..host.meta_len], bytes, @ptrCast(&host.bytes), Pump.copy);
+        defer e.discardState(2);
+        const restored = e.snaps.get(2).?;
+        try std.testing.expectEqual(@as(usize, 2048), restored.pos);
+        try std.testing.expectEqual(@as(?u32, 1), restored.owner);
+        try std.testing.expectEqualSlices(u1, &.{1}, restored.cur);
+        try std.testing.expect(std.mem.allEqual(u8, M.slice(restored.buf.ptr, restored.buf.len), 0x5a));
+        host.meta[0] = 0;
+        try std.testing.expectError(error.SpillMetaVersion, e.importState(3, 2048, host.meta[0..host.meta_len], bytes, @ptrCast(&host.bytes), Pump.copy));
+        try std.testing.expect(!e.holds(3));
+    }
+    try std.testing.expect(M.empty());
+}
+
+test "paired spill imports refuse missing corrupt and mismatched owner halves before publishing reuse" {
+    const M = @import("cuda_test_driver.zig").Memory;
+    const C = @import("cuda_test_collectives.zig").Collectives;
+    const Fixture = struct {
+        e: Engine = undefined,
+        outcome: enum { valid, missing, corrupt } = .valid,
+        owner: u32 = 0,
+        forgotten: usize = 0,
+        failed: ?anyerror = null,
+
+        fn apply(ptr: *anyopaque, command: persistence.Command) anyerror!void {
+            const f: *@This() = @ptrCast(@alignCast(ptr));
+            if (command.operation == .forget) {
+                f.forgotten += 1;
+                return;
+            }
+            if (f.outcome == .missing) return error.NotStored;
+            if (f.outcome == .corrupt) return error.PayloadHash;
+            const buf = try cuda.DeviceBuffer.alloc(f.e.d, 1);
+            const cur = try f.e.gpa.alloc(u1, 0);
+            try f.e.snaps.put(f.e.gpa, command.id, .{ .buf = buf, .pos = command.at, .mtp_len = command.at, .owner = f.owner, .cur = cur });
+        }
+        fn unused(_: *anyopaque) anyerror!void {}
+        fn close(_: *anyopaque) void {}
+        fn forget(_: *anyopaque, _: u64, _: u32) void {}
+        fn init(f: *@This(), d: *const cuda.Driver, lib: *const cuda.nccl.Library, endpoint: *C.End) !void {
+            f.e.d = d;
+            f.e.gpa = std.testing.allocator;
+            f.e.lib = lib;
+            f.e.comm = @ptrCast(endpoint);
+            f.e.share.rank = endpoint.rank;
+            f.e.share.world = 2;
+            f.e.stream = .{ .d = d, .handle = null };
+            f.e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
+            f.e.snaps = .empty;
+            f.e.pair_failure = owner_kv.failPair;
+            f.e.disk = .{ .ctx = f, .tier = f, .identity = @splat(0), .apply = apply, .request = apply, .flush = unused, .forget = forget, .close = close };
+        }
+        fn deinit(f: *@This()) void {
+            f.e.discardState(7);
+            f.e.snaps.deinit(f.e.gpa);
+            f.e.shared_buf.free();
+        }
+        fn run(f: *@This()) void {
+            f.e.persist(.{ .operation = .read, .id = 7, .key = 1, .at = 2048 }) catch |err| { f.failed = err; };
+        }
+    };
+    var d = M.driver();
+    var lib: cuda.nccl.Library = .{ .lib = undefined, .api = undefined };
+    lib.api.ncclAllReduce = C.allReduce;
+    for (0..4) |case| {
+        var channel: C.Channel = .{};
+        var endpoints = [_]C.End{ .{ .rank = 0, .channel = &channel }, .{ .rank = 1, .channel = &channel } };
+        var a: Fixture = .{};
+        var b: Fixture = .{};
+        try a.init(&d, &lib, &endpoints[0]);
+        defer a.deinit();
+        try b.init(&d, &lib, &endpoints[1]);
+        defer b.deinit();
+        if (case == 0) b.outcome = .missing;
+        if (case == 1) b.outcome = .corrupt;
+        if (case == 2) b.owner = 1;
+        const first = try std.Thread.spawn(.{}, Fixture.run, .{&a});
+        const second = try std.Thread.spawn(.{}, Fixture.run, .{&b});
+        first.join();
+        second.join();
+        if (case == 3) {
+            try std.testing.expect(a.failed == null and b.failed == null);
+            try std.testing.expect(a.e.holds(7) and b.e.holds(7));
+        } else {
+            const expected: anyerror = if (case == 0) error.NotStored else error.SpillRefused;
+            try std.testing.expectEqual(expected, a.failed.?);
+            try std.testing.expectEqual(expected, b.failed.?);
+            try std.testing.expect(!a.e.holds(7) and !b.e.holds(7));
+            try std.testing.expectEqual(@as(usize, if (case == 0) 0 else 1), a.forgotten);
+            try std.testing.expectEqual(a.forgotten, b.forgotten);
+        }
+    }
+    try std.testing.expect(M.empty());
 }
 
 test "owner-only snapshots carry main and MTP prefixes to a new owner and refuse an invalid peer before transfer" {

@@ -28,7 +28,8 @@ pub const explains_open = true;
 /// The server's reading of this rank's room after its load (the budget streams are admitted by); null if unreadable.
 pub const Room = engine.Room;
 /// `slide` stays false: the server refuses --slide for a family without a learner (no `slide` here).
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, room: ?Room = null };
+pub const PersistenceOpen = struct { ctx: *anyopaque, attach: *const fn (*anyopaque, *engine.Engine, *follow.Link) anyerror!engine.persistence.Port };
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, room: ?Room = null, persistence: ?PersistenceOpen = null };
 /// The smallest room among the other ranks and whose it is.
 pub const Peer = struct { bytes: u64, rank: usize };
 
@@ -109,6 +110,19 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer own.e.deinit();
     own.link = try follow.Link.init(gpa, ctx.d, &own.lib, own.comm, own.e.stream, cap);
     errdefer own.link.deinit();
+    if (o.persistence) |persistence| {
+        var problem_: ?anyerror = null;
+        own.e.disk = persistence.attach(persistence.ctx, own.e, &own.link) catch |err| blk: {
+            problem_ = err;
+            break :blk null;
+        };
+        if (!try own.e.pairedReady(problem_ == null)) return problem_ orelse error.PeerSpillOpen;
+        const hashes = try gpa.alloc([32]u8, p.world);
+        defer gpa.free(hashes);
+        const mine = own.e.disk.?.identity;
+        try ranks.gather([32]u8, ctx.d, &own.lib, own.comm, own.e.stream, p.rank, mine, hashes);
+        for (hashes) |hash| if (!std.mem.eql(u8, &mine, &hash)) return error.SpillIdentityMismatch;
+    }
     // Rank 0 admits by the smallest room of the ranks; its sizes are the largest (the first ranks take the remainder).
     const rooms = try gpa.alloc(u64, p.world);
     defer gpa.free(rooms);
@@ -124,6 +138,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
             std.process.exit(1);
         };
         std.log.info("rank {d}: rank 0 ended; leaving", .{p.rank});
+        if (own.e.disk) |disk| disk.close(disk.ctx);
         std.process.exit(0);
     }
     // Rank 0 alone reads these: TF_GLM_PROMPT_STEPS=0 passes prompts whole, TF_GLM_SHARED=0 runs windows alone.
@@ -185,6 +200,34 @@ pub fn snap_drop(ptr: *anyopaque, saved: *anyopaque) void {
     const k: *engine.Kept = @ptrCast(@alignCast(saved));
     e.dropState(k.id);
     e.gpa.destroy(k);
+}
+
+pub fn snap_tier(ptr: *anyopaque) ?*anyopaque {
+    const e: *engine.Engine = @ptrCast(@alignCast(ptr));
+    return if (e.disk) |p| p.tier else null;
+}
+
+pub fn snap_spill_write(ptr: *anyopaque, saved: *anyopaque, _: anytype, name: anytype, tokens: []const u32) !void {
+    const e: *engine.Engine = @ptrCast(@alignCast(ptr));
+    const k: *engine.Kept = @ptrCast(@alignCast(saved));
+    const p = e.disk orelse return error.SpillDisabled;
+    try p.request(p.ctx, .{ .operation = .write, .id = k.id, .key = name.key, .at = name.at, .tokens = tokens });
+}
+
+pub fn snap_spill_read(ptr: *anyopaque, _: anytype, name: anytype) !*anyopaque {
+    const e: *engine.Engine = @ptrCast(@alignCast(ptr));
+    const p = e.disk orelse return error.SpillDisabled;
+    const k = try e.gpa.create(engine.Kept);
+    errdefer e.gpa.destroy(k);
+    k.* = .{ .id = e.next_snap, .at = name.at };
+    e.next_snap += 1;
+    try p.request(p.ctx, .{ .operation = .read, .id = k.id, .key = name.key, .at = name.at });
+    return k;
+}
+
+pub fn snap_spill_forget(ptr: *anyopaque, name: anytype) void {
+    const e: *engine.Engine = @ptrCast(@alignCast(ptr));
+    if (e.disk) |p| p.forget(p.ctx, name.key, name.at);
 }
 
 fn close(ptr: *anyopaque) void {

@@ -6,7 +6,7 @@ const engine = @import("cuda_engine.zig");
 const sampler = @import("cuda_sampler.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve, spill_write, spill_read, spill_forget };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -120,6 +120,16 @@ pub const Leader = struct {
         try x.e.bind(slot);
     }
 
+    pub fn persist(x: Leader, command: engine.persistence.Command) !void {
+        const kind: Kind = switch (command.operation) {
+            .write => .spill_write,
+            .read => .spill_read,
+            .forget => .spill_forget,
+        };
+        try x.send(.{ .kind = @backingInt(kind), .a = command.id, .seed = command.key, .depth = command.at }, command.tokens);
+        try x.e.persist(command);
+    }
+
     /// Rank 0 chooses a physical extent before the paired begin/restore command.
     pub fn reserve(x: Leader, rows: usize) !void {
         const r = try x.e.placement(rows) orelse return;
@@ -151,7 +161,8 @@ pub const Leader = struct {
     }
 
     /// States rank 0 dropped since the last step, so the other ranks free theirs (ids that fit one step at a time).
-    fn flush(x: Leader) !void {
+    pub fn flush(x: Leader) !void {
+        if (x.e.disk) |p| try p.flush(p.ctx);
         const d = &x.e.dropped;
         while (d.items.len > 0) {
             const n = @min(d.items.len, x.link.ids.len);
@@ -241,6 +252,19 @@ pub fn follow(e: *Engine, link: *Link) !void {
         const step = try link.receive();
         const h = step.h;
         const kind: Kind = @fromBackingInt(@intCast(h.kind));
+        if (kind == .spill_write or kind == .spill_read or kind == .spill_forget) {
+            const operation: engine.persistence.Operation = switch (kind) {
+                .spill_write => .write,
+                .spill_read => .read,
+                .spill_forget => .forget,
+                else => unreachable,
+            };
+            e.persist(.{ .operation = operation, .id = h.a, .key = h.seed, .at = h.depth, .tokens = step.ids }) catch |err| switch (err) {
+                error.NotStored, error.SpillRefused => {},
+                else => return err,
+            };
+            continue;
+        }
         if (kind == .reserve) {
             e.reservePaired(h.slot, .{ .base = @intCast(h.a), .rows = @intCast(h.seed) }) catch |err| switch (err) {
                 error.KvReservationRefused => {},
@@ -270,7 +294,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 };
             },
             .verify => try e.verify(step.ids, sampled[0..step.ids.len]),
-            .reserve => unreachable,
+            .reserve, .spill_write, .spill_read, .spill_forget => unreachable,
             .shared => {
                 const k = h.depth;
                 if (k == 0 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadStep;

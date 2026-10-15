@@ -2,6 +2,7 @@
 const std = @import("std");
 const lanes = @import("lanes");
 const Allocator = std.mem.Allocator;
+pub const spill_identity = @import("spill_identity.zig");
 
 /// The server's name for one request, unique while the process lives.
 pub const Id = u64;

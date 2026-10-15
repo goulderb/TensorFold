@@ -42,6 +42,7 @@ pub const LaneHost = struct {
     lone: ?api.Lone = null, // the backend's driver for a lone greedy stream; null: every stream in the lane core
     lone_job: ?*Job = null, // the job that driver holds now
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
+    spill_counts: pc.SpillCounts = .{},
     decoded_rows: bool = false, // the backend prefills Request.decode_spans with decoded rows' arithmetic, cache or not
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
@@ -123,7 +124,16 @@ pub const LaneHost = struct {
     }
 
     pub fn engine(h: *LaneHost) Engine {
-        return .{ .ctx = h, .vtable = &.{ .info = infoFn, .submit = submitFn, .cancel = cancelFn, .status = status.read, .memory = memoryFn, .keepalive = keepaliveFn, .learn = learn.submit } };
+        return .{ .ctx = h, .vtable = &.{ .info = infoFn, .submit = submitFn, .cancel = cancelFn, .status = status.read, .memory = memoryFn, .keepalive = keepaliveFn, .learn = learn.submit, .spill = spillFn } };
+    }
+
+    fn spillFn(ctx: *anyopaque, out: *api.SpillStatus) bool {
+        const h = self(ctx);
+        h.lock();
+        defer h.unlock();
+        const store = h.cache orelse return false;
+        out.* = .{ .tier = store.spillInfo() orelse return false, .cache = h.spill_counts };
+        return true;
     }
 
     /// The family's queue as a keepalive target, when it set one.
@@ -517,6 +527,7 @@ pub const LaneHost = struct {
             h.fillOne();
             status.noteLive(h);
             h.lock();
+            if (h.cache) |store| h.spill_counts = store.spill_counts;
             if (h.closing) {
                 const left = h.queued.items.len + h.admitted.items.len;
                 h.unlock();
