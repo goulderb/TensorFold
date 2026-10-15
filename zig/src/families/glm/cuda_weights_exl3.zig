@@ -5,6 +5,7 @@ const cuda = @import("cuda");
 const core = @import("core");
 const shard = @import("cuda_shard.zig");
 const W = @import("cuda_weights.zig");
+const projections = @import("cuda_weights_projs.zig");
 
 /// EXL3 matrix `name`'s share: inputs [klo, khi) (khi 0: all), `spans`' columns; tiles to `tiles`, suh+svh `scales`.
 pub fn gather(ck: *core.Checkpoint, gpa: std.mem.Allocator, name: []const u8, klo: usize, khi: usize, spans: []const shard.Span, tiles: *std.ArrayList(u8), scales: *std.ArrayList(u8)) !cuda.exl3_linear.Matrix {
@@ -129,16 +130,17 @@ pub fn moe(L: *W.Loader, i: u32) !@import("cuda_moe.zig").Layer {
     const sh = L.w.share.shared;
     if (!L.w.exl3) {
         inline for (.{ "gate_proj", "up_proj" }) |proj| try L.rows(try L.get("layers.{d}.mlp.shared_experts." ++ proj ++ ".weight", .{i}), sh.lo, sh.hi, c.shared_inter, .bf16);
-        const gu = try L.put("layers.{d}.moe.shared.gu", .{i});
+        const gu = try projections.finish(L, "layers.{d}.moe.shared.gu", .{i}, 2 * sh.len(), d);
         try L.cols(try L.get("layers.{d}.mlp.shared_experts.down_proj.weight", .{i}), sh.lo, sh.hi, .bf16);
-        const down = try L.put("layers.{d}.moe.shared.down", .{i});
+        const down = try projections.finish(L, "layers.{d}.moe.shared.down", .{i}, d, sh.len());
         return .{
             .router = router,
             .bias = bias,
             .routed = .{ .format = .exl3, .up = ptrs[0], .down = ptrs[1], .up_scale = ptrs[2], .down_scale = ptrs[3], .width = cut.len(), .dims = d, .experts = c.experts, .limit = c.swiglu_limit, .exl3 = widths },
             .count = c.experts,
-            .shared_gu = gu,
-            .shared_down = .{ .b16 = down },
+            .shared_gu = if (gu == .b16) gu.b16 else 0,
+            .shared_gu_q = if (gu == .q) gu.q else null,
+            .shared_down = down,
             .shared = sh.len(),
             .top_k = c.topk,
             .scale = c.routed_scale,

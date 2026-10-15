@@ -136,6 +136,9 @@ pub const Buffers = struct {
         var mm: usize = 4;
         // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
         for (b16Shapes(w)) |sh_| mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), sh_[0], sh_[1]));
+        if (w.precision.dense == .q4) for (b16Shapes(w)) |shape| {
+            mm = @max(mm, rows * (shape[1] / 64) * 4);
+        };
         const hist_len = if (pairs > cuda.grouped.small) (pairs + cuda.grouped.small - 1) / cuda.grouped.small * (count + 1) else 1;
         const sizes = [_]usize{
             rows * 4,     rows * S * D * 2, rows * D * 2,           rows * (D / 64) * 4,

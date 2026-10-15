@@ -19,7 +19,8 @@ fn mm(k: Kernels, stream: cuda.Stream, p: b16.Proj, x: u64, ldx: usize, rows: us
         .b16 => |w| return b16.matmul(k.set, stream, x, ldx, w, out, part, rows, n, dims, wide),
         .q => |w| w,
     };
-    const in: cuda.qlinear.Rows = .{ .x = x, .ldx = ldx };
+    if (q == .affine4 and !prompt) try b16.groupSums(k.set, stream, x, ldx, part, rows, dims);
+    const in: cuda.qlinear.Rows = .{ .x = x, .ldx = ldx, .sums = part, .part = part };
     if (prompt) {
         std.debug.assert(x % 16 == 0 and (rows == 1 or ldx % 8 == 0));
         return if (wide) k.linear.promptF32(stream, q, in, out, rows) else k.linear.prompt(stream, q, in, out, rows);

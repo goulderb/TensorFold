@@ -99,7 +99,8 @@ pub fn proj(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, p: Proj
         .b16 => |w| return matmul(set, stream, x, x_stride, w, out, part, m, n, k, wide),
         .q => |w| {
             if (w.outputs() != n or w.inputs() != k) return error.ShapeMismatch;
-            const in: cuda.qlinear.Rows = .{ .x = x, .ldx = x_stride };
+            if (w == .affine4 and m < rows_from) try groupSums(set, stream, x, x_stride, part, m, k);
+            const in: cuda.qlinear.Rows = .{ .x = x, .ldx = x_stride, .sums = part, .part = part };
             const l = set.linear;
             if (m >= rows_from) return if (wide) l.promptF32(stream, w, in, out, m) else l.prompt(stream, w, in, out, m);
             return if (wide) l.decodeF32(stream, w, in, out, m) else l.decode(stream, w, in, out, m);
