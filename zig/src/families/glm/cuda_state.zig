@@ -3,6 +3,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const weights = @import("cuda_weights.zig");
+const cache_rows = @import("cuda_cache.zig");
 const kda = @import("cuda_kda.zig");
 const b16 = @import("cuda_b16.zig");
 const latent = @import("cuda_latent.zig");
@@ -253,7 +254,7 @@ pub const State = struct {
     proj_layer: usize,
     proj_row: usize,
 
-    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize) !State {
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, format: cache_rows.Format) !State {
         const c = &w.config;
         const s = &w.share;
         var nk: usize = 0;
@@ -269,7 +270,7 @@ pub const State = struct {
         defer sizes.deinit(gpa);
         try sizes.appendSlice(gpa, &.{ 4, nk * 3 * 3 * n * 2, 2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * window_rows * kw * 2 });
         try sizes.appendSlice(gpa, &.{ nk * window_rows * n * 4, nk * window_rows * n * 2, nk * window_rows * n * 4, nk * window_rows * s.kda.len() * 4 });
-        for (0..nd + 1) |_| try sizes.appendSlice(gpa, &.{ capacity * c.kv_lora * 2, capacity * c.i_dim * 2, capacity * c.i_dim * 2, pk_rows * c.i_dim * 2 });
+        for (0..nd + 1) |_| try sizes.appendSlice(gpa, &.{ capacity * format.rowBytes(c.kv_lora), capacity * c.i_dim * 2, capacity * c.i_dim * 2, pk_rows * format.rowBytes(c.i_dim) });
         try sizes.append(gpa, 4); // the MTP head's position
         const p = try gpa.alloc(u64, sizes.items.len);
         defer gpa.free(p);
@@ -279,8 +280,8 @@ pub const State = struct {
         errdefer gpa.free(cur);
         @memset(cur, 0);
         const caches = try gpa.alloc(dsa_block.Caches, nd);
-        for (caches, 0..) |*x, j| x.* = .{ .lc = p[8 + 4 * j], .ik = p[9 + 4 * j], .ig = p[10 + 4 * j], .pk = p[11 + 4 * j], .pk_rows = pk_rows };
-        return .{ .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw };
+        for (caches, 0..) |*x, j| x.* = .{ .lc = .{ .ptr = p[8 + 4 * j], .format = format }, .ik = p[9 + 4 * j], .ig = p[10 + 4 * j], .pk = .{ .ptr = p[11 + 4 * j], .format = format }, .pk_rows = pk_rows };
+        return .{ .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = .{ .ptr = p[8 + 4 * nd], .format = format }, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = .{ .ptr = p[11 + 4 * nd], .format = format }, .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw };
     }
 
     pub fn deinit(st: *State) void {

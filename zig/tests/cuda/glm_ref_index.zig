@@ -19,7 +19,7 @@ fn orderKey(s: f32) u32 {
 }
 
 /// sparse.selectTokens for 96 rows at 6,000 (1,500 to 1,524 visible pools in a 2,048-pool bucket).
-pub fn selection(r: *Rig, set: glm.glue.Set, ops: cuda.Module) !void {
+pub fn selection(r: *Rig, set: glm.glue.Set, ops: cuda.Module, format: glm.cache.Format) !void {
     const pos = 6000;
     const rows = 96;
     const cap = 4096;
@@ -28,19 +28,19 @@ pub fn selection(r: *Rig, set: glm.glue.Set, ops: cuda.Module) !void {
     const qi = try r.bfs(rows * heads * d, 1.0);
     const wts = try r.bfs(rows * heads, 1.0);
     const pk = try r.bfs(np * d, 1.0);
+    const cache = try @import("glm_ref_cache.zig").upload(r, set, pk, d, format);
     const p0: i32 = pos;
     const s: sp.Scratch = .{ .scores = try r.zeros(rows * np * 4), .ls = try r.zeros(rows * sp.select_list * 4), .li = try r.zeros(rows * sp.select_list * 4), .pools = try r.zeros(rows * sp.topk_pools * 8), .at = try r.zeros(4) };
     const tokens = try r.zeros(rows * sp.width * 4);
     const counts = try r.zeros(rows * 4);
-    try sp.selectTokens(set, ops, r.s, try r.dev(std.mem.sliceAsBytes(qi)), try r.dev(std.mem.sliceAsBytes(wts)), heads, try r.dev(std.mem.sliceAsBytes(pk)), try r.dev(std.mem.asBytes(&p0)), pos, rows, heads, d, cap, s, tokens, counts);
+    try sp.selectTokens(set, ops, r.s, try r.dev(std.mem.sliceAsBytes(qi)), try r.dev(std.mem.sliceAsBytes(wts)), heads, cache.dev, try r.dev(std.mem.asBytes(&p0)), pos, rows, heads, d, cap, s, tokens, counts);
     const raw = try r.back(s.scores, rows * np * 4);
     const got = std.mem.bytesAsSlice(f32, raw);
 
     // float64: sum_h w_h relu(scale q_h . k_p); bound: (128 + 8) 2^-24 scale sum |q k| a dot, 40 2^-24 sum |w_h relu|.
     const scale = 1 / @sqrt(@as(f64, d));
     const wscale: f64 = sp.headScale(heads);
-    const kd = try r.a.alloc(f64, np * d);
-    for (kd, pk) |*v, b| v.* = bf(b);
+    const kd = cache.f64s;
     const col = try r.a.alloc(f64, cols);
     @memset(col, 0);
     for (0..rows) |row| {

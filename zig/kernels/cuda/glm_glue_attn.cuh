@@ -2,6 +2,7 @@
 #pragma once
 
 #include "glm_glue_router.cuh"
+#include "glm_cache.cuh"
 
 namespace glm_attn {
 
@@ -50,8 +51,8 @@ constexpr int wide_smem() {
   return (HB * LW + 2 * KT * LW + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4;
 }
 
-template <int HB>
-__device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
+template <int HB, bool FP8 = false>
+__device__ void chunks_wide(const __nv_bfloat16* qa, const void* lc, const int* pos, const int* tok,
                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
                             float scale, int sparse) {
   constexpr int MT = HB / 16;
@@ -74,7 +75,10 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       const int64_t ki = first + key;
       const bool ok = sparse ? ki < n : ki <= limit;
       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-      cp16(dst + wide(key, u), lc + src * LW + u * 8, ok);
+      if constexpr (FP8)
+        glm_cache::load8<LW>(dst + wide(key, u), lc, src, u * 8, ok);
+      else
+        cp16(dst + wide(key, u), static_cast<const __nv_bfloat16*>(lc) + src * LW + u * 8, ok);
     }
   };
   float m[MT][2], l[MT][2], o[MT][8][4];
@@ -118,6 +122,12 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       for (int e = 0; e < 2; ++e) {
         const int64_t ki = first + kg * 8 + q * 2 + e;
         const bool ok = sparse ? ki < n : ki <= limit;
+        if constexpr (FP8) {
+          const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+          const float ks = ok ? glm_cache::scale<LW>(lc, src) : 1.0f;
+          acc[e] = __fmul_rn(acc[e], ks);
+          acc[e + 2] = __fmul_rn(acc[e + 2], ks);
+        }
         sc[e] = ok ? __fmul_rn(acc[e], scale) : -INFINITY;
         sc[e + 2] = ok ? __fmul_rn(acc[e + 2], scale) : -INFINITY;
       }
@@ -149,7 +159,17 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
             p[e] = active && ok ? glm_triton::exp_approx(sc[hf * 2 + e] - nm) : 0.0f;
           }
           const int hr = i * 16 + hf * 8 + g, col = kg * 8 + q * 2;
-          *reinterpret_cast<__nv_bfloat162*>(ps + narrow(hr, col >> 3) + (col & 7)) = __floats2bfloat162_rn(p[0], p[1]);
+          float scaled[2] = {p[0], p[1]};
+          if constexpr (FP8) {
+            for (int e = 0; e < 2; ++e) {
+              const int64_t ki = first + col + e;
+              const bool ok = sparse ? ki < n : ki <= limit;
+              const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+              const float ks = ok ? glm_cache::scale<LW>(lc, src) : 1.0f;
+              scaled[e] = __fmul_rn(p[e], ks);
+            }
+          }
+          *reinterpret_cast<__nv_bfloat162*>(ps + narrow(hr, col >> 3) + (col & 7)) = __floats2bfloat162_rn(scaled[0], scaled[1]);
           const float s = quad_sum(p[0] + p[1]);
           if (q == 0) red[hr * 4 + kg] = s;
         }
@@ -213,6 +233,18 @@ extern "C" __global__ void __launch_bounds__(256)
   glm_attn::chunks_wide<32>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse);
 }
 
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks_16_fp8(const __nv_bfloat16* qa, const void* lc, const int* pos, const int* tok, const int* cnt,
+                         float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
+  glm_attn::chunks_wide<16, true>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks_32_fp8(const __nv_bfloat16* qa, const void* lc, const int* pos, const int* tok, const int* cnt,
+                         float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
+  glm_attn::chunks_wide<32, true>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse);
+}
+
 // latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
 extern "C" __global__ void __launch_bounds__(128)
     tf_glm_merge(const float* po, const float* pm, const float* pl, __nv_bfloat16* out, const int* cnt, int64_t rows,
@@ -242,8 +274,8 @@ extern "C" __global__ void __launch_bounds__(128)
 }
 
 // sparse._scores, block (row, L pool blocks) of 4 warps, 16 pools a warp: sum_h w relu(dots scale), -inf past visible.
-extern "C" __global__ void __launch_bounds__(128)
-    tf_glm_scores(const __nv_bfloat16* qi, const __nv_bfloat16* wts, int64_t w_stride, const __nv_bfloat16* pk,
+template <bool FP8>
+__device__ void glm_scores(const __nv_bfloat16* qi, const __nv_bfloat16* wts, int64_t w_stride, const void* pk,
                   float* out, const int* pos, int64_t np, int64_t nb, float scale, float wscale, int64_t heads,
                   int loop) {
   constexpr int D = 128, HP = 32, BP = 64;
@@ -269,7 +301,11 @@ extern "C" __global__ void __launch_bounds__(128)
       const int idx = lane + t * 32, row = idx / (D / 8), u = idx % (D / 8);
       const int64_t p = p0 + row;
       const bool ok = p < npool;
-      glm_attn::cp16(sm + (warp * 2 + buf) * 16 * D + at(row, u), pk + (ok ? p : 0) * D + u * 8, ok);
+      __nv_bfloat16* dst = sm + (warp * 2 + buf) * 16 * D + at(row, u);
+      if constexpr (FP8)
+        glm_cache::load8<D>(dst, pk, ok ? p : 0, u * 8, ok);
+      else
+        glm_attn::cp16(dst, static_cast<const __nv_bfloat16*>(pk) + (ok ? p : 0) * D + u * 8, ok);
     }
   };
   const int64_t first = (int64_t)blockIdx.y * loop;
@@ -310,6 +346,14 @@ extern "C" __global__ void __launch_bounds__(128)
     __syncwarp();
     for (int nt = 0; nt < 2; ++nt)
       for (int e = 0; e < 2; ++e) {
+        const int64_t p = p0 + nt * 8 + q * 2 + e;
+        if constexpr (FP8) {
+          const float ks = p < npool ? glm_cache::scale<D>(pk, p) : 1.0f;
+          for (int h = 0; h < 2; ++h) {
+            acc[h][nt][e] = __fmul_rn(acc[h][nt][e], ks);
+            acc[h][nt][e + 2] = __fmul_rn(acc[h][nt][e + 2], ks);
+          }
+        }
         const float v0 = fmaxf(__fmul_rn(acc[0][nt][e], scale), 0.0f),
                     v1 = fmaxf(__fmul_rn(acc[0][nt][e + 2], scale), 0.0f);
         const float v2 = fmaxf(__fmul_rn(acc[1][nt][e], scale), 0.0f),
@@ -319,8 +363,19 @@ extern "C" __global__ void __launch_bounds__(128)
         s = __fmaf_rn(wv[2], v2, s);
         s = __fmaf_rn(wv[3], v3, s);
         for (int o = 16; o >= 4; o >>= 1) s = s + __shfl_xor_sync(0xffffffffu, s, o);
-        const int64_t p = p0 + nt * 8 + q * 2 + e;
         if (g == 0 && p < np) out[r * np + p] = p < npool ? s : -INFINITY;
       }
   }
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_scores(const __nv_bfloat16* qi, const __nv_bfloat16* wts, int64_t w_stride, const __nv_bfloat16* pk,
+                  float* out, const int* pos, int64_t np, int64_t nb, float scale, float wscale, int64_t heads, int loop) {
+  glm_scores<false>(qi, wts, w_stride, pk, out, pos, np, nb, scale, wscale, heads, loop);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_scores_fp8(const __nv_bfloat16* qi, const __nv_bfloat16* wts, int64_t w_stride, const void* pk,
+                      float* out, const int* pos, int64_t np, int64_t nb, float scale, float wscale, int64_t heads, int loop) {
+  glm_scores<true>(qi, wts, w_stride, pk, out, pos, np, nb, scale, wscale, heads, loop);
 }

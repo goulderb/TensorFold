@@ -4,6 +4,7 @@ pub const experts = @import("cuda_experts.zig");
 pub const glue = @import("cuda_glue.zig");
 pub const kda = @import("cuda_kda.zig");
 pub const b16 = @import("cuda_b16.zig");
+pub const cache = @import("cuda_cache.zig");
 pub const latent = @import("cuda_latent.zig");
 pub const sparse = @import("cuda_sparse.zig");
 pub const moe = @import("cuda_moe.zig");
@@ -29,6 +30,7 @@ test {
     _ = glue;
     _ = kda;
     _ = b16;
+    _ = cache;
     _ = latent;
     _ = sparse;
     _ = moe;

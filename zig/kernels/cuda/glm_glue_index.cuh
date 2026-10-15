@@ -2,6 +2,7 @@
 #pragma once
 
 #include "glm_triton.cuh"
+#include "glm_cache.cuh"
 
 using namespace glm_triton;
 
@@ -35,12 +36,13 @@ extern "C" __global__ void __launch_bounds__(32)
 }
 
 // sparse._pool_keys, a warp a completed pool: softmax of its 4 gate rows (+ ape) times bf16 keys, summed in order.
-extern "C" __global__ void __launch_bounds__(32)
-    tf_glm_pool_keys(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape, __nv_bfloat16* pk,
+template <bool FP8>
+__device__ void glm_pool_keys(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape, void* pk,
                      const int* pos, int64_t rows) {
   constexpr int D = 128;
   const int64_t P = pos[0], p = P / 4 + blockIdx.x;
   if (4 * p + 3 > P + rows - 1) return;
+  float pooled[4];
   for (int j = 0; j < 4; ++j) {
     const int d = threadIdx.x * 4 + j;
     float l[4], e[4];
@@ -53,8 +55,21 @@ extern "C" __global__ void __launch_bounds__(32)
       const float tq = rbf(__fmul_rn(rbf(div_full(e[q], s)), bf(ik[(4 * p + q) * D + d])));
       t = q == 0 ? tq : t + tq;
     }
-    pk[p * D + d] = __float2bfloat16_rn(t);
+    pooled[j] = t;
   }
+  glm_cache::store<D, 4, FP8>(pk, p, pooled);
+}
+
+extern "C" __global__ void __launch_bounds__(32)
+    tf_glm_pool_keys(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape,
+                     __nv_bfloat16* pk, const int* pos, int64_t rows) {
+  glm_pool_keys<false>(ik, ig, ape, pk, pos, rows);
+}
+
+extern "C" __global__ void __launch_bounds__(32)
+    tf_glm_pool_keys_fp8(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape,
+                         void* pk, const int* pos, int64_t rows) {
+  glm_pool_keys<true>(ik, ig, ape, pk, pos, rows);
 }
 
 namespace glm_index {

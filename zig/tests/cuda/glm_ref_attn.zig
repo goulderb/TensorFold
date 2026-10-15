@@ -61,15 +61,14 @@ fn reference(r: *Rig, q: []const u16, cd: []const f64, keys: []const []const u32
     return .{ .want = want, .tol = tol };
 }
 
-fn cacheOf(r: *Rig, keys: usize) !struct { dev: u64, f64s: []f64 } {
+fn cacheOf(r: *Rig, set: glm.glue.Set, keys: usize, format: glm.cache.Format) !@import("glm_ref_cache.zig").Uploaded {
     const c = try r.bfs(keys * lw, 1.0);
-    const cd = try r.a.alloc(f64, keys * lw);
-    for (cd, c) |*d, v| d.* = bf(v);
-    return .{ .dev = try r.dev(std.mem.sliceAsBytes(c)), .f64s = cd };
+    @memset(c[0..lw], 0);
+    return @import("glm_ref_cache.zig").upload(r, set, c, lw, format);
 }
 
 /// latent.attention of `rows` rows at `pos` (keys 0 .. pos + r each) with head block hb into a fresh output.
-fn attend(r: *Rig, set: glm.glue.Set, q: u64, cache: u64, pos: usize, rows: usize, scale: f32, hb: usize) !u64 {
+fn attend(r: *Rig, set: glm.glue.Set, q: u64, cache: glm.cache.Cache, pos: usize, rows: usize, scale: f32, hb: usize) !u64 {
     const nch = latent.chunksFor(pos + rows);
     const out = try r.zeros(rows * heads * lw * 2);
     const p0: i32 = @intCast(pos);
@@ -85,13 +84,13 @@ fn sameRow(r: *Rig, name: []const u8, wide: []const u8, one: u64, row: usize) !v
 }
 
 /// Dense causal attention on 1,500 keys: 70 rows at 1,430 vs float64 (32-head), 16-head blocks' bytes, one-row windows.
-pub fn dense(r: *Rig, set: glm.glue.Set) !void {
+pub fn dense(r: *Rig, set: glm.glue.Set, format: glm.cache.Format) !void {
     const pos = 1430;
     const rows = 70;
     const scale: f32 = 0.125;
     const q = try r.bfs(rows * heads * lw, 1.0);
     const dq = try r.dev(std.mem.sliceAsBytes(q));
-    const c = try cacheOf(r, pos + rows);
+    const c = try cacheOf(r, set, pos + rows, format);
     const wide = try attend(r, set, dq, c.dev, pos, rows, scale, latent.heads_tile_wide);
     const keys = try r.a.alloc([]const u32, rows);
     for (keys, 0..) |*k, row| {
@@ -113,14 +112,14 @@ pub fn dense(r: *Rig, set: glm.glue.Set) !void {
 }
 
 /// Sparse attention on indexer lists (<= 1,100 of 6,000 keys): 70 rows vs float64, 1-row windows, count 0 left alone.
-pub fn sparse(r: *Rig, set: glm.glue.Set) !void {
+pub fn sparse(r: *Rig, set: glm.glue.Set, format: glm.cache.Format) !void {
     const keys = 6000;
     const rows = 70;
     const w = 1100;
     const scale: f32 = 0.125;
     const q = try r.bfs(rows * heads * lw, 1.0);
     const dq = try r.dev(std.mem.sliceAsBytes(q));
-    const c = try cacheOf(r, keys);
+    const c = try cacheOf(r, set, keys, format);
     const tok = try r.a.alloc(i32, rows * w);
     @memset(tok, -1);
     const cnt = try r.a.alloc(i32, rows);

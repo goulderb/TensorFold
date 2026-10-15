@@ -6,6 +6,7 @@ const glue = @import("cuda_glue.zig");
 const b16 = @import("cuda_b16.zig");
 const latent = @import("cuda_latent.zig");
 const sparse = @import("cuda_sparse.zig");
+const cache = @import("cuda_cache.zig");
 
 /// A prompt chunk's rows one dense latent attention call takes (geometry.MLA_PROMPT_ATT_ROWS).
 pub const prompt_att_rows = 512;
@@ -35,8 +36,8 @@ pub const Layer = struct {
     dense_limit: usize, // the largest context whose top-k selection keeps every visible key (Config.keyWidth)
 };
 
-/// The caches: latent bf16 [capacity][lw], index keys/gates bf16 [capacity][128], pooled keys bf16 [pk_rows][128].
-pub const Caches = struct { lc: u64, ik: u64, ig: u64, pk: u64, pk_rows: usize };
+/// Latent and pooled keys share a format; individual index keys and gates stay BF16.
+pub const Caches = struct { lc: cache.Cache, ik: u64, ig: u64, pk: cache.Cache, pk_rows: usize };
 
 /// The block's scratch for up to `rows` rows.
 pub const Scratch = struct {

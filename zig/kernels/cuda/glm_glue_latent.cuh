@@ -2,6 +2,7 @@
 #pragma once
 
 #include "glm_triton.cuh"
+#include "glm_cache.cuh"
 
 using namespace glm_triton;
 
@@ -71,4 +72,12 @@ extern "C" __global__ void tf_glm_lat_write(const __nv_bfloat16* lat, int64_t la
                                             const int* pos, int64_t lw) {
   const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
   for (int64_t k = threadIdx.x; k < lw; k += blockDim.x) cache[at * lw + k] = lat[r * lat_stride + k];
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_lat_write_fp8(const __nv_bfloat16* lat, int64_t lat_stride, void* cache, const int* pos, int64_t lw) {
+  const int64_t r = blockIdx.x;
+  float x[4];
+  for (int j = 0; j < 4; ++j) x[j] = bf(lat[r * lat_stride + threadIdx.x * 4 + j]);
+  glm_cache::store<512, 4, true>(cache, (int64_t)pos[0] + r, x);
 }

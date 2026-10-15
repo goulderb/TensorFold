@@ -184,7 +184,7 @@ pub const Engine = struct {
         if (e.seqs.items[slot] == null) {
             const q = try e.gpa.create(Seq);
             errdefer e.gpa.destroy(q);
-            q.* = .{ .st = try fw.State.init(e.gpa, e.d, &e.w, e.capacity) };
+            q.* = .{ .st = try fw.State.init(e.gpa, e.d, &e.w, e.capacity, e.settings.kv) };
             e.seqs.items[slot] = q;
         }
         e.cur = e.seqs.items[slot].?;
