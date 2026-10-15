@@ -48,6 +48,7 @@ const kernels = [_]Kernel{
     .{ .name = "glm_glue", .flags = &.{"-O3"} }, // ours: the Python family's Triton glue by hand, its PTX op for op
     .{ .name = "glm_ops", .flags = &.{"-O3"} }, // ours: GLM's integer work the Python family did in torch (the DSA token lists)
     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
+    .{ .name = "glm_vision_ops", .flags = &.{ "-O3", "--fmad=false" } },
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
     .{ .name = "torch_pointwise", .src = "torch_ops/pointwise", .flags = torch_ops },
@@ -163,6 +164,20 @@ fn glmCuda(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     m.addImport("canon", canon);
     m.addImport("lanes", lanes);
     m.addImport("heat", heat);
+    const cudnn_headers = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/vision_headers/cudnn_headers.zig"), .target = target, .optimize = optimize });
+    const codec_headers = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/vision_headers/image_codec_headers.zig"), .target = target, .optimize = optimize });
+    const cudnn = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/glm_vision_cudnn.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    cudnn.addImport("cudnn_headers", cudnn_headers);
+    cudnn.addImport("cuda", cuda);
+    const sdpa = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/glm_vision_sdpa.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    sdpa.addImport("cudnn_headers", cudnn_headers);
+    sdpa.addImport("cuda", cuda);
+    const vision_ops = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/glm_vision_ops.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    vision_ops.addImport("cuda", cuda);
+    m.addImport("cudnn", cudnn);
+    m.addImport("vision_sdpa", sdpa);
+    m.addImport("vision_ops", vision_ops);
+    m.addImport("image_codec_headers", codec_headers);
     return m;
 }
 

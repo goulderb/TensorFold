@@ -26,6 +26,12 @@ pub const engine = @import("cuda_engine.zig");
 pub const follow = @import("cuda_follow.zig");
 pub const lanes = @import("cuda_lanes.zig");
 pub const native = @import("cuda_native.zig");
+pub const vision = @import("cuda_vision.zig");
+pub const vision_codec = @import("cuda_vision_codec.zig");
+pub const vision_engine = @import("cuda_vision_engine.zig");
+pub const vision_pipeline = @import("cuda_vision_pipeline.zig");
+pub const vision_binding = @import("cuda_vision_binding.zig");
+pub const vision_replica = @import("cuda_vision_replica.zig");
 
 test {
     _ = @import("cuda_checkpoint.zig");
@@ -55,5 +61,11 @@ test {
     _ = follow;
     _ = lanes;
     _ = native;
+    _ = vision;
+    _ = vision_codec;
+    _ = vision_engine;
+    _ = vision_pipeline;
+    _ = vision_binding;
+    _ = vision_replica;
     _ = @import("heat"); // upstream's heat bands, run where the GLM ranks use them
 }
