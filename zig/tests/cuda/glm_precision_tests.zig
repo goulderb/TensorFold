@@ -105,6 +105,10 @@ fn head(r: *Rig, modules: *const glm.forward.Modules, set: glm.glue.Set) !void {
         values[row * k + col] = core.quant.fp8.e4m3(code) * scales[row * (k / 128) + col / 128];
         weights[row * k + col] = bf16(@floatCast(values[row * k + col]));
     };
+    // Torch's scalar division is float32 reciprocal multiplication: 168 * fp32(1/448) is 0x3ec00001.
+    const scale_bits = [_]u32{ 0x3e000000, 0x3e800000, 0x3ec00001, 0x3f000000 };
+    for (scales, 0..) |*s, g| s.* = @bitCast(scale_bits[g % scale_bits.len]);
+    for (values, codes, 0..) |*value, code, i| value.* = core.quant.fp8.e4m3(code) * scales[i / 128];
     const npad = cuda.fp8.padded(n);
     var model: glm.weights.Weights = .{ .gpa = r.gpu.gpa, .config = undefined, .share = undefined };
     defer model.deinit();

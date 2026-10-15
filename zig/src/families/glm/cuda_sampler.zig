@@ -52,7 +52,7 @@ pub const Sampler = struct {
         errdefer meta.free();
         var tok = try cuda.DeviceBuffer.alloc(d, rows * 4);
         errdefer tok.free();
-        const prob = try cuda.DeviceBuffer.alloc(d, rows * 4);
+        var prob = try cuda.DeviceBuffer.alloc(d, rows * 4);
         errdefer prob.free();
         const bits = try cuda.DeviceBuffer.alloc(d, rows * ((vocab + 31) / 32) * 4);
         return .{ .d = d, .module = m, .tf_draw = f, .mask_fn = mask_fn, .vocab = vocab, .rows = rows, .full = full, .rule = r, .meta = meta, .tok = tok, .prob = prob, .bits = bits };
