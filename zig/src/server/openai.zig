@@ -425,11 +425,12 @@ const Run = struct {
         run: *Run,
         tools: bool,
         opened: bool = false,
+        prompt_len: usize = 0,
 
         fn accepted(ctx: *anyopaque) error{Closed}!void {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
             const r = s.run;
-            try r.out.vt.open(r.out.ctx);
+            try r.out.vt.open(r.out.ctx, s.prompt_len);
             s.opened = true;
             if (!s.tools and r.is_chat) try r.emit(r.chunk(roleDelta(r.a) catch return error.Closed, null) catch return error.Closed);
         }
@@ -499,7 +500,7 @@ const Run = struct {
             compaction = ready.stamp;
             break :blk ready.prepared;
         };
-        var sink_state: StreamSink = .{ .run = r, .tools = tools };
+        var sink_state: StreamSink = .{ .run = r, .tools = tools, .prompt_len = prepared.prompt_len };
         const sink: chat.Sink = .{ .ctx = &sink_state, .call = StreamSink.call, .accepted = StreamSink.accepted };
         var reply = (if (r.turn) |t| cortheon.loop.stream(t, r.srv, &cx, &r.plan.input, prepared, sink, gone) else chat.generate(r.srv, &cx, prepared, sink, gone)) catch |e| {
             if (!sink_state.opened) return r.unsent(&cx, e, field);

@@ -248,7 +248,7 @@ pub const Store = struct {
         if (bytes > s.budget) return have;
         const tokens = s.gpa.dupe(u32, hit.tokens) catch return have; // room-making writes may evict the hit from disk
         while (s.held + s.spare() + bytes > s.budget) {
-            const v = s.victimBut(have, prompt, false) orelse {
+            const v = s.victimBut(have, prompt, @intCast(prompt.len), false) orelse {
                 s.gpa.free(tokens);
                 return have;
             };
