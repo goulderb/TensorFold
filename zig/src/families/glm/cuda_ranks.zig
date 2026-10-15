@@ -12,6 +12,7 @@ pub const Settings = struct {
     kv: cache.Format = .bf16,
     weight_dense: precision.Dense = .bf16,
     weight_head: precision.Head = .bf16,
+    vision: bool = false,
     kv_pool_tokens: u32 = 0,
     kv_shard: bool = false,
     split: bool = true, // TF_GLM_PREFILL_REDUCE: split (each rank glues its own rows) or gather
@@ -32,6 +33,12 @@ pub const Settings = struct {
             problem.* = "TF_GLM_HEAD: bf16 or fp8";
             return error.BadSetting;
         };
+        if (get("TF_GLM_VISION")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.vision = true else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_VISION: 0 or 1";
+                return error.BadSetting;
+            }
+        }
         var spill_hash = Sha256.init(.{});
         inline for (.{ "TENSORFOLD_SPILL_GIB", "TENSORFOLD_SPILL_HOST_GIB", "TENSORFOLD_SPILL_HIGHWATER", "TENSORFOLD_SPILL_MIN_TOKENS", "TENSORFOLD_SPILL_MIN_FREE_GIB", "TENSORFOLD_SPILL_FLUSH_S", "TENSORFOLD_SPILL_KEEP_BUILDS" }) |name| {
             spill_hash.update(name ++ "=");
@@ -104,7 +111,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 8, // this struct's version
+    layout: u32 = 9, // this struct's version
     world: u32,
     rank: u32,
     split: u32,
@@ -114,6 +121,7 @@ pub const Fingerprint = extern struct {
     kv: u32,
     weight_dense: u32 = 0,
     weight_head: u32 = 0,
+    vision: u32 = 0,
     kv_pool_tokens: u32,
     kv_shard: u32,
     spill: [32]u8 = @splat(0),
@@ -124,13 +132,14 @@ pub const Fingerprint = extern struct {
     program: [32]u8, // sha256 of this executable
     checkpoint: [64]u8, // the checkpoint folder's last name (the snapshot's revision), zero padded
 
-    pub const Field = enum { layout, rank, world, split, kda_wide, pieces, layers, kv, weight_dense, weight_head, kv_pool_tokens, kv_shard, spill, capacity, heat_high, heat_low, config, program, checkpoint };
+    pub const Field = enum { layout, rank, world, split, kda_wide, pieces, layers, kv, weight_dense, weight_head, vision, kv_pool_tokens, kv_shard, spill, capacity, heat_high, heat_low, config, program, checkpoint };
 
     pub fn of(world: usize, rank: usize, s: Settings, capacity: usize, config: [32]u8, program: [32]u8, checkpoint_dir: []const u8) Fingerprint {
         var f: Fingerprint = .{ .world = @intCast(world), .rank = @intCast(rank), .split = @intFromBool(s.split), .kda_wide = @intFromBool(s.kda_wide), .pieces = s.pieces, .layers = s.layers, .kv = @backingInt(s.kv), .kv_pool_tokens = s.kv_pool_tokens, .kv_shard = @intFromBool(s.kv_shard), .capacity = capacity, .heat_high = if (s.heat) |b| b.high_c else 0, .heat_low = if (s.heat) |b| b.low_c else 0, .config = config, .program = program, .checkpoint = @splat(0) };
         f.spill = s.spill;
         f.weight_dense = @intFromEnum(s.weight_dense);
         f.weight_head = @intFromEnum(s.weight_head);
+        f.vision = @intFromBool(s.vision);
         const name = std.fs.path.basename(std.mem.trimEnd(u8, checkpoint_dir, "/"));
         const n = @min(name.len, f.checkpoint.len);
         @memcpy(f.checkpoint[0..n], name[0..n]);
@@ -145,7 +154,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
     for (all, 0..) |f, r| {
         if (f.layout != all[0].layout) return .{ .field = .layout, .rank = r };
         if (f.rank != r) return .{ .field = .rank, .rank = r };
-        inline for (.{ "world", "split", "kda_wide", "pieces", "layers", "kv", "weight_dense", "weight_head", "kv_pool_tokens", "kv_shard", "spill", "capacity", "heat_high", "heat_low", "config", "program", "checkpoint" }) |name| {
+        inline for (.{ "world", "split", "kda_wide", "pieces", "layers", "kv", "weight_dense", "weight_head", "vision", "kv_pool_tokens", "kv_shard", "spill", "capacity", "heat_high", "heat_low", "config", "program", "checkpoint" }) |name| {
             if (!std.mem.eql(u8, std.mem.asBytes(&@field(f, name)), std.mem.asBytes(&@field(all[0], name))))
                 return .{ .field = @field(Fingerprint.Field, name), .rank = r };
         }
@@ -198,6 +207,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .kv => "TF_GLM_KV",
         .weight_dense => "TF_GLM_DENSE",
         .weight_head => "TF_GLM_HEAD",
+        .vision => "TF_GLM_VISION",
         .kv_pool_tokens => "TF_GLM_KV_POOL_TOKENS",
         .kv_shard => "TF_GLM_KV_SHARD",
         .spill => "TENSORFOLD_SPILL settings",
@@ -341,4 +351,22 @@ test "weight precision and spill enablement must agree before rank startup" {
     all[1].weight_head = all[0].weight_head;
     all[1].spill = defaults.spill;
     try std.testing.expectEqual(Fingerprint.Field.spill, mismatch(&all).?.field);
+}
+
+test "vision startup is explicit and requires rank agreement" {
+    const Values = struct {
+        fn enabled(name: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, name, "TF_GLM_VISION")) "1" else null;
+        }
+        fn invalid(name: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, name, "TF_GLM_VISION")) "true" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    try std.testing.expect((try Settings.read(Values.enabled, &problem)).vision);
+    try std.testing.expectError(error.BadSetting, Settings.read(Values.invalid, &problem));
+    try std.testing.expectEqualStrings("TF_GLM_VISION: 0 or 1", problem);
+    const hash: [32]u8 = @splat(0);
+    const all = [_]Fingerprint{ Fingerprint.of(2, 0, .{ .vision = true }, 8192, hash, hash, "/checkpoint"), Fingerprint.of(2, 1, .{}, 8192, hash, hash, "/checkpoint") };
+    try std.testing.expectEqual(Fingerprint.Field.vision, mismatch(&all).?.field);
 }
