@@ -155,6 +155,7 @@ pub const Metrics = struct {
         try histogram(w, "request_prefill_time_seconds", "Seconds a finished request's prompt pass took, under vLLM's name.", snap.prefill);
         try gauge(w, "client_disconnections_total", "counter", "Requests a client left before the reply left the server.", snap.disconnects);
         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
+        if (status.shared_prefix_waits) |n| try gauge(w, "shared_prefix_waits_total", "counter", "Distinct requests that waited for a compatible in-flight prefix.", n);
     }
 };
 
@@ -271,11 +272,17 @@ test "render exposes live counters, rounds, prefill and TPOT without cache famil
     var m: Metrics = .{ .gpa = gpa };
     m.note(std.testing.io, 10, 0, 3, 0, 0, 2, 1.0, null, null, 0.25, m.tpotValue(1_000_000_000, 3_000_000_000, 3));
     var stub: RenderStub = .{};
+    stub.status_value.shared_prefix_waits = 9;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
     const body = out.written();
     try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:generation_tokens_running 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:shared_prefix_waits_total 9\n") != null);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const health = try @import("live.zig").snapshot(arena.allocator(), stub.engine());
+    try std.testing.expectEqual(@as(?i64, 9), health.get("shared_prefix_waits").?.int64());
     try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:decode_rounds_total 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:request_prefill_seconds_sum 0.25") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:request_time_per_output_token_seconds_sum 1") != null);

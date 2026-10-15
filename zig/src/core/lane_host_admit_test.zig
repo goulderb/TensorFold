@@ -85,6 +85,11 @@ test "shared prefix admission lets unrelated work pass and releases attempted or
     try std.testing.expectEqual(@as(?usize, 1), pick(&host));
     _ = host.queued.pop();
     try std.testing.expectEqual(@as(?usize, null), pick(&host));
+    try std.testing.expectEqual(@as(u64, 1), host.shared_prefix_waits);
+    try std.testing.expectEqual(@as(?u32, 8), waiter.prefix_wait_at);
+    var observed: api.Status = .{};
+    host.engine().status(&observed, &.{});
+    try std.testing.expectEqual(@as(?u64, 1), observed.shared_prefix_waits);
     producer.kept_through = 8;
     try std.testing.expectEqual(@as(?usize, 0), pick(&host));
     producer.kept_through = 0;
@@ -93,6 +98,12 @@ test "shared prefix admission lets unrelated work pass and releases attempted or
     store.rules.shared_wait = true;
     host.filling.clearRetainingCapacity();
     try std.testing.expectEqual(@as(?usize, 0), pick(&host));
+    try std.testing.expectEqual(@as(u64, 1), host.shared_prefix_waits);
+    var second: LaneHost.Job = .{ .host = &host, .id = 4, .request = &request, .sink = undefined };
+    host.queued.items[0] = &second;
+    try host.filling.append(gpa, &producer);
+    try std.testing.expectEqual(@as(?usize, null), pick(&host));
+    try std.testing.expectEqual(@as(u64, 2), host.shared_prefix_waits);
 }
 
 test "a short request behind one that waits for pool room runs beside the running stream" {

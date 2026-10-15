@@ -269,6 +269,8 @@ pub const Status = struct {
     prefill_tokens_per_second: f64 = 0,
     /// Requests that gave a lane up to a later one; null when the engine does not count them.
     preemptions: ?u64 = null,
+    /// Distinct requests that deferred admission for a compatible in-flight prefix.
+    shared_prefix_waits: ?u64 = null,
     warming: bool = false,
     /// Live streams written to the caller's buffer: tokens each holds.
     streams: usize = 0,

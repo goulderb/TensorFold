@@ -27,7 +27,7 @@ pub fn pick(h: *LaneHost) ?usize {
     return null;
 }
 
-fn waiting(h: *LaneHost, job: *const Job) bool {
+fn waiting(h: *LaneHost, job: *Job) bool {
     const store = h.cache orelse return false;
     if (!store.rules.shared_wait or job.request.untaught or job.request.prompt_logprobs != null) return false;
     const r = job.request;
@@ -36,7 +36,13 @@ fn waiting(h: *LaneHost, job: *const Job) bool {
     for (h.filling.items) |producer| {
         if (producer.request.untaught or producer.request.prompt_logprobs != null or producer.request.background) continue;
         if (prefix.pending(.{ .tokens = r.prompt, .spans = spans, .starts = r.chunks }, .{ .tokens = producer.request.prompt, .spans = if (h.decoded_rows) producer.request.decode_spans else &.{} }, producer.marks, @max(have, producer.kept_through), store.rules.lookahead, store.rules.grid)) |at| {
-            if (store.family.vtable.bytes(store.family.ptr, at) <= store.budget) return true;
+            if (store.family.vtable.bytes(store.family.ptr, at) <= store.budget) {
+                if (job.prefix_wait_at == null) {
+                    job.prefix_wait_at = at;
+                    h.shared_prefix_waits += 1;
+                }
+                return true;
+            }
         }
     }
     return false;

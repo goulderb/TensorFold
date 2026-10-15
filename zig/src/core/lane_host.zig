@@ -49,6 +49,7 @@ pub const LaneHost = struct {
     learner: ?api.Learner = null, // the family's Sliding Weights learner; null: learn requests are refused
     lessons: std.ArrayList(Lesson) = .empty, // learn requests waiting for an idle engine
     lesson_open: bool = false, // the learner holds a begun job (engine thread only)
+    shared_prefix_waits: u64 = 0,
     admissions: u64 = 0, // jobs admitted so far: each job's `seq`
     memory_lanes: ?usize = null, // lanes the backend had memory for at its last LaneMemory, until a job ends
     warm_quiet: u64 = 0, // ns a warm pass waits for other work before its first chunk (0: none), set by its family
@@ -72,6 +73,7 @@ pub const LaneHost = struct {
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
         kept0: u64 = 0, // the store's kept count when the job looked it up
         kept_through: u32 = 0,
+        prefix_wait_at: ?u32 = null,
         seq: u64 = 0, // its admission's number
         waits_since: ?u64 = null, // the admissions count when it first waited at the head for pool room
 

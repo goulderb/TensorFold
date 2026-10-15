@@ -25,6 +25,7 @@ pub fn read(ctx: *anyopaque, out: *api.Status, stream_tokens: []u32) void {
         .decode_tokens_per_second = @as(f64, @floatFromInt(tokens)) / 2.0,
         .prefill_tokens_per_second = if (now - h.prefill_at <= window_ns) h.prefill_rate else 0,
         .preemptions = 0,
+        .shared_prefix_waits = h.shared_prefix_waits,
         .streams = n,
         .generation_tokens = h.live_generated,
     };

@@ -19,6 +19,7 @@ pub fn snapshot(a: Allocator, engine: api.Engine) Allocator.Error!json.Value {
     const o = try json.newObject(a);
     try o.put(a, "connections", try json.intValue(a, status.running + status.waiting));
     try o.put(a, "waiting", try json.intValue(a, status.waiting));
+    if (status.shared_prefix_waits) |n| try o.put(a, "shared_prefix_waits", try json.intValue(a, n));
     try o.put(a, "decode_tokens_per_second", .{ .float = round1(status.decode_tokens_per_second) });
     try o.put(a, "prefill_tokens_per_second", .{ .float = round1(status.prefill_tokens_per_second) });
     return .{ .object = o };
