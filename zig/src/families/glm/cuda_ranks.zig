@@ -9,6 +9,8 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 /// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
 pub const Settings = struct {
     kv: cache.Format = .bf16,
+    kv_pool_tokens: u32 = 0,
+    kv_shard: bool = false,
     split: bool = true, // TF_GLM_PREFILL_REDUCE: split (each rank glues its own rows) or gather
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE: 1 (decode windows on KDA's three-kernel chain) or 0
     pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole).
@@ -18,6 +20,23 @@ pub const Settings = struct {
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
         var s: Settings = .{};
+        if (get("TF_GLM_KV_POOL_TOKENS")) |raw| {
+            const v = std.mem.trim(u8, raw, " \t\r\n");
+            s.kv_pool_tokens = std.fmt.parseInt(u32, v, 10) catch {
+                problem.* = "TF_GLM_KV_POOL_TOKENS: an unsigned token count";
+                return error.BadSetting;
+            };
+        }
+        if (get("TF_GLM_KV_SHARD")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.kv_shard = true else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_KV_SHARD: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (s.kv_shard and s.kv_pool_tokens == 0) {
+            problem.* = "TF_GLM_KV_SHARD requires TF_GLM_KV_POOL_TOKENS";
+            return error.BadSetting;
+        }
         if (get("TF_GLM_KV")) |raw| {
             const v = std.mem.trim(u8, raw, " \t\r\n");
             if (v.len == 0 or std.mem.eql(u8, v, "bf16")) s.kv = .bf16 else if (std.mem.eql(u8, v, "fp8")) s.kv = .fp8 else {
@@ -66,7 +85,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 5, // this struct's version
+    layout: u32 = 6, // this struct's version
     world: u32,
     rank: u32,
     split: u32,
@@ -74,6 +93,8 @@ pub const Fingerprint = extern struct {
     pieces: u32,
     layers: u32, // TF_GLM_LAYERS (0: all)
     kv: u32,
+    kv_pool_tokens: u32,
+    kv_shard: u32,
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -81,10 +102,10 @@ pub const Fingerprint = extern struct {
     program: [32]u8, // sha256 of this executable
     checkpoint: [64]u8, // the checkpoint folder's last name (the snapshot's revision), zero padded
 
-    pub const Field = enum { layout, rank, world, split, kda_wide, pieces, layers, kv, capacity, heat_high, heat_low, config, program, checkpoint };
+    pub const Field = enum { layout, rank, world, split, kda_wide, pieces, layers, kv, kv_pool_tokens, kv_shard, capacity, heat_high, heat_low, config, program, checkpoint };
 
     pub fn of(world: usize, rank: usize, s: Settings, capacity: usize, config: [32]u8, program: [32]u8, checkpoint_dir: []const u8) Fingerprint {
-        var f: Fingerprint = .{ .world = @intCast(world), .rank = @intCast(rank), .split = @intFromBool(s.split), .kda_wide = @intFromBool(s.kda_wide), .pieces = s.pieces, .layers = s.layers, .kv = @backingInt(s.kv), .capacity = capacity, .heat_high = if (s.heat) |b| b.high_c else 0, .heat_low = if (s.heat) |b| b.low_c else 0, .config = config, .program = program, .checkpoint = @splat(0) };
+        var f: Fingerprint = .{ .world = @intCast(world), .rank = @intCast(rank), .split = @intFromBool(s.split), .kda_wide = @intFromBool(s.kda_wide), .pieces = s.pieces, .layers = s.layers, .kv = @backingInt(s.kv), .kv_pool_tokens = s.kv_pool_tokens, .kv_shard = @intFromBool(s.kv_shard), .capacity = capacity, .heat_high = if (s.heat) |b| b.high_c else 0, .heat_low = if (s.heat) |b| b.low_c else 0, .config = config, .program = program, .checkpoint = @splat(0) };
         const name = std.fs.path.basename(std.mem.trimEnd(u8, checkpoint_dir, "/"));
         const n = @min(name.len, f.checkpoint.len);
         @memcpy(f.checkpoint[0..n], name[0..n]);
@@ -99,7 +120,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
     for (all, 0..) |f, r| {
         if (f.layout != all[0].layout) return .{ .field = .layout, .rank = r };
         if (f.rank != r) return .{ .field = .rank, .rank = r };
-        inline for (.{ "world", "split", "kda_wide", "pieces", "layers", "kv", "capacity", "heat_high", "heat_low", "config", "program", "checkpoint" }) |name| {
+        inline for (.{ "world", "split", "kda_wide", "pieces", "layers", "kv", "kv_pool_tokens", "kv_shard", "capacity", "heat_high", "heat_low", "config", "program", "checkpoint" }) |name| {
             if (!std.mem.eql(u8, std.mem.asBytes(&@field(f, name)), std.mem.asBytes(&@field(all[0], name))))
                 return .{ .field = @field(Fingerprint.Field, name), .rank = r };
         }
@@ -150,6 +171,8 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .pieces => "TF_GLM_OVERLAP_PIECES",
         .layers => "TF_GLM_LAYERS",
         .kv => "TF_GLM_KV",
+        .kv_pool_tokens => "TF_GLM_KV_POOL_TOKENS",
+        .kv_shard => "TF_GLM_KV_SHARD",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",
@@ -223,4 +246,31 @@ test "cache format is parsed once and rank disagreement is refused" {
     try std.testing.expectEqual(Mismatch{ .field = .kv, .rank = 1 }, mismatch(&all).?);
     all[0] = Fingerprint.of(2, 0, .{ .kv = .fp8 }, 8192, hash, hash, "/checkpoint");
     try std.testing.expect(mismatch(&all) == null);
+}
+
+test "shared pool and ownership options are explicit and ranks agree on their geometry" {
+    const Values = struct {
+        fn shared(name: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "TF_GLM_KV_POOL_TOKENS")) return "32768";
+            if (std.mem.eql(u8, name, "TF_GLM_KV_SHARD")) return "1";
+            return null;
+        }
+        fn missing(name: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "TF_GLM_KV_SHARD")) return "1";
+            return null;
+        }
+    };
+    var problem: []const u8 = "";
+    const settings = try Settings.read(Values.shared, &problem);
+    try std.testing.expectEqual(@as(u32, 32768), settings.kv_pool_tokens);
+    try std.testing.expect(settings.kv_shard);
+    try std.testing.expectError(error.BadSetting, Settings.read(Values.missing, &problem));
+    const hash: [32]u8 = @splat(0);
+    var all = [_]Fingerprint{ Fingerprint.of(2, 0, settings, 8192, hash, hash, "/checkpoint"), Fingerprint.of(2, 1, settings, 8192, hash, hash, "/checkpoint") };
+    try std.testing.expectEqual(@as(?Mismatch, null), mismatch(&all));
+    all[1].kv_pool_tokens = 16384;
+    try std.testing.expectEqual(Fingerprint.Field.kv_pool_tokens, mismatch(&all).?.field);
+    all[1].kv_pool_tokens = 32768;
+    all[1].kv_shard = 0;
+    try std.testing.expectEqual(Fingerprint.Field.kv_shard, mismatch(&all).?.field);
 }

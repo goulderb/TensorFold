@@ -2,7 +2,8 @@ const std = @import("std");
 const cache = @import("cuda_cache.zig");
 
 pub const Lengths = struct { main: usize, mtp: usize };
-pub const Range = struct { live: usize, saved: usize, bytes: usize };
+pub const Plane = enum { fixed, latent, keys, gates, pooled };
+pub const Range = struct { plane: Plane = .fixed, layer: usize = 0, offset: usize = 0, saved: usize, bytes: usize };
 
 pub const Layout = struct {
     capacity: usize,
@@ -17,6 +18,7 @@ pub const Layout = struct {
     pooled_stride: usize,
     mtp_pos: usize,
     total_bytes: usize,
+    external_planes: bool = false,
 
     pub fn init(fixed_sizes: [8]usize, capacity: usize, max_window: usize, dsa_layers: usize, format: cache.Format, latent_width: usize, index_width: usize) !Layout {
         if (capacity == 0 or max_window == 0 or latent_width == 0 or index_width == 0) return error.InvalidGeometry;
@@ -46,6 +48,23 @@ pub const Layout = struct {
         return .{ .capacity = capacity, .ring_rows = ring, .dsa_layers = dsa_layers, .fixed = fixed, .fixed_end = end, .cache_offsets = offsets, .cache_stride = stride, .latent_stride = lat, .index_stride = index, .pooled_stride = pooled, .mtp_pos = mtp_pos, .total_bytes = try std.math.add(usize, mtp_pos, 256) };
     }
 
+    /// Keep recurrent state and raw rings private; latent/pooled planes will be bound from the shared pool.
+    pub fn external(layout: Layout) !Layout {
+        var out = layout;
+        const raw = try aligned(try std.math.mul(usize, layout.ring_rows, layout.index_stride));
+        out.cache_offsets = .{ 0, 0, raw, 0 };
+        out.cache_stride = try std.math.mul(usize, raw, 2);
+        out.mtp_pos = try std.math.add(usize, layout.fixed_end, try std.math.mul(usize, layout.dsa_layers + 1, out.cache_stride));
+        out.total_bytes = try std.math.add(usize, out.mtp_pos, 256);
+        out.external_planes = true;
+        return out;
+    }
+
+    pub fn address(layout: Layout, r: Range) usize {
+        std.debug.assert(!layout.external_planes);
+        return r.offset + if (r.plane == .fixed) @as(usize, 0) else layout.cacheOffsets(r.layer)[@backingInt(r.plane) - 1];
+    }
+
     pub fn cacheOffsets(layout: Layout, layer: usize) [4]usize {
         std.debug.assert(layer <= layout.dsa_layers);
         var out = layout.cache_offsets;
@@ -64,11 +83,19 @@ pub const Plan = struct {
     lengths: Lengths,
 
     pub fn ranges(plan: Plan) Iterator {
-        return .{ .plan = plan };
+        return plan.rangesFor(true);
+    }
+
+    pub fn rangesFor(plan: Plan, latent_resident: bool) Iterator {
+        return .{ .plan = plan, .latent_resident = latent_resident };
     }
 
     pub fn byteCount(plan: Plan) usize {
-        var it = plan.ranges();
+        return plan.bytesFor(true);
+    }
+
+    pub fn bytesFor(plan: Plan, latent_resident: bool) usize {
+        var it = plan.rangesFor(latent_resident);
         var count: usize = 0;
         while (it.next()) |r| count += r.bytes;
         return count;
@@ -79,29 +106,33 @@ pub const Iterator = struct {
     plan: Plan,
     stage: usize = 0,
     saved: usize = 0,
+    latent_resident: bool = true,
 
     pub fn next(it: *Iterator) ?Range {
         const l = it.plan.layout;
         while (it.stage < 1 + (l.dsa_layers + 1) * 4) {
             const stage = it.stage;
             it.stage += 1;
-            var live: usize = 0;
+            var offset: usize = 0;
+            var plane: Plane = .fixed;
+            var layer: usize = 0;
             var bytes: usize = l.fixed_end;
             if (stage > 0) {
-                const layer = (stage - 1) / 4;
+                layer = (stage - 1) / 4;
                 const field = (stage - 1) % 4;
                 const n = if (layer == l.dsa_layers) it.plan.lengths.mtp else it.plan.lengths.main;
-                live = l.cacheOffsets(layer)[field];
+                plane = @fromBackingInt(@intCast(field + 1));
+                if (plane == .latent and !it.latent_resident) continue;
                 bytes = switch (field) {
                     0 => n * l.latent_stride,
                     1, 2 => n % 4 * l.index_stride,
                     3 => n / 4 * l.pooled_stride,
                     else => unreachable,
                 };
-                if (field == 1 or field == 2) live += (n - n % 4) % l.ring_rows * l.index_stride;
+                if (field == 1 or field == 2) offset = (n - n % 4) % l.ring_rows * l.index_stride;
             }
             if (bytes == 0) continue;
-            const r: Range = .{ .live = live, .saved = it.saved, .bytes = bytes };
+            const r: Range = .{ .plane = plane, .layer = layer, .offset = offset, .saved = it.saved, .bytes = bytes };
             it.saved += bytes;
             return r;
         }
@@ -137,11 +168,10 @@ test "main and MTP prefixes retain independent incomplete pools" {
     const l = try Layout.init(.{ 4, 3, 5, 0, 0, 0, 0, 0 }, 8192, 2048, 2, .fp8, 512, 128);
     const plan = try l.snapshot(.{ .main = 2115, .mtp = 7 });
     var it = plan.ranges();
-    try std.testing.expectEqual(Range{ .live = 0, .saved = 0, .bytes = 768 }, it.next().?);
-    const first = l.cacheOffsets(0);
-    try std.testing.expectEqual(Range{ .live = first[0], .saved = 768, .bytes = 2115 * 528 }, it.next().?);
-    try std.testing.expectEqual(first[1], it.next().?.live); // unfinished pool wraps to ring slots 0..2
-    try std.testing.expectEqual(first[2], it.next().?.live);
+    try std.testing.expectEqual(Range{ .saved = 0, .bytes = 768 }, it.next().?);
+    try std.testing.expectEqual(Range{ .plane = .latent, .saved = 768, .bytes = 2115 * 528 }, it.next().?);
+    try std.testing.expectEqual(@as(usize, 0), it.next().?.offset); // unfinished pool wraps to ring slots 0..2
+    try std.testing.expectEqual(@as(usize, 0), it.next().?.offset);
     try std.testing.expectEqual(@as(usize, 528 * 144), it.next().?.bytes);
     const main_bytes = 2115 * 528 + 2 * 3 * 256 + 528 * 144;
     const mtp_bytes = 7 * 528 + 2 * 3 * 256 + 144;
@@ -164,19 +194,36 @@ test "prefix packing restores only visible bytes after storage is reused" {
             var end: usize = 0;
             while (save.next()) |r| {
                 try std.testing.expectEqual(end, r.saved);
-                try std.testing.expect(r.live + r.bytes <= live.len);
-                @memcpy(saved[r.saved..][0..r.bytes], live[r.live..][0..r.bytes]);
+                try std.testing.expect(l.address(r) + r.bytes <= live.len);
+                @memcpy(saved[r.saved..][0..r.bytes], live[l.address(r)..][0..r.bytes]);
                 end += r.bytes;
             }
             try std.testing.expectEqual(plan.byteCount(), end);
             @memset(live, 0xa5);
             var restore = plan.ranges();
-            while (restore.next()) |r| @memcpy(live[r.live..][0..r.bytes], saved[r.saved..][0..r.bytes]);
+            while (restore.next()) |r| @memcpy(live[l.address(r)..][0..r.bytes], saved[r.saved..][0..r.bytes]);
             var verify = plan.ranges();
-            while (verify.next()) |r| for (live[r.live..][0..r.bytes], r.live..) |b, i| {
+            while (verify.next()) |r| for (live[l.address(r)..][0..r.bytes], l.address(r)..) |b, i| {
                 try std.testing.expectEqual(@as(u8, @truncate(i *% 37 +% at)), b);
             };
             try std.testing.expectEqual(@as(u8, 0xa5), live[l.mtp_pos]);
         }
     }
+}
+
+test "shared layouts retain private rings and resolve independent resident snapshot bytes" {
+    const full = try Layout.init(.{ 4, 512, 512, 256, 0, 0, 0, 0 }, 8192, 2048, 2, .fp8, 512, 128);
+    const shared = try full.external();
+    try std.testing.expect(shared.total_bytes < full.total_bytes);
+    try std.testing.expectEqual(@as(usize, 2112 * 256 * 2), shared.cache_stride);
+    const plan = try shared.snapshot(.{ .main = 2115, .mtp = 7 });
+    try std.testing.expectEqual(plan.byteCount() - (2 * 2115 + 7) * 528, plan.bytesFor(false));
+    var it = plan.rangesFor(false);
+    var end: usize = 0;
+    while (it.next()) |r| {
+        try std.testing.expect(r.plane != .latent);
+        try std.testing.expectEqual(end, r.saved);
+        end += r.bytes;
+    }
+    try std.testing.expectEqual(plan.bytesFor(false), end);
 }

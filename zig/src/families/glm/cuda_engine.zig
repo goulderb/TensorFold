@@ -10,9 +10,14 @@ const fw = @import("cuda_forward.zig");
 const ranks = @import("cuda_ranks.zig");
 const sampler = @import("cuda_sampler.zig");
 const heat = @import("heat");
+const owner_kv = @import("cuda_kv_owner.zig");
+const cache_pool = @import("cuda_kv_pool.zig");
 const modelopt = @import("core").modelopt;
 
+pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
+
 pub const Options = struct {
+    room: ?Room = null,
     capacity: usize, // tokens a sequence holds
     mtp: bool, // load the MTP head (drafts)
     settings: ranks.Settings,
@@ -46,7 +51,7 @@ const Seq = struct {
 };
 
 /// One rank's copy of a kept prompt state: visible cache prefixes, raw index tails and fixed recurrent state.
-const Snap = struct { buf: cuda.DeviceBuffer, pos: usize, mtp_len: usize, cur: []u1 };
+const Snap = struct { buf: cuda.DeviceBuffer, pos: usize, mtp_len: usize, cur: []u1, owner: ?u32 = null };
 
 /// Where a prompt pass resumes: a kept state (every rank holds `id`) at `at`, a multiple of the chunk rows.
 pub const Resume = struct { id: u64, at: usize };
@@ -80,6 +85,7 @@ pub const Engine = struct {
     slot: u32 = 0,
     capacity: usize,
     mtp: bool,
+    pool: ?cache_pool.Pool = null,
     heat_gate: heat.Gate, // upstream's bands (off unless set), read before each prompt chunk on the gathered maximum
     shared_buf: cuda.DeviceBuffer, // one f64 every rank all-reduces to its maximum
     snaps: std.AutoHashMapUnmanaged(u64, Snap) = .empty, // kept prompt states by id (the same ids on every rank)
@@ -106,6 +112,11 @@ pub const Engine = struct {
         errdefer stream.deinit();
         const fp = ranks.Fingerprint.of(world, rank, o.settings, o.capacity, try ranks.hashFile(a, io, cfg_path), try ranks.hashFile(a, io, "/proc/self/exe"), checkpoint);
         try ranks.agree(d, lib, comm, stream, fp, try a.alloc(ranks.Fingerprint, world));
+        if (o.settings.kv_pool_tokens > 0) {
+            if (o.settings.kv_shard and (world != 2 or c.mla_heads % 2 != 0)) return error.KvShardNeedsTp2;
+            if (c.kv_lora != 512 or c.i_dim != 128) return error.KvPoolShape;
+            _ = try cache_pool.extent.Pool.init(o.settings.kv_pool_tokens, if (o.settings.kv_shard) 2 else 1);
+        }
         const share = try shard.Share.of(&c, rank, world);
         const spans = try gpa.alloc(shard.Span, world);
         errdefer gpa.free(spans);
@@ -125,13 +136,13 @@ pub const Engine = struct {
             e.free(0);
             e.seqs.deinit(gpa);
         }
-        e.bp = try fw.Buffers.init(d, &e.w, fw.prefill_rows, true, o.capacity);
+        e.bp = if (o.settings.kv_shard) try fw.Buffers.initOwned(d, &e.w, fw.prefill_rows, true, o.capacity) else try fw.Buffers.init(d, &e.w, fw.prefill_rows, true, o.capacity);
         errdefer e.bp.deinit();
-        e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+        e.bd = if (o.settings.kv_shard) try fw.Buffers.initOwned(d, &e.w, fw.window_rows, false, o.capacity) else try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bd.deinit();
-        e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+        e.bm = if (o.settings.kv_shard) try fw.Buffers.initOwned(d, &e.w, fw.window_rows, false, o.capacity) else try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bm.deinit();
-        if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
+        if (o.mtp) e.bs = if (o.settings.kv_shard) try fw.Buffers.initSharedOwned(d, &e.w, shared_rows, o.capacity) else try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
         e.hold = try cuda.DeviceBuffer.alloc(d, c.hidden * 2);
         errdefer e.hold.free();
@@ -140,6 +151,22 @@ pub const Engine = struct {
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
         errdefer e.smp.deinit();
         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
+        errdefer e.shared_buf.free();
+        errdefer if (e.pool) |*p| p.deinit();
+        if (o.settings.kv_pool_tokens > 0) {
+            const shape = try cache_pool.Shape.init(o.settings.kv_pool_tokens, if (o.settings.kv_shard) 2 else 1, e.cur.st.caches.len + 1, o.settings.kv);
+            const rooms = try a.alloc(u64, world);
+            const mine = if (o.room) |r| r.read(r.ctx) orelse 0 else std.math.maxInt(u64);
+            try ranks.gather(u64, d, lib, comm, stream, rank, mine, rooms);
+            for (rooms) |room| if (shape.bytes > room) return error.NoKvPoolRoom;
+            var failed: ?anyerror = null;
+            e.pool = cache_pool.Pool.init(d, shape, rank, o.settings.kv) catch |err| blk: {
+                failed = err;
+                break :blk null;
+            };
+            try ranks.gather(u64, d, lib, comm, stream, rank, @intFromBool(failed == null), rooms);
+            for (rooms) |ready| if (ready == 0) return failed orelse error.PeerKvPoolFailed;
+        }
         try e.stream.synchronize();
         return e;
     }
@@ -160,6 +187,7 @@ pub const Engine = struct {
         e.bp.deinit();
         for (0..e.seqs.items.len) |i| e.free(i);
         e.seqs.deinit(e.gpa);
+        if (e.pool) |*p| p.deinit();
         e.w.deinit();
         e.pieces.deinit();
         e.m.deinit();
@@ -184,15 +212,38 @@ pub const Engine = struct {
         if (e.seqs.items[slot] == null) {
             const q = try e.gpa.create(Seq);
             errdefer e.gpa.destroy(q);
-            q.* = .{ .st = try fw.State.init(e.gpa, e.d, &e.w, e.capacity, e.settings.kv) };
+            q.* = .{ .st = if (e.settings.kv_pool_tokens > 0) try fw.State.initShared(e.gpa, e.d, &e.w, e.capacity, e.settings.kv) else try fw.State.init(e.gpa, e.d, &e.w, e.capacity, e.settings.kv) };
             e.seqs.items[slot] = q;
         }
         e.cur = e.seqs.items[slot].?;
         e.slot = slot;
     }
 
+    pub fn placement(e: *const Engine, rows: usize) !?cache_pool.extent.Region {
+        if (e.pool) |*p| return try p.regions.plan(e.slot, rows);
+        return null;
+    }
+
+    pub fn reserveAt(e: *Engine, region: cache_pool.extent.Region) !void {
+        const p = if (e.pool) |*p| p else return error.NoKvPool;
+        if (p.regions.slots[e.slot]) |old| if (!std.meta.eql(old, region)) return error.KvAlreadyReserved;
+        try p.regions.apply(e.slot, region);
+        p.bind(&e.cur.st, region);
+    }
+
+    pub fn fits(e: *const Engine, prompt: usize, output: usize) bool {
+        const p = if (e.pool) |*p| p else return true;
+        const rows = cache_pool.extent.requestRows(prompt, output, fw.window_rows, e.capacity) catch return true;
+        for (p.regions.slots, 0..) |maybe, slot| if (maybe == null) {
+            _ = p.regions.plan(slot, rows) catch |err| return err != error.LaneMemory;
+            return true;
+        };
+        return false;
+    }
+
     /// Frees slot `slot`'s sequence (slot 0 stays: the first stream's, made at init) and binds slot 0.
     pub fn release(e: *Engine, slot: u32) void {
+        if (e.pool) |*p| p.regions.release(slot);
         if (slot != 0) e.free(slot);
         e.cur = e.seqs.items[0].?;
         e.slot = 0;
@@ -218,6 +269,10 @@ pub const Engine = struct {
 
     /// A fresh sequence with `sampling` (null or temperature 0: greedy).
     pub fn begin(e: *Engine, sampling: ?sampler.Sampling) !void {
+        if (e.pool) |*p| if (p.regions.slots[e.slot] == null) {
+            const r = try p.regions.plan(e.slot, e.capacity);
+            try e.reserveAt(r);
+        };
         e.cur.sampling = sampler.check(sampling);
         e.cur.in_head = 0;
         try e.cur.st.reset(e.stream);
@@ -236,9 +291,7 @@ pub const Engine = struct {
         if (len == 0 or len + fw.window_rows >= e.cur.st.capacity) return error.PromptTooLong;
         const r = from orelse return 0;
         if (r.at == 0 or r.at >= len or r.at % fw.prefill_rows != 0) return error.BadResume;
-        const kept = e.snaps.get(r.id) orelse return error.NoKeptState;
-        if (kept.pos != r.at) return error.BadResume;
-        try e.restoreState(r.id);
+        try e.restoreAt(r.id, r.at);
         return r.at;
     }
 
@@ -307,26 +360,64 @@ pub const Engine = struct {
         const st = &e.cur.st;
         if (st.pending != 0 or e.cur.in_head != 0 or st.mtp_len != (if (e.mtp) st.pos else 0)) return error.NotAtMark;
         const plan = try st.layout.snapshot(.{ .main = st.pos, .mtp = st.mtp_len });
-        var buf = try cuda.DeviceBuffer.alloc(e.d, plan.byteCount());
+        const owner = if (st.layout.external_planes) st.mtp_caches.owner else null;
+        const resident = owner == null or owner.? == e.share.rank;
+        var buf = try cuda.DeviceBuffer.alloc(e.d, plan.bytesFor(resident));
         errdefer buf.free();
-        var it = plan.ranges();
-        while (it.next()) |r| try e.copy(buf.ptr + r.saved, st.arena.buf.ptr + r.live, r.bytes);
+        var it = plan.rangesFor(resident);
+        while (it.next()) |r| try e.copy(buf.ptr + r.saved, st.address(r), r.bytes);
         try e.stream.synchronize();
         const cur = try e.gpa.dupe(u1, e.cur.st.cur);
         errdefer e.gpa.free(cur);
-        try e.snaps.put(e.gpa, id, .{ .buf = buf, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur });
+        try e.snaps.put(e.gpa, id, .{ .buf = buf, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .owner = owner });
     }
 
     /// The live state made kept state `id`'s; a rank without it refuses rather than prefill from another position.
     fn restoreState(e: *Engine, id: u64) !void {
-        const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
-        const plan = try e.cur.st.layout.snapshot(.{ .main = s.pos, .mtp = s.mtp_len });
-        if (plan.byteCount() != s.buf.len) return error.BadKeptState;
-        var it = plan.ranges();
-        while (it.next()) |r| try e.copy(e.cur.st.arena.buf.ptr + r.live, s.buf.ptr + r.saved, r.bytes);
-        try e.cur.st.restoreHost(e.stream, s.pos, s.mtp_len, s.cur);
+        return e.restoreAt(id, null);
+    }
+
+    fn restoreAt(e: *Engine, id: u64, expected: ?usize) !void {
+        const st = &e.cur.st;
+        const destination_owner = if (st.layout.external_planes) st.mtp_caches.owner else null;
+        const s = e.snaps.getPtr(id);
+        var problem: ?anyerror = null;
+        var plan: ?@import("cuda_layout.zig").Plan = null;
+        var source_resident = true;
+        if (s) |saved| {
+            if (expected != null and saved.pos != expected.?) problem = error.BadResume;
+            if (problem == null) {
+                plan = st.layout.snapshot(.{ .main = saved.pos, .mtp = saved.mtp_len }) catch |err| blk: {
+                    problem = err;
+                    break :blk null;
+                };
+                source_resident = saved.owner == null or saved.owner.? == e.share.rank;
+                if (plan != null and (plan.?.bytesFor(source_resident) != saved.buf.len or saved.pos > st.capacity or saved.mtp_len > st.capacity or (saved.owner == null) != (destination_owner == null))) problem = error.BadKeptState;
+            }
+        } else problem = error.NoKeptState;
+        if (destination_owner != null) {
+            if (!try e.ownerTransport().prepared(e.stream, e.shared_buf, problem == null)) return problem orelse error.PeerKeptStateInvalid;
+        }
+        if (problem) |err| return err;
+        const saved = s.?;
+        var full = plan.?.ranges();
+        var local = plan.?.rangesFor(source_resident);
+        while (full.next()) |r| {
+            const from = if (r.plane == .latent and !source_resident) null else local.next();
+            if (r.plane == .latent and destination_owner != null) {
+                try e.ownerTransport().carry(e.stream, saved.owner.?, destination_owner.?, if (from) |f| saved.buf.ptr + f.saved else 0, if (destination_owner.? == e.share.rank) st.address(r) else 0, r.bytes);
+            } else {
+                try e.copy(st.address(r), saved.buf.ptr + from.?.saved, r.bytes);
+            }
+        }
+        try e.stream.synchronize();
+        try st.restoreHost(e.stream, saved.pos, saved.mtp_len, saved.cur);
         e.cur.in_head = 0;
         try e.stream.synchronize();
+    }
+
+    fn ownerTransport(e: *const Engine) owner_kv.Transport {
+        return .{ .d = e.d, .lib = e.lib, .comm = e.comm, .rank = e.share.rank };
     }
 
     pub fn holds(e: *const Engine, id: u64) bool {
@@ -540,6 +631,7 @@ test "snapshot capture refuses uncommitted windows and mismatched MTP marks befo
 test "prompt resume refuses a saved position that differs from its requested mark" {
     var seq: Seq = undefined;
     seq.st.capacity = 8192;
+    seq.st.layout = try @import("cuda_layout.zig").Layout.init(.{ 4, 0, 0, 0, 0, 0, 0, 0 }, 8192, fw.prefill_rows, 0, .bf16, 512, 128);
     var e: Engine = undefined;
     e.cur = &seq;
     e.snaps = .empty;
@@ -598,6 +690,15 @@ test "engine snapshot save and restore preserve visible state through reused sto
         seq.in_head = 0;
         seq.st.arena = .{ .buf = .{ .d = &d, .ptr = @intFromPtr(live.ptr), .len = live.len, .borrowed = true } };
         seq.st.layout = layout;
+        seq.st.capacity = layout.capacity;
+        var caches: [2]@import("cuda_dsa_block.zig").Caches = undefined;
+        for (&caches, 0..) |*c, layer| {
+            const offsets = layout.cacheOffsets(layer);
+            c.* = .{ .lc = .{ .ptr = seq.st.arena.buf.ptr + offsets[0], .format = format }, .index = .{ .keys = seq.st.arena.buf.ptr + offsets[1], .gates = seq.st.arena.buf.ptr + offsets[2], .rows = layout.ring_rows }, .pk = .{ .ptr = seq.st.arena.buf.ptr + offsets[3], .format = format }, .pk_rows = 1026 };
+        }
+        seq.st.caches = &caches;
+        const mo = layout.cacheOffsets(2);
+        seq.st.mtp_caches = .{ .lc = .{ .ptr = seq.st.arena.buf.ptr + mo[0], .format = format }, .index = .{ .keys = seq.st.arena.buf.ptr + mo[1], .gates = seq.st.arena.buf.ptr + mo[2], .rows = layout.ring_rows }, .pk = .{ .ptr = seq.st.arena.buf.ptr + mo[3], .format = format }, .pk_rows = 1026 };
         seq.st.cur = &parity;
         seq.st.pos_dev = seq.st.arena.buf.ptr + layout.fixed[0];
         seq.st.mtp_pos_dev = seq.st.arena.buf.ptr + layout.mtp_pos;
@@ -630,8 +731,118 @@ test "engine snapshot save and restore preserve visible state through reused sto
         const plan = try layout.snapshot(.{ .main = seq.st.pos, .mtp = seq.st.mtp_len });
         const kept: [*]const u8 = @ptrFromInt(saved.buf.ptr);
         var it = plan.ranges();
-        while (it.next()) |range| try std.testing.expectEqualSlices(u8, kept[range.saved..][0..range.bytes], live[range.live..][0..range.bytes]);
+        while (it.next()) |range| try std.testing.expectEqualSlices(u8, kept[range.saved..][0..range.bytes], live[layout.address(range)..][0..range.bytes]);
         try std.testing.expectEqual(@as(u32, if (mtp) 2115 else 0), std.mem.bytesToValue(u32, live[layout.mtp_pos..][0..4]));
         try std.testing.expectEqual(@as(u8, 0xa5), live[layout.cacheOffsets(0)[0] + 2115 * layout.latent_stride]);
     };
+}
+
+test "owner-only snapshots carry main and MTP prefixes to a new owner and refuse an invalid peer before transfer" {
+    const M = @import("cuda_test_driver.zig").Memory;
+    const C = @import("cuda_test_collectives.zig").Collectives;
+    const Layout = @import("cuda_layout.zig").Layout;
+    const Fixture = struct {
+        e: Engine,
+        seq: Seq,
+        caches: [1]@import("cuda_dsa_block.zig").Caches,
+        parity: [1]u1,
+        failed: ?anyerror = null,
+
+        fn init(f: *@This(), d: *const cuda.Driver, lib: *const cuda.nccl.Library, endpoint: *C.End, old_owner: usize, format: @import("cuda_cache.zig").Format) !void {
+            const layout = try (try Layout.init(.{ 4, 256, 256, 256, 256, 256, 256, 256 }, 4096, fw.prefill_rows, 1, format, 512, 128)).external();
+            f.parity = .{@intCast(endpoint.rank)};
+            f.failed = null;
+            f.seq = undefined;
+            f.seq.in_head = 0;
+            f.seq.st = undefined;
+            f.seq.st.arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, layout.total_bytes) };
+            f.seq.st.layout = layout;
+            f.seq.st.capacity = layout.capacity;
+            f.seq.st.cur = &f.parity;
+            f.seq.st.caches = &f.caches;
+            for (0..2) |layer| {
+                const offsets = layout.cacheOffsets(layer);
+                const raw: @import("cuda_dsa_block.zig").Caches = .{ .lc = .{ .ptr = 0, .format = format }, .index = .{ .keys = f.seq.st.arena.buf.ptr + offsets[1], .gates = f.seq.st.arena.buf.ptr + offsets[2], .rows = layout.ring_rows }, .pk = .{ .ptr = 0, .format = format }, .pk_rows = 0 };
+                if (layer == 0) f.caches[0] = raw else f.seq.st.mtp_caches = raw;
+            }
+            f.seq.st.pos_dev = f.seq.st.arena.buf.ptr;
+            f.seq.st.mtp_pos_dev = f.seq.st.arena.buf.ptr + layout.mtp_pos;
+            f.seq.st.pending = 0;
+            f.e = undefined;
+            f.e.d = d;
+            f.e.lib = lib;
+            f.e.comm = @ptrCast(endpoint);
+            f.e.share.rank = endpoint.rank;
+            f.e.gpa = std.testing.allocator;
+            f.e.cur = &f.seq;
+            f.e.slot = 0;
+            f.e.stream = .{ .d = d, .handle = null };
+            f.e.mtp = true;
+            f.e.snaps = .empty;
+            f.e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
+            f.e.pool = try cache_pool.Pool.init(d, try cache_pool.Shape.init(16384, 2, 2, format), endpoint.rank, format);
+            try f.e.reserveAt(.{ .base = old_owner * 8192, .rows = 4096 });
+            const plan = try layout.snapshot(.{ .main = 2115, .mtp = 2115 });
+            var it = plan.rangesFor(endpoint.rank == old_owner);
+            while (it.next()) |r| @memset(M.slice(f.seq.st.address(r), r.bytes), @intCast(40 + endpoint.rank + @backingInt(r.plane)));
+            try f.seq.st.setPos(f.e.stream, 2115);
+            try f.seq.st.setMtpLen(f.e.stream, 2115);
+            try f.e.keepAs(1);
+            @memset(M.slice(f.e.pool.?.buf.ptr, f.e.pool.?.buf.len), 0xa5);
+            @memset(M.slice(f.seq.st.arena.buf.ptr, f.seq.st.arena.buf.len), 0xa5);
+            f.e.pool.?.regions.release(0);
+            try f.e.reserveAt(.{ .base = (1 - old_owner) * 8192, .rows = 4096 });
+        }
+        fn deinit(f: *@This()) void {
+            f.e.freeSnap(f.e.snaps.getPtr(1).?);
+            f.e.snaps.deinit(f.e.gpa);
+            f.e.pool.?.deinit();
+            f.e.shared_buf.free();
+            f.seq.st.arena.buf.free();
+        }
+        fn run(f: *@This()) void {
+            f.e.restoreAt(1, 2115) catch |err| {
+                f.failed = err;
+            };
+        }
+        fn pair(a: *@This(), b: *@This()) !void {
+            const first = try std.Thread.spawn(.{}, run, .{a});
+            const second = try std.Thread.spawn(.{}, run, .{b});
+            first.join();
+            second.join();
+        }
+    };
+    var d = M.driver();
+    var lib: cuda.nccl.Library = .{ .lib = undefined, .api = undefined };
+    lib.api.ncclBroadcast = C.broadcast;
+    for ([_]@import("cuda_cache.zig").Format{ .bf16, .fp8 }) |format| for (0..2) |old_owner| {
+        var channel: C.Channel = .{};
+        var endpoints = [_]C.End{ .{ .rank = 0, .channel = &channel }, .{ .rank = 1, .channel = &channel } };
+        var fixtures: [2]Fixture = undefined;
+        for (&fixtures, &endpoints) |*f, *endpoint| try f.init(&d, &lib, endpoint, old_owner, format);
+        defer for (&fixtures) |*f| f.deinit();
+        try std.testing.expect(fixtures[old_owner].e.snaps.get(1).?.buf.len > fixtures[1 - old_owner].e.snaps.get(1).?.buf.len);
+        try std.testing.expectEqual(@as(usize, 0), channel.epoch.load(.acquire));
+        try Fixture.pair(&fixtures[0], &fixtures[1]);
+        for (&fixtures, 0..) |*f, rank| {
+            try std.testing.expectEqual(@as(?anyerror, null), f.failed);
+            try std.testing.expectEqual(@as(usize, 2115), f.seq.st.pos);
+            try std.testing.expectEqual(@as(usize, 2115), f.seq.st.mtp_len);
+            try std.testing.expectEqual(@as(u1, @intCast(rank)), f.parity[0]);
+            const plan = try f.seq.st.layout.snapshot(.{ .main = 2115, .mtp = 2115 });
+            var it = plan.rangesFor(rank == 1 - old_owner);
+            while (it.next()) |r| {
+                if (r.plane == .fixed) continue;
+                const expected: u8 = @intCast(40 + (if (r.plane == .latent) old_owner else rank) + @backingInt(r.plane));
+                for (M.slice(f.seq.st.address(r), r.bytes)) |value| try std.testing.expectEqual(expected, value);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 4), channel.epoch.load(.acquire));
+        fixtures[1].seq.st.capacity = 2048;
+        try Fixture.pair(&fixtures[0], &fixtures[1]);
+        try std.testing.expectEqual(error.PeerKeptStateInvalid, fixtures[0].failed.?);
+        try std.testing.expectEqual(error.BadKeptState, fixtures[1].failed.?);
+        try std.testing.expectEqual(@as(usize, 6), channel.epoch.load(.acquire));
+    };
+    try std.testing.expect(M.empty());
 }

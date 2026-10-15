@@ -1,4 +1,4 @@
-# GLM native CUDA cache precision
+# GLM native CUDA cache storage
 
 The native GLM family accepts `TF_GLM_KV=bf16` or `TF_GLM_KV=fp8`.
 Unset or empty means BF16. Every TP rank must use the same setting;
@@ -65,8 +65,8 @@ gates, MTP windows, and kept-state restore on the actual model.
 
 CPU checks and compilation do not qualify device numerics, generation,
 throughput or capacity. GPU comparisons remain pending. FP8 is lossy and
-can change replies and sparse selections relative to BF16. Sharded KV/carry,
-shared dynamic capacity, prefix wait, durable spill and vision remain separate
+can change replies and sparse selections relative to BF16. Owner KV and shared capacity are described below; their device qualification
+remains pending. Prefix wait, durable spill and vision remain separate
 production requirements.
 
 ## Raw index rings and retained prefixes
@@ -85,8 +85,7 @@ with no drafted MTP rows. The byte estimate and both copy directions iterate
 the same plan. Restore validates the requested resume position before copying
 and regenerates device positions from host metadata.
 
-Snapshots remain device-backed and process-local. This is preparation for
-shared capacity and persistence; it does not provide either feature.
+Snapshots remain device-backed and process-local. Durable persistence remains a separate feature.
 
 Host layout tests pack, poison and restore synthetic arenas in both formats,
 including independent MTP lengths, ring wrap, invalid lengths and overflow.
@@ -98,3 +97,59 @@ The compiled `glm-ref` suite also compares bounded-ring kernels with the
 original full-context kernels using varied keys, gates and positional biases,
 then restores an unfinished tail after reusing the rings. These device checks
 must be executed during qualification before relying on the new layout.
+
+## Shared capacity and owner-only latent storage
+
+Both options default off. `TF_GLM_KV_POOL_TOKENS` enables one physical cache
+pool with a positive token count aligned to 2048. `TF_GLM_KV_SHARD=1`
+requires that pool, TP2, equal MLA head counts and a pool divisible by 4096.
+Settings and aggregate capacity participate in rank agreement. This source
+has not been device-qualified; the options do not select a production recipe.
+
+Shared mode allocates latent and pooled-key planes once. Fixed recurrent
+state and raw index rings remain private per slot. An admitted request
+reserves prompt plus output allowance plus an eight-row write margin,
+rounded to 2048. Owner mode divides the pool into two rank partitions;
+a reservation cannot cross a partition. Placement favors fewer live streams,
+then more free rows, then rank and base. Rank 0 announces the exact extent
+before begin, and followers validate and apply it. Release returns the extent,
+including slot zero. The existing lane host waits for temporary pool pressure;
+permanently oversized requests fail during opening even when idle admission
+bypasses the fit callback. Reserved requests do not need midstream growth.
+
+Pool allocation uses the smallest post-load peer budget, including existing
+memory limits and reserve. Scratch is allocated before this survey. Pool
+allocation success is exchanged before startup continues. The native wrapper
+then admits additional streams by their private state cost; pool bytes have
+already reduced the observed room. Retained snapshots remain separate copies
+and consume the existing snapshot budget, never held or aliased pool extents.
+
+Only the latent owner writes and reads a conversation's latent rows. Raw index
+updates and pooled keys stay replicated. For each bounded row tile, the other
+head rank sends its absorbed queries to the owner and receives its result.
+The owner also computes its own heads. Existing attention kernels, head-block
+choices, output projections, hidden exchanges, sampler and scheduler remain
+in use. The same attention seam handles prompt chunks, shared-window segments
+and MTP. This baseline trades extra communication for bounded scratch; its
+latency and throughput are unmeasured.
+
+Snapshot capture performs local copies only, retaining latent rows on their
+owner and the remaining ranges on every rank. Byte estimates conservatively
+charge the worst owner. During paired restore, both ranks validate the saved
+state and destination before any data transfer. Encoded latent rows and scales
+move in bounded chunks if the new reservation has another owner; private and
+pooled ranges restore locally. Host positions and parity publish after the
+copies complete. No absent nonowner latent pointer is dereferenced.
+
+Pooled views expose two masked padding rows. Those rows may overlap the next
+extent's pooled prefix: the pooling writer writes only complete pools inside
+the reservation. No padding holes are charged per extent.
+
+Host checks exercise real allocation/binding and engine capture/restore with
+mock CUDA memory and two communicating CPU threads. They cover placement
+against the pinned donor, adjacent/reused extents, both ownership directions,
+BF16/FP8, MTP, local query outputs and refusal before an invalid peer transfer.
+The normal native build compiles the kernel-facing prefill/shared/MTP paths.
+Device attention numerics, full TP2 generation, cancellation/peer loss and
+performance remain pending. Live compaction/growth carry, parked-prefix
+sharing, twins, compact prompt-history fetch and durable spill are deferred.

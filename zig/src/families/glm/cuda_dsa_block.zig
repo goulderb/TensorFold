@@ -37,7 +37,7 @@ pub const Layer = struct {
 };
 
 /// Latent and pooled keys share a format; individual index keys and gates stay BF16.
-pub const Caches = struct { lc: cache.Cache, index: cache.Index, pk: cache.Cache, pk_rows: usize };
+pub const Caches = struct { lc: cache.Cache, index: cache.Index, pk: cache.Cache, pk_rows: usize, owner: ?u32 = null };
 
 /// The block's scratch for up to `rows` rows.
 pub const Scratch = struct {
@@ -60,11 +60,13 @@ pub const Scratch = struct {
     tokens: u64, // i32 [rows][sparse.width]
     counts: u64, // i32 [rows]
     mm_part: u64, // fp32 split-K partials
+    owner_q: u64 = 0,
+    owner_out: u64 = 0,
     at: u64, // an i32: a prompt block's first position (pos + its first row)
 };
 
 /// The kernels: the captured Triton set and glm_ops (the token lists and position offsets).
-pub const Kernels = struct { set: glue.Set, ops: cuda.Module };
+pub const Kernels = struct { set: glue.Set, ops: cuda.Module, owner: ?@import("cuda_kv_owner.zig").Transport = null };
 
 /// forward.dsa_block (latent path) of `rows` rows at pos to an fp32 partial; `nch`: 512-key chunks, `part_rows`: block.
 pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize, out: u64) !void {
@@ -125,19 +127,40 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
     v.qa += r0 * l.heads * l.lw * 2;
     v.ol += r0 * l.heads * l.lw * 2;
     v.qi += r0 * ix.heads * ix.d * 2;
-    try latent.latentWrite(set, stream, v.lat, l.lw, c.lc, pos, rows, l.lw);
+    if (c.owner == null or (k.owner != null and k.owner.?.rank == c.owner.?)) try latent.latentWrite(set, stream, v.lat, l.lw, c.lc, pos, rows, l.lw);
     try sparse.indexUpdate(set, stream, v.ikr, kw_rows, v.igr, ix.ln_w, ix.ln_b, ix.ape, c.index, c.pk, pos, rows);
     const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
-    if (host_pos < l.dense_limit) try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale);
-    if (sparseRows(l, host_pos, rows)) {
-        try sparse.selectTokens(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts);
-        try latent.sparseAttention(set, stream, v.qa, c.lc, v.tokens, v.counts, sparse.width, v.partials, v.ol, rows, l.heads, l.lw, scale);
+    const sparse_any = sparseRows(l, host_pos, rows);
+    if (sparse_any) try sparse.selectTokens(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts);
+    if (c.owner) |owner| {
+        const transport = k.owner orelse return error.NoKvOwnerTransport;
+        var first: usize = 0;
+        while (first < rows) {
+            const n = @min(part_rows, rows - first);
+            var tile = v;
+            tile.qa += first * l.heads * l.lw * 2;
+            tile.ol += first * l.heads * l.lw * 2;
+            tile.tokens += first * sparse.width * 4;
+            tile.counts += first * 4;
+            var at = pos;
+            if (first > 0) {
+                var args: cuda.Args = .{};
+                inline for (.{ pos, @as(c_int, @intCast(first)), v.at }) |value| args.add(value);
+                try cuda.launch.launch(try k.ops.function("tf_glm_add_i32"), .{ .grid = .{}, .block = .{ .x = 32 } }, stream, &args);
+                at = v.at;
+            }
+            var work: Attention = .{ .k = k, .stream = stream, .l = l, .c = c, .s = tile, .pos = at, .host_pos = host_pos + first, .rows = n, .nch = nch, .scale = scale, .hb = latent.headBlock(rows) };
+            try transport.attention(stream, owner, tile.qa, tile.ol, v.owner_q, v.owner_out, n * l.heads * l.lw * 2, .{ .ctx = &work, .run = Attention.run });
+            first += n;
+        }
+    } else {
+        if (host_pos < l.dense_limit) try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale, latent.headBlock(rows));
+        if (sparse_any) try latent.sparseAttention(set, stream, v.qa, c.lc, v.tokens, v.counts, sparse.width, v.partials, v.ol, rows, l.heads, l.lw, scale);
     }
 }
 
 /// forward.dense_attention: latent.attention in `part_rows`-row blocks, each at its first row's position.
-fn denseAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, pos: u64, rows: usize, nch: usize, part_rows: usize, scale: f32) !void {
-    const hb = latent.headBlock(rows);
+fn denseAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, pos: u64, rows: usize, nch: usize, part_rows: usize, scale: f32, hb: usize) !void {
     var r0: usize = 0;
     while (r0 < rows) : (r0 += part_rows) {
         const n = @min(part_rows, rows - r0);
@@ -154,3 +177,25 @@ fn denseAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scrat
         try latent.attention(k.set, stream, s.qa + off, c.lc, at, s.partials, s.ol + off, s.dummy, n, l.heads, l.lw, nch, scale, hb);
     }
 }
+
+const Attention = struct {
+    k: Kernels,
+    stream: cuda.Stream,
+    l: Layer,
+    c: Caches,
+    s: Scratch,
+    pos: u64,
+    host_pos: usize,
+    rows: usize,
+    nch: usize,
+    scale: f32,
+    hb: usize,
+    fn run(ptr: *anyopaque, qa: u64, out: u64) !void {
+        const a: *@This() = @ptrCast(@alignCast(ptr));
+        var s = a.s;
+        s.qa = qa;
+        s.ol = out;
+        if (a.host_pos < a.l.dense_limit) try denseAttention(a.k, a.stream, a.l, a.c, s, a.pos, a.rows, a.nch, a.rows, a.scale, a.hb);
+        if (sparseRows(a.l, a.host_pos, a.rows)) try latent.sparseAttentionBlock(a.k.set, a.stream, qa, a.c.lc, s.tokens, s.counts, sparse.width, s.partials, out, a.rows, a.l.heads, a.l.lw, a.scale, a.hb);
+    }
+};

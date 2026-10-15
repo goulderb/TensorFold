@@ -146,12 +146,17 @@ pub const Lanes = struct {
     fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
         const ids = s.prompt();
         if (ids.len + s.max_new + max_rows >= self.x.e.capacity) return error.PromptTooLong;
+        const free_slot = self.freeSlot();
         const gop = try self.lanes.getOrPut(self.x.e.gpa, s);
-        if (!gop.found_existing) gop.value_ptr.* = .{ .slot = self.freeSlot() };
+        if (!gop.found_existing) gop.value_ptr.* = .{ .slot = free_slot };
         gop.value_ptr.pending_rows = null;
         gop.value_ptr.held_n = 0;
         gop.value_ptr.fill = null;
         try self.x.bind(gop.value_ptr.slot);
+        if (self.x.e.pool != null) {
+            const rows = try @import("cuda_kv_extent.zig").requestRows(ids.len, s.max_new, fw.window_rows, self.x.e.capacity);
+            try self.x.reserve(rows);
+        }
         try self.x.begin(s.sampling);
         s.cached = 0;
         return self.resumeFrom(s, ids.len);

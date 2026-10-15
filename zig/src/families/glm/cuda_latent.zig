@@ -81,8 +81,12 @@ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: cache_rows.Cache, 
 
 /// latent.sparse_attention: rows with counts > 0 over their selected tokens (i32 [rows][w]); others left alone.
 pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: cache_rows.Cache, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
+    return sparseAttentionBlock(set, stream, qa, cache, tokens, counts, w, p, out, rows, heads, lw, scale, headBlock(rows));
+}
+
+pub fn sparseAttentionBlock(set: glue.Set, stream: cuda.Stream, qa: u64, cache: cache_rows.Cache, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32, hb: usize) !void {
     const nch = chunksFor(w);
-    try chunks(set, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, headBlock(rows), true);
+    try chunks(set, stream, qa, cache, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, hb, true);
     try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
 }
 

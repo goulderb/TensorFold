@@ -61,7 +61,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, sparse_any);
             for (r.segs) |g| {
                 const nch = @min(latent.chunksFor(g.st.pos + g.rows), b.nch);
-                try dsa_block.attend(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);
+                try dsa_block.attend(f.dsaKernels(r), f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);
             }
             try latent.expandV(f.set(), f.stream, b.dsa.ol, a.wv, b.dsa.vn, rows, a.heads, a.dv, a.lw);
             try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, out);

@@ -23,7 +23,7 @@ pub const snap_grid: u32 = prompt_rows;
 pub const explains_open = true;
 
 /// The server's reading of this rank's room after its load (the budget streams are admitted by); null if unreadable.
-pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
+pub const Room = engine.Room;
 /// `slide` stays false: the server refuses --slide for a family without a learner (no `slide` here).
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, room: ?Room = null };
 /// The smallest room among the other ranks and whose it is.
@@ -42,6 +42,7 @@ pub const Loaded = struct {
     deinit: *const fn (*anyopaque) void,
     lone: ?LoneRun = null,
     target: *engine.Engine, // the prompt cache keeps this engine's states (snap_*)
+    admit: ?struct { ctx: *anyopaque, fits: *const fn (*anyopaque, u32, u32) bool } = null,
     peer_room: ?Peer = null, // rank 0: the server admits streams and kept states by this when it is smaller
 };
 
@@ -100,7 +101,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     try own.lib.check(own.lib.api.ncclCommInitRank(&own.comm, @intCast(p.world), id, @intCast(p.rank)), "ncclCommInitRank");
     errdefer _ = own.lib.api.ncclCommDestroy(own.comm);
     const cap = capacity(o.context);
-    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.lib, own.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set });
+    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.lib, own.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set, .room = o.room });
     errdefer own.e.deinit();
     own.link = try follow.Link.init(gpa, ctx.d, &own.lib, own.comm, own.e.stream, cap);
     errdefer own.link.deinit();
@@ -138,7 +139,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .deinit = close,
         .target = own.e,
         .peer_room = peer,
+        .admit = if (own.e.pool != null) .{ .ctx = own.e, .fits = fits } else null,
     };
+}
+
+fn fits(ptr: *anyopaque, prompt: u32, output: u32) bool {
+    const e: *const engine.Engine = @ptrCast(@alignCast(ptr));
+    return e.fits(prompt, output);
 }
 
 // Each rank keeps a copy under rank 0's id, in the room rank 0 admitted by (the smallest over the ranks).

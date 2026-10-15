@@ -96,16 +96,24 @@ pub const Buffers = struct {
     part: u64, // fp32 [rows][dims]: this rank's partial rows a split exchange sends from
 
     pub fn init(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize) !Buffers {
-        return make(d, w, rows, prefill, capacity, rows);
+        return make(d, w, rows, prefill, capacity, rows, false);
     }
 
     /// A shared window's scratch: `rows` rows of several streams, each one's attention and KDA chain on `window_rows`.
     pub fn initShared(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, capacity: usize) !Buffers {
-        return make(d, w, rows, false, capacity, window_rows);
+        return make(d, w, rows, false, capacity, window_rows, false);
+    }
+
+    pub fn initOwned(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize) !Buffers {
+        return make(d, w, rows, prefill, capacity, if (prefill) rows else window_rows, true);
+    }
+
+    pub fn initSharedOwned(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, capacity: usize) !Buffers {
+        return make(d, w, rows, false, capacity, window_rows, true);
     }
 
     /// `seg`: the most rows one stream's attention takes (a decode window's rows, or a shared window's segment).
-    fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize) !Buffers {
+    fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, owned: bool) !Buffers {
         const c = &w.config;
         const s = &w.share;
         const D: usize = c.hidden;
@@ -166,6 +174,8 @@ pub const Buffers = struct {
             rows * D * 2, rows * D * 2, rows * 2 * D * 2, rows * D * 2, // hin, me, mcat, mx
             rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
             if (w.quantizedAttention()) rows * 3 * n * 2 else 4, // the KDA projection's staging (EXL3)
+            if (owned) part_rows * HL * lw * 2 else 0,
+            if (owned) part_rows * HL * lw * 2 else 0,
         };
         var p: [sizes.len]u64 = undefined;
         const a = try arena(d, &sizes, &p);
@@ -206,6 +216,8 @@ pub const Buffers = struct {
                 .counts = p[41],
                 .mm_part = p[42],
                 .at = p[43],
+                .owner_q = p[72],
+                .owner_out = p[73],
             },
             .dense = .{ .tmp = p[44], .gu = p[45], .act = p[46], .xs_act = p[47], .part = p[42] },
             .moe = .{ .mlog = p[48], .router_part = p[26], .pick = p[49], .wts = p[50], .plan = .{ .members = p[51], .items = p[52], .counts = p[53], .rank = p[54], .hist = p[55] }, .eact = p[56], .ey = p[57], .sgu = p[58], .sact = p[59], .sxs = p[60], .sy = p[61], .mm_part = p[42] },
@@ -257,6 +269,14 @@ pub const State = struct {
     proj_row: usize,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, format: cache_rows.Format) !State {
+        return make(gpa, d, w, capacity, format, false);
+    }
+
+    pub fn initShared(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, format: cache_rows.Format) !State {
+        return make(gpa, d, w, capacity, format, true);
+    }
+
+    fn make(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, format: cache_rows.Format, external_planes: bool) !State {
         const c = &w.config;
         const s = &w.share;
         var nk: usize = 0;
@@ -268,10 +288,11 @@ pub const State = struct {
         const n = s.kda.len() * c.kda_dim;
         const kw = 3 * n + 2 * c.kda_dim + s.kda.len();
         const pk_rows = capacity / sparse.pool + 2;
-        const layout = try layout_mod.Layout.init(.{
+        var layout = try layout_mod.Layout.init(.{
             4,                        nk * 3 * 3 * n * 2,       2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * window_rows * kw * 2,
             nk * window_rows * n * 4, nk * window_rows * n * 2, nk * window_rows * n * 4,                   nk * window_rows * s.kda.len() * 4,
         }, capacity, @max(prefill_rows, window_rows), nd, format, c.kv_lora, c.i_dim);
+        if (external_planes) layout = try layout.external();
         var a: Arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, layout.total_bytes), .used = layout.total_bytes };
         errdefer a.buf.free();
         try a.buf.fill8(0, null);
@@ -287,7 +308,19 @@ pub const State = struct {
 
     fn bindCaches(layout: layout_mod.Layout, base: u64, layer: usize, format: cache_rows.Format, pk_rows: usize) dsa_block.Caches {
         const p = layout.cacheOffsets(layer);
-        return .{ .lc = .{ .ptr = base + p[0], .format = format }, .index = .{ .keys = base + p[1], .gates = base + p[2], .rows = layout.ring_rows }, .pk = .{ .ptr = base + p[3], .format = format }, .pk_rows = pk_rows };
+        return .{ .lc = .{ .ptr = if (layout.external_planes) 0 else base + p[0], .format = format }, .index = .{ .keys = base + p[1], .gates = base + p[2], .rows = layout.ring_rows }, .pk = .{ .ptr = if (layout.external_planes) 0 else base + p[3], .format = format }, .pk_rows = pk_rows };
+    }
+
+    pub fn address(st: *const State, r: layout_mod.Range) u64 {
+        if (r.plane == .fixed) return st.arena.buf.ptr + r.offset;
+        const c = if (r.layer == st.caches.len) st.mtp_caches else st.caches[r.layer];
+        return r.offset + switch (r.plane) {
+            .fixed => unreachable,
+            .latent => c.lc.ptr,
+            .keys => c.index.keys,
+            .gates => c.index.gates,
+            .pooled => c.pk.ptr,
+        };
     }
 
     pub fn deinit(st: *State) void {

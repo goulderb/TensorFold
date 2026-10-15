@@ -6,7 +6,7 @@ const engine = @import("cuda_engine.zig");
 const sampler = @import("cuda_sampler.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -117,6 +117,14 @@ pub const Leader = struct {
     /// The stream's sequence for the steps that follow (each step names it, so the other ranks bind it too).
     pub fn bind(x: Leader, slot: u32) !void {
         try x.e.bind(slot);
+    }
+
+    /// Rank 0 chooses a physical extent before the paired begin/restore command.
+    pub fn reserve(x: Leader, rows: usize) !void {
+        const r = try x.e.placement(rows) orelse return;
+        try x.flush();
+        try x.send(.{ .kind = @backingInt(Kind.reserve), .a = r.base, .seed = r.rows }, &.{});
+        try x.e.reserveAt(r);
     }
 
     /// Frees a stream's sequence on every rank.
@@ -240,6 +248,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 };
             },
             .verify => try e.verify(step.ids, sampled[0..step.ids.len]),
+            .reserve => try e.reserveAt(.{ .base = @intCast(h.a), .rows = @intCast(h.seed) }),
             .shared => {
                 const k = h.depth;
                 if (k == 0 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadStep;

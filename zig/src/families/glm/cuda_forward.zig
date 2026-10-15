@@ -210,6 +210,13 @@ pub const Forward = struct {
         try glue.hcPost(f.set(), f.stream, r.b.x, r.b.x, r.b.gathered, r.b.post, r.b.comb, rows, c.hidden, c.hc, r.w.share.world);
     }
 
+    pub fn dsaKernels(f: *const Forward, r: Rank) dsa_block.Kernels {
+        return .{ .set = f.set(), .ops = f.m.ops(), .owner = switch (f.exchange) {
+            .local => null,
+            .nccl => |n| .{ .d = f.d, .lib = n.lib, .comm = n.comm, .rank = r.w.share.rank },
+        } };
+    }
+
     /// forward._mixer: the layer's KDA or DSA block on b.normed; `li`/`di`: its index among loaded KDA / DSA layers.
     fn mixer(f: *const Forward, r: Rank, l: weights.Layer, li: usize, di: usize, rows: usize, nch: usize, out: ?u64) !void {
         const c = &r.w.config;
@@ -234,7 +241,7 @@ pub const Forward = struct {
                 if (b.prefill) st.cur[li] = 1 - cur; // a prompt chunk keeps every row: the layer commits now
             },
             .mla => |a| {
-                try dsa_block.body(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows);
+                try dsa_block.body(f.dsaKernels(r), f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows);
                 if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
             },
         }
@@ -531,7 +538,7 @@ pub const Forward = struct {
             try b16.proj(f.set(), f.stream, b.mcat, 2 * D, m.eh, b.mx, b.kda.mm_part, n, D, 2 * D, false);
             try glue.rmsnorm(f.set(), f.stream, b.mx, D, m.layer.in_norm, b.normed, D, b.xs, c.eps, n, D);
             const nch = @min(latent.chunksFor(r.st.mtp_len + n), b.nch);
-            try dsa_block.block(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
+            try dsa_block.block(f.dsaKernels(r), f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
         }
         try f.gather(n);
         for (f.ranks) |r| {
