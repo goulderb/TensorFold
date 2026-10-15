@@ -27,6 +27,7 @@ fn schemaText(cx: *Cx, raw: Value, where: []const u8) errors.Refused![]const u8 
     };
     if (value == .bool) value = if (value.bool) .{ .object = try json.newObject(cx.a) } else .null;
     if (value != .object) return cx.fail(.request, "{s} must be a JSON schema object", .{where});
+    try @import("schema_subset.zig").validate(cx, value);
     return json.stringify(cx.a, value, .{ .ascii = false });
 }
 
@@ -61,6 +62,7 @@ pub fn spec(cx: *Cx, body: Value) errors.Refused!?Spec {
         if (kind != null and kind.? == .string and std.mem.eql(u8, name, "json_schema")) {
             const js = rf.get("json_schema");
             if (js == null or js.? != .object or js.?.field("schema") == null) return cx.refuse("response_format json_schema needs json_schema.schema (a JSON schema object)");
+            if (js.?.get("strict")) |strict| if (strict != .bool) return cx.refuse("response_format json_schema.strict must be a boolean");
             return .{ .kind = .json_schema, .text = try schemaText(cx, js.?.get("schema").?, "response_format json_schema.schema") };
         }
         if (!(kind != null and kind.? == .string and std.mem.eql(u8, name, "text")))
