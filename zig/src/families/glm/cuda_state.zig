@@ -46,7 +46,7 @@ fn arena(d: *const cuda.Driver, sizes: []const usize, out: []u64) !Arena {
 }
 
 /// A rank's B16 matmul shapes ([n, k]) whose split-K partials the buffers hold.
-fn b16Shapes(w: *const weights.Weights) [11][2]usize {
+fn b16Shapes(w: *const weights.Weights) [13][2]usize {
     const c = &w.config;
     const s = &w.share;
     const n = s.kda.len() * c.kda_dim;
@@ -57,6 +57,8 @@ fn b16Shapes(w: *const weights.Weights) [11][2]usize {
         .{ c.i_heads * c.i_dim, c.q_lora },  .{ c.hidden, s.mla.len() * c.v_dim }, .{ 2 * s.shared.len(), c.hidden },
         .{ c.hidden, 2 * c.hidden }, // the MTP head's eh_proj
         .{ 2 * c.kda_dim + s.kda.len(), c.hidden }, // EXL3: [f_a | g_a | b] apart from qkv
+        .{ s.dense.len(), c.hidden },
+        .{ c.hidden, s.dense.len() },
     };
 }
 
@@ -203,7 +205,7 @@ pub const Buffers = struct {
                 .mm_part = p[42],
                 .at = p[43],
             },
-            .dense = .{ .tmp = p[44], .gu = p[45], .act = p[46], .xs_act = p[47] },
+            .dense = .{ .tmp = p[44], .gu = p[45], .act = p[46], .xs_act = p[47], .part = p[42] },
             .moe = .{ .mlog = p[48], .router_part = p[26], .pick = p[49], .wts = p[50], .plan = .{ .members = p[51], .items = p[52], .counts = p[53], .rank = p[54], .hist = p[55] }, .eact = p[56], .ey = p[57], .sgu = p[58], .sact = p[59], .sxs = p[60], .sy = p[61], .mm_part = p[42] },
             .hidden = p[62],
             .fnormed = p[63],

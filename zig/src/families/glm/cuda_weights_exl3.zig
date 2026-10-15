@@ -17,6 +17,7 @@ pub fn gather(ck: *core.Checkpoint, gpa: std.mem.Allocator, name: []const u8, kl
     const tn = t.dim(1);
     const words = t.dim(2);
     const k_all = t.dim(0) * 16;
+    if (suh.dtype != .f16 or suh.rank != 1 or suh.dim(0) != k_all or svh.dtype != .f16 or svh.rank != 1 or svh.dim(0) != tn * 16) return error.UnexpectedExl3Scales;
     const k_hi = if (khi == 0) k_all else khi;
     if (klo % 128 != 0 or k_hi % 128 != 0 or k_hi > k_all) return error.Exl3RowCut;
     var n: usize = 0;
@@ -113,6 +114,9 @@ pub fn moe(L: *W.Loader, i: u32) !@import("cuda_moe.zig").Layer {
         for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, 0..) |p, m| {
             const name = try std.fmt.bufPrint(&nb, W.prefix ++ "layers.{d}.mlp.experts.{d}.{s}", .{ i, e, p });
             const q = if (m < 2) try gather(L.ck, L.gpa, name, 0, 0, &.{cut}, &t_up, &h_up) else try gather(L.ck, L.gpa, name, cut.lo, cut.hi, &.{.{ .lo = 0, .hi = d }}, &t_dn, &h_dn);
+            if (e > 0 or m > 0) {
+                if (q.codebook != widths.codebook or (m < 2 and q.bits != widths.up) or (m == 2 and e > 0 and q.bits != widths.down)) return error.InconsistentExl3Experts;
+            }
             if (m < 2) widths.up = q.bits else widths.down = q.bits;
             widths.codebook = q.codebook;
         }
@@ -123,6 +127,24 @@ pub fn moe(L: *W.Loader, i: u32) !@import("cuda_moe.zig").Layer {
         p.* = try L.put("layers.{d}.moe.experts.{s}", .{ i, what });
     }
     const sh = L.w.share.shared;
+    if (!L.w.exl3) {
+        inline for (.{ "gate_proj", "up_proj" }) |proj| try L.rows(try L.get("layers.{d}.mlp.shared_experts." ++ proj ++ ".weight", .{i}), sh.lo, sh.hi, c.shared_inter, .bf16);
+        const gu = try L.put("layers.{d}.moe.shared.gu", .{i});
+        try L.cols(try L.get("layers.{d}.mlp.shared_experts.down_proj.weight", .{i}), sh.lo, sh.hi, .bf16);
+        const down = try L.put("layers.{d}.moe.shared.down", .{i});
+        return .{
+            .router = router,
+            .bias = bias,
+            .routed = .{ .format = .exl3, .up = ptrs[0], .down = ptrs[1], .up_scale = ptrs[2], .down_scale = ptrs[3], .width = cut.len(), .dims = d, .experts = c.experts, .limit = c.swiglu_limit, .exl3 = widths },
+            .count = c.experts,
+            .shared_gu = gu,
+            .shared_down = .{ .b16 = down },
+            .shared = sh.len(),
+            .top_k = c.topk,
+            .scale = c.routed_scale,
+            .norm = c.norm_topk,
+        };
+    }
     return .{
         .router = router,
         .bias = bias,

@@ -24,6 +24,7 @@ pub const lanes = @import("cuda_lanes.zig");
 pub const native = @import("cuda_native.zig");
 
 test {
+    _ = @import("cuda_checkpoint.zig");
     _ = experts;
     _ = glue;
     _ = kda;

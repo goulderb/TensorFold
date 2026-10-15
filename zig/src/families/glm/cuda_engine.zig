@@ -97,7 +97,7 @@ pub const Engine = struct {
         const cfg_path = try std.fs.path.join(a, &.{ checkpoint, "config.json" });
         const text = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, a, .limited(1 << 24));
         var why: modelopt.Why = .{};
-        modelopt.admit(gpa, text, &why) catch |err| { // a quant_algo other than NVFP4 is refused before anything loads
+        _ = @import("cuda_checkpoint.zig").admit(gpa, text, &why) catch |err| {
             std.log.err("{s}: {s}", .{ cfg_path, why.text() });
             return err;
         };

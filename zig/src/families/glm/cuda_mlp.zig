@@ -3,17 +3,22 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const glue = @import("cuda_glue.zig");
+const b16 = @import("cuda_b16.zig");
 
 /// One dense layer on a rank: gate and up [width][dims] and down [dims][width], NVFP4 (Fp4Linear's) or EXL3.
-pub const Layer = struct { gate: cuda.qlinear.Weight, up: cuda.qlinear.Weight, down: cuda.qlinear.Weight, width: usize, dims: usize, limit: f32 };
+pub const Layer = struct { gate: b16.Proj, up: b16.Proj, down: b16.Proj, width: usize, dims: usize, limit: f32 };
 
 /// The block's scratch for up to `rows` rows: one projection's rows, the [gate | up] rows, the activation and its sums.
-pub const Scratch = struct { tmp: u64, gu: u64, act: u64, xs_act: u64 };
+pub const Scratch = struct { tmp: u64, gu: u64, act: u64, xs_act: u64, part: u64 };
 
 pub const Kernels = struct { set: glue.Set, linear: cuda.qlinear.Linear, copy_rows: cuda.Function };
 
 /// Fp4Linear.__call__ (prefill on a prompt chunk): bf16 out, or fp32 with `wide`; the prompt GEMM needs `ldx` % 8 == 0.
-fn mm(k: Kernels, stream: cuda.Stream, q: cuda.qlinear.Weight, x: u64, ldx: usize, rows: usize, out: u64, wide: bool, prompt: bool) !void {
+fn mm(k: Kernels, stream: cuda.Stream, p: b16.Proj, x: u64, ldx: usize, rows: usize, out: u64, part: u64, n: usize, dims: usize, wide: bool, prompt: bool) !void {
+    const q = switch (p) {
+        .b16 => |w| return b16.matmul(k.set, stream, x, ldx, w, out, part, rows, n, dims, wide),
+        .q => |w| w,
+    };
     const in: cuda.qlinear.Rows = .{ .x = x, .ldx = ldx };
     if (prompt) {
         std.debug.assert(x % 16 == 0 and (rows == 1 or ldx % 8 == 0));
@@ -30,15 +35,15 @@ pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_st
 
 /// forward.out_proj's fill for the dense MLP: down of rows lo..hi (s.act) into out [hi - lo][dims] fp32.
 pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi: usize, prompt: bool, out: u64) !void {
-    try mm(k, stream, l.down, s.act + lo * l.width * 2, l.width, hi - lo, out, true, prompt);
+    try mm(k, stream, l.down, s.act + lo * l.width * 2, l.width, hi - lo, out, s.part, l.dims, l.width, true, prompt);
 }
 
 /// The block up to its down projection: [gate | up] and SwiGLU into s.act.
 pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool) !void {
     const w = l.width;
-    for ([_]cuda.qlinear.Weight{ l.gate, l.up }, 0..) |proj, j| {
+    for ([_]b16.Proj{ l.gate, l.up }, 0..) |proj, j| {
         // Fp4Linear(out=a column slice): the rows computed contiguous, then copied into their half of each row
-        try mm(k, stream, proj, x, x_stride, rows, s.tmp, false, prompt);
+        try mm(k, stream, proj, x, x_stride, rows, s.tmp, s.part, l.width, l.dims, false, prompt);
         var a: cuda.Args = .{};
         a.add(s.tmp);
         a.add(@as(c_longlong, @intCast(w * 2)));

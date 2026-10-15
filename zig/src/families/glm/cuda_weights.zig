@@ -134,7 +134,7 @@ pub const Loader = struct {
     }
 
     /// Columns [lo, hi) of every row of a matrix: split.py's "col" cut.
-    fn cols(L: *Loader, t: Tensor, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
+    pub fn cols(L: *Loader, t: Tensor, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
         if (t.rank != 2) return error.UnexpectedTensor;
         const k = t.dim(1);
         for (0..t.dim(0)) |r| try L.add(t, r * k + lo, r * k + hi, to);
@@ -285,22 +285,42 @@ pub const Loader = struct {
         const c = &L.w.config;
         const s = L.w.share.dense;
         const d = c.hidden;
+        var dense_name: [192]u8 = undefined;
+        const weight_name = try std.fmt.bufPrint(&dense_name, prefix ++ "layers.{d}.mlp.gate_proj.weight", .{i});
+        if (L.ck.has(weight_name)) {
+            const gate = try L.ck.get(weight_name);
+            if (gate.dtype == .bf16 or gate.dtype == .f32) return .{
+                .gate = .{ .b16 = try L.denseB16(i, "gate_proj", s.lo, s.hi, 0, d) },
+                .up = .{ .b16 = try L.denseB16(i, "up_proj", s.lo, s.hi, 0, d) },
+                .down = .{ .b16 = try L.denseB16(i, "down_proj", 0, d, s.lo, s.hi) },
+                .width = s.len(),
+                .dims = d,
+                .limit = c.swiglu_limit,
+            };
+        }
         if (L.w.exl3) return .{
-            .gate = try x3.layerMatrix(L, "layers.{d}.mlp.gate_proj", i, 0, 0, &.{s}),
-            .up = try x3.layerMatrix(L, "layers.{d}.mlp.up_proj", i, 0, 0, &.{s}),
-            .down = try x3.layerMatrix(L, "layers.{d}.mlp.down_proj", i, s.lo, s.hi, &.{.{ .lo = 0, .hi = d }}),
+            .gate = .{ .q = try x3.layerMatrix(L, "layers.{d}.mlp.gate_proj", i, 0, 0, &.{s}) },
+            .up = .{ .q = try x3.layerMatrix(L, "layers.{d}.mlp.up_proj", i, 0, 0, &.{s}) },
+            .down = .{ .q = try x3.layerMatrix(L, "layers.{d}.mlp.down_proj", i, s.lo, s.hi, &.{.{ .lo = 0, .hi = d }}) },
             .width = s.len(),
             .dims = d,
             .limit = c.swiglu_limit,
         };
         return .{
-            .gate = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.gate_proj", i, s.lo, s.hi, 0, d) },
-            .up = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.up_proj", i, s.lo, s.hi, 0, d) },
-            .down = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.down_proj", i, 0, d, s.lo, s.hi) },
+            .gate = .{ .q = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.gate_proj", i, s.lo, s.hi, 0, d) } },
+            .up = .{ .q = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.up_proj", i, s.lo, s.hi, 0, d) } },
+            .down = .{ .q = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.down_proj", i, 0, d, s.lo, s.hi) } },
             .width = s.len(),
             .dims = d,
             .limit = c.swiglu_limit,
         };
+    }
+
+    fn denseB16(L: *Loader, i: u32, comptime proj: []const u8, lo: usize, hi: usize, klo: usize, khi: usize) !u64 {
+        const t = try L.get("layers.{d}.mlp." ++ proj ++ ".weight", .{i});
+        if (t.rank != 2 or (t.dtype != .bf16 and t.dtype != .f32) or hi > t.dim(0) or khi > t.dim(1)) return error.UnexpectedTensor;
+        for (lo..hi) |row| try L.add(t, row * t.dim(1) + klo, row * t.dim(1) + khi, .bf16);
+        return L.put("layers.{d}.mlp." ++ proj ++ ".b16", .{i});
     }
 
     /// One device allocation the loader frees itself (staging for the GPU's quantizers).
@@ -370,7 +390,8 @@ pub const Loader = struct {
 
     /// weights.load's moe(i) on NVFP4: router and bias, routed experts as Experts4, the BF16 shared expert's share.
     fn moeLayer(L: *Loader, i: u32) !moe.Layer {
-        if (L.w.exl3) return x3.moe(L, i);
+        var routed_name: [192]u8 = undefined;
+        if (L.w.exl3 or L.ck.has(try std.fmt.bufPrint(&routed_name, prefix ++ "layers.{d}.mlp.experts.0.gate_proj.trellis", .{i}))) return x3.moe(L, i);
         const c = &L.w.config;
         const d: usize = c.hidden;
         const cut = L.w.share.moe;
