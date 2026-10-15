@@ -87,6 +87,18 @@ fn scaledBytes(g: f64) error{Invalid}!u64 {
     return @intFromFloat(bytes);
 }
 
+pub fn laneCount(asked: u32, fixed: bool, limit: u32) error{TooManyLanes}!u32 {
+    if (fixed and asked > limit) return error.TooManyLanes;
+    return @min(asked, limit);
+}
+
+test "automatic lanes respect the family limit and explicit oversized parallel refuses" {
+    try std.testing.expectEqual(@as(u32, 64), try laneCount(128, false, 64));
+    try std.testing.expectEqual(@as(u32, 8), try laneCount(8, true, 64));
+    try std.testing.expectError(error.TooManyLanes, laneCount(65, true, 64));
+    try std.testing.expectEqual(@as(u32, 128), try laneCount(128, true, std.math.maxInt(u32)));
+}
+
 /// Free streams use no room; admit all asked when they fit, refusing zero or an oversized fixed count.
 pub fn admit(room: u64, stream: u64, free: u32, asked: u32, fixed: bool) error{ NoStream, TooMany }!u32 {
     const more = if (stream == 0) asked else std.math.cast(u32, room / stream) orelse std.math.maxInt(u32);

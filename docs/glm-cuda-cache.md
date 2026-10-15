@@ -133,7 +133,7 @@ in use. The same attention seam handles prompt chunks, shared-window segments
 and MTP. This baseline trades extra communication for bounded scratch; its
 latency and throughput are unmeasured.
 
-Snapshot capture performs local copies only, retaining latent rows on their
+Snapshot data capture uses local copies, retaining latent rows on their
 owner and the remaining ranges on every rank. Byte estimates conservatively
 charge the worst owner. During paired restore, both ranks validate the saved
 state and destination before any data transfer. Encoded latent rows and scales
@@ -153,3 +153,13 @@ The normal native build compiles the kernel-facing prefill/shared/MTP paths.
 Device attention numerics, full TP2 generation, cancellation/peer loss and
 performance remain pending. Live compaction/growth carry, parked-prefix
 sharing, twins, compact prompt-history fetch and durable spill are deferred.
+
+The initial shared pool supports at most 64 lanes. Automatic lane admission caps
+at that limit; an explicit larger `--parallel` is refused. In sharded mode a request must fit within one owner's half of the pool.
+
+Both ranks acknowledge each new reservation and prompt snapshot. A snapshot ID
+is returned to the prompt cache only after both copies succeed; a failed capture
+frees any successful peer copy. Invalid restores are refused before data transfer.
+Once an owner attention or restore transfer fails, the rank terminates rather
+than serving another request with a damaged pair. Device numerical parity,
+concurrent full-length occupancy and failure recovery still require qualification.

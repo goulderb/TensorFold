@@ -361,7 +361,12 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         low = try std.fmt.allocPrint(a, " on rank {d}, the smallest room of the ranks", .{pr.rank});
     };
     const free = loaded.free_streams;
-    const streams = budget.admit(room, loaded.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
+    const lane_limit = if (@hasField(@TypeOf(loaded), "lane_limit")) loaded.lane_limit else std.math.maxInt(u32);
+    const asked = budget.laneCount(o.lanes, o.lanes_fixed, lane_limit) catch {
+        problem.* = try std.fmt.allocPrint(a, "this CUDA cache supports at most {d} lanes; lower --parallel {d}", .{ lane_limit, o.lanes });
+        return null;
+    };
+    const streams = budget.admit(room, loaded.stream_bytes, free, asked, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
             error.NoStream => try std.fmt.allocPrint(a, "the CUDA memory budget fits no stream: one at a {d}-token window takes {d:.2} GiB, and {d:.2} GiB is left after the model's {d:.2} GiB and the {d:.1} GiB reserve{s}; lower --context, or free device memory", .{ window, toGib(loaded.stream_bytes), toGib(room), toGib(model), toGib(after.reserve), low }),
             error.TooMany => try std.fmt.allocPrint(a, "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token window, and the CUDA memory budget leaves {d:.2} GiB{s}: serve --parallel {d}, or lower --context", .{ o.lanes, toGib(loaded.stream_bytes * (o.lanes -| free)), window, toGib(room), low, free + room / loaded.stream_bytes }),

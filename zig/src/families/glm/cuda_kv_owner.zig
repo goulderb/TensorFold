@@ -1,6 +1,11 @@
 const std = @import("std");
 const cuda = @import("cuda");
 
+pub fn failPair(err: anyerror) void {
+    std.log.err("GLM paired cache operation failed ({s}); terminating this rank", .{@errorName(err)});
+    std.process.exit(1);
+}
+
 pub const Work = struct { ctx: *anyopaque, run: *const fn (*anyopaque, u64, u64) anyerror!void };
 
 pub const Transport = struct {
@@ -8,9 +13,11 @@ pub const Transport = struct {
     lib: *const cuda.nccl.Library,
     comm: cuda.nccl.Comm,
     rank: usize,
+    failure: *const fn (anyerror) void = failPair,
 
     /// Each head rank keeps its own result; only the cache owner executes the existing attention kernels.
     pub fn attention(t: Transport, stream: cuda.Stream, owner: u32, qa: u64, out: u64, staged_q: u64, staged_out: u64, bytes: usize, work: Work) !void {
+        errdefer t.failure(error.PairedTransferFailed);
         for (0..2) |head_rank| {
             if (head_rank == owner) {
                 if (t.rank == owner) try work.run(work.ctx, qa, out);
@@ -23,6 +30,7 @@ pub const Transport = struct {
     }
 
     pub fn prepared(t: Transport, stream: cuda.Stream, buffer: cuda.DeviceBuffer, valid: bool) !bool {
+        errdefer t.failure(error.PairedTransferFailed);
         try t.d.check(t.d.api.cuMemsetD32Async(buffer.ptr, @intFromBool(valid), 1, stream.handle), "cuMemsetD32Async");
         var ready = true;
         for (0..2) |rank| {
@@ -36,6 +44,7 @@ pub const Transport = struct {
     }
 
     pub fn carry(t: Transport, stream: cuda.Stream, source_owner: u32, destination_owner: u32, source: u64, destination: u64, bytes: usize) !void {
+        errdefer t.failure(error.PairedTransferFailed);
         return t.carryBounded(stream, source_owner, destination_owner, source, destination, bytes, 64 << 20);
     }
 
@@ -111,4 +120,21 @@ test "two ranks retain their own head outputs when either cache owner runs atten
         for (jobs[1 - owner].restored) |v| try std.testing.expectEqual(@as(u8, 91), v);
         try std.testing.expectEqual(@as(usize, 8), channel.epoch.load(.acquire));
     }
+}
+
+test "an attention execution failure invokes the fatal pair policy before returning" {
+    const Failure = struct {
+        var called = false;
+        fn fatal(_: anyerror) void {
+            called = true;
+        }
+        fn kernel(_: *anyopaque, _: u64, _: u64) !void {
+            return error.InjectedAttentionFailure;
+        }
+    };
+    Failure.called = false;
+    var marker: u8 = 0;
+    const t: Transport = .{ .d = undefined, .lib = undefined, .comm = null, .rank = 0, .failure = Failure.fatal };
+    try std.testing.expectError(error.InjectedAttentionFailure, t.attention(undefined, 0, 0, 0, 0, 0, 0, .{ .ctx = &marker, .run = Failure.kernel }));
+    try std.testing.expect(Failure.called);
 }

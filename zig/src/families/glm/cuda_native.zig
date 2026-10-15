@@ -37,6 +37,7 @@ pub const Loaded = struct {
     rows: u32,
     stream_bytes: usize,
     free_streams: u32 = 1,
+    lane_limit: u32 = std.math.maxInt(u32),
     learn_bytes: usize = 0, // no learner: the streams keep all the room
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
@@ -134,6 +135,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .facts = own.lanes.facts(),
         .rows = glm_lanes.max_rows,
         .stream_bytes = own.e.seqBytes(), // each stream past the first makes its own sequence on every rank
+        .lane_limit = if (own.e.pool != null) @import("cuda_kv_extent.zig").max_slots else std.math.maxInt(u32),
         .free_streams = 1, // the first is the sequence the engine made
         .ctx = own,
         .deinit = close,

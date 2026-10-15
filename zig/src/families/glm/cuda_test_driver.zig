@@ -2,6 +2,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 
 pub const Memory = struct {
+    var mutex: std.atomic.Mutex = .unlocked;
     var blocks: [128]?[]align(256) u8 = @splat(null);
 
     pub fn driver() cuda.Driver {
@@ -10,6 +11,7 @@ pub const Memory = struct {
         d.api.cuMemFree_v2 = free;
         d.api.cuMemcpyDtoDAsync_v2 = copy;
         d.api.cuMemcpyDtoH_v2 = download;
+        d.api.cuMemcpyHtoDAsync_v2 = upload;
         d.api.cuMemsetD8_v2 = fill8;
         d.api.cuMemsetD8Async = fill8Async;
         d.api.cuMemsetD32Async = fill32;
@@ -28,6 +30,8 @@ pub const Memory = struct {
     }
 
     fn alloc(ptr: *u64, n: usize) callconv(.c) cuda.abi.Result {
+        while (!mutex.tryLock()) std.Thread.yield() catch {};
+        defer mutex.unlock();
         for (&blocks) |*b| if (b.* == null) {
             b.* = std.testing.allocator.alignedAlloc(u8, .fromByteUnits(256), n) catch return 2;
             ptr.* = @intFromPtr(b.*.?.ptr);
@@ -36,6 +40,8 @@ pub const Memory = struct {
         return 2;
     }
     fn free(ptr: u64) callconv(.c) cuda.abi.Result {
+        while (!mutex.tryLock()) std.Thread.yield() catch {};
+        defer mutex.unlock();
         for (&blocks) |*b| if (b.*) |bytes| if (@intFromPtr(bytes.ptr) == ptr) {
             std.testing.allocator.free(bytes);
             b.* = null;
@@ -45,6 +51,11 @@ pub const Memory = struct {
     }
     fn copy(dst: u64, src: u64, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
         @memcpy(slice(dst, n), slice(src, n));
+        return 0;
+    }
+    fn upload(dst: u64, src: ?*const anyopaque, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        const from: [*]const u8 = @ptrCast(src.?);
+        @memcpy(slice(dst, n), from[0..n]);
         return 0;
     }
     fn download(dst: ?*anyopaque, src: u64, n: usize) callconv(.c) cuda.abi.Result {

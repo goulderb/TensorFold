@@ -110,7 +110,8 @@ pub const Leader = struct {
     /// The step on the bound stream's sequence (its slot) to every rank.
     fn send(x: Leader, h: Header, ids: []const u32) !void {
         var hh = h;
-        hh.slot = x.e.slot;
+        hh.slot = if (h.kind == @backingInt(Kind.release)) h.slot else x.e.slot;
+        errdefer if (x.e.pool != null) x.e.pair_failure(error.PairedCommandFailed);
         try x.link.send(x.e.m.glue.put_words, hh, ids);
     }
 
@@ -124,14 +125,28 @@ pub const Leader = struct {
         const r = try x.e.placement(rows) orelse return;
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.reserve), .a = r.base, .seed = r.rows }, &.{});
-        try x.e.reserveAt(r);
+        try x.e.reservePaired(x.e.slot, r);
+    }
+
+    fn complete(x: Leader, result: anytype) @TypeOf(result) {
+        return result catch |err| {
+            x.failed(err);
+            return err;
+        };
+    }
+
+    fn failed(x: Leader, err: anyerror) void {
+        if (x.e.pool == null) return;
+        switch (err) {
+            error.Cancelled, error.KeptStateRefused => {},
+            else => x.e.pair_failure(err),
+        }
     }
 
     /// Frees a stream's sequence on every rank.
     pub fn release(x: Leader, slot: u32) !void {
         try x.flush();
-        try x.e.bind(slot);
-        try x.send(.{ .kind = @backingInt(Kind.release) }, &.{});
+        try x.send(.{ .kind = @backingInt(Kind.release), .slot = slot }, &.{});
         x.e.release(slot);
     }
 
@@ -158,14 +173,14 @@ pub const Leader = struct {
             h.top_k = v.top_k;
         }
         try x.send(h, &.{});
-        try x.e.begin(c);
+        try x.complete(x.e.begin(c));
     }
 
     /// `cancel` (rank 0's), asked before each chunk, decides for every rank; `from` every rank holds; `marks` rank 0's.
     pub fn prefill(x: Leader, ids: []const u32, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !u32 {
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.prefill), .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0 }, ids);
-        return x.e.prefill(ids, from, cancel, marks);
+        return x.complete(x.e.prefill(ids, from, cancel, marks));
     }
 
     /// One chunk of a prompt pass on every rank (Engine.prefillChunk); the first token once the chunk ends the prompt.
@@ -174,13 +189,13 @@ pub const Leader = struct {
         try x.flush();
         const part = ids[start..@min(ids.len, start + engine.prompt_rows + 1)];
         try x.send(.{ .kind = @backingInt(Kind.chunk), .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
-        return x.e.prefillChunk(part, start, ids.len, from, cancel, marks);
+        return x.complete(x.e.prefillChunk(part, start, ids.len, from, cancel, marks));
     }
 
     pub fn verify(x: Leader, ids: []const u32, out: []u32) !void {
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.verify) }, ids);
-        try x.e.verify(ids, out);
+        try x.complete(x.e.verify(ids, out));
     }
 
     /// Several streams' windows in one forward on every rank (Engine.verifyShared): parts' slots and rows, then ids.
@@ -197,19 +212,19 @@ pub const Leader = struct {
             n += p.ids.len;
         }
         try x.send(.{ .kind = @backingInt(Kind.shared), .depth = @intCast(parts.len) }, buf[0..n]);
-        try x.e.verifyShared(parts);
+        try x.complete(x.e.verifyShared(parts));
     }
 
     pub fn keep(x: Leader, n: usize) !void {
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.keep), .a = n }, &.{});
-        try x.e.keep(n);
+        try x.complete(x.e.keep(n));
     }
 
     pub fn draft(x: Leader, from_prompt: bool, follow_ids: []const u32, depth: usize, out: []u32) !void {
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.draft), .depth = @intCast(depth), .flags = @intFromBool(from_prompt) }, follow_ids);
-        try x.e.draft(from_prompt, follow_ids, depth, out);
+        try x.complete(x.e.draft(from_prompt, follow_ids, depth, out));
     }
 
     /// The other ranks leave their loops.
@@ -226,7 +241,14 @@ pub fn follow(e: *Engine, link: *Link) !void {
         const step = try link.receive();
         const h = step.h;
         const kind: Kind = @fromBackingInt(@intCast(h.kind));
-        if (kind != .end and kind != .drop and kind != .shared) try e.bind(h.slot);
+        if (kind == .reserve) {
+            e.reservePaired(h.slot, .{ .base = @intCast(h.a), .rows = @intCast(h.seed) }) catch |err| switch (err) {
+                error.KvReservationRefused => {},
+                else => return err,
+            };
+            continue;
+        }
+        if (kind != .end and kind != .drop and kind != .shared and kind != .release) try e.bind(h.slot);
         switch (kind) {
             .begin => try e.begin(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null),
             .prefill => {
@@ -234,7 +256,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 defer e.gpa.free(ids);
                 const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
                 _ = e.prefill(ids, from, null, null) catch |err| switch (err) {
-                    error.Cancelled => {},
+                    error.Cancelled, error.KeptStateRefused => {},
                     else => return err,
                 };
             },
@@ -243,12 +265,12 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 defer e.gpa.free(ids);
                 const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
                 _ = e.prefillChunk(ids, h.depth, h.top_k, from, null, null) catch |err| switch (err) {
-                    error.Cancelled => {},
+                    error.Cancelled, error.KeptStateRefused => {},
                     else => return err,
                 };
             },
             .verify => try e.verify(step.ids, sampled[0..step.ids.len]),
-            .reserve => try e.reserveAt(.{ .base = @intCast(h.a), .rows = @intCast(h.seed) }),
+            .reserve => unreachable,
             .shared => {
                 const k = h.depth;
                 if (k == 0 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadStep;

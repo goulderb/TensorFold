@@ -86,6 +86,7 @@ pub const Engine = struct {
     capacity: usize,
     mtp: bool,
     pool: ?cache_pool.Pool = null,
+    pair_failure: *const fn (anyerror) void = owner_kv.failPair,
     heat_gate: heat.Gate, // upstream's bands (off unless set), read before each prompt chunk on the gathered maximum
     shared_buf: cuda.DeviceBuffer, // one f64 every rank all-reduces to its maximum
     snaps: std.AutoHashMapUnmanaged(u64, Snap) = .empty, // kept prompt states by id (the same ids on every rank)
@@ -208,6 +209,7 @@ pub const Engine = struct {
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
     pub fn bind(e: *Engine, slot: u32) !void {
+        if (e.settings.kv_pool_tokens > 0 and slot >= cache_pool.extent.max_slots) return error.BadKvRequest;
         if (slot >= e.seqs.items.len) try e.seqs.appendNTimes(e.gpa, null, slot + 1 - e.seqs.items.len);
         if (e.seqs.items[slot] == null) {
             const q = try e.gpa.create(Seq);
@@ -226,9 +228,31 @@ pub const Engine = struct {
 
     pub fn reserveAt(e: *Engine, region: cache_pool.extent.Region) !void {
         const p = if (e.pool) |*p| p else return error.NoKvPool;
+        if (e.slot >= cache_pool.extent.max_slots) return error.BadKvRequest;
         if (p.regions.slots[e.slot]) |old| if (!std.meta.eql(old, region)) return error.KvAlreadyReserved;
         try p.regions.apply(e.slot, region);
         p.bind(&e.cur.st, region);
+    }
+
+    pub fn pairedReady(e: *Engine, valid: bool) !bool {
+        errdefer e.pair_failure(error.PairedOperationFailed);
+        if (e.share.world == 1) return valid;
+        return try e.shared(if (valid) 0 else 1) == 0;
+    }
+
+    pub fn reservePaired(e: *Engine, slot: u32, region: cache_pool.extent.Region) !void {
+        var problem: ?anyerror = null;
+        e.bind(slot) catch |err| {
+            problem = err;
+        };
+        const bound = problem == null;
+        if (bound) e.reserveAt(region) catch |err| {
+            problem = err;
+        };
+        if (!try e.pairedReady(problem == null)) {
+            if (bound) e.release(slot);
+            return error.KvReservationRefused;
+        }
     }
 
     pub fn fits(e: *const Engine, prompt: usize, output: usize) bool {
@@ -244,7 +268,7 @@ pub const Engine = struct {
     /// Frees slot `slot`'s sequence (slot 0 stays: the first stream's, made at init) and binds slot 0.
     pub fn release(e: *Engine, slot: u32) void {
         if (e.pool) |*p| p.regions.release(slot);
-        if (slot != 0) e.free(slot);
+        if (slot != 0 and slot < e.seqs.items.len) e.free(slot);
         e.cur = e.seqs.items[0].?;
         e.slot = 0;
     }
@@ -269,6 +293,7 @@ pub const Engine = struct {
 
     /// A fresh sequence with `sampling` (null or temperature 0: greedy).
     pub fn begin(e: *Engine, sampling: ?sampler.Sampling) !void {
+        if (e.pool != null and e.slot >= cache_pool.extent.max_slots) return error.BadKvRequest;
         if (e.pool) |*p| if (p.regions.slots[e.slot] == null) {
             const r = try p.regions.plan(e.slot, e.capacity);
             try e.reserveAt(r);
@@ -328,9 +353,23 @@ pub const Engine = struct {
 
     /// The chunk gate on every rank: a kept state at the mark, the heat wait, rank 0's cancel; the id exchanged first.
     fn gate(e: *Engine, cancel: ?Cancel) !void {
-        const kept = try e.shared(@floatFromInt(e.announce));
-        e.announce = 0;
-        if (kept > 0 and e.share.rank != 0) try e.keepAs(@intFromFloat(kept));
+        if (e.pool != null) {
+            while (true) {
+                const kept = e.shared(0) catch |err| {
+                    e.pair_failure(err);
+                    return err;
+                };
+                if (kept == 0) break;
+                e.capturePaired(@intFromFloat(kept)) catch |err| switch (err) {
+                    error.SnapshotRefused => {},
+                    else => return err,
+                };
+            }
+        } else {
+            const kept = try e.shared(@floatFromInt(e.announce));
+            e.announce = 0;
+            if (kept > 0 and e.share.rank != 0) try e.keepAs(@intFromFloat(kept));
+        }
         if (e.heat_gate.bands != null) {
             var w: Wait = .{ .e = e, .cancel = cancel };
             const before = e.heat_gate.waited_s;
@@ -349,10 +388,33 @@ pub const Engine = struct {
     /// Rank 0, at a mark in a prompt pass: a copy of the state under a new id, named to the other ranks at the gate.
     pub fn keepState(e: *Engine) !u64 {
         const id = e.next_snap;
-        try e.keepAs(id);
         e.next_snap += 1;
-        e.announce = id;
+        if (e.pool != null) {
+            // The follower is already at the chunk gate: announce before capture's status exchange.
+            _ = e.shared(@floatFromInt(id)) catch |err| {
+                e.pair_failure(err);
+                return err;
+            };
+            try e.capturePaired(id);
+        } else {
+            try e.keepAs(id);
+            e.announce = id;
+        }
         return id;
+    }
+
+    fn capturePaired(e: *Engine, id: u64) !void {
+        var problem: ?anyerror = null;
+        e.keepAs(id) catch |err| {
+            problem = err;
+        };
+        if (!try e.pairedReady(problem == null)) {
+            if (problem == null) {
+                var kept = e.snaps.fetchRemove(id).?;
+                e.freeSnap(&kept.value);
+            }
+            return error.SnapshotRefused;
+        }
     }
 
     fn keepAs(e: *Engine, id: u64) !void {
@@ -396,9 +458,12 @@ pub const Engine = struct {
             }
         } else problem = error.NoKeptState;
         if (destination_owner != null) {
-            if (!try e.ownerTransport().prepared(e.stream, e.shared_buf, problem == null)) return problem orelse error.PeerKeptStateInvalid;
+            if (!try e.ownerTransport().prepared(e.stream, e.shared_buf, problem == null)) return error.KeptStateRefused;
+        } else if (st.layout.external_planes) {
+            if (!try e.pairedReady(problem == null)) return error.KeptStateRefused;
         }
         if (problem) |err| return err;
+        errdefer if (st.layout.external_planes) e.pair_failure(error.PairedRestoreFailed);
         const saved = s.?;
         var full = plan.?.ranges();
         var local = plan.?.rangesFor(source_resident);
@@ -417,7 +482,7 @@ pub const Engine = struct {
     }
 
     fn ownerTransport(e: *const Engine) owner_kv.Transport {
-        return .{ .d = e.d, .lib = e.lib, .comm = e.comm, .rank = e.share.rank };
+        return .{ .d = e.d, .lib = e.lib, .comm = e.comm, .rank = e.share.rank, .failure = e.pair_failure };
     }
 
     pub fn holds(e: *const Engine, id: u64) bool {
@@ -747,6 +812,7 @@ test "owner-only snapshots carry main and MTP prefixes to a new owner and refuse
         caches: [1]@import("cuda_dsa_block.zig").Caches,
         parity: [1]u1,
         failed: ?anyerror = null,
+        action: enum { restore, capture, reserve } = .restore,
 
         fn init(f: *@This(), d: *const cuda.Driver, lib: *const cuda.nccl.Library, endpoint: *C.End, old_owner: usize, format: @import("cuda_cache.zig").Format) !void {
             const layout = try (try Layout.init(.{ 4, 256, 256, 256, 256, 256, 256, 256 }, 4096, fw.prefill_rows, 1, format, 512, 128)).external();
@@ -773,6 +839,12 @@ test "owner-only snapshots carry main and MTP prefixes to a new owner and refuse
             f.e.lib = lib;
             f.e.comm = @ptrCast(endpoint);
             f.e.share.rank = endpoint.rank;
+            f.e.share.world = 2;
+            f.e.pair_failure = owner_kv.failPair;
+            f.e.settings = .{ .kv_pool_tokens = 16384 };
+            f.e.seqs = .empty;
+            try f.e.seqs.append(std.testing.allocator, &f.seq);
+            f.action = .restore;
             f.e.gpa = std.testing.allocator;
             f.e.cur = &f.seq;
             f.e.slot = 0;
@@ -794,14 +866,22 @@ test "owner-only snapshots carry main and MTP prefixes to a new owner and refuse
             try f.e.reserveAt(.{ .base = (1 - old_owner) * 8192, .rows = 4096 });
         }
         fn deinit(f: *@This()) void {
-            f.e.freeSnap(f.e.snaps.getPtr(1).?);
+            var it = f.e.snaps.valueIterator();
+            while (it.next()) |s| f.e.freeSnap(s);
             f.e.snaps.deinit(f.e.gpa);
+            f.e.seqs.deinit(f.e.gpa);
             f.e.pool.?.deinit();
             f.e.shared_buf.free();
             f.seq.st.arena.buf.free();
         }
         fn run(f: *@This()) void {
-            f.e.restoreAt(1, 2115) catch |err| {
+            f.failed = null;
+            const result = switch (f.action) {
+                .restore => f.e.restoreAt(1, 2115),
+                .capture => f.e.capturePaired(2),
+                .reserve => f.e.reservePaired(0, .{ .base = 16384, .rows = 4096 }),
+            };
+            result catch |err| {
                 f.failed = err;
             };
         }
@@ -815,6 +895,7 @@ test "owner-only snapshots carry main and MTP prefixes to a new owner and refuse
     var d = M.driver();
     var lib: cuda.nccl.Library = .{ .lib = undefined, .api = undefined };
     lib.api.ncclBroadcast = C.broadcast;
+    lib.api.ncclAllReduce = C.allReduce;
     for ([_]@import("cuda_cache.zig").Format{ .bf16, .fp8 }) |format| for (0..2) |old_owner| {
         var channel: C.Channel = .{};
         var endpoints = [_]C.End{ .{ .rank = 0, .channel = &channel }, .{ .rank = 1, .channel = &channel } };
@@ -840,9 +921,40 @@ test "owner-only snapshots carry main and MTP prefixes to a new owner and refuse
         try std.testing.expectEqual(@as(usize, 4), channel.epoch.load(.acquire));
         fixtures[1].seq.st.capacity = 2048;
         try Fixture.pair(&fixtures[0], &fixtures[1]);
-        try std.testing.expectEqual(error.PeerKeptStateInvalid, fixtures[0].failed.?);
-        try std.testing.expectEqual(error.BadKeptState, fixtures[1].failed.?);
+        try std.testing.expectEqual(error.KeptStateRefused, fixtures[0].failed.?);
+        try std.testing.expectEqual(error.KeptStateRefused, fixtures[1].failed.?);
         try std.testing.expectEqual(@as(usize, 6), channel.epoch.load(.acquire));
+        fixtures[1].seq.st.capacity = 4096;
+        for (&fixtures) |*f| f.action = .capture;
+        fixtures[1].seq.in_head = 1;
+        try Fixture.pair(&fixtures[0], &fixtures[1]);
+        for (&fixtures) |*f| {
+            try std.testing.expectEqual(error.SnapshotRefused, f.failed.?);
+            try std.testing.expect(!f.e.holds(2));
+        }
+        fixtures[1].seq.in_head = 0;
+        try Fixture.pair(&fixtures[0], &fixtures[1]);
+        for (&fixtures) |*f| {
+            try std.testing.expectEqual(@as(?anyerror, null), f.failed);
+            try std.testing.expect(f.e.holds(2));
+            f.action = .reserve;
+        }
+        try Fixture.pair(&fixtures[0], &fixtures[1]);
+        for (&fixtures) |*f| {
+            try std.testing.expectEqual(error.KvReservationRefused, f.failed.?);
+            try std.testing.expect(f.e.pool.?.regions.slots[0] == null);
+        }
+        try std.testing.expectEqual(@as(usize, 9), channel.epoch.load(.acquire));
     };
     try std.testing.expect(M.empty());
+}
+
+test "pooled engine refuses out-of-range slots before reading state or metadata" {
+    var e: Engine = undefined;
+    e.settings = .{ .kv_pool_tokens = 8192 };
+    e.pool = @as(cache_pool.Pool, undefined);
+    e.slot = cache_pool.extent.max_slots;
+    try std.testing.expectError(error.BadKvRequest, e.bind(e.slot));
+    try std.testing.expectError(error.BadKvRequest, e.reserveAt(.{ .base = 0, .rows = 2048 }));
+    try std.testing.expectError(error.BadKvRequest, e.begin(null));
 }
