@@ -99,18 +99,18 @@ pub fn sparseRows(l: Layer, host_pos: usize, rows: usize) bool {
 pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool) !void {
     const width = l.q_lora + l.lw;
     switch (l.input) {
-      .separate => |pair| {
-        const kv = s.dp + rows * l.q_lora * 2;
-        try b16.proj(set, stream, x, x_stride, pair.qa, s.dp, s.mm_part, rows, l.q_lora, l.dims, false);
-        try b16.proj(set, stream, x, x_stride, pair.kva, kv, s.mm_part, rows, l.lw, l.dims, false);
-        try glue.rmsnorm(set, stream, s.dp, l.q_lora, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
-        try glue.rmsnorm(set, stream, kv, l.lw, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
-      },
-      .combined_bf16 => |proj| {
-        try b16.matmul(set, stream, x, x_stride, proj, s.dp, s.mm_part, rows, width, l.dims, false);
-        try glue.rmsnorm(set, stream, s.dp, width, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
-        try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
-      },
+        .separate => |pair| {
+            const kv = s.dp + rows * l.q_lora * 2;
+            try b16.proj(set, stream, x, x_stride, pair.qa, s.dp, s.mm_part, rows, l.q_lora, l.dims, false);
+            try b16.proj(set, stream, x, x_stride, pair.kva, kv, s.mm_part, rows, l.lw, l.dims, false);
+            try glue.rmsnorm(set, stream, s.dp, l.q_lora, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
+            try glue.rmsnorm(set, stream, kv, l.lw, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
+        },
+        .combined_bf16 => |proj| {
+            try b16.matmul(set, stream, x, x_stride, proj, s.dp, s.mm_part, rows, width, l.dims, false);
+            try glue.rmsnorm(set, stream, s.dp, width, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
+            try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
+        },
     }
     try b16.proj(set, stream, s.qr, l.q_lora, l.q_b, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
     const ix = l.index;

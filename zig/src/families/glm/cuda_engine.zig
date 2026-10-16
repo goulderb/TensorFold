@@ -27,6 +27,28 @@ pub const Options = struct {
     settings: ranks.Settings,
 };
 
+fn validateKdaProjection(c: *const config.Config, world: usize, converted: bool) !void {
+    if (!converted) return;
+    for (0..world) |rank| {
+        const heads = (try shard.Share.of(c, rank, world)).kda.len();
+        const n = heads * c.kda_dim;
+        const width = 3 * n + 2 * c.kda_dim + heads;
+        if (width % 8 != 0 or (3 * n) % 8 != 0 or (3 * n + c.kda_dim) % 8 != 0) return error.UnalignedKdaProjection;
+    }
+}
+
+test "converted KDA validates every TP rank from shared geometry" {
+    const c = config.Config{};
+    try validateKdaProjection(&c, 2, true);
+    try std.testing.expectEqual(@as(usize, 32), (try shard.Share.of(&c, 0, 2)).kda.len());
+    try std.testing.expectEqual(@as(usize, 32), (try shard.Share.of(&c, 1, 2)).kda.len());
+
+    try std.testing.expectEqual(@as(usize, 8), (try shard.Share.of(&c, 0, 9)).kda.len());
+    try std.testing.expectEqual(@as(usize, 7), (try shard.Share.of(&c, 1, 9)).kda.len());
+    try std.testing.expectError(error.UnalignedKdaProjection, validateKdaProjection(&c, 9, true));
+    try validateKdaProjection(&c, 9, false);
+}
+
 /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
 pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
 
@@ -136,13 +158,8 @@ pub const Engine = struct {
             if (c.kv_lora != 512 or c.i_dim != 128) return error.KvPoolShape;
             _ = try cache_pool.extent.Pool.init(o.settings.kv_pool_tokens, if (o.settings.kv_shard) 2 else 1);
         }
+        try validateKdaProjection(&c, world, o.settings.weight_dense.get(.kda) != .bf16);
         const share = try shard.Share.of(&c, rank, world);
-        if (o.settings.weight_dense.get(.kda) != .bf16) {
-            const heads = share.kda.len();
-            const n = heads * c.kda_dim;
-            const width = 3 * n + 2 * c.kda_dim + heads;
-            if (width % 8 != 0 or (3 * n) % 8 != 0 or (3 * n + c.kda_dim) % 8 != 0) return error.UnalignedKdaProjection;
-        }
         const spans = try gpa.alloc(shard.Span, world);
         errdefer gpa.free(spans);
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;

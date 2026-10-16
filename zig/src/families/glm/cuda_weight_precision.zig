@@ -9,8 +9,12 @@ pub const groups = std.meta.tags(Group);
 pub const DensePolicy = struct {
     values: [groups.len]Dense = @splat(.bf16),
 
-    pub fn uniform(value: Dense) DensePolicy { return .{ .values = @splat(value) }; }
-    pub fn get(p: DensePolicy, group: Group) Dense { return p.values[@intFromEnum(group)]; }
+    pub fn uniform(value: Dense) DensePolicy {
+        return .{ .values = @splat(value) };
+    }
+    pub fn get(p: DensePolicy, group: Group) Dense {
+        return p.values[@backingInt(group)];
+    }
 
     pub fn read(getEnv: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !DensePolicy {
         const default = parseDense(getEnv("TF_GLM_DENSE")) catch {
@@ -27,7 +31,7 @@ pub const DensePolicy = struct {
                 .mtp_eh => "TF_GLM_DENSE_MTP_EH",
             };
             if (getEnv(name)) |value| {
-                result.values[@intFromEnum(group)] = std.meta.stringToEnum(Dense, value) orelse {
+                result.values[@backingInt(group)] = std.meta.stringToEnum(Dense, value) orelse {
                     problem.* = name ++ ": bf16, q4, fp8 or nvfp4";
                     return error.BadSetting;
                 };
@@ -89,7 +93,9 @@ test "precision is explicit and defaults to checkpoint BF16" {
 
 test "global and family settings resolve to one effective policy" {
     const E = struct {
-        fn empty(_: [:0]const u8) ?[]const u8 { return null; }
+        fn empty(_: [:0]const u8) ?[]const u8 {
+            return null;
+        }
         fn mixed(name: [:0]const u8) ?[]const u8 {
             if (std.mem.eql(u8, name, "TF_GLM_DENSE")) return "fp8";
             if (std.mem.eql(u8, name, "TF_GLM_DENSE_DSA")) return "bf16";

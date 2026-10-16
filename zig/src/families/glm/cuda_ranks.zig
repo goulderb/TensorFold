@@ -123,7 +123,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 11, // this struct's version
+    layout: u32 = 11,
     world: u32,
     rank: u32,
     split: u32,
@@ -399,7 +399,9 @@ test "weight precision and spill enablement must agree before rank startup" {
 
 test "effective family policy governs rank and persistent numerical identity" {
     const Env = struct {
-        fn empty(_: [:0]const u8) ?[]const u8 { return null; }
+        fn empty(_: [:0]const u8) ?[]const u8 {
+            return null;
+        }
         fn equivalent(name: [:0]const u8) ?[]const u8 {
             if (std.mem.eql(u8, name, "TF_GLM_DENSE")) return "fp8";
             inline for (.{ "TF_GLM_DENSE_KDA", "TF_GLM_DENSE_DSA", "TF_GLM_DENSE_MLP", "TF_GLM_DENSE_SHARED", "TF_GLM_DENSE_MTP_EH" }) |key| {
