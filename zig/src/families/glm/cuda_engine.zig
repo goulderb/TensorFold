@@ -51,6 +51,7 @@ const Seq = struct {
     st: fw.State,
     sampling: ?sampler.Sampling = null, // null: greedy
     in_head: usize = 0, // drafted rows the MTP caches hold past the kept ones (st.mtp_drafted)
+    retained: ?cuda.DeviceBuffer = null, // MTP rows that must survive another sequence using the forward scratch
     rows_at: u64 = 0, // its last verify's final-norm rows (bf16 [rows][hidden]), which the next draft reads
     vision: ?VisionOwned = null,
 };
@@ -94,7 +95,6 @@ pub const Engine = struct {
     bd: fw.Buffers, // verify windows
     bm: fw.Buffers, // the MTP head's rows
     bs: ?fw.Buffers = null, // shared verify windows (with the MTP head, as the lane core shares only then)
-    hold: cuda.DeviceBuffer, // the prompt's last row's hidden (decode's e.last_hidden), the first draft's source
     pairs: cuda.DeviceBuffer, // every rank's (value, id) of a greedy draw
     smp: sampler.Sampler,
     seqs: std.ArrayList(?*Seq) = .empty, // every stream's sequence by slot (the lane backend's), slot 0 made at init
@@ -147,7 +147,7 @@ pub const Engine = struct {
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .hold = undefined, .pairs = undefined, .smp = undefined, .mtp = o.mtp };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .mtp = o.mtp };
         var wt = e.m.tools();
         wt.precision = .{ .dense = o.settings.weight_dense, .head = o.settings.weight_head };
         e.w = try weights.load(gpa, io, d, stream, wt, checkpoint, c, share, layers, o.mtp);
@@ -165,8 +165,6 @@ pub const Engine = struct {
         errdefer e.bm.deinit();
         if (o.mtp) e.bs = if (o.settings.kv_shard) try fw.Buffers.initSharedOwned(d, &e.w, shared_rows, o.capacity) else try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
-        e.hold = try cuda.DeviceBuffer.alloc(d, c.hidden * 2);
-        errdefer e.hold.free();
         e.pairs = try cuda.DeviceBuffer.alloc(d, 8 * world);
         errdefer e.pairs.free();
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
@@ -202,7 +200,6 @@ pub const Engine = struct {
         e.shared_buf.free();
         e.smp.deinit();
         e.pairs.free();
-        e.hold.free();
         if (e.bs) |*b| b.deinit();
         e.bm.deinit();
         e.bd.deinit();
@@ -236,6 +233,8 @@ pub const Engine = struct {
             const q = try e.gpa.create(Seq);
             errdefer e.gpa.destroy(q);
             q.* = .{ .st = if (e.settings.kv_pool_tokens > 0) try fw.State.initShared(e.gpa, e.d, &e.w, e.capacity, e.settings.kv) else try fw.State.init(e.gpa, e.d, &e.w, e.capacity, e.settings.kv) };
+            errdefer q.st.deinit();
+            if (e.mtp) q.retained = try cuda.DeviceBuffer.alloc(e.d, fw.window_rows * e.c.hidden * 2);
             e.seqs.items[slot] = q;
         }
         e.cur = e.seqs.items[slot].?;
@@ -303,6 +302,7 @@ pub const Engine = struct {
         e.stream.synchronize() catch {};
         if (e.settings.vision) e.clearVision(slot);
         q.st.deinit();
+        if (q.retained) |*rows| rows.free();
         e.gpa.destroy(q);
         e.seqs.items[slot] = null;
     }
@@ -321,9 +321,10 @@ pub const Engine = struct {
         q.vision = null;
     }
 
-    /// Bytes one more stream's sequence takes on this rank (its state arena).
+    /// Bytes one more stream's sequence takes on this rank, including retained MTP rows.
     pub fn seqBytes(e: *const Engine) u64 {
-        return e.seqs.items[0].?.st.arena.buf.len;
+        const q = e.seqs.items[0].?;
+        return q.st.arena.buf.len + if (q.retained) |rows| rows.len else @as(usize, 0);
     }
 
     /// The committed length: the pending token sits at this position, a window's row r draws position pos + 1 + r.
@@ -380,7 +381,7 @@ pub const Engine = struct {
             first = t[0];
         }
         if (e.mtp) {
-            if (last) try e.copy(e.hold.ptr, e.bp.fnormed + (rows - 1) * e.c.hidden * 2, e.c.hidden * 2);
+            if (last) try e.retainRows(e.bp.fnormed + (rows - 1) * e.c.hidden * 2, 1);
             const nxt = as_i32[1..];
             if (nxt.len > 0) { // decode._absorb_rows
                 try f.mtp(nxt, &.{e.bp.fnormed});
@@ -662,7 +663,7 @@ pub const Engine = struct {
         const f = e.view(&e.bd, &one);
         const at = e.cur.st.pos;
         try f.run(@ptrCast(ids));
-        e.cur.rows_at = e.bd.fnormed;
+        try e.retainRows(e.bd.fnormed, ids.len);
         if (masked) try e.drawMasked(e.bd.logits, ids.len, at + 1, out) else try e.draw(e.bd.logits, ids.len, at + 1, out);
     }
 
@@ -698,6 +699,18 @@ pub const Engine = struct {
         try f.commit(n);
     }
 
+    fn retainRows(e: *Engine, source: u64, rows: usize) !void {
+        if (rows == 0 or rows > fw.window_rows) return error.WindowTooWide;
+        if (e.cur.retained) |kept| {
+            try e.copy(kept.ptr, source, rows * e.c.hidden * 2);
+            e.cur.rows_at = kept.ptr;
+        } else e.cur.rows_at = source;
+    }
+
+    fn draftRows(e: *const Engine, from_prompt: bool) u64 {
+        return if (from_prompt) e.cur.retained.?.ptr else e.cur.rows_at;
+    }
+
     /// decode.draft: the MTP head absorbs the kept rows (committed first) with `follow`, then chains `depth` drafts.
     pub fn draft(e: *Engine, from_prompt: bool, follow: []const u32, depth: usize, out: []u32) !void {
         if (!e.mtp) return error.NoDraftHead;
@@ -705,7 +718,7 @@ pub const Engine = struct {
         var one: [1]fw.Rank = undefined;
         const f = e.view(&e.bm, &one);
         const D = e.c.hidden;
-        const hidden = if (from_prompt) e.hold.ptr else e.cur.rows_at;
+        const hidden = e.draftRows(from_prompt);
         try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len - e.cur.in_head);
         e.cur.in_head = 0;
         const next: []const i32 = @ptrCast(follow);
@@ -1220,4 +1233,40 @@ test "pooled engine refuses out-of-range slots before reading state or metadata"
     try std.testing.expectError(error.BadKvRequest, e.bind(e.slot));
     try std.testing.expectError(error.BadKvRequest, e.reserveAt(.{ .base = 0, .rows = 2048 }));
     try std.testing.expectError(error.BadKvRequest, e.begin(null));
+}
+
+test "MTP hidden rows survive other sequences reusing prompt and verify scratch" {
+    const M = @import("cuda_test_driver.zig").Memory;
+    var d = M.driver();
+    var e: Engine = undefined;
+    e.d = &d;
+    e.stream = .{ .d = &d, .handle = null };
+    e.c.hidden = 2;
+    var a: Seq = .{ .st = undefined, .retained = try cuda.DeviceBuffer.alloc(&d, fw.window_rows * 4) };
+    defer a.retained.?.free();
+    var b: Seq = .{ .st = undefined, .retained = try cuda.DeviceBuffer.alloc(&d, fw.window_rows * 4) };
+    defer b.retained.?.free();
+    var scratch = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0 };
+    e.cur = &a;
+    try e.retainRows(@intFromPtr(&scratch), 1);
+    scratch[0..2].* = .{ 0x4100, 0x4110 };
+    e.cur = &b;
+    try e.retainRows(@intFromPtr(&scratch), 1);
+    @memset(&scratch, 0);
+    e.cur = &a;
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]u16{ 0x3f80, 0x4000 }), M.slice(e.draftRows(true), 4));
+    e.cur = &b;
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]u16{ 0x4100, 0x4110 }), M.slice(e.draftRows(true), 4));
+
+    scratch = .{ 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0 };
+    e.cur = &a;
+    try e.retainRows(@intFromPtr(&scratch), 3);
+    scratch = .{ 0x4180, 0x4190, 0x41a0, 0x41b0, 0x41c0, 0x41d0 };
+    e.cur = &b;
+    try e.retainRows(@intFromPtr(&scratch), 2);
+    @memset(&scratch, 0);
+    e.cur = &a;
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0 }), M.slice(e.draftRows(false), 12));
+    e.cur = &b;
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]u16{ 0x4180, 0x4190, 0x41a0, 0x41b0 }), M.slice(e.draftRows(false), 8));
 }
