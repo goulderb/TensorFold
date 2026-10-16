@@ -41,8 +41,10 @@ pub const Cuda = struct {
     e: *Engine,
     head: ?*Head,
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
-    /// KV pool pages promised to admitted requests whose lanes their prefill has not made yet (fits).
-    promised: usize = 0,
+    /// KV pool pages promised to admitted requests whose prefill has not started yet (fits), oldest first: each prefill
+    /// takes the oldest back. At most every lane no stream holds can wait so, so older ones are stale and dropped.
+    promises: [engine.max_streams]usize = undefined,
+    promised: usize = 0, // how many of `promises` are live
     own_free: bool = true, // no stream holds the engine's own sequence
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
@@ -237,7 +239,11 @@ pub const Cuda = struct {
         _ = max_tokens; // decode growth past the margin comes from the pool's slack (the proxy budgets each request)
         const self = of(ptr);
         const pool = self.e.kv_pool orelse return true;
-        var future: usize = self.promised;
+        // only lanes no stream holds can belong to admitted requests not yet prefilled: older promises are stale
+        const open = engine.max_streams -| self.lanes.count();
+        while (self.promised > open) self.takePromise();
+        var future: usize = 0;
+        for (self.promises[0..self.promised]) |pages| future += pages;
         var it = self.lanes.iterator();
         while (it.next()) |kv| {
             const want = self.poolPages(kv.key_ptr.*.context.items.len);
@@ -246,8 +252,17 @@ pub const Cuda = struct {
         }
         const need = self.poolPages(prompt);
         if (pool.free.items.len < future + need) return false;
-        self.promised += need;
+        if (self.promised == self.promises.len) self.takePromise();
+        self.promises[self.promised] = need;
+        self.promised += 1;
         return true;
+    }
+
+    /// The oldest promise is kept or gone: a prefill starting maps its own pages from here on.
+    fn takePromise(self: *Cuda) void {
+        if (self.promised == 0) return;
+        std.mem.copyForwards(usize, self.promises[0 .. self.promised - 1], self.promises[1..self.promised]);
+        self.promised -= 1;
     }
 
     /// A cancel, or a background pass stepping aside for a foreground request, stops the prompt at its next chunk.
@@ -286,8 +301,9 @@ pub const Cuda = struct {
         const e = self.e;
         const ids = s.prompt();
         if (ids.len == 0 or ids.len + s.max_new + state.max_rows > e.max_len) return error.PromptTooLong;
+        self.takePromise();
         const gop = try self.lanes.getOrPut(self.gpa, s);
-        if (gop.found_existing) self.drop(gop.value_ptr.*) else self.promised -|= self.poolPages(ids.len);
+        if (gop.found_existing) self.drop(gop.value_ptr.*);
         // the engine's own sequence while it is free: its rounds replay the captured graphs
         // the own graphs carry the pocket; a layer split has no graphs but only the own sequence, on both ranks
         const own = self.own_free and (e.serial != null or e.peer != null) and !s.untaught;
