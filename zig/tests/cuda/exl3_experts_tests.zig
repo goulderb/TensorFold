@@ -150,6 +150,7 @@ fn checkLayer(c: Ctx, what: []const u8, x: Experts, d: Dev, xs: []const u16, slo
     var ulp: [2]usize = .{ 0, 0 };
     for ([_]bool{ false, true }) |prompt| {
         const pi: usize = @intFromBool(prompt);
+        const tensor_math = prompt or c.g.exl3.?.decode == .tensor;
         const act = try rig.zeros(pairs * x.width * 2);
         const y = try rig.zeros(pairs * x.dims * 4);
         try layerRun(c, d, xd, slots, picks, prompt, act, y, -1);
@@ -164,11 +165,11 @@ fn checkLayer(c: Ctx, what: []const u8, x: Experts, d: Dev, xs: []const u16, slo
         for (0..pairs) |p| {
             const e: usize = @intCast(picks[p]);
             for ([_][]const t3.Host{ x.gate, x.up }, [_][]const f32{ g_h, u_h }) |hs, got| {
-                try t3.reference(a, hs[e], xp[p * x.dims ..][0..x.dims], 1, ref[0..x.width], bound[0..x.width], prompt);
+                try t3.reference(a, hs[e], xp[p * x.dims ..][0..x.dims], 1, ref[0..x.width], bound[0..x.width], tensor_math);
                 try t3.compare(what, got[p * x.width ..][0..x.width], ref[0..x.width], bound[0..x.width], 1, x.width, b);
             }
             // down's fp32 rows: the prompt path's bound covers its fp16 inputs and tensor-unit sums
-            try t3.reference(a, x.down[e], act_h[p * x.width ..][0..x.width], 1, ref[0..x.dims], bound[0..x.dims], prompt);
+            try t3.reference(a, x.down[e], act_h[p * x.width ..][0..x.width], 1, ref[0..x.dims], bound[0..x.dims], tensor_math);
             try t3.compare(what, y_h[p * x.dims ..][0..x.dims], ref[0..x.dims], bound[0..x.dims], 1, x.dims, b);
             for (0..x.width) |j| {
                 const want = bfRound(swiglu(g_h[p * x.width + j], u_h[p * x.width + j], d.layer.limit));
@@ -237,6 +238,7 @@ pub fn run(gpu: Gpu, dir: ?[]const u8) !void {
     for ([_]struct { n: usize, d: usize, ni: usize, up: u32, down: u32, book: E.Codebook, tokens: usize, slots: usize, limit: f32 }{
         .{ .n = 6, .d = 256, .ni = 384, .up = 4, .down = 5, .book = .mul1, .tokens = 7, .slots = 4, .limit = 10 },
         .{ .n = 9, .d = 384, .ni = 256, .up = 3, .down = 6, .book = .mcg, .tokens = 9, .slots = 3, .limit = 0 },
+        .{ .n = 3, .d = 256, .ni = 128, .up = 4, .down = 4, .book = .mcg, .tokens = 33, .slots = 2, .limit = 10 },
     }, 0..) |cs, i| {
         var prng = std.Random.DefaultPrng.init(0xE7 + i);
         const r = prng.random();
@@ -260,8 +262,12 @@ pub fn run(gpu: Gpu, dir: ?[]const u8) !void {
         defer rig.deinit();
         const d = try upload(a, &rig, x, cs.limit);
         var name: [64]u8 = undefined;
-        try checkLayer(c, try std.fmt.bufPrint(&name, "synthetic {d} experts {d}/{d} bits {t}", .{ cs.n, cs.up, cs.down, cs.book }), x, d, xs, cs.slots, picks, &b);
+        for ([_]X.Decode{ .scalar, .tensor }) |policy| {
+            ex.decode = policy;
+            try checkLayer(c, try std.fmt.bufPrint(&name, "synthetic {d} experts {d}/{d} bits {t} {t}", .{ cs.n, cs.up, cs.down, cs.book, policy }), x, d, xs, cs.slots, picks, &b);
+        }
     }
+    ex.decode = .scalar;
     if (dir) |path| try real(c, path, &b);
     check.pass("exl3 experts: {d} FP64 values, max error {e}, max {d:.4} of the bound, worst column {e} of the largest output", .{ b.values, b.max_error, b.max_fraction, b.worst_column });
 }
@@ -294,6 +300,12 @@ fn real(c: Ctx, dir: []const u8, b: *t3.Bound) !void {
     defer rig.deinit();
     const d = try upload(a, &rig, x, 10);
     try checkLayer(c, "layer 3 experts 0-15", x, d, xs, slots, &picks, b);
+    var tensor = c.g.exl3.?.*;
+    tensor.decode = .tensor;
+    var tc = c;
+    tc.g.exl3 = &tensor;
+    try checkLayer(tc, "layer 3 experts 0-15 tensor decode", x, d, xs, slots, &picks, b);
+    try decodeTimings(c, tc, x, d, &rig);
     // a decode step's experts: one token's 8 pairs, up and down, timed as a whole
     const xd = try rig.put(xs);
     const act = try rig.zeros(slots * x.width * 2);
@@ -346,4 +358,36 @@ fn real(c: Ctx, dir: []const u8, b: *t3.Bound) !void {
 
 fn gbs(bytes: usize, sec: f64) f64 {
     return @as(f64, @floatFromInt(bytes)) / 1e9 / sec;
+}
+
+fn decodeTimings(scalar: Ctx, tensor: Ctx, x: Experts, d: Dev, rig: *t3.Rig) !void {
+    const a = scalar.gpu.gpa;
+    const slots = 8;
+    var prng = std.Random.DefaultPrng.init(0xdec0de);
+    for ([_]usize{ 1, 4, 32 }) |rows| {
+        const xs = try t3.randomRows(a, prng.random(), rows, x.dims);
+        defer a.free(xs);
+        const picks = try a.alloc(i32, rows * slots);
+        defer a.free(picks);
+        for (picks, 0..) |*pick, i| pick.* = @intCast((i / slots * 5 + i % slots * 2) % x.gate.len);
+        const xd = try rig.put(xs);
+        const act = try rig.zeros(rows * slots * x.width * 2);
+        const y = try rig.zeros(rows * slots * x.dims * 4);
+        var p = try PlanBufs.init(scalar.gpu, scalar.router, scalar.s, picks, x.gate.len, 16);
+        defer p.deinit();
+        var times: [2][5]f64 = undefined;
+        const contexts = [_]Ctx{ scalar, tensor };
+        for (0..6) |rep| for (0..2) |turn| {
+            const mode = (rep + turn) % 2;
+            const c = contexts[mode];
+            const start = check.now(c.gpu.io);
+            for (0..20) |_| {
+                try c.g.decode(c.s, .up, .{ .x = xd, .stride = x.dims, .slots = slots }, d.layer, p.plan, act, p.items, -1);
+                try c.g.decode(c.s, .down_f32, .{ .x = act, .stride = x.width }, d.layer, p.plan, y, p.items, -1);
+            }
+            try c.s.synchronize();
+            if (rep > 0) times[mode][rep - 1] = @as(f64, @floatFromInt(check.now(c.gpu.io) - start)) / 20e3;
+        };
+        check.pass("EXL3 microkernel diagnostic, unsharded layer 3 D={d} NI={d}, {d} rows, 8 experts/row, 16-pair plan, F32 down: scalar {d:.1} us, tensor {d:.1} us (5 alternating samples after warmup, 20 repetitions, host wall + stream sync)", .{ x.dims, x.width, rows, check.median(&times[0]), check.median(&times[1]) });
+    }
 }

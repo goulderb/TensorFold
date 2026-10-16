@@ -88,10 +88,7 @@ pub const Adapter = struct {
         }
         digest.update(&try glm.ranks.hashFile(a.gpa, a.io, "/proc/self/exe"));
         digest.update(&e.spillShape().digest());
-        digest.update(@tagName(e.settings.weight_dense));
-        digest.update("\x00");
-        digest.update(@tagName(e.settings.weight_head));
-        digest.update("\x00");
+        e.settings.hashNumerics(&digest);
         const mine = digest.finalResult();
         const tier = try spill.Tier.open(a.gpa, a.io, a.settings, "glm-cuda", mine, @intCast(e.share.rank), @intCast(e.share.world));
         a.state = .{ .attached = .{ .e = e, .link = link, .tier = tier } };

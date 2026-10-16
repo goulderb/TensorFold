@@ -20,6 +20,9 @@ pub const Geometry = extern struct { k: u32, n: u32, bits: u32, tiles_n: u32, ma
 /// A layer's EXL3 widths and codebook; every expert of a layer shares them (a family stacks its shared ones apart).
 pub const Widths = struct { up: u32 = 0, down: u32 = 0, codebook: exl3.Codebook = .mul1 };
 
+/// Tensor decode uses the prompt kernel's FP16 rotated inputs, retaining the decode plan and epilogue.
+pub const Decode = enum { scalar, tensor };
+
 /// Halves an expert matrix carries: suh (k) then svh (n).
 pub fn halves(k: usize, n: usize) usize {
     return k + n;
@@ -46,6 +49,7 @@ pub const Experts = struct {
     decode_fn: Function, // every width and codebook
     prompt_fn: Function, // prompt rows on the tensor units
     resident: [2]usize, // blocks the grid may hold, decode and prompt: per SM times SMs
+    decode: Decode = .scalar,
 
     pub fn load(d: *const Driver, sms: usize) !Experts {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -87,7 +91,8 @@ pub const Experts = struct {
     /// Decode rows 16 pairs at a time, prompt rows 64 on the tensor units; a row's bits are its path's at every plan.
     pub fn run(e: *const Experts, s: Stream, epi: experts.Epi, in: experts.Rows, l: experts.Layer, p: grouped.Plan, out: u64, items: usize, skip: i32, prompt: bool) !void {
         const g = try geometry(epi, l);
-        const pi: usize = @intFromBool(prompt);
+        const tensor = prompt or e.decode == .tensor;
+        const pi: usize = @intFromBool(tensor);
         const grid = @min(items * (g.n / 128), e.resident[pi]);
         if (grid < 1) return;
         const up = epi == .up;
@@ -101,7 +106,7 @@ pub const Experts = struct {
         a.add(if (up) l.limit else @as(f32, 0.0));
         a.add(skip);
         a.add(g);
-        try launch_.launch(if (prompt) e.prompt_fn else e.decode_fn, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &a);
+        try launch_.launch(if (tensor) e.prompt_fn else e.decode_fn, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &a);
     }
 };
 
@@ -121,4 +126,48 @@ test "an EXL3 layer's geometry follows the epilogue, and a shape exl3.cu cannot 
     bad.width = 2000;
     try std.testing.expectError(error.InvalidExl3Matrix, Experts.geometry(.up, bad));
     try std.testing.expectEqual(@as(usize, 288 * 2 * (4096 + 2048)), Stacks.upHalves(288, 4096, 2048));
+}
+
+test "tensor decode preserves the grouped decode plan, F32 epilogue and shared skip at the driver boundary" {
+    const abi = @import("abi.zig");
+    const Mock = struct {
+        var function: usize = 0;
+        var grid: u32 = 0;
+        var values: [11]u64 = undefined;
+        var geom: Geometry = undefined;
+        fn launch(f: abi.Function, gx: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: abi.Stream, params: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) abi.Result {
+            function = @intFromPtr(f);
+            grid = gx;
+            for (0..11) |i| values[i] = switch (i) {
+                1, 2, 9, 10 => @as(*align(1) const u32, @ptrCast(params.?[i].?)).*,
+                else => @as(*align(1) const u64, @ptrCast(params.?[i].?)).*,
+            };
+            geom = @as(*align(1) const Geometry, @ptrCast(params.?[11].?)).*;
+            return abi.success;
+        }
+    };
+    var d: Driver = undefined;
+    d.api.cuLaunchKernel = Mock.launch;
+    var e: Experts = .{ .mod = undefined, .decode_fn = .{ .d = &d, .handle = @ptrFromInt(1) }, .prompt_fn = .{ .d = &d, .handle = @ptrFromInt(2) }, .resident = .{ 9999, 9999 } };
+    const g: experts.Grouped = .{ .exl3 = &e };
+    const s: Stream = .{ .d = &d, .handle = null };
+    const p: grouped.Plan = .{ .items = 101, .counts = 102, .members = 103, .rank = 104, .hist = 105 };
+    const l: experts.Layer = .{ .format = .exl3, .up = 201, .down = 202, .up_scale = 203, .down_scale = 204, .dims = 4096, .width = 1024, .experts = 256, .exl3 = .{ .up = 4, .down = 4 } };
+    const items = grouped.maxItems(32 * 9, 257, 16);
+    for ([_]Decode{ .scalar, .tensor }) |policy| {
+        e.decode = policy;
+        for ([_]experts.Epi{ .up, .down_f32 }) |epi| {
+            try g.decode(s, epi, .{ .x = 301, .stride = 4096, .slots = 9 }, l, p, 302, items, 256);
+            try std.testing.expectEqual(@as(usize, if (policy == .scalar) 1 else 2), Mock.function);
+            try std.testing.expectEqual(@as(u32, @intCast(items * (if (epi == .up) @as(usize, 8) else 32))), Mock.grid);
+            try std.testing.expectEqualSlices(u64, &.{ 101, 102, 103, 302 }, Mock.values[5..9]);
+            try std.testing.expectEqual(@as(u64, 256), Mock.values[10]);
+            try std.testing.expectEqual(@as(u32, if (epi == .up) 2 else 0), Mock.geom.epi);
+            try std.testing.expectEqual(@as(u64, if (epi == .up) 9 else 0), Mock.values[2]);
+        }
+    }
+    e.decode = .scalar;
+    try g.prompt(s, .down_bf16, .{ .x = 301, .stride = 1024 }, l, p, 302, 1, 256);
+    try std.testing.expectEqual(@as(usize, 2), Mock.function);
+    try std.testing.expectEqual(@as(u32, 3), Mock.geom.epi);
 }
