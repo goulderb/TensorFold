@@ -10,6 +10,7 @@ pub const Memory = struct {
         d.api.cuMemAlloc_v2 = alloc;
         d.api.cuMemFree_v2 = free;
         d.api.cuMemcpyDtoDAsync_v2 = copy;
+        d.api.cuMemcpy2DAsync_v2 = copy2D;
         d.api.cuMemcpyDtoH_v2 = download;
         d.api.cuMemcpyHtoDAsync_v2 = upload;
         d.api.cuMemsetD8_v2 = fill8;
@@ -27,6 +28,12 @@ pub const Memory = struct {
     pub fn empty() bool {
         for (blocks) |b| if (b != null) return false;
         return true;
+    }
+
+    fn copy2D(c: *const cuda.abi.Memcpy2D, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        std.debug.assert(c.src_type == 2 and c.dst_type == 2 and c.src_array == null and c.dst_array == null);
+        for (0..c.height) |row| @memcpy(slice(c.dst + (c.dst_y + row) * c.dst_pitch + c.dst_x, c.width), slice(c.src + (c.src_y + row) * c.src_pitch + c.src_x, c.width));
+        return 0;
     }
 
     fn alloc(ptr: *u64, n: usize) callconv(.c) cuda.abi.Result {

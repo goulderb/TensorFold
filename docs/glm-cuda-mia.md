@@ -20,7 +20,9 @@ remain the execution path. The shared v1.0.12 trunk has separate source pins.
 | `TF_GLM_DFLASH_KERNELS` | Pinned captured-kernel directory | Installed DFlash2 assets |
 | `TF_GLM_EXL3_ROUTED` | `generic`, `mia-mcg4` | `generic` |
 
-DFlash2 requires the existing drafts option, TP2 and sm121. It evaluates the
+DFlash2 requires the existing drafts option, TP2, sm121 and a dense-source
+`lm_head.weight` in the target checkpoint. The routed-only EXL3 production
+checkpoint has that head. A full-EXL3 head is refused. DFlash2 evaluates the
 donor's eight-position block and returns at most three proposals through the
 current lane interface. The returned count can be smaller. The target sampler
 and acceptance loop decide which proposals to keep. Checkpoint configuration
@@ -39,7 +41,7 @@ identity from the generic expert path.
 
 ## Accepted state and persistence
 
-Target forwards capture post-layer stream means at layers5,14,24,33 and42.
+Target forwards capture post-layer stream means at zero-based layers5,14,24,33 and42.
 Whole, shared and pieced forwards use the allocated plane stride. Split
 prefills exchange rank-owned tap slices with the normalized row slices.
 Each lane retains its own pending window before shared scratch is reused.

@@ -39,6 +39,27 @@ const MiaMatrix = struct {
     }
 };
 
+fn sharedInputHalves(gate: []const u8, up: []const u8, experts: usize, dims: usize) bool {
+    const size = dims * @sizeOf(f16);
+    if (experts == 0 or gate.len != experts * size or up.len != experts * size) return false;
+    const first = gate[0..size];
+    for (0..experts) |expert| {
+        const offset = expert * size;
+        if (!std.mem.eql(u8, first, gate[offset..][0..size]) or !std.mem.eql(u8, first, up[offset..][0..size])) return false;
+    }
+    return true;
+}
+
+test "Mia shares input Hadamard only when every gate and up half matches bitwise" {
+    const first = [_]u8{ 0x00, 0x80, 0x00, 0x00 };
+    const same = first ++ first;
+    try std.testing.expect(sharedInputHalves(&same, &same, 2, 2));
+    const changed = first ++ [_]u8{ 0x00, 0x00, 0x00, 0x00 };
+    try std.testing.expect(!sharedInputHalves(&changed, &same, 2, 2));
+    try std.testing.expect(!sharedInputHalves(&same, &changed, 2, 2));
+    try std.testing.expect(!sharedInputHalves(&same, &first, 2, 2));
+}
+
 test "Mia input and output halves remain separate across experts" {
     var gate: MiaMatrix = .{};
     defer gate.deinit(std.testing.allocator);
@@ -74,7 +95,8 @@ fn miaMoe(L: *W.Loader, i: u32) !@import("cuda_moe.zig").Layer {
             if (j < 2) try mats[j].append(L, name, 0, 0, &.{cut}, c.hidden, cut.len()) else try mats[j].append(L, name, cut.lo, cut.hi, &.{.{ .lo = 0, .hi = c.hidden }}, cut.len(), c.hidden);
         }
     }
-    const weights: mia.Experts = .{
+    const shared_suh = sharedInputHalves(mats[0].suh.items, mats[1].suh.items, c.experts, c.hidden);
+    var weights: mia.Experts = .{
         .gate_trellis = try putBytes(L, mats[0].trellis.items, i, "gate_trellis"),
         .up_trellis = try putBytes(L, mats[1].trellis.items, i, "up_trellis"),
         .down_trellis = try putBytes(L, mats[2].trellis.items, i, "down_trellis"),
@@ -88,6 +110,7 @@ fn miaMoe(L: *W.Loader, i: u32) !@import("cuda_moe.zig").Layer {
         .width = cut.len(),
         .count = c.experts,
     };
+    if (shared_suh) weights.shared_suh = weights.gate_suh;
     inline for (.{ "gate_proj", "up_proj" }) |proj| try L.rows(try L.get("layers.{d}.mlp.shared_experts." ++ proj ++ ".weight", .{i}), sh.lo, sh.hi, c.shared_inter, .bf16);
     const gu = try projections.finish(L, .shared, "layers.{d}.moe.shared.gu", .{i}, 2 * sh.len(), c.hidden);
     try L.cols(try L.get("layers.{d}.mlp.shared_experts.down_proj.weight", .{i}), sh.lo, sh.hi, .bf16);

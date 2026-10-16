@@ -14,6 +14,7 @@ pub const Experts = struct {
     gate_svh: u64,
     up_svh: u64,
     down_svh: u64,
+    shared_suh: u64 = 0,
     dims: usize,
     width: usize,
     count: usize,
@@ -57,10 +58,13 @@ pub const Scratch = struct {
 pub const Kernels = struct {
     module: cuda.Module,
     rot: cuda.Function,
+    rot_shared: cuda.Function,
     decode_gu: cuda.Function,
+    decode_gu_shared: cuda.Function,
     gateup: cuda.Function,
     decode_down: cuda.Function,
     prompt_gu: cuda.Function,
+    prompt_gu_shared: cuda.Function,
     prompt_down: cuda.Function,
     cast_prompt: cuda.Function,
 
@@ -68,15 +72,19 @@ pub const Kernels = struct {
         var m = try cuda.Module.load(d, image);
         errdefer m.unload();
         const rot = try m.function("glm_exl3_rot_0");
+        const rot_shared = try m.function("glm_exl3_rot_1");
         const decode_gu = try m.function("glm_exl3_dec_16_0_0");
+        const decode_gu_shared = try m.function("glm_exl3_dec_16_0_1");
         const gateup = try m.function("glm_exl3_gateup");
         const decode_down = try m.function("glm_exl3_dec_16_1_0");
         const prompt_gu = try m.function("glm_exl3_prompt_gu_0");
+        const prompt_gu_shared = try m.function("glm_exl3_prompt_gu_1");
         const prompt_down = try m.function("glm_exl3_prompt_down");
         const cast_prompt = try m.function("glm_exl3_slot_f32_to_bf16");
         try prompt_gu.allowDynamicShared(43008);
+        try prompt_gu_shared.allowDynamicShared(33792);
         try prompt_down.allowDynamicShared(43008);
-        return .{ .module = m, .rot = rot, .decode_gu = decode_gu, .gateup = gateup, .decode_down = decode_down, .prompt_gu = prompt_gu, .prompt_down = prompt_down, .cast_prompt = cast_prompt };
+        return .{ .module = m, .rot = rot, .rot_shared = rot_shared, .decode_gu = decode_gu, .decode_gu_shared = decode_gu_shared, .gateup = gateup, .decode_down = decode_down, .prompt_gu = prompt_gu, .prompt_gu_shared = prompt_gu_shared, .prompt_down = prompt_down, .cast_prompt = cast_prompt };
     }
 
     pub fn unload(k: *Kernels) void {
@@ -98,7 +106,7 @@ fn launch(f: cuda.Function, config: cuda.launch.Config, stream: cuda.Stream, val
     try cuda.launch.launch(f, config, stream, &args);
 }
 
-const Step = enum { rot, decode_gu, gateup, decode_down, prompt_gu, prompt_down, cast_prompt };
+const Step = enum { rot, rot_shared, decode_gu, decode_gu_shared, gateup, decode_down, prompt_gu, prompt_gu_shared, prompt_down, cast_prompt };
 
 const DeviceDispatch = struct {
     kernels: *const Kernels,
@@ -120,13 +128,29 @@ fn routedWith(dispatch: anytype, e: Experts, plan: cuda.grouped.Plan, s: Scratch
     const tile: usize = if (prompt) 64 else 16;
     const pairs = s.decode_capacity * s.slots;
     const items = cuda.grouped.maxItems(rows * s.slots, e.count + 1, tile);
-    try dispatch.emit(.rot, cfg(rows * s.slots, e.dims / 128, 2, 32, 0), .{ x, iv(stride), picks, e.gate_suh, e.up_suh, s.xg, s.xu, iv(e.dims), iv(s.slots) });
+    const shared = e.shared_suh != 0;
+    const xu = if (shared) s.xg else s.xu;
+    if (shared) {
+        try dispatch.emit(.rot_shared, cfg(rows, e.dims / 128, 1, 32, 0), .{ x, iv(stride), @as(u64, 0), e.shared_suh, e.shared_suh, s.xg, s.xg, iv(e.dims), @as(c_int, 1) });
+    } else {
+        try dispatch.emit(.rot, cfg(rows * s.slots, e.dims / 128, 2, 32, 0), .{ x, iv(stride), picks, e.gate_suh, e.up_suh, s.xg, s.xu, iv(e.dims), iv(s.slots) });
+    }
     if (prompt) {
-        try dispatch.emit(.prompt_gu, cfg(e.width / 128, items, 1, 256, 43008), .{ s.xg, s.xu, e.gate_trellis, e.up_trellis, plan.items, plan.counts, plan.members, e.gate_svh, e.up_svh, e.down_suh, s.xd, iv(e.dims), iv(e.width), iv(e.count), limit, iv(s.slots), @as(u64, 0) });
+        const gu_cfg = cfg(e.width / 128, items, 1, 256, if (shared) 33792 else 43008);
+        if (shared) {
+            try dispatch.emit(.prompt_gu_shared, gu_cfg, .{ s.xg, xu, e.gate_trellis, e.up_trellis, plan.items, plan.counts, plan.members, e.gate_svh, e.up_svh, e.down_suh, s.xd, iv(e.dims), iv(e.width), iv(e.count), limit, iv(s.slots), @as(u64, 0) });
+        } else {
+            try dispatch.emit(.prompt_gu, gu_cfg, .{ s.xg, xu, e.gate_trellis, e.up_trellis, plan.items, plan.counts, plan.members, e.gate_svh, e.up_svh, e.down_suh, s.xd, iv(e.dims), iv(e.width), iv(e.count), limit, iv(s.slots), @as(u64, 0) });
+        }
         try dispatch.emit(.prompt_down, cfg(e.dims / 256, items, 1, 256, 43008), .{ s.xd, e.down_trellis, plan.items, plan.counts, plan.members, e.down_svh, s.work, iv(e.width), iv(e.dims), iv(e.count), @as(u64, 0) });
         return dispatch.emit(.cast_prompt, cfg((rows * s.slots * e.dims + 255) / 256, 1, 1, 256, 0), .{ s.work, output, iv(rows), iv(s.slots), iv(e.dims) });
     }
-    try dispatch.emit(.decode_gu, cfg(items, e.width / 128, 8, 128, 0), .{ s.xg, s.xu, e.gate_trellis, e.up_trellis, plan.items, plan.counts, plan.members, s.work, iv(e.dims), iv(e.width), iv(pairs), @as(c_int, 4), iv(e.count), iv(s.slots), e.gate_svh, e.up_svh, e.down_suh, s.xd, limit, @as(u64, 0) });
+    const gu_cfg = cfg(items, e.width / 128, 8, 128, 0);
+    if (shared) {
+        try dispatch.emit(.decode_gu_shared, gu_cfg, .{ s.xg, xu, e.gate_trellis, e.up_trellis, plan.items, plan.counts, plan.members, s.work, iv(e.dims), iv(e.width), iv(pairs), @as(c_int, 4), iv(e.count), iv(s.slots), e.gate_svh, e.up_svh, e.down_suh, s.xd, limit, @as(u64, 0) });
+    } else {
+        try dispatch.emit(.decode_gu, gu_cfg, .{ s.xg, xu, e.gate_trellis, e.up_trellis, plan.items, plan.counts, plan.members, s.work, iv(e.dims), iv(e.width), iv(pairs), @as(c_int, 4), iv(e.count), iv(s.slots), e.gate_svh, e.up_svh, e.down_suh, s.xd, limit, @as(u64, 0) });
+    }
     try dispatch.emit(.gateup, cfg(rows * s.slots, e.width / 128, 1, 32, 0), .{ s.work, picks, e.gate_svh, e.up_svh, e.down_suh, s.xd, iv(pairs), iv(e.width), @as(c_int, 4), iv(s.slots), limit });
     try dispatch.emit(.decode_down, cfg(items, e.dims / 128, 1, 128, 0), .{ s.xd, s.xd, e.down_trellis, e.down_trellis, plan.items, plan.counts, plan.members, s.work, iv(e.width), iv(e.dims), iv(pairs), @as(c_int, 1), iv(e.count), iv(s.slots), e.down_svh, e.down_svh, e.down_svh, output, @as(f32, 0), @as(u64, 0) });
 }
@@ -147,7 +171,7 @@ test "mia geometry and scratch layout reject unsupported routed shapes" {
 }
 
 test "mia launch trace keeps decode epilogue and prompt output contract" {
-    const Record = struct { step: Step, argc: usize, grid: cuda.launch.Config, arg8: ?u64, arg11: ?u64, size14: u16 };
+    const Record = struct { step: Step, argc: usize, grid: cuda.launch.Config, arg0: ?u64, arg1: ?u64, arg2: ?u64, arg3: ?u64, arg4: ?u64, arg5: ?u64, arg6: ?u64, arg8: ?u64, arg11: ?u64, size14: u16 };
     const Trace = struct {
         records: [4]Record = undefined,
         len: usize = 0,
@@ -155,7 +179,7 @@ test "mia launch trace keeps decode epilogue and prompt output contract" {
         fn emit(t: *@This(), comptime step: Step, config: cuda.launch.Config, values: anytype) !void {
             var args: cuda.Args = .{};
             inline for (values) |v| args.add(v);
-            t.records[t.len] = .{ .step = step, .argc = args.count, .grid = config, .arg8 = args.integer(8), .arg11 = args.integer(11), .size14 = if (args.count > 14) args.sizes[14] else 0 };
+            t.records[t.len] = .{ .step = step, .argc = args.count, .grid = config, .arg0 = args.integer(0), .arg1 = args.integer(1), .arg2 = args.integer(2), .arg3 = args.integer(3), .arg4 = args.integer(4), .arg5 = args.integer(5), .arg6 = args.integer(6), .arg8 = args.integer(8), .arg11 = args.integer(11), .size14 = if (args.count > 14) args.sizes[14] else 0 };
             t.len += 1;
         }
     };
@@ -174,6 +198,11 @@ test "mia launch trace keeps decode epilogue and prompt output contract" {
     try std.testing.expectEqual(@as(?u64, 1), decode.records[3].arg11);
     try std.testing.expectEqual(@as(u32, 76), decode.records[1].grid.grid.x);
     try std.testing.expectEqual(@as(u32, 72), decode.records[2].grid.grid.x);
+    try std.testing.expectEqual(@as(u32, 72), decode.records[0].grid.grid.x);
+    try std.testing.expectEqual(@as(u32, 2), decode.records[0].grid.grid.z);
+    try std.testing.expectEqual(@as(?u64, 22), decode.records[0].arg2);
+    try std.testing.expectEqual(@as(?u64, 4), decode.records[0].arg3);
+    try std.testing.expectEqual(@as(?u64, 5), decode.records[0].arg4);
     var prompt: Trace = .{};
     try routedWith(&prompt, ex, plan, scratch, 21, 4096, 22, 64, true, 10, 23);
     try std.testing.expectEqual(@as(usize, 4), prompt.len);
@@ -184,4 +213,29 @@ test "mia launch trace keeps decode epilogue and prompt output contract" {
     try std.testing.expectEqual(@as(u32, 43008), prompt.records[1].grid.shared);
     try std.testing.expectEqual(@as(u32, 298), prompt.records[1].grid.grid.y);
     try std.testing.expectEqual(@as(u16, 4), prompt.records[1].size14);
+    var shared_ex = ex;
+    shared_ex.shared_suh = 31;
+    var shared_decode: Trace = .{};
+    try routedWith(&shared_decode, shared_ex, plan, scratch, 21, 4096, 22, 8, false, 10, 23);
+    try std.testing.expectEqualSlices(Step, &.{ .rot_shared, .decode_gu_shared, .gateup, .decode_down }, &.{ shared_decode.records[0].step, shared_decode.records[1].step, shared_decode.records[2].step, shared_decode.records[3].step });
+    try std.testing.expectEqual(@as(u32, 8), shared_decode.records[0].grid.grid.x);
+    try std.testing.expectEqual(@as(u32, 1), shared_decode.records[0].grid.grid.z);
+    try std.testing.expectEqual(@as(?u64, 0), shared_decode.records[0].arg2);
+    try std.testing.expectEqual(@as(?u64, 31), shared_decode.records[0].arg3);
+    try std.testing.expectEqual(@as(?u64, 31), shared_decode.records[0].arg4);
+    try std.testing.expectEqual(@as(?u64, scratch.xg), shared_decode.records[0].arg5);
+    try std.testing.expectEqual(@as(?u64, scratch.xg), shared_decode.records[0].arg6);
+    try std.testing.expectEqual(@as(?u64, scratch.xg), shared_decode.records[1].arg0);
+    try std.testing.expectEqual(@as(?u64, scratch.xg), shared_decode.records[1].arg1);
+    try std.testing.expectEqual(@as(u32, 76), shared_decode.records[1].grid.grid.x);
+    var shared_prompt: Trace = .{};
+    try routedWith(&shared_prompt, shared_ex, plan, scratch, 21, 4096, 22, 64, true, 10, 23);
+    try std.testing.expectEqualSlices(Step, &.{ .rot_shared, .prompt_gu_shared, .prompt_down, .cast_prompt }, &.{ shared_prompt.records[0].step, shared_prompt.records[1].step, shared_prompt.records[2].step, shared_prompt.records[3].step });
+    try std.testing.expectEqual(@as(u32, 64), shared_prompt.records[0].grid.grid.x);
+    try std.testing.expectEqual(@as(u32, 1), shared_prompt.records[0].grid.grid.z);
+    try std.testing.expectEqual(@as(?u64, scratch.xg), shared_prompt.records[1].arg0);
+    try std.testing.expectEqual(@as(?u64, scratch.xg), shared_prompt.records[1].arg1);
+    try std.testing.expectEqual(@as(u32, 33792), shared_prompt.records[1].grid.shared);
+    try std.testing.expectEqual(@as(u32, 43008), shared_prompt.records[2].grid.shared);
+    try std.testing.expectEqual(@as(u32, 298), shared_prompt.records[1].grid.grid.y);
 }

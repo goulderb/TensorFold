@@ -46,6 +46,7 @@ pub const DFlash = struct {
         const rank = try config.Rank.init(deps.world, deps.rank);
         var target = try core.Checkpoint.openModelPrefix(gpa, io, target_dir, "lm_head.");
         defer target.close();
+        if (!target.has("lm_head.weight")) return error.DFlashNeedsDenseTargetHead;
         var draft = try core.Checkpoint.openModel(gpa, io, draft_dir);
         defer draft.close();
         const p = try gpa.create(DFlash);
@@ -122,9 +123,18 @@ pub const DFlash = struct {
         if (row0 > plane_rows or rows > plane_rows - row0) return error.BadDraftWindow;
     }
     fn pack(d: *DFlash, destination: u64, source: u64, plane_rows: usize, row0: usize, rows: usize) !void {
-        for (0..rows) |row| for (0..5) |plane| {
-            try d.forward.th.base.copy(destination + (row * 5 + plane) * 8192, source + state.tapOffset(plane_rows, row0, plane, row), 8192);
-        };
+        if (rows == 0) return;
+        for (0..5) |plane| {
+            const copy: cuda.abi.Memcpy2D = .{
+                .src = source + state.tapOffset(plane_rows, row0, plane, 0),
+                .src_pitch = 8192,
+                .dst = destination + plane * 8192,
+                .dst_pitch = 5 * 8192,
+                .width = 8192,
+                .height = rows,
+            };
+            try d.forward.d.check(d.forward.d.api.cuMemcpy2DAsync_v2(&copy, d.forward.stream.handle), "DFlash pack taps");
+        }
     }
     pub fn stageWindow(d: *DFlash, slot: usize, source: u64, plane_rows: usize, row0: usize, rows: usize, start: usize) !void {
         const l = try d.lane(slot);
@@ -271,6 +281,7 @@ fn testPackage(driver: *const cuda.Driver) DFlash {
     const stream: cuda.Stream = .{ .d = driver, .handle = null };
     d.capacity = 8192;
     d.lanes = @splat(.{});
+    d.forward.d = driver;
     d.forward.stream = stream;
     d.forward.th = .{ .ops = undefined, .s = stream, .base = .{ .f = undefined, .s = stream } };
     d.forward.rank = config.Rank.init(2, 0) catch unreachable;
@@ -279,7 +290,18 @@ fn testPackage(driver: *const cuda.Driver) DFlash {
 
 test "staging copies strided planes into independent owned lane windows" {
     const Memory = @import("cuda_test_driver.zig").Memory;
-    const driver = Memory.driver();
+    var driver = Memory.driver();
+    const Copies = struct {
+        var calls: usize = 0;
+        var delegate: @TypeOf(driver.api.cuMemcpy2DAsync_v2) = undefined;
+        fn copy(transfer: *const cuda.abi.Memcpy2D, stream: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            calls += 1;
+            return delegate(transfer, stream);
+        }
+    };
+    Copies.calls = 0;
+    Copies.delegate = driver.api.cuMemcpy2DAsync_v2;
+    driver.api.cuMemcpy2DAsync_v2 = Copies.copy;
     var d = testPackage(&driver);
     var source = try cuda.DeviceBuffer.alloc(&driver, 5 * 32 * 8192);
     defer source.free();
@@ -294,6 +316,7 @@ test "staging copies strided planes into independent owned lane windows" {
     };
     try d.stageWindow(3, source.ptr, 32, 2, 4, 0);
     try d.stageWindow(5, source.ptr, 32, 8, 3, 0);
+    try std.testing.expectEqual(@as(usize, 10), Copies.calls);
     @memset(Memory.slice(source.ptr, source.len), 0xff);
     for (0..4) |row| for (0..5) |plane| {
         try std.testing.expect(std.mem.allEqual(u8, Memory.slice(a.ptr + (row * 5 + plane) * 8192, 8192), @intCast(plane * 32 + row + 2)));
