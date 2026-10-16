@@ -132,7 +132,7 @@ pub const Forward = struct {
     }
 
     fn cache(f: *const Forward, base: u64, layer: usize) u64 {
-        return base + layer * f.max_len * f.c.kv_heads * f.c.head_dim * 2;
+        return base + layer * f.max_len * state.kvRowBytes(f.c);
     }
 
     /// Engine.norm: h = x + delta (dense, or the experts' slot-order sum), then the block's RMSNorm into y and xs.
@@ -335,6 +335,10 @@ pub const Forward = struct {
                 },
                 .attention => {
                     const a = blk.attn;
+                    var lay = at; // this layer's cache format and scales
+                    lay.fp8 = c.kv_fp8;
+                    lay.ks = a.ks;
+                    lay.vs = a.vs;
                     const qd: u64 = c.heads * c.head_dim;
                     try o.dense(b.y, b.xs, a.qkv, b.qkv, rows);
                     try f.mark(.qkv);
@@ -343,7 +347,7 @@ pub const Forward = struct {
                         const part = segs[k0..@min(segs.len, k0 + glue.max_segs)];
                         var at_segs: [glue.max_segs]glue.AttnSeg = undefined;
                         for (part, at_segs[0..part.len]) |s, *out| out.* = .{ .kc = f.cache(s.b.k_cache, aj.*), .vc = f.cache(s.b.v_cache, aj.*), .meta = s.b.meta, .row0 = s.row0, .rows = s.rows };
-                        try t.attentionSegs(at_segs[0..part.len], b.qkv, b.po, b.pm, b.pl, b.att, b.axs, at);
+                        try t.attentionSegs(at_segs[0..part.len], b.qkv, b.po, b.pm, b.pl, b.att, b.axs, lay);
                     }
                     try f.mark(.attention);
                     try o.dense(b.att, b.axs, a.o, b.delta, rows);
@@ -581,10 +585,19 @@ pub const Forward = struct {
                 const kc = f.cache(b.k_cache, w.aj);
                 const vc = f.cache(b.v_cache, w.aj);
                 const qd = c.heads * c.head_dim;
-                try f.glue.kvWrite(b.qkv, kc, vc, b.p_meta, w.rows, f.ashape());
+                const a = f.w.blocks[i].attn;
+                var at = f.ashape();
+                at.fp8 = c.kv_fp8;
+                at.ks = a.ks;
+                at.vs = a.vs;
+                try f.glue.kvWrite(b.qkv, kc, vc, b.p_meta, w.rows, at);
                 try o.torch().copyRows(b.qkv, c.qkvDim() * 2, b.q, qd * 2, qd * 2, w.rows);
                 const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(c.head_dim), -0.5));
-                try o.prefillAttention(b.q, kc, vc, b.att, w.pos, w.rows, c.heads, c.kv_heads, scale);
+                if (c.kv_fp8) {
+                    // the chunk reads every key and value up to its last row as the window kernels see them: dequantized
+                    try f.glue.kvDequant(kc, vc, b.k16, b.v16, (w.pos + w.rows) * c.kv_heads * c.head_dim, at);
+                    try o.prefillAttention(b.q, b.k16, b.v16, b.att, w.pos, w.rows, c.heads, c.kv_heads, scale);
+                } else try o.prefillAttention(b.q, kc, vc, b.att, w.pos, w.rows, c.heads, c.kv_heads, scale);
             },
             .moe => {},
         }

@@ -104,6 +104,8 @@ pub const Loaded = struct {
     /// Two-GPU TP: the peer's room (free memory less the 1536 MiB floor) after its load; the host admits streams and
     /// kept states by the smaller of the two, since every one takes the same bytes on both.
     peer_room: ?struct { rank: usize, bytes: u64 } = null,
+    /// A shared KV pool's admission: the lane host holds a request its pages cannot hold yet (cuda_lanes fits).
+    admit: ?struct { ctx: *anyopaque, fits: *const fn (*anyopaque, u32, u32) bool } = null,
 };
 
 /// Two-GPU tensor parallel (TENSORFOLD_TP=2): rank 0 on this device and rank 1 on the other internal one, each with
@@ -112,11 +114,12 @@ fn openTp(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
     const pair = (try splitPair(ctx.d)) orelse return error.TpNeedsTwoDevices;
     if (pair[0] != ctx.device_ordinal) return error.TpRankZeroNotFirst;
     // TENSORFOLD_KV_POOL_TOKENS: every sequence's KV rows from one page pool a rank, created whole now
-    const pool_bytes = try kvPoolBytes(gpa, io, dir);
+    const kv_fp8 = if (std.c.getenv("TENSORFOLD_KV_FP8")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+    const pool_bytes = try kvPoolBytes(gpa, io, dir, kv_fp8);
     var pools: [2]?*cuda.KvPool = .{ null, null };
     errdefer for (pools) |x| if (x) |q| q.deinit();
     if (pool_bytes > 0) pools[0] = try cuda.KvPool.init(gpa, ctx.d, ctx.device, pool_bytes);
-    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{ .context = o.context, .mtp = false, .graphs = false, .sampling = null, .segments = 1, .precision = o.precision, .tp = 0, .range = .{ .embed = true, .head = true, .norm_f = true }, .kv_pool = pools[0] });
+    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{ .context = o.context, .mtp = false, .graphs = false, .sampling = null, .segments = 1, .precision = o.precision, .tp = 0, .range = .{ .embed = true, .head = true, .norm_f = true }, .kv_pool = pools[0], .kv_fp8 = kv_fp8 });
     errdefer e.deinit();
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
@@ -129,7 +132,7 @@ fn openTp(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
     errdefer p.ctx.deinit();
     try p.ctx.makeCurrent();
     if (pool_bytes > 0) pools[1] = try cuda.KvPool.init(gpa, ctx.d, p.ctx.device, pool_bytes);
-    p.e = try engine.Engine.init(gpa, io, &p.ctx, dir, kernels, .{ .context = o.context, .mtp = false, .graphs = false, .sampling = null, .segments = 1, .precision = o.precision, .tp = 1, .range = .{ .embed = true, .head = false, .norm_f = false }, .kv_pool = pools[1] });
+    p.e = try engine.Engine.init(gpa, io, &p.ctx, dir, kernels, .{ .context = o.context, .mtp = false, .graphs = false, .sampling = null, .segments = 1, .precision = o.precision, .tp = 1, .range = .{ .embed = true, .head = false, .norm_f = false }, .kv_pool = pools[1], .kv_fp8 = kv_fp8 });
     errdefer {
         p.ctx.makeCurrent() catch {};
         p.e.deinit();
@@ -143,7 +146,7 @@ fn openTp(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
     own.peer = p;
     own.link = link;
     own.pools = pools;
-    if (pool_bytes > 0) std.log.info("tp KV pool: {d} MiB a rank, {d}-token context a request", .{ pool_bytes >> 20, o.context });
+    if (pool_bytes > 0) std.log.info("tp KV pool: {d} MiB a rank ({s}), {d}-token context a request", .{ pool_bytes >> 20, if (kv_fp8) "fp8 e4m3" else "bf16", o.context });
     const floor: usize = 1536 << 20;
     const peer_free = (try p.ctx.memInfo()).free;
     if (peer_free < floor or (try ctx.memInfo()).free < floor) return error.TpMemoryFloor;
@@ -166,17 +169,21 @@ fn openTp(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
         .taps = &own.taps,
         .living = false,
         .peer_room = .{ .rank = 1, .bytes = peer_free - floor },
+        .admit = if (pool_bytes > 0) .{ .ctx = &own.lanes, .fits = Lanes.fits } else null,
     };
 }
 
 /// A TP rank's KV pool bytes for TENSORFOLD_KV_POOL_TOKENS tokens (its KV head of every attention layer, keys and
 /// values); 0 when unset.
-fn kvPoolBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !usize {
+fn kvPoolBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, kv_fp8: bool) !usize {
     const raw = std.c.getenv("TENSORFOLD_KV_POOL_TOKENS") orelse return 0;
     const tokens = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch return error.BadKvPoolTokens;
     if (tokens == 0) return 0;
-    const c = try (try @import("config.zig").Config.read(gpa, io, dir)).forTp(0, tp2.world);
-    return tokens * c.count(.attention) * state.kvRowBytes(c) * 2;
+    var c = try (try @import("config.zig").Config.read(gpa, io, dir)).forTp(0, tp2.world);
+    c.kv_fp8 = kv_fp8;
+    // a sequence holds whole pages under each layer's rows in each plane: one page a layer-plane of slack a lane
+    const slack = @as(usize, engine.max_streams) * c.count(.attention) * 2 * (2 << 20);
+    return tokens * c.count(.attention) * state.kvRowBytes(c) * 2 + slack;
 }
 
 /// The first shard, index or config.json in `dir` that a write in place would reach through a link, or null.

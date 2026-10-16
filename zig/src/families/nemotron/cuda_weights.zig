@@ -25,7 +25,7 @@ pub const Adapter = struct { a: u64, b: u64, tau: u64, xa: u64, xn: u64, gates: 
 
 /// A `*_rest` is a lesson's change past its projection's 4-bit codes ([out, in] bf16), added after it; 0 when none.
 pub const Mamba = struct { in_proj: QLinear, out_proj: QLinear, conv_w: u64, conv_b: u64, a: u64, d: u64, dt_bias: u64, gnorm: u64, out_rest: u64 = 0, adapter: ?Adapter = null };
-pub const Attention = struct { qkv: QLinear, o: QLinear, o_rest: u64 = 0, adapter: ?Adapter = null };
+pub const Attention = struct { qkv: QLinear, o: QLinear, o_rest: u64 = 0, adapter: ?Adapter = null, ks: f32 = 1, vs: f32 = 1 };
 /// The pocket kernels' neurons (config's pocket): input weights and outputs, [n, D] fp32 each, from the 4-bit codes.
 pub const Pocket = kern.Pocket;
 /// The shared expert's down projection rest in two halves (experts E and E + 1); its learned change reads both.
@@ -481,6 +481,12 @@ pub const Loader = struct {
         att.o_rest = 0;
         att.adapter = null;
         att.o = try modelopt.denseCut(L, ck, try join(&a, name, ".o"), &.{try join(&q, pre, "o_proj")}, &.{.{ .cols = .{ r * qd, qd } }});
+        // the checkpoint's calibrated KV scales (ModelOpt's FP8 KV scheme): an FP8 cache stores value / scale
+        if (c.kv_fp8) {
+            att.ks = try modelopt.scalarOf(ck, try join(&k, pre, "k_proj.k_scale"));
+            att.vs = try modelopt.scalarOf(ck, try join(&v, pre, "v_proj.v_scale"));
+            if (!(att.ks > 0) or !(att.vs > 0)) return error.BadKvScale;
+        }
         return att;
     }
 

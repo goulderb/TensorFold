@@ -1,6 +1,7 @@
 // Merge absolute 512-key attention chunks in order, so a row's bits ignore its window.
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <math.h>
 #include <stdint.h>
 
@@ -32,15 +33,38 @@ __device__ __forceinline__ float half_sum(float v) {
     return v;
 }
 
+// The KV cache's element formats: bf16, or (FP8) e4m3 codes of value / scale, the layer's calibrated scale
+// (ModelOpt's k_scale and v_scale). A load gives two neighbouring values as one word of two bf16, as the shared
+// tiles hold them; an FP8 pair is dequantized to bf16 first, so the attention arithmetic is the same for both.
+__device__ __forceinline__ uint32_t kv_pair(const __nv_bfloat16* p, int64_t at, int w, int fp8, float s) {
+    if (!fp8) return reinterpret_cast<const uint32_t*>(p + at)[w];
+    const uint16_t two = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(p) + at)[w];
+    __nv_fp8_e4m3 a, b;
+    a.__x = static_cast<__nv_fp8_storage_t>(two & 0xFFu);
+    b.__x = static_cast<__nv_fp8_storage_t>(two >> 8);
+    const __nv_bfloat16 x = __float2bfloat16_rn(__fmul_rn(static_cast<float>(a), s));
+    const __nv_bfloat16 y = __float2bfloat16_rn(__fmul_rn(static_cast<float>(b), s));
+    return static_cast<uint32_t>(__bfloat16_as_ushort(x)) | (static_cast<uint32_t>(__bfloat16_as_ushort(y)) << 16);
+}
+
+// Element i of a KV plane: v as bf16, or (FP8) its e4m3 code of v / scale, saturating at the finite range.
+__device__ __forceinline__ void kv_put(__nv_bfloat16* p, int64_t i, __nv_bfloat16 v, int fp8, float s) {
+    if (!fp8) {
+        p[i] = v;
+        return;
+    }
+    reinterpret_cast<__nv_fp8_e4m3*>(p)[i] = __nv_fp8_e4m3(__fdiv_rn(__bfloat162float(v), s));
+}
+
 }  // namespace
 
 // Row r's keys and values written at its position: K and V follow the query columns of each qkv row.
 extern "C" __global__ void tf_nemo_kv_write(const __nv_bfloat16* __restrict__ QKV, __nv_bfloat16* __restrict__ KC,
-                                             __nv_bfloat16* __restrict__ VC, const int* __restrict__ META, int NQKV, int QD, int KVD) {
+                                             __nv_bfloat16* __restrict__ VC, const int* __restrict__ META, int NQKV, int QD, int KVD, int FP8, float KS, float VS) {
     const int64_t r = blockIdx.x, pos = META[0];
     for (int o = threadIdx.x; o < KVD; o += blockDim.x) {
-        KC[(pos + r) * KVD + o] = QKV[r * NQKV + QD + o];
-        VC[(pos + r) * KVD + o] = QKV[r * NQKV + QD + KVD + o];
+        kv_put(KC, (pos + r) * KVD + o, QKV[r * NQKV + QD + o], FP8, KS);
+        kv_put(VC, (pos + r) * KVD + o, QKV[r * NQKV + QD + KVD + o], FP8, VS);
     }
 }
 
@@ -48,7 +72,7 @@ extern "C" __global__ void tf_nemo_kv_write(const __nv_bfloat16* __restrict__ QK
 extern "C" __global__ void __launch_bounds__(256) tf_nemo_attn_chunk(const __nv_bfloat16* __restrict__ QKV, const __nv_bfloat16* __restrict__ KC,
                                                                        const __nv_bfloat16* __restrict__ VC, const int* __restrict__ META,
                                                                        float* __restrict__ PO, float* __restrict__ PM, float* __restrict__ PL,
-                                                                       int NQKV, int H, int HK, int G, int CH, int NCH, float scale) {
+                                                                       int NQKV, int H, int HK, int G, int CH, int NCH, float scale, int FP8, float KS, float VS) {
     __shared__ __align__(16) float qs[GMAX][HD];
     __shared__ __align__(16) uint32_t kw[TILE][KW];
     __shared__ __align__(16) uint32_t vw[TILE][HD / 2];
@@ -72,8 +96,8 @@ extern "C" __global__ void __launch_bounds__(256) tf_nemo_attn_chunk(const __nv_
                 const int j = i / (HD / 2), w = i % (HD / 2);
                 const int64_t at = (static_cast<int64_t>(key0 + j) * HK + hk) * HD;
                 const bool in = key0 + j < limit;
-                kw[j][w] = in ? reinterpret_cast<const uint32_t*>(KC + at)[w] : 0u;
-                vw[j][w] = in ? reinterpret_cast<const uint32_t*>(VC + at)[w] : 0u;
+                kw[j][w] = in ? kv_pair(KC, at, w, FP8, KS) : 0u;
+                vw[j][w] = in ? kv_pair(VC, at, w, FP8, VS) : 0u;
             }
             __syncthreads();
             float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -197,20 +221,20 @@ __device__ __forceinline__ int seg_of(const AttnSegs& sg, int rq) {
     return k;
 }
 
-extern "C" __global__ void tf_nemo_kv_write_segs(const AttnSegs sg, const __nv_bfloat16* __restrict__ QKV, int NQKV, int QD, int KVD) {
+extern "C" __global__ void tf_nemo_kv_write_segs(const AttnSegs sg, const __nv_bfloat16* __restrict__ QKV, int NQKV, int QD, int KVD, int FP8, float KS, float VS) {
     const int rq = blockIdx.x, k = seg_of(sg, rq);
     __nv_bfloat16* __restrict__ KC = sg.KC[k];
     __nv_bfloat16* __restrict__ VC = sg.VC[k];
     const int64_t r = rq - sg.ROW0[k], pos = sg.META[k][0];
     for (int o = threadIdx.x; o < KVD; o += blockDim.x) {
-        KC[(pos + r) * KVD + o] = QKV[static_cast<int64_t>(rq) * NQKV + QD + o];
-        VC[(pos + r) * KVD + o] = QKV[static_cast<int64_t>(rq) * NQKV + QD + KVD + o];
+        kv_put(KC, (pos + r) * KVD + o, QKV[static_cast<int64_t>(rq) * NQKV + QD + o], FP8, KS);
+        kv_put(VC, (pos + r) * KVD + o, QKV[static_cast<int64_t>(rq) * NQKV + QD + KVD + o], FP8, VS);
     }
 }
 
 extern "C" __global__ void __launch_bounds__(256) tf_nemo_attn_chunk_segs(const AttnSegs sg, const __nv_bfloat16* __restrict__ QKV,
                                                                             float* __restrict__ PO, float* __restrict__ PM, float* __restrict__ PL,
-                                                                            int NQKV, int H, int HK, int G, int CH, int NCH, float scale) {
+                                                                            int NQKV, int H, int HK, int G, int CH, int NCH, float scale, int FP8, float KS, float VS) {
     __shared__ __align__(16) float qs[GMAX][HD];
     __shared__ __align__(16) uint32_t kw[TILE][KW];
     __shared__ __align__(16) uint32_t vw[TILE][HD / 2];
@@ -237,8 +261,8 @@ extern "C" __global__ void __launch_bounds__(256) tf_nemo_attn_chunk_segs(const 
                 const int j = i / (HD / 2), w = i % (HD / 2);
                 const int64_t at = (static_cast<int64_t>(key0 + j) * HK + hk) * HD;
                 const bool in = key0 + j < limit;
-                kw[j][w] = in ? reinterpret_cast<const uint32_t*>(KC + at)[w] : 0u;
-                vw[j][w] = in ? reinterpret_cast<const uint32_t*>(VC + at)[w] : 0u;
+                kw[j][w] = in ? kv_pair(KC, at, w, FP8, KS) : 0u;
+                vw[j][w] = in ? kv_pair(VC, at, w, FP8, VS) : 0u;
             }
             __syncthreads();
             float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -350,7 +374,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_nemo_attn_merge_segs(const 
 extern "C" __global__ void __launch_bounds__(256, 2) tf_nemo_attn_chunk_pf(const __nv_bfloat16* __restrict__ QKV, const __nv_bfloat16* __restrict__ KC,
                                                                        const __nv_bfloat16* __restrict__ VC, const int* __restrict__ META,
                                                                        float* __restrict__ PO, float* __restrict__ PM, float* __restrict__ PL,
-                                                                       int NQKV, int H, int HK, int G, int CH, int NCH, float scale) {
+                                                                       int NQKV, int H, int HK, int G, int CH, int NCH, float scale, int FP8, float KS, float VS) {
     __shared__ __align__(16) float qs[GMAX][HD];
     __shared__ __align__(16) uint32_t kw[TILE][KW];
     __shared__ __align__(16) uint32_t vw[TILE][HD / 2];
@@ -376,8 +400,8 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_nemo_attn_chunk_pf(const
                 const int i = t + 256 * u, j = i / (HD / 2), w = i % (HD / 2);
                 const int64_t at = (static_cast<int64_t>(k0 + j) * HK + hk) * HD;
                 const bool in = k0 + j < limit;
-                nk[u] = in ? reinterpret_cast<const uint32_t*>(KC + at)[w] : 0u;
-                nv[u] = in ? reinterpret_cast<const uint32_t*>(VC + at)[w] : 0u;
+                nk[u] = in ? kv_pair(KC, at, w, FP8, KS) : 0u;
+                nv[u] = in ? kv_pair(VC, at, w, FP8, VS) : 0u;
             }
         };
         fetch(c * CH);
@@ -450,5 +474,19 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_nemo_attn_chunk_pf(const
             PM[base] = m;
             PL[base] = den;
         }
+    }
+}
+
+// The first `n` elements of both KV planes as bf16 (a prompt chunk's attention reads them so): FP8 codes times the
+// layer's scale, rounded to bf16 as the decode kernels' tiles hold them.
+extern "C" __global__ void __launch_bounds__(256) tf_nemo_kv_dequant(const uint8_t* __restrict__ KC, const uint8_t* __restrict__ VC,
+                                                                      __nv_bfloat16* __restrict__ K16, __nv_bfloat16* __restrict__ V16,
+                                                                      int64_t n, float KS, float VS) {
+    for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        __nv_fp8_e4m3 a, b;
+        a.__x = KC[i];
+        b.__x = VC[i];
+        K16[i] = __float2bfloat16_rn(__fmul_rn(static_cast<float>(a), KS));
+        V16[i] = __float2bfloat16_rn(__fmul_rn(static_cast<float>(b), VS));
     }
 }

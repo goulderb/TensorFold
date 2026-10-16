@@ -84,7 +84,8 @@ pub const Tri = struct {
         try t.run("_conv_commit", .{ cdiv(m.cd, 128), 1, 1 }, &.{ p("P", "*bf16", proj), p("BASE", "*bf16", base), int("R", rows) }, &.{ ci("PROJ", m.proj), ci("XOFF", m.xd), ci("CD", m.cd), ci("BC", 128) });
     }
 
-    pub const Attn = struct { nqkv: usize, heads: usize, kv_heads: usize, dim: usize, nch: usize };
+    /// `fp8`: the cache holds e4m3 codes of value / ks (keys) or vs (values); else bf16. Our kernels alone read it.
+    pub const Attn = struct { nqkv: usize, heads: usize, kv_heads: usize, dim: usize, nch: usize, fp8: bool = false, ks: f32 = 1, vs: f32 = 1 };
 
     pub fn kvWrite(t: Tri, qkv: u64, kc: u64, vc: u64, meta: u64, rows: usize, a: Attn) !void {
         try t.run("_kv_write", .{ u(rows), 1, 1 }, &.{ p("QKV", "*bf16", qkv), p("KC", "*bf16", kc), p("VC", "*bf16", vc), p("META", "*i32", meta), int("R", rows) }, &.{ ci("NQKV", a.nqkv), ci("QD", a.heads * a.dim), ci("KVD", a.kv_heads * a.dim) });

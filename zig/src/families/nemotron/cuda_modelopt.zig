@@ -32,6 +32,10 @@ fn name(buf: []u8, comptime fmt: []const u8, args: anytype) ![]const u8 {
 }
 
 /// An fp32 tensor of one element, read through the map (a few bytes; the loader's O_DIRECT reads are for bulk).
+pub fn scalarOf(ck: *core.Checkpoint, n: []const u8) !f32 {
+    return scalar(ck, n);
+}
+
 fn scalar(ck: *core.Checkpoint, n: []const u8) !f32 {
     const t = try ck.get(n);
     if (t.dtype != .f32 or t.bytes.len != 4) return error.UnexpectedTensor;

@@ -41,6 +41,8 @@ pub const Cuda = struct {
     e: *Engine,
     head: ?*Head,
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
+    /// KV pool pages promised to admitted requests whose lanes their prefill has not made yet (fits).
+    promised: usize = 0,
     own_free: bool = true, // no stream holds the engine's own sequence
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
@@ -218,6 +220,36 @@ pub const Cuda = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
+    /// Rows past a prompt a lane is assumed to grow by before the pool's slack takes over.
+    const pool_margin = 512;
+
+    /// The KV pool pages a sequence of `tokens` rows holds: whole pages under every attention layer's rows, both planes.
+    fn poolPages(self: *const Cuda, tokens: usize) usize {
+        const pool = self.e.kv_pool orelse return 0;
+        const per_page = pool.gran / state.kvRowBytes(self.e.c);
+        return (tokens + pool_margin + per_page - 1) / per_page * self.e.c.count(.attention) * 2;
+    }
+
+    /// The lane host's admission (a shared KV pool): a request of `prompt` tokens waits while the pool's free pages
+    /// cannot hold its prompt beside what every live lane and every request admitted before it still has to map.
+    /// Rank 0's pool speaks for both: a TP pair's sequences take the same pages on each.
+    pub fn fits(ptr: *anyopaque, prompt: u32, max_tokens: u32) bool {
+        _ = max_tokens; // decode growth past the margin comes from the pool's slack (the proxy budgets each request)
+        const self = of(ptr);
+        const pool = self.e.kv_pool orelse return true;
+        var future: usize = self.promised;
+        var it = self.lanes.iterator();
+        while (it.next()) |kv| {
+            const want = self.poolPages(kv.key_ptr.*.context.items.len);
+            const have = if (kv.value_ptr.seq.paged) |x| x.kv[0].mapped() + x.kv[1].mapped() else 0;
+            future += want -| have;
+        }
+        const need = self.poolPages(prompt);
+        if (pool.free.items.len < future + need) return false;
+        self.promised += need;
+        return true;
+    }
+
     /// A cancel, or a background pass stepping aside for a foreground request, stops the prompt at its next chunk.
     fn cancelled(ptr: *anyopaque) bool {
         const s: *lanes.Stream = @ptrCast(@alignCast(ptr));
@@ -255,7 +287,7 @@ pub const Cuda = struct {
         const ids = s.prompt();
         if (ids.len == 0 or ids.len + s.max_new + state.max_rows > e.max_len) return error.PromptTooLong;
         const gop = try self.lanes.getOrPut(self.gpa, s);
-        if (gop.found_existing) self.drop(gop.value_ptr.*);
+        if (gop.found_existing) self.drop(gop.value_ptr.*) else self.promised -|= self.poolPages(ids.len);
         // the engine's own sequence while it is free: its rounds replay the captured graphs
         // the own graphs carry the pocket; a layer split has no graphs but only the own sequence, on both ranks
         const own = self.own_free and (e.serial != null or e.peer != null) and !s.untaught;

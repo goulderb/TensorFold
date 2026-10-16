@@ -104,7 +104,7 @@ pub const seq_fields = [_][]const u8{ "k_cache", "v_cache", "ssm", "conv_base", 
 
 /// Bytes of one token's key (or value) row in one attention layer: every KV head's dims in bf16.
 pub fn kvRowBytes(c: Config) usize {
-    return c.kv_heads * c.head_dim * 2;
+    return c.kv_heads * c.head_dim * @as(usize, if (c.kv_fp8) 1 else 2);
 }
 
 /// Bytes of every Mamba layer's SSM and conv states (seq_fields' ssm, conv_base): a prompt mark keeps both whole.
@@ -316,6 +316,8 @@ pub const Buffers = struct {
     job: u64, // rank 0's job to the other ranks: a header and the rows their shares read (cuda_worker.zig)
     ck8: u64, // the checkpoint's math: e4m3 rows an FP8 projection reads
     ck4: u64, // and a latent MoE's NVFP4 rows (cuda_latent_ck.zig)
+    k16: u64 = 0, // an FP8 cache's rows as bf16 for a prompt chunk's attention (max_len rows of one layer's KV heads)
+    v16: u64 = 0,
 
     /// Sizes every buffer for `max_len` cache rows and `nch` attention chunk partials a row; the own sequence's first.
     pub fn init(d: *const cuda.Driver, c: Config, max_len: usize, nch: usize, carve: ?*cuda.Carveout) !Buffers {
@@ -333,6 +335,8 @@ pub const Buffers = struct {
         errdefer if (carved) |x| x.give();
         var total = if (paged != null) kvlessBytes(&own) else Carved.arenaBytes(carved, &own);
         for (scratch) |n| total += n + 256;
+        const plane16: usize = if (c.kv_fp8) max_len * c.kv_heads * c.head_dim * 2 else 0;
+        total += 2 * (plane16 + 256);
         var a: Arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, total) };
         errdefer a.buf.free();
         // Zeroed: the Mamba convolution and recurrent planes are read before they are first written, so a fresh
@@ -344,6 +348,8 @@ pub const Buffers = struct {
         b.state_bytes = own[0..7].*;
         inline for (seq_fields, own, 0..) |name, n, i| @field(b, name) = if (paged != null and i < 2) paged.?.kv[i].va else if (carved != null and i < 2) carved.?.kv[i].ptr else a.take(n);
         for (b.scratchPtrs(), scratch) |f, n| f.* = a.take(n);
+        b.k16 = if (plane16 > 0) a.take(plane16) else 0;
+        b.v16 = if (plane16 > 0) a.take(plane16) else 0;
         b.arena = a;
         return b;
     }

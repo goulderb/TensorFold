@@ -105,6 +105,9 @@ pub const Config = struct {
     /// whole. Apart from `rank`/`world`, which a latent MoE's ranks over hosts use.
     tp_rank: usize = 0,
     tp_world: usize = 1,
+    /// The KV cache in e4m3 by each attention layer's calibrated k_scale and v_scale (TENSORFOLD_KV_FP8=1, TP only):
+    /// a row is half a bf16 one's bytes.
+    kv_fp8: bool = false,
     ck: bool = false, // --precision checkpoint: e4m3 rows into the FP8 layers, NVFP4 rows into the experts
     widths: [max_layers][4]Width = @splat(@splat(.{})), // each layer's matrices (members(kind) order) at their widths
     embed_width: Width = .{},

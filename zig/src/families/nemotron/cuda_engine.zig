@@ -47,6 +47,8 @@ pub const Options = struct {
     /// Every sequence's KV planes from this shared page pool (sized by TENSORFOLD_KV_POOL_TOKENS); null: each
     /// sequence's planes cover its whole context.
     kv_pool: ?*cuda.KvPool = null,
+    /// The KV cache in e4m3 by the checkpoint's KV scales (two-GPU TP only: the MTP head's caches stay bf16).
+    kv_fp8: bool = false,
 };
 
 /// Asked before each prompt chunk (or segmented call): true stops the prompt with error.Cancelled.
@@ -172,6 +174,10 @@ pub const Engine = struct {
         e.trace = std.c.getenv("TF_SLIDE_TRACE") != null;
         e.c = try Config.read(gpa, io, model_dir);
         if (opts.tp) |rank| e.c = try e.c.forTp(rank, tp2.world);
+        if (opts.kv_fp8) {
+            if (opts.tp == null or opts.mtp) return error.Fp8KvNeedsTp;
+            e.c.kv_fp8 = true;
+        }
         try latent.place(&e.c);
         if (e.c.rank > 0) return error.RankServesExperts; // ranks past 0 run cuda_worker.serve, not an engine
         e.c.ck = try @import("cuda_latent_ck.zig").wanted(ctx, e.c, opts.precision);
