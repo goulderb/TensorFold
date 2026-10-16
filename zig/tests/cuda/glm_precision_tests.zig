@@ -110,7 +110,7 @@ fn fp8Projection(r: *Rig, modules: *const glm.forward.Modules, set: glm.glue.Set
     const npad = cuda.fp8.padded(n);
     var model: glm.weights.Weights = .{ .gpa = r.gpu.gpa, .config = undefined, .share = undefined };
     defer model.deinit();
-    model.config.hidden = k;
+    model.config.hidden = @intCast(k);
     model.share.vocab = .{ .lo = 0, .hi = n };
     var tools = modules.tools();
     tools.precision.head = .fp8;
