@@ -15,6 +15,30 @@ const Sampling = @import("cuda_sampler.zig").Sampling;
 pub const BatchRequest = batch.Request;
 pub const BatchResult = batch.Result;
 
+const WidthHistogram = struct {
+    bins: [batch.max_lanes]u64 = @splat(0),
+    total: u64 = 0,
+    emitted: u64 = 0,
+
+    fn record(h: *WidthHistogram, width: usize) void {
+        std.debug.assert(width > 0 and width <= batch.max_lanes);
+        h.bins[width - 1] += 1;
+        h.total += 1;
+    }
+
+    fn due(h: *const WidthHistogram) bool {
+        return h.total == 1 or (h.total != 0 and h.total % 64 == 0);
+    }
+
+    const Snapshot = struct { total: u64, bins: [batch.max_lanes]u64 };
+
+    fn snapshot(h: *WidthHistogram) ?Snapshot {
+        if (h.total == h.emitted) return null;
+        h.emitted = h.total;
+        return .{ .total = h.total, .bins = h.bins };
+    }
+};
+
 pub const Dependencies = struct {
     driver: *const cuda.Driver,
     context: *const cuda.Context,
@@ -41,6 +65,7 @@ pub const DFlash = struct {
     lanes: [8]state.Lane = @splat(.{}),
     pending: [8]cuda.DeviceBuffer,
     max_packed_width: usize = 0,
+    width_histogram: WidthHistogram = .{},
 
     pub fn open(gpa: std.mem.Allocator, io: std.Io, target_dir: []const u8, draft_dir: []const u8, streams: usize, capacity: usize, deps: Dependencies) !*DFlash {
         if (streams != 8 or capacity == 0 or capacity > std.math.maxInt(i64) - 8) return error.BadDraftCapacity;
@@ -59,6 +84,7 @@ pub const DFlash = struct {
         p.capacity = capacity;
         p.lanes = @splat(.{});
         p.max_packed_width = 0;
+        p.width_histogram = .{};
         p.loader = .{ .gpa = gpa, .driver = deps.driver, .target = &target, .draft = &draft, .rank = rank };
         errdefer p.loader.deinit();
         const w = try p.loader.load(rank);
@@ -94,6 +120,7 @@ pub const DFlash = struct {
     }
     pub fn deinit(d: *DFlash) void {
         d.forward.stream.synchronize() catch {};
+        d.flushWidths();
         for (&d.pending) |*b| b.free();
         d.forward.deinit();
         d.aot.deinit();
@@ -122,7 +149,18 @@ pub const DFlash = struct {
         l.* = .{};
     }
     pub fn release(d: *DFlash, slot: usize) void {
-        if (slot < 8) d.lanes[slot] = .{ .healthy = false };
+        if (slot < 8) {
+            d.lanes[slot] = .{ .healthy = false };
+            d.flushWidths();
+        }
+    }
+    fn flushWidths(d: *DFlash) void {
+        if (d.forward.rank.rank != 0) return;
+        const snapshot = d.width_histogram.snapshot() orelse return;
+        std.log.info("DFlash width histogram: version=1 rank=0 total={d} widths={d},{d},{d},{d},{d},{d},{d},{d}", .{
+            snapshot.total,   snapshot.bins[0], snapshot.bins[1], snapshot.bins[2], snapshot.bins[3],
+            snapshot.bins[4], snapshot.bins[5], snapshot.bins[6], snapshot.bins[7],
+        });
     }
     fn validateView(plane_rows: usize, row0: usize, rows: usize) !void {
         if (row0 > plane_rows or rows > plane_rows - row0) return error.BadDraftWindow;
@@ -213,10 +251,6 @@ pub const DFlash = struct {
         try d.forward.stage(d.forward.bpos, std.mem.sliceAsBytes(meta.begins[0..plan.count]));
         try d.forward.stage(d.forward.bslots, std.mem.sliceAsBytes(meta.block_slots[0..plan.count]));
         try d.forward.block(plan.count);
-        if (plan.count > d.max_packed_width) {
-            d.max_packed_width = plan.count;
-            if (d.forward.rank.rank == 0) std.log.info("DFlash packed proposal width: active_count={d} requested_count={d}", .{ plan.count, requests.len });
-        }
         var candidates: [4 * batch.max_lanes * 7 * 32]f32 = undefined;
         var projection: [batch.max_lanes * 7 * 256]f32 = undefined;
         const candidate_slice = candidates[0 .. d.forward.rank.world * plan.count * 7 * 32];
@@ -231,6 +265,12 @@ pub const DFlash = struct {
             try d.forward.check();
             try d.forward.read(d.forward.candidates, std.mem.sliceAsBytes(candidate_slice));
             try d.forward.read(d.forward.projection, std.mem.sliceAsBytes(projection_slice));
+        }
+        d.width_histogram.record(plan.count);
+        if (d.width_histogram.due()) d.flushWidths();
+        if (plan.count > d.max_packed_width) {
+            d.max_packed_width = plan.count;
+            if (d.forward.rank.rank == 0) std.log.info("DFlash packed proposal width: active_count={d} requested_count={d}", .{ plan.count, requests.len });
         }
         try batch.select(plan, candidate_slice, projection_slice, d.forward.rank.world, .{ .pred = d.pred, .succ = d.succ }, results[0..requests.len]);
         @memcpy(out, results[0..requests.len]);
@@ -300,6 +340,7 @@ fn testPackage(driver: *const cuda.Driver) DFlash {
     d.capacity = 8192;
     d.lanes = @splat(.{});
     d.max_packed_width = 0;
+    d.width_histogram = .{};
     d.forward.d = driver;
     d.forward.stream = stream;
     d.forward.th = .{ .ops = undefined, .s = stream, .base = .{ .f = undefined, .s = stream } };
@@ -362,6 +403,8 @@ test "two and eight packed lanes launch one graph and read one invalid flag" {
         try std.testing.expectError(error.BadDraftIndex, d.proposeBatch(requests[0..count], results[0..count]));
         try std.testing.expectEqual(@as(usize, 1), Mock.launches);
         try std.testing.expectEqual(@as(usize, 1), Mock.reads);
+        try std.testing.expectEqual(@as(u64, 0), d.width_histogram.total);
+        try std.testing.expectEqual(@as(usize, 0), d.max_packed_width);
         for (requests[0..count]) |r| try std.testing.expect(!d.lanes[r.slot].healthy);
         Mock.launches = 0;
         Mock.reads = 0;
@@ -370,6 +413,174 @@ test "two and eight packed lanes launch one graph and read one invalid flag" {
         try std.testing.expectError(error.BadDraftSlot, d.proposeBatch(requests[0..count], results[0..count]));
         try std.testing.expectEqual(@as(usize, 0), Mock.launches);
         try std.testing.expectEqual(@as(usize, 0), Mock.reads);
+        try std.testing.expectEqual(@as(u64, 0), d.width_histogram.total);
+    }
+}
+
+test "width histogram snapshots first and every 64 completions and flushes only dirty state" {
+    var h: WidthHistogram = .{};
+    try std.testing.expect(h.snapshot() == null);
+    h.record(2);
+    try std.testing.expect(h.due());
+    const first = h.snapshot().?;
+    try std.testing.expectEqual(@as(u64, 1), first.total);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 1, 0, 0, 0, 0, 0, 0 }, &first.bins);
+    try std.testing.expect(h.snapshot() == null);
+    for (2..65) |total| {
+        h.record(8);
+        try std.testing.expectEqual(total == 64, h.due());
+    }
+    const interval = h.snapshot().?;
+    try std.testing.expectEqual(@as(u64, 64), interval.total);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 1, 0, 0, 0, 0, 0, 63 }, &interval.bins);
+    h.record(1);
+    try std.testing.expect(!h.due());
+    const tail = h.snapshot().?;
+    try std.testing.expectEqual(@as(u64, 65), tail.total);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 1, 0, 0, 0, 0, 0, 63 }, &tail.bins);
+    try std.testing.expect(h.snapshot() == null);
+}
+
+test "release flushes dirty rank zero widths without resetting lifetime counts" {
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    var driver = Memory.driver();
+    var d = testPackage(&driver);
+    d.width_histogram.record(3);
+    d.release(2);
+    try std.testing.expectEqual(@as(u64, 1), d.width_histogram.emitted);
+    try std.testing.expect(!d.lanes[2].healthy);
+    d.release(2);
+    try std.testing.expect(d.width_histogram.snapshot() == null);
+    d.width_histogram.record(8);
+    d.release(7);
+    try std.testing.expectEqual(@as(u64, 2), d.width_histogram.total);
+    try std.testing.expectEqual(@as(u64, 2), d.width_histogram.emitted);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 0, 1, 0, 0, 0, 0, 1 }, &d.width_histogram.bins);
+    d.forward.rank = try config.Rank.init(2, 1);
+    d.width_histogram.record(1);
+    d.release(1);
+    try std.testing.expectEqual(@as(u64, 2), d.width_histogram.emitted);
+}
+
+test "completed readbacks count once before CPU selection and failed GPU work never counts" {
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    var driver = Memory.driver();
+    const Mock = struct {
+        const Failure = enum { none, launch, sync, flag, invalid, candidates, projection, selection };
+        var failure: Failure = .none;
+        var invalid: u64 = 0;
+        var candidates: u64 = 0;
+        var projection: u64 = 0;
+        var histogram: *const WidthHistogram = undefined;
+        var baseline: u64 = 0;
+        var premature: bool = false;
+        var launches: usize = 0;
+        var reads: usize = 0;
+        var download: @TypeOf(driver.api.cuMemcpyDtoH_v2) = undefined;
+        fn observe() void {
+            premature = premature or histogram.total != baseline;
+        }
+        fn graph(_: cuda.abi.GraphExec, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            observe();
+            launches += 1;
+            if (failure == .launch) return cuda.abi.error_not_ready;
+            @memset(Memory.slice(invalid, 4), if (failure == .invalid) 1 else 0);
+            @memset(Memory.slice(candidates, 2 * 2 * 7 * 32 * 4), 0);
+            @memset(Memory.slice(projection, 2 * 7 * 256 * 4), 0);
+            if (failure == .selection) @memset(Memory.slice(candidates, 4), 0xff);
+            return 0;
+        }
+        fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            observe();
+            return if (failure == .sync and launches != 0) cuda.abi.error_not_ready else 0;
+        }
+        fn read(dst: ?*anyopaque, src: u64, n: usize) callconv(.c) cuda.abi.Result {
+            observe();
+            reads += 1;
+            if ((failure == .flag and src == invalid) or (failure == .candidates and src == candidates) or (failure == .projection and src == projection)) return cuda.abi.error_not_ready;
+            return download(dst, src, n);
+        }
+        fn readAsync(dst: ?*anyopaque, src: u64, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return read(dst, src, n);
+        }
+        fn upload(dst: u64, src: ?*const anyopaque, n: usize) callconv(.c) cuda.abi.Result {
+            @memcpy(Memory.slice(dst, n), @as([*]const u8, @ptrCast(src.?))[0..n]);
+            return 0;
+        }
+    };
+    Mock.download = driver.api.cuMemcpyDtoH_v2;
+    driver.api.cuGraphLaunch = Mock.graph;
+    driver.api.cuStreamSynchronize = Mock.sync;
+    driver.api.cuMemcpyDtoH_v2 = Mock.read;
+    driver.api.cuMemcpyDtoHAsync_v2 = Mock.readAsync;
+    driver.api.cuMemcpyHtoD_v2 = Mock.upload;
+    var scratch = try cuda.DeviceBuffer.alloc(&driver, 96 * 1024);
+    defer scratch.free();
+    const host = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(16), 96 * 1024);
+    defer std.testing.allocator.free(host);
+    const codes: [256]f32 = @splat(0);
+    for ([_]bool{ false, true }) |async_read| {
+        for (std.enums.values(Mock.Failure)) |failure| {
+            var d = testPackage(&driver);
+            d.pred = @constCast(&codes);
+            d.succ = @constCast(&codes);
+            d.forward.cfg = .{};
+            d.forward.streams = 8;
+            d.forward.stager = .{};
+            d.forward.pin = if (async_read) .{ .d = &driver, .bytes = host } else null;
+            d.forward.tap_pending = false;
+            d.forward.blocks = @splat(null);
+            d.forward.blocks[1] = .{ .d = &driver, .handle = @ptrFromInt(2) };
+            d.forward.ids = scratch.ptr;
+            d.forward.rowpos = scratch.ptr + 256;
+            d.forward.rowslots = scratch.ptr + 768;
+            d.forward.bpos = scratch.ptr + 1280;
+            d.forward.bslots = scratch.ptr + 1408;
+            d.forward.invalid = scratch.ptr + 1536;
+            d.forward.candidates = scratch.ptr + 2048;
+            d.forward.projection = scratch.ptr + 16384;
+            Mock.invalid = d.forward.invalid;
+            Mock.candidates = d.forward.candidates;
+            Mock.projection = d.forward.projection;
+            Mock.histogram = &d.width_histogram;
+            Mock.baseline = 0;
+            Mock.premature = false;
+            Mock.launches = 0;
+            Mock.reads = 0;
+            Mock.failure = failure;
+            d.lanes[0].end = 10;
+            d.lanes[3].end = 20;
+            const requests = [_]BatchRequest{
+                .{ .slot = 0, .end = 10, .pending = 0, .depth = 1, .sampling = null },
+                .{ .slot = 3, .end = 20, .pending = 0, .depth = 1, .sampling = null },
+                .{ .slot = 5, .end = 0, .pending = 0, .depth = 0, .sampling = null },
+            };
+            var results: [3]BatchResult = @splat(.{ .count = 99 });
+            switch (failure) {
+                .none => {
+                    try d.proposeBatch(&requests, &results);
+                    try std.testing.expectEqual(@as(usize, 1), results[0].count);
+                    try std.testing.expectEqual(@as(usize, 1), results[1].count);
+                    try std.testing.expectEqual(@as(usize, 0), results[2].count);
+                },
+                .selection => try std.testing.expectError(error.BadCandidates, d.proposeBatch(&requests, &results)),
+                .invalid => try std.testing.expectError(error.BadDraftIndex, d.proposeBatch(&requests, &results)),
+                else => try std.testing.expectError(error.NotReady, d.proposeBatch(&requests, &results)),
+            }
+            const completed = failure == .none or failure == .selection;
+            try std.testing.expectEqual(@as(u64, if (completed) 1 else 0), d.width_histogram.total);
+            try std.testing.expectEqual(@as(u64, if (completed) 1 else 0), d.width_histogram.bins[1]);
+            try std.testing.expectEqual(@as(usize, if (completed) 2 else 0), d.max_packed_width);
+            try std.testing.expect(!Mock.premature);
+            if (failure != .none) for (results) |r| try std.testing.expectEqual(@as(usize, 99), r.count);
+            const launches = Mock.launches;
+            const reads = Mock.reads;
+            Mock.baseline = d.width_histogram.total;
+            try d.proposeBatch(&.{requests[2]}, results[0..1]);
+            try std.testing.expectEqual(Mock.baseline, d.width_histogram.total);
+            try std.testing.expectEqual(launches, Mock.launches);
+            try std.testing.expectEqual(reads, Mock.reads);
+        }
     }
 }
 
@@ -460,4 +671,9 @@ test "snapshots restore every KV ring head and wrapped tail into a different slo
     try std.testing.expectError(error.NotReady, d.restore(5, snapshot.ptr, 5000));
     try std.testing.expectEqual(@as(usize, 4000), d.lanes[5].end);
     try std.testing.expect(!d.snapshotReady(5, 4000));
+    d.width_histogram.record(4);
+    try d.reset(5);
+    try std.testing.expect(d.snapshotReady(5, 0));
+    try std.testing.expectEqual(@as(u64, 1), d.width_histogram.total);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 0, 0, 1, 0, 0, 0, 0 }, &d.width_histogram.bins);
 }

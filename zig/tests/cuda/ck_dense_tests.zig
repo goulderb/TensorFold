@@ -61,9 +61,122 @@ pub fn run(gpu: check.Gpu) !void {
     var pack = try cuda.modelopt.Packer.load(gpu.d);
     defer pack.unload();
     try packing(gpu, stream, &ck, &pack);
+    for ([_]Mode{ .fp8, .nvfp4 }) |mode| try edges(gpu, stream, &ck, &pack, mode);
     for ([_][2]usize{ .{ 160, 4096 }, .{ 12576, 4096 }, .{ 4096, 128 }, .{ 4096, 6144 } }) |shape| {
         for ([_]Mode{ .fp8, .nvfp4 }) |mode| try dense(gpu, stream, &ck, &pack, mode, shape[0], shape[1]);
     }
+}
+
+fn edges(gpu: check.Gpu, s: cuda.Stream, ck: *const cuda.ck.Ck, pack: *const cuda.modelopt.Packer, mode: Mode) !void {
+    const n = 160;
+    const k = 128;
+    const stride = k + 8;
+    const npad = 256;
+    const row_bits = [_]u16{ 0x0000, 0x0080, 0x0040, 0x7f00, 0x3f80, 0x7fc1, 0xbf80, 0x7f80, 0x4000, 0xff80, 0x3f00, 0xff00, 0x4040, 0x3e80, 0xc000, 0x8000, 0x8040 };
+    const rows = row_bits.len;
+    var weights: [n * k]u16 = @splat(0);
+    for (0..n) |col| weights[col * k + (col * 17) % k] = tobf(if (col % 2 == 0) 1.5 else -1.5);
+    var source = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(&weights));
+    defer source.free();
+    var raw = try cuda.DeviceBuffer.alloc(gpu.d, npad * k);
+    defer raw.free();
+    var raw_scales = try cuda.DeviceBuffer.alloc(gpu.d, npad * k / 16);
+    defer raw_scales.free();
+    var codes = try cuda.DeviceBuffer.alloc(gpu.d, npad * k);
+    defer codes.free();
+    var scales = try cuda.DeviceBuffer.alloc(gpu.d, npad * k / 16);
+    defer scales.free();
+    try raw.fill8(0, s.handle);
+    try raw_scales.fill8(0, s.handle);
+    const weight: cuda.qlinear.Weight = if (mode == .fp8) blk: {
+        try ck.quantizeWeight8(s, source.ptr, n, k, 1, raw.ptr);
+        try pack.fp8Lane(s, raw.ptr, codes.ptr, n, k);
+        break :blk .{ .ck8 = .{ .codes = codes.ptr, .scale = 1, .n = n, .k = k, .npad = npad } };
+    } else blk: {
+        try ck.quantizeWeight4(s, source.ptr, n, k, 1, raw.ptr, raw_scales.ptr);
+        try ck.pack(s, raw.ptr, raw_scales.ptr, 1, npad, k, 0, k, codes.ptr, scales.ptr);
+        break :blk .{ .ck4 = .{ .words = codes.ptr, .scales = scales.ptr, .scale = 1, .n = n, .k = k, .npad = npad } };
+    };
+    var inputs: [rows * stride]u16 = @splat(0x7fc1);
+    var packed_rows: [rows * k]u16 = undefined;
+    for (row_bits, 0..) |bits, row| {
+        @memset(inputs[row * stride ..][0..k], if (std.math.isFinite(bf(bits))) bits else 0x3f80);
+        inputs[row * stride + k - 1] = bits;
+        if (bf(bits) == 0) for (0..k) |col| {
+            inputs[row * stride + col] = if (col % 2 == 0) 0x0000 else 0x8000;
+        };
+        @memcpy(packed_rows[row * k ..][0..k], inputs[row * stride ..][0..k]);
+    }
+    var x = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(&inputs));
+    defer x.free();
+    var xp = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(&packed_rows));
+    defer xp.free();
+    var workspace = try cuda.DeviceBuffer.alloc(gpu.d, try weight.nativeWorkspaceBytes(rows));
+    defer workspace.free();
+    const work: cuda.ck.Workspace = .{ .ptr = workspace.ptr, .bytes = workspace.len };
+    var output = try cuda.DeviceBuffer.alloc(gpu.d, rows * n * 4);
+    defer output.free();
+    const linear: cuda.qlinear.Linear = .{ .ck = ck };
+    try linear.promptF32(s, weight, .{ .x = x.ptr, .ldx = stride, .native = work }, output.ptr, rows);
+    try s.synchronize();
+    var full: [rows * n]f32 = undefined;
+    try output.download(0, std.mem.sliceAsBytes(&full));
+    var row_scales: [rows]f32 = undefined;
+    const layout = try cuda.ck.workspaceLayout(mode, rows, n, k);
+    try workspace.download(layout.scales, std.mem.sliceAsBytes(&row_scales));
+    for (row_bits, 0..) |bits, row| {
+        if (!std.math.isFinite(bf(bits))) {
+            try check.expect(std.math.isNan(row_scales[row]), "{t} nonfinite edge row {d} has NaN scale", .{ mode, row });
+        } else if (bf(bits) == 0) {
+            try check.expect(row_scales[row] == 1, "{t} signed zero edge row uses literal scale 1", .{mode});
+        } else if ((bits & 0x7fff) <= 0x0080) {
+            try check.expect(@as(u32, @bitCast(row_scales[row])) == 0x00800000, "{t} tiny normal/subnormal row uses literal FLT_MIN scale", .{mode});
+        }
+    }
+    var narrow: [rows * n]u16 = undefined;
+    try linear.prompt(s, weight, .{ .x = x.ptr, .ldx = stride, .native = work }, output.ptr, rows);
+    try s.synchronize();
+    try output.download(0, std.mem.sliceAsBytes(&narrow));
+    for (row_bits, 0..) |bits, row| for (0..n) |col| {
+        const v = full[row * n + col];
+        const b = narrow[row * n + col];
+        if (!std.math.isFinite(bf(bits))) {
+            try check.expect(std.math.isNan(v) and std.math.isNan(bf(b)), "{t} exceptional row {d} col {d} is NaN in F32 and BF16", .{ mode, row, col });
+        } else if (bf(bits) == 0) {
+            try check.expect(v == 0 and bf(b) == 0, "{t} signed zero row has exact zero F32/BF16 output", .{mode});
+        } else {
+            const want = @as(f64, bf(bits)) * @as(f64, if (col % 2 == 0) 1.5 else -1.5);
+            const tolerance = @abs(want) / 16;
+            try check.expect(std.math.isFinite(v) and std.math.isFinite(bf(b)) and @abs(@as(f64, v) - want) <= tolerance and @abs(@as(f64, bf(b)) - want) <= tolerance, "{t} finite edge row {d} col {d}: F32 {e}, BF16 {e}, independent ideal {e}", .{ mode, row, col, v, bf(b), want });
+            try check.expect(b == tobf(v), "{t} finite edge BF16 rounds its F32 output once", .{mode});
+        }
+    };
+    var got: [rows * n]f32 = undefined;
+    var got_bf: [rows * n]u16 = undefined;
+    try linear.decodeF32(s, weight, .{ .x = xp.ptr, .ldx = k, .native = work }, output.ptr, rows);
+    try s.synchronize();
+    try output.download(0, std.mem.sliceAsBytes(&got));
+    try linear.decode(s, weight, .{ .x = xp.ptr, .ldx = k, .native = work }, output.ptr, rows);
+    try s.synchronize();
+    try output.download(0, std.mem.sliceAsBytes(&got_bf));
+    for (row_bits, 0..) |bits, row| {
+        const start = row * n;
+        if (!std.math.isFinite(bf(bits))) {
+            for (got[start..][0..n], got_bf[start..][0..n]) |v, b| try check.expect(std.math.isNan(v) and std.math.isNan(bf(b)), "{t} packed exceptional row stays NaN in both epilogues", .{mode});
+            continue;
+        }
+        try check.sameBytes("finite edge packed/strided F32 isolation", std.mem.sliceAsBytes(got[start..][0..n]), std.mem.sliceAsBytes(full[start..][0..n]));
+        try check.sameBytes("finite edge packed/strided BF16 isolation", std.mem.sliceAsBytes(got_bf[start..][0..n]), std.mem.sliceAsBytes(narrow[start..][0..n]));
+        try linear.decodeF32(s, weight, .{ .x = x.ptr + row * stride * 2, .ldx = stride, .native = work }, output.ptr, 1);
+        try s.synchronize();
+        try output.download(0, std.mem.sliceAsBytes(got[0..n]));
+        try check.sameBytes("finite edge F32 row alone survives exceptional neighbors", std.mem.sliceAsBytes(got[0..n]), std.mem.sliceAsBytes(full[start..][0..n]));
+        try linear.decode(s, weight, .{ .x = x.ptr + row * stride * 2, .ldx = stride, .native = work }, output.ptr, 1);
+        try s.synchronize();
+        try output.download(0, std.mem.sliceAsBytes(got_bf[0..n]));
+        try check.sameBytes("finite edge BF16 row alone survives exceptional neighbors", std.mem.sliceAsBytes(got_bf[0..n]), std.mem.sliceAsBytes(narrow[start..][0..n]));
+    }
+    check.pass("native {t} edge rows: signed zero, scale floor, finite extremes, NaN/Inf, F32/BF16 and neighbor isolation", .{mode});
 }
 
 fn packing(gpu: check.Gpu, s: cuda.Stream, ck: *const cuda.ck.Ck, pack: *const cuda.modelopt.Packer) !void {
