@@ -18,6 +18,7 @@ const quant = @import("cuda_quant.zig");
 const q4 = @import("cuda_q4.zig");
 const state = @import("cuda_state.zig");
 const shared = @import("cuda_shared.zig");
+const vision_binding = @import("cuda_vision_binding.zig");
 
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
@@ -475,12 +476,12 @@ pub const Forward = struct {
         }
         const c = &f.ranks[0].w.config;
         for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
-        if (f.vision) |binding| for (f.ranks) |r| try @import("cuda_vision_binding.zig").inject(binding, .{
+        if (f.vision) |binding| for (f.ranks) |r| try vision_binding.inject(binding, .{
             .stream = f.stream,
             .context = binding.owner.context,
             .embedding = .{ .d = f.d, .ptr = r.b.x, .len = r.b.rows * 4 * c.hidden * 2, .borrowed = true },
             .start = r.st.pos,
-            .capacity = r.st.capacity,
+            .capacity = vision_binding.logicalCapacity(r.st.capacity),
             .window = r.b.rows,
             .vocab = c.vocab,
             .world = @intCast(r.w.share.world),

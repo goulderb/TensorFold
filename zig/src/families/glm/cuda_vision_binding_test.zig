@@ -146,6 +146,19 @@ test "vision window requires original language IDs and bounded context, row coun
     try t.expectError(error.VisionRankMismatch, binding.plan(b, dst, &.{1}));
 }
 
+test "padded native sequence capacity admits a short image prompt inside logical context" {
+    var driver: cuda.Driver = undefined;
+    var owner = table(&driver);
+    const b = try owner.binding();
+    var dst = target(&driver, 0);
+    dst.capacity = binding.logicalCapacity(262208);
+    try t.expectEqual(@as(usize, 262144), dst.capacity);
+    const plan = try binding.plan(b, dst, &.{ 1, @intCast(image_token), @intCast(image_token), 2 });
+    try t.expectEqual(@as(usize, 2), plan.count);
+    dst.capacity = 262208;
+    try t.expectError(error.BadCapacity, binding.plan(b, dst, &.{ 1, @intCast(image_token), @intCast(image_token), 2 }));
+}
+
 // ABI mocks exercise the REAL native copy/launch path; no driver/library/context/module is opened or loaded.
 const Native = struct {
     const Copy = struct { dst: u64, src: u64, bytes: usize };

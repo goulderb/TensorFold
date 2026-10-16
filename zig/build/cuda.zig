@@ -259,6 +259,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     // the GLM-5.3-Flash CUDA family's host side
     const glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm })).step);
+    const binding_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"padded native sequence capacity"} }));
+    b.step("test-glm-vision-binding", "Padded native sequence versus logical vision context (CPU only)").dependOn(&binding_run.step);
+    const codec_headers = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/vision_headers/image_codec_headers.zig"), .target = host, .optimize = .debug });
+    const codec_cases = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda_vision_codec_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    codec_cases.addImport("cuda", cuda);
+    codec_cases.addImport("image_codec_headers", codec_headers);
+    const codec_run = b.addRunArtifact(b.addTest(.{ .root_module = codec_cases, .filters = &.{"actual"} }));
+    b.step("test-glm-vision-codec", "PNG, JPEG and WebP native shim against Pillow pixel goldens (CPU only)").dependOn(&codec_run.step);
     // the shares a GLM-5.3-Flash rank takes (cluster/canon.zig against the Python family's)
     const shares = b.createModule(.{ .root_source_file = b.path("zig/src/cluster/canon_glm_test.zig"), .target = host, .optimize = .debug });
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = shares })).step);

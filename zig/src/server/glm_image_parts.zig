@@ -79,6 +79,7 @@ pub fn prepare(cx: *Cx, original: Value, probe: Probe) errors.Refused!Prepared {
     var rows: std.ArrayList(u32) = .empty;
     var total_rows: usize = 0;
     var total_images: usize = 0;
+    var total_encoded_bytes: usize = 0;
     for (original.array) |message| {
         const content = message.get("content") orelse continue;
         if (content != .array) continue;
@@ -104,6 +105,8 @@ pub fn prepare(cx: *Cx, original: Value, probe: Probe) errors.Refused!Prepared {
             if (encoded.items.len >= 50) return cx.refuse("too many images in one request");
             const url = imageUrl(part) orelse return cx.refuse("an image_url part needs a URL");
             const bytes = inlineBytes(cx.a, url, 10 * 1024 * 1024) catch |err| return cx.fail(.request, "invalid image data URL ({s})", .{@errorName(err)});
+            total_encoded_bytes = std.math.add(usize, total_encoded_bytes, bytes.len) catch return cx.refuse("image request exceeds the total byte limit");
+            if (total_encoded_bytes > 64 * 1024 * 1024) return cx.refuse("image request exceeds the total byte limit");
             const count = probe.rows(probe.ctx, bytes, total_images) catch |err| return cx.fail(.request, "cannot decode image ({s})", .{@errorName(err)});
             if (count == 0 or count > 8000) return cx.refuse("image produced an invalid number of feature rows");
             total_rows = std.math.add(usize, total_rows, count) catch return cx.refuse("too many image rows");
@@ -160,4 +163,27 @@ test "tool screenshots use the same ordered markers" {
     var context: u8 = 0;
     const result = try prepare(&cx, messages, .{ .ctx = &context, .rows = mock.rows });
     try std.testing.expectEqualStrings("<|begin_of_image|><|image|><|end_of_image|>", result.messages.array[0].strField("content").?);
+}
+
+test "multiple pictures retain message order and the shared per-picture budget" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const parsed = try json.parse(cx.a,
+        \\[{"role":"user","content":[{"type":"text","text":"First "},{"type":"image_url","image_url":{"url":"data:image/png;base64,YQ=="}}]},{"role":"tool","tool_call_id":"t1","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,Yg=="}}]}]
+    );
+    const messages = switch (parsed) { .ok => |v| v, .err => return error.TestUnexpectedResult };
+    const mock = struct {
+        fn rows(_: *anyopaque, _: []const u8, images: usize) !u32 {
+            try std.testing.expectEqual(@as(usize, 2), images);
+            return 1;
+        }
+    };
+    var context: u8 = 0;
+    const result = try prepare(&cx, messages, .{ .ctx = &context, .rows = mock.rows });
+    try std.testing.expectEqual(@as(usize, 2), result.encoded.len);
+    try std.testing.expectEqualStrings("a", result.encoded[0]);
+    try std.testing.expectEqualStrings("b", result.encoded[1]);
+    try std.testing.expectEqualStrings("First <|begin_of_image|><|image|><|end_of_image|>", result.messages.array[0].strField("content").?);
+    try std.testing.expectEqualStrings("<|begin_of_image|><|image|><|end_of_image|>", result.messages.array[1].strField("content").?);
 }

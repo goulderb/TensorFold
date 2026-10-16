@@ -5,6 +5,12 @@ const cuda = @import("cuda");
 const max_context: usize = 256 * 1024;
 const max_rows: usize = @import("cuda_state.zig").prefill_rows;
 
+/// The sequence allocation includes an internal decode-window pad beyond the
+/// model's logical context; image positions must remain inside the latter.
+pub fn logicalCapacity(allocated: usize) usize {
+    return @min(allocated, max_context);
+}
+
 fn product(xs: []const usize) !usize {
     var n: usize = 1;
     for (xs) |x| n = try std.math.mul(usize, n, x);

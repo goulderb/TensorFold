@@ -12,6 +12,7 @@ const config = @import("config.zig");
 const shard = @import("cuda_shard.zig");
 const vision_probe = @import("cuda_vision_probe.zig");
 const vision_runtime = @import("cuda_vision_runtime.zig");
+const vision_startup = @import("cuda_vision_startup.zig");
 
 pub const model_type = "glm5_next";
 pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "exl3" };
@@ -94,6 +95,11 @@ const Owned = struct {
     vision: ?*vision_runtime.Service = null,
 };
 
+fn visionReady(ptr: *anyopaque, valid: bool) !bool {
+    const e: *engine.Engine = @ptrCast(@alignCast(ptr));
+    return e.pairedReady(valid);
+}
+
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     _ = kernels; // our own kernels: a captured set is not used
     const p = try place();
@@ -135,10 +141,23 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         try ranks.gather([32]u8, ctx.d, &own.lib, own.comm, own.e.stream, p.rank, mine, hashes);
         for (hashes) |hash| if (!std.mem.eql(u8, &mine, &hash)) return error.SpillIdentityMismatch;
     }
-    if (p.rank == 0 and set.vision) {
-        const path = std.c.getenv("TF_GLM_VISION_CODEC") orelse return error.MissingVisionCodecPath;
-        own.probe = try vision_probe.Probe.open(gpa, io, dir, std.mem.span(path));
-        own.vision = try vision_runtime.Service.open(gpa, io, ctx.d, ctx.handle, own.e.stream, dir, own.probe.?);
+    if (set.vision) {
+        var vision_problem: ?anyerror = null;
+        if (p.rank == 0) {
+            if (std.c.getenv("TF_GLM_VISION_CODEC")) |path| {
+                own.probe = vision_probe.Probe.open(gpa, io, dir, std.mem.span(path)) catch |err| blk: {
+                    vision_problem = err;
+                    break :blk null;
+                };
+                if (own.probe) |probe| {
+                    own.vision = vision_runtime.Service.open(gpa, io, ctx.d, ctx.handle, own.e.stream, dir, probe) catch |err| blk: {
+                        vision_problem = err;
+                        break :blk null;
+                    };
+                }
+            } else vision_problem = error.MissingVisionCodecPath;
+        }
+        try vision_startup.paired(vision_problem, .{ .ctx = own.e, .ready = visionReady });
     }
     // Rank 0 admits by the smallest room of the ranks; its sizes are the largest (the first ranks take the remainder).
     const rooms = try gpa.alloc(u64, p.world);
