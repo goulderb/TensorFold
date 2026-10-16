@@ -15,16 +15,28 @@ fn owned(L: *W.Loader, name: []const u8, suffix: []const u8, bytes: usize) !u64 
     return buffer.ptr;
 }
 
+fn fp8Projection(L: *W.Loader, name: []const u8, n: usize, k: usize, source: u64) !b16.Proj {
+    if (n == 0 or k == 0 or k % 128 != 0) return error.InvalidFp8Shape;
+    const qk = L.tools.quant orelse return error.NoQuantizer;
+    const npad = cuda.fp8.padded(n);
+    const codes = try owned(L, name, "codes", npad * k);
+    const scales = try owned(L, name, "scales", npad * (k / 64) * 4);
+    try quant.fp8Rows(qk, L.stream, source, n, k, codes, scales);
+    try L.stream.synchronize();
+    return .{ .q = .{ .fp8g = cuda.fp8.weight(codes, scales, n, k) } };
+}
+
 pub fn finish(L: *W.Loader, comptime fmt: []const u8, args: anytype, n: usize, k: usize) !b16.Proj {
     if (L.tools.precision.dense == .bf16) return .{ .b16 = try L.put(fmt, args) };
-    if (n == 0 or k == 0 or k % 64 != 0 or L.host.items.len != n * k * 2) return error.InvalidDenseShape;
+    if (n == 0 or k == 0 or k % 64 != 0 or (L.tools.precision.dense == .fp8 and k % 128 != 0) or L.host.items.len != n * k * 2) return error.InvalidDenseShape;
     const qk = L.tools.quant orelse return error.NoQuantizer;
-    const pack = L.tools.affine4 orelse return error.NoQuantizer;
     const name = try std.fmt.allocPrint(L.gpa, fmt, args);
     defer L.gpa.free(name);
     var source = try cuda.DeviceBuffer.fromHost(L.d, L.host.items);
     defer source.free();
     L.host.clearRetainingCapacity();
+    if (L.tools.precision.dense == .fp8) return fp8Projection(L, name, n, k, source.ptr);
+    const pack = L.tools.affine4 orelse return error.NoQuantizer;
     var raw: [3]cuda.DeviceBuffer = undefined;
     var made: usize = 0;
     defer for (raw[0..made]) |*buffer| buffer.free();
@@ -55,12 +67,7 @@ pub fn head(L: *W.Loader) !void {
     };
     const n = L.w.share.vocab.len();
     const k = L.w.config.hidden;
-    const npad = cuda.fp8.padded(n);
-    const codes = try owned(L, "head", "codes", npad * k);
-    const scales = try owned(L, "head", "scales", npad * (k / 64) * 4);
-    try quant.fp8Rows(L.tools.quant orelse return error.NoQuantizer, L.stream, source, n, k, codes, scales);
-    try L.stream.synchronize();
-    L.w.head = .{ .q = .{ .fp8g = cuda.fp8.weight(codes, scales, n, k) } };
+    L.w.head = try fp8Projection(L, "head", n, k, source);
     for (L.w.buffers.items, 0..) |buffer, i| if (buffer.ptr == source) {
         var old = L.w.buffers.swapRemove(i);
         old.free();
@@ -99,4 +106,10 @@ test "Q4 rejects an unsupported shape before uploading" {
     var loader: W.Loader = undefined;
     loader.tools = .{ .pack_dense = undefined, .precision = .{ .dense = .q4 } };
     try std.testing.expectError(error.InvalidDenseShape, finish(&loader, "invalid", .{}, 4, 63));
+}
+
+test "FP8 dense rejects an unsupported input tile before driver access" {
+    var loader: W.Loader = undefined;
+    loader.tools = .{ .pack_dense = undefined, .precision = .{ .dense = .fp8 } };
+    try @import("std").testing.expectError(error.InvalidDenseShape, finish(&loader, "invalid", .{}, 4, 64));
 }

@@ -48,6 +48,12 @@ fn arena(d: *const cuda.Driver, sizes: []const usize, out: []u64) !Arena {
 }
 
 /// A rank's B16 matmul shapes ([n, k]) whose split-K partials the buffers hold.
+fn fp8PartBytes(rows: usize, n: usize, k: usize) usize {
+    const m = @min(rows, cuda.qmmf.fused_rows - 1);
+    const plan = cuda.qmmf.plan(m, n, k, false);
+    return if (plan.reduce) @as(usize, plan.sk) * m * n * 4 else 0;
+}
+
 fn b16Shapes(w: *const weights.Weights) [13][2]usize {
     const c = &w.config;
     const s = &w.share;
@@ -138,6 +144,9 @@ pub const Buffers = struct {
         for (b16Shapes(w)) |sh_| mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), sh_[0], sh_[1]));
         if (w.precision.dense == .q4) for (b16Shapes(w)) |shape| {
             mm = @max(mm, rows * (shape[1] / 64) * 4);
+        };
+        if (w.precision.dense == .fp8) for (b16Shapes(w)) |shape| {
+            mm = @max(mm, fp8PartBytes(rows, shape[0], shape[1]));
         };
         const hist_len = if (pairs > cuda.grouped.small) (pairs + cuda.grouped.small - 1) / cuda.grouped.small * (count + 1) else 1;
         const sizes = [_]usize{
@@ -370,3 +379,9 @@ pub const State = struct {
         return st.rec + (@as(usize, copy) * st.kda_layers + li) * st.rec_layer;
     }
 };
+
+test "FP8 projection scratch covers decode and unfused prompt tails without clusters" {
+    try std.testing.expectEqual(@as(usize, 4096), fp8PartBytes(1, 128, 4096));
+    try std.testing.expectEqual(@as(usize, 2097152), fp8PartBytes(32, 4096, 4096));
+    try std.testing.expectEqual(@as(usize, 1044480), fp8PartBytes(2048, 128, 4096));
+}

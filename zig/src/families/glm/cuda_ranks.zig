@@ -40,7 +40,7 @@ pub const Settings = struct {
             };
         }
         s.weight_dense = precision.parseDense(get("TF_GLM_DENSE")) catch {
-            problem.* = "TF_GLM_DENSE: bf16 or q4";
+            problem.* = "TF_GLM_DENSE: bf16, q4 or fp8";
             return error.BadSetting;
         };
         s.weight_head = precision.parseHead(get("TF_GLM_HEAD")) catch {
@@ -371,7 +371,7 @@ test "weight precision and spill enablement must agree before rank startup" {
             return null;
         }
         fn badDense(name: [:0]const u8) ?[]const u8 {
-            return if (std.mem.eql(u8, name, "TF_GLM_DENSE")) "fp8" else null;
+            return if (std.mem.eql(u8, name, "TF_GLM_DENSE")) "int8" else null;
         }
         fn badHead(name: [:0]const u8) ?[]const u8 {
             return if (std.mem.eql(u8, name, "TF_GLM_HEAD")) "q4" else null;
@@ -383,7 +383,7 @@ test "weight precision and spill enablement must agree before rank startup" {
     try std.testing.expectEqual(precision.Dense.q4, settings.weight_dense);
     try std.testing.expectEqual(precision.Head.fp8, settings.weight_head);
     try std.testing.expectError(error.BadSetting, Settings.read(Values.badDense, &problem));
-    try std.testing.expectEqualStrings("TF_GLM_DENSE: bf16 or q4", problem);
+    try std.testing.expectEqualStrings("TF_GLM_DENSE: bf16, q4 or fp8", problem);
     try std.testing.expectError(error.BadSetting, Settings.read(Values.badHead, &problem));
     try std.testing.expectEqualStrings("TF_GLM_HEAD: bf16 or fp8", problem);
     const hash: [32]u8 = @splat(0);

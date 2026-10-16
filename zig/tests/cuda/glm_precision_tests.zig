@@ -12,7 +12,7 @@ fn products(r: *Rig, set: glm.glue.Set, weight: cuda.qlinear.Weight, values: []c
     const n = weight.outputs();
     const k = weight.inputs();
     const stride = k + 8;
-    const rows = [_]usize{ 1, 3, 17, 40, 128 };
+    const rows = [_]usize{ 1, 3, 17, 40, 128, 256 };
     const maximum = rows[rows.len - 1];
     const x = try r.bfs(maximum * stride, 0.125);
     for (0..maximum) |row| @memset(x[row * stride + k ..][0..8], bf16(100));
@@ -91,9 +91,7 @@ fn dense(r: *Rig, modules: *const glm.forward.Modules, set: glm.glue.Set, n: usi
     check.pass("Q4 MSE conversion, upstream packing and projection [{d},{d}]", .{ n, k });
 }
 
-fn head(r: *Rig, modules: *const glm.forward.Modules, set: glm.glue.Set) !void {
-    const n = 130;
-    const k = 256;
+fn fp8Projection(r: *Rig, modules: *const glm.forward.Modules, set: glm.glue.Set, dense_projection: bool, n: usize, k: usize) !void {
     const weights = try r.a.alloc(u16, n * k);
     const codes = try r.a.alloc(u8, n * k);
     const scales = try r.a.alloc(f32, n * k / 128);
@@ -116,11 +114,16 @@ fn head(r: *Rig, modules: *const glm.forward.Modules, set: glm.glue.Set) !void {
     model.share.vocab = .{ .lo = 0, .hi = n };
     var tools = modules.tools();
     tools.precision.head = .fp8;
+    tools.precision.dense = if (dense_projection) .fp8 else .bf16;
     var loader: glm.weights.Loader = .{ .gpa = r.gpu.gpa, .d = r.gpu.d, .stream = r.s, .pack_dense = modules.pack_dense, .tools = tools, .w = &model, .ck = undefined };
     defer loader.host.deinit(r.gpu.gpa);
     try loader.host.appendSlice(r.gpu.gpa, std.mem.sliceAsBytes(weights));
-    model.head = .{ .b16 = try loader.put("head", .{}) };
-    try glm.weights.projections.head(&loader);
+    if (dense_projection) {
+        model.head = try glm.weights.projections.finish(&loader, "dense", .{}, n, k);
+    } else {
+        model.head = .{ .b16 = try loader.put("head", .{}) };
+        try glm.weights.projections.head(&loader);
+    }
     const dcodes = model.head.q.fp8g.codes;
     const dscales = model.head.q.fp8g.scales;
     var physical: usize = 0;
@@ -153,7 +156,8 @@ pub fn run(gpu: check.Gpu) !void {
     const set: glm.glue.Set = .{ .glue = &modules.glue, .linear = linear };
     try dense(&r, &modules, set, 130, 128);
     try dense(&r, &modules, set, 128, 1024);
-    try head(&r, &modules, set);
+    try fp8Projection(&r, &modules, set, false, 130, 256);
+    try fp8Projection(&r, &modules, set, true, 130, 4096);
     check.pass("glm-precision: packed bytes and float64 products pass, worst {d:.3} of declared tolerance", .{r.worst});
 }
 

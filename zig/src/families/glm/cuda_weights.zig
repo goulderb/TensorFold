@@ -191,7 +191,7 @@ pub const Loader = struct {
         if (ex) {
             q_a = try x3.whole(L, "layers.{d}.self_attn.q_a_proj", i);
             kv_a = try x3.whole(L, "layers.{d}.self_attn.kv_a_proj_with_mqa", i);
-        } else if (L.tools.precision.dense == .q4) {
+        } else if (L.tools.precision.dense != .bf16) {
             try L.whole(try L.get("layers.{d}.self_attn.q_a_proj.weight", .{i}), .bf16);
             q_a = (try projections.finish(L, "layers.{d}.dsa.qa", .{i}, c.q_lora, c.hidden)).q;
             try L.whole(try L.get("layers.{d}.self_attn.kv_a_proj_with_mqa.weight", .{i}), .bf16);

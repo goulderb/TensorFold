@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Dense = enum { bf16, q4 };
+pub const Dense = enum { bf16, q4, fp8 };
 pub const Head = enum { bf16, fp8 };
 pub const Settings = struct {
     dense: Dense = .bf16,
@@ -24,6 +24,7 @@ test "precision is explicit and defaults to checkpoint BF16" {
     try std.testing.expectEqual(Head.bf16, try parseHead(""));
     try std.testing.expectEqual(Dense.q4, try parseDense("q4"));
     try std.testing.expectEqual(Head.fp8, try parseHead("fp8"));
-    try std.testing.expectError(error.InvalidDensePrecision, parseDense("fp8"));
+    try std.testing.expectEqual(Dense.fp8, try parseDense("fp8"));
+    try std.testing.expectError(error.InvalidDensePrecision, parseDense("int8"));
     try std.testing.expectError(error.InvalidHeadPrecision, parseHead("q4"));
 }
