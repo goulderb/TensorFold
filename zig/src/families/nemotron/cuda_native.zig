@@ -101,8 +101,8 @@ pub const Loaded = struct {
     vision: ?*vision.Vision = null, // --vision: the tower the server's image requests reach
     taps: []const u32 = &.{}, // the rows a recorder may ask `backend` for (empty: none)
     living: bool = false, // Living Weights loaded from the model folder: decoding is not the checkpoint's alone
-    /// Two-GPU TP: the peer's room (free memory less the 1536 MiB floor) after its load; the host admits streams and
-    /// kept states by the smaller of the two, since every one takes the same bytes on both.
+    /// Two-GPU TP: the smaller rank's room (free memory less the 1536 MiB floor and its unmapped KV pool) after the
+    /// load; the host admits streams and kept states by it, since every one takes the same bytes on both.
     peer_room: ?struct { rank: usize, bytes: u64 } = null,
     /// A shared KV pool's admission: the lane host holds a request its pages cannot hold yet (cuda_lanes fits).
     admit: ?struct { ctx: *anyopaque, fits: *const fn (*anyopaque, u32, u32) bool } = null,
@@ -149,7 +149,12 @@ fn openTp(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
     if (pool_bytes > 0) std.log.info("tp KV pool: {d} MiB a rank ({s}), {d}-token context a request", .{ pool_bytes >> 20, if (kv_fp8) "fp8 e4m3" else "bf16", o.context });
     const floor: usize = 1536 << 20;
     const peer_free = (try p.ctx.memInfo()).free;
-    if (peer_free < floor or (try ctx.memInfo()).free < floor) return error.TpMemoryFloor;
+    const own_free = (try ctx.memInfo()).free;
+    if (peer_free < floor or own_free < floor) return error.TpMemoryFloor;
+    // The pool's pages map on demand, so free memory still counts them now: a rank's room for streams and kept prompt
+    // states is its free memory less the floor and the whole pool, or the cache takes what full sequences map later.
+    const rooms = [2]u64{ own_free -| floor -| pool_bytes, peer_free -| floor -| pool_bytes };
+    const low_rank: usize = if (rooms[1] < rooms[0]) 1 else 0;
     try ctx.makeCurrent();
     try own.lanes.measure(io, dir);
     own.taps = .{@import("cuda_lanes.zig").finalTap(e.c)};
@@ -168,7 +173,7 @@ fn openTp(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
         .vision = null,
         .taps = &own.taps,
         .living = false,
-        .peer_room = .{ .rank = 1, .bytes = peer_free - floor },
+        .peer_room = .{ .rank = low_rank, .bytes = rooms[low_rank] },
         .admit = if (pool_bytes > 0) .{ .ctx = &own.lanes, .fits = Lanes.fits } else null,
     };
 }
