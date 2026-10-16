@@ -99,7 +99,8 @@ pub fn prepare(cx: *Cx, original: Value, probe: Probe) errors.Refused!Prepared {
                 continue;
             }
             if (!part.typeIs("image_url")) return cx.refuse("this server accepts text and still image parts only");
-            if (!std.mem.eql(u8, message.strField("role") orelse "", "user")) return cx.refuse("only user messages can contain image parts");
+            const role = message.strField("role") orelse "";
+            if (!std.mem.eql(u8, role, "user") and !std.mem.eql(u8, role, "tool")) return cx.refuse("only user and tool messages can contain image parts");
             if (encoded.items.len >= 50) return cx.refuse("too many images in one request");
             const url = imageUrl(part) orelse return cx.refuse("an image_url part needs a URL");
             const bytes = inlineBytes(cx.a, url, 10 * 1024 * 1024) catch |err| return cx.fail(.request, "invalid image data URL ({s})", .{@errorName(err)});
@@ -143,4 +144,20 @@ test "a still image keeps its ordered text, expands exact marker rows and preser
     try std.testing.expectEqual(@as(usize, 1), result.encoded.len);
     try std.testing.expectEqual(@as(u32, 2), result.rows[0]);
     try std.testing.expectEqualStrings("What? <|begin_of_image|><|image|><|image|><|end_of_image|> Thanks", result.messages.array[0].strField("content").?);
+}
+
+test "tool screenshots use the same ordered markers" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const parsed = try json.parse(cx.a,
+        \\[{"role":"tool","tool_call_id":"t1","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,YWJj"}}]}]
+    );
+    const messages = switch (parsed) { .ok => |v| v, .err => return error.TestUnexpectedResult };
+    const mock = struct {
+        fn rows(_: *anyopaque, _: []const u8, _: usize) !u32 { return 1; }
+    };
+    var context: u8 = 0;
+    const result = try prepare(&cx, messages, .{ .ctx = &context, .rows = mock.rows });
+    try std.testing.expectEqualStrings("<|begin_of_image|><|image|><|end_of_image|>", result.messages.array[0].strField("content").?);
 }

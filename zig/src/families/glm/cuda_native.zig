@@ -252,10 +252,10 @@ fn close(ptr: *anyopaque) void {
     const own: *Owned = @ptrCast(@alignCast(ptr));
     own.lanes.x.end() catch {};
     own.lanes.deinit();
-    if (own.vision) |v| v.close();
-    if (own.probe) |probe| probe.close();
     own.link.deinit();
     own.e.deinit();
+    if (own.vision) |v| v.close();
+    if (own.probe) |probe| probe.close();
     _ = own.lib.api.ncclCommDestroy(own.comm);
     own.lib.close();
     own.gpa.destroy(own);
