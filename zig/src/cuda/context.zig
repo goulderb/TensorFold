@@ -24,6 +24,7 @@ pub const Context = struct {
 
     /// Waits for all work, then drops this retain; resources made in it must be released first.
     pub fn deinit(self: *Context) void {
+        self.makeCurrent() catch return;
         _ = self.d.api.cuCtxSynchronize();
         _ = self.d.api.cuDevicePrimaryCtxRelease_v2(self.device);
         self.* = undefined;

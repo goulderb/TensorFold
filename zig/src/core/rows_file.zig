@@ -48,6 +48,7 @@ pub const Writer = struct {
     payload: u64 = 0,
 
     pub fn open(dir: []const u8, stem: []const u8, ext: []const u8) !Writer {
+        if (comptime builtin.os.tag == .windows) return error.RowsWrite;
         var w: Writer = .{ .fd = -1 };
         const t = try path(&w.tmp, dir, stem, ext, true);
         w.tmp_len = t.len;
@@ -70,6 +71,7 @@ pub const Writer = struct {
 
     /// The metadata pieces and the trailer, then (a state) fsync, then the rename that makes it a file of the store.
     pub fn finish(w: *Writer, t: Trailer, pieces: []const []const u8, sync: bool) !u64 {
+        if (comptime builtin.os.tag == .windows) return error.RowsWrite;
         var trailer = t;
         trailer.payload = w.payload;
         trailer.payload_hash = w.hash.final();
@@ -100,6 +102,7 @@ pub const Writer = struct {
 
     /// A write given up: the `.part` file goes.
     pub fn abort(w: *Writer) void {
+        if (comptime builtin.os.tag == .windows) return;
         if (w.fd >= 0) _ = std.c.close(w.fd);
         w.fd = -1;
         _ = std.c.unlink(w.tmpPath());
@@ -107,6 +110,7 @@ pub const Writer = struct {
 };
 
 fn put(fd: c_int, bytes: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) return error.RowsWrite;
     var done: usize = 0;
     while (done < bytes.len) {
         const n = std.c.write(fd, bytes.ptr + done, @min(bytes.len - done, 1 << 30));
@@ -135,6 +139,7 @@ pub const Opened = struct {
     trailer: Trailer,
 
     pub fn close(o: *Opened) void {
+        if (comptime builtin.os.tag == .windows) return;
         _ = std.c.close(o.fd);
         o.fd = -1;
     }
@@ -142,6 +147,7 @@ pub const Opened = struct {
 
 /// `file` opened past the page cache, its trailer read and checked against its size, kind and (when given) its name.
 pub fn open(file: [:0]const u8, kind: Kind, name: ?Name) !Opened {
+    if (comptime builtin.os.tag == .windows) return error.RowsMissing;
     var fd: c_int = -1;
     if (builtin.os.tag == .linux) fd = std.c.open(file, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true, .DIRECT = true }, @as(std.c.mode_t, 0));
     if (fd < 0) fd = std.c.open(file, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
@@ -166,6 +172,7 @@ pub fn open(file: [:0]const u8, kind: Kind, name: ?Name) !Opened {
 
 /// The payload into `into` (aligned reads from offset 0), checked against its hash; the bytes are its first `payload`.
 pub fn payload(o: *const Opened, into: Stage) ![]u8 {
+    if (comptime builtin.os.tag == .windows) return error.RowsRead;
     const n = o.trailer.payload;
     const span = std.mem.alignForward(u64, n, alignment);
     if (span > into.len) return error.RowsStage;
@@ -196,6 +203,7 @@ pub fn meta(o: *const Opened, a: std.mem.Allocator) ![]u8 {
 
 /// `dest.len` bytes at `at` of `fd`, through an aligned bounce buffer (O_DIRECT allows no other).
 fn readUnaligned(fd: c_int, dest: []u8, at: u64) bool {
+    if (comptime builtin.os.tag == .windows) return false;
     var bounce: [64 * 1024]u8 align(4096) = undefined;
     var done: usize = 0;
     while (done < dest.len) {

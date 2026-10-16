@@ -84,6 +84,8 @@ fn find(io: std.Io, a: Allocator) Loaded {
 
 /// One candidate: null when it does not load or lacks TurboJPEG 3; `.wrong` when its version string is not the pin.
 fn open(io: std.Io, a: Allocator, path: []const u8) ?Loaded {
+    // Zig 0.17's std.DynLib does not build on Windows. JPEG is refused; PNG does not use this library.
+    if (comptime builtin.os.tag == .windows) return null;
     var dl = std.DynLib.open(path) catch return null;
     var f: Fns = undefined;
     const info = @typeInfo(Fns).@"struct";

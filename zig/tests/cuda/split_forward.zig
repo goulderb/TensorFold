@@ -123,7 +123,6 @@ fn split(gpu: check.Gpu, model: []const u8, cfg: nemotron.Config, prompt: []cons
             .sampling = null,
             .segments = 1,
             .range = r,
-            .norm_done = rank == 1,
         });
         made += 1;
         const after = try ctx[rank].memInfo();
@@ -153,7 +152,7 @@ fn split(gpu: check.Gpu, model: []const u8, cfg: nemotron.Config, prompt: []cons
         try r0.forward(null).chunkMixer(&w0, i);
         try r0.forward(null).chunkPost(&w0, i);
     }
-    try r0.forward(null).finalNorm(&w0);
+    try r0.forward(null).seamNorm(&w0);
     try r0.stream.synchronize();
     check.pass("split-forward rank 0: its {d} blocks and the seam norm ran", .{mid});
     // The norm leaves h in the buffer w.x now points at, which alternates between h[0] and h[1].
@@ -169,7 +168,7 @@ fn split(gpu: check.Gpu, model: []const u8, cfg: nemotron.Config, prompt: []cons
     try gpu.d.check(gpu.d.api.cuMemcpyHtoD_v2(r1.b.y, stage.bytes.ptr + h_bytes, h_bytes), "cuMemcpyHtoD");
     try gpu.d.check(gpu.d.api.cuMemcpyHtoD_v2(r1.b.xs, stage.bytes.ptr + 2 * h_bytes, xs_bytes), "cuMemcpyHtoD");
     const start = r0.forward(null).counters();
-    var w1: fwd.Walk = .{ .rows = rows, .pos = 0, .x = r1.b.h[0], .delta = .none, .mj = start.mj, .aj = start.aj };
+    var w1: fwd.Walk = .{ .rows = rows, .pos = 0, .input = .{ .normalized = r1.b.h[0] }, .x = r1.b.h[0], .delta = .none, .mj = start.mj, .aj = start.aj };
     for (mid..cfg.layers) |i| {
         try r1.forward(null).chunkPre(&w1, i);
         try r1.forward(null).chunkMixer(&w1, i);

@@ -449,6 +449,9 @@ pub const Range = struct {
     last: usize = std.math.maxInt(usize), // exclusive
     embed: bool = true,
     head: bool = true,
+    /// The final norm. A layer split's receiving rank runs it (its last block feeds it) while the head stays on the
+    /// sending rank, so this and `head` are separate.
+    norm_f: bool = true,
     /// The receiving rank's first block, whose norm this rank runs at the seam. null: no seam.
     seam_norm: ?usize = null,
 
@@ -516,7 +519,7 @@ pub fn loadRange(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const
         // sender's own range. Only the sender sets `seam_norm`; the receiver loads that block's norm as its own and
         // skips running it.
         var pb: [128]u8 = undefined;
-        w.seam_norm = try L.raw("seam.norm", try ck.expect(try std.fmt.bufPrint(&pb, "backbone.layers.{d}.norm.weight", .{at}), .bf16, &.{c.hidden}));
+        w.seam_norm = try L.raw("seam.norm", try ck.expect(try std.fmt.bufPrint(&pb, "{s}backbone.layers.{d}.norm.weight", .{ pre, at }), .bf16, &.{c.hidden}));
     }
     if (!range.embed) {
         try ck.skip("backbone.embeddings.");
@@ -530,12 +533,17 @@ pub fn loadRange(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const
             .k = emb.dim(1) * 8,
         };
     }
+    // A layer split's receiving rank runs the final norm (its last block feeds it) but not the head, which stays on
+    // the sending rank with the sample. `norm_f` and `head` are therefore separate choices.
     var tail: [96]u8 = undefined;
-    if (!range.head) {
+    if (!range.norm_f) {
         try ck.skip(try std.fmt.bufPrint(&tail, "{s}backbone.norm_f.", .{pre}));
-        try ck.skip(try std.fmt.bufPrint(&tail, "{s}lm_head", .{pre}));
     } else {
         w.norm_f = try L.raw("norm_f", try ck.expect(try std.fmt.bufPrint(&tail, "{s}backbone.norm_f.weight", .{pre}), .bf16, &.{c.hidden}));
+    }
+    if (!range.head) {
+        try ck.skip(try std.fmt.bufPrint(&tail, "{s}lm_head", .{pre}));
+    } else {
         w.head = try L.dense(&ck, "head", &.{try std.fmt.bufPrint(&tail, "{s}lm_head", .{pre})});
     }
     // a ModelOpt checkpoint keeps its MTP head in its own shards

@@ -253,6 +253,8 @@ pub const Store = struct {
     } = null,
 
     pub fn open(io: std.Io, root: [:0]const u8) !Store {
+        // The digest cache is statx and /proc. Windows does not serve GLM spill through it.
+        if (comptime @import("builtin").os.tag == .windows) return error.IdentityCacheUnsafe;
         const rfd = try openRootChain(root);
         defer _ = std.c.close(rfd);
         try requirePrivateDir(rfd);
@@ -267,6 +269,7 @@ pub const Store = struct {
     }
 
     pub fn close(s: *Store) void {
+        if (comptime @import("builtin").os.tag == .windows) return;
         _ = std.c.close(s.fd);
     }
 
@@ -299,6 +302,7 @@ pub const Store = struct {
     }
 
     pub fn digest(s: *Store, path: [:0]const u8, index: [32]u8) !Result {
+        if (comptime @import("builtin").os.tag == .windows) return error.WeightsUnreadable;
         var flags: std.c.O = .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true };
         if (s.hook) |hook| if (hook.open_flags) |observe| observe(hook.ptr, &flags);
         const fd = std.c.open(path, flags, @as(std.c.mode_t, 0));

@@ -248,7 +248,7 @@ template __global__ void tf_prefill_attention::pattn_kernel<128, 8, 8, 8>(const 
     const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, __nv_bfloat16* __restrict__, int, int, int, int, int, float);
 // Head dim 64, eight warps, four query heads a block, eight staging slots (LFM2's 4 heads a KV head, causal or trees).
 template __global__ void tf_prefill_attention::tree_kernel<64, 8, 4, 8>(const __nv_bfloat16* __restrict__,
-    const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, __nv_bfloat16* __restrict__, const int*, int, int, int, int, int, float);
+    const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, __nv_bfloat16* __restrict__, const int* __restrict__, int, int, int, int, int, float);
 // Head dim 72, eight warps of one head, eight staging slots (SigLIP2's tower, 72 dims padded to 80 inside).
 template __global__ void tf_prefill_attention::full_kernel<72, 8, 8>(const __nv_bfloat16* __restrict__, __nv_bfloat16* __restrict__, int, int,
     float);

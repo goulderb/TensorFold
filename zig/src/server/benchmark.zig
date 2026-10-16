@@ -51,7 +51,7 @@ pub fn main(init: std.process.Init, argv: []const []const u8, engines: cli.Engin
         .home = init.environ_map.get("HOME") orelse ".",
         .out = &out.interface,
         .err = &err.interface,
-        .input = .{ .tty = std.Io.File.stdin().isTty(io) catch false, .reader = &in.interface, .fd = std.posix.STDIN_FILENO },
+        .input = .{ .tty = std.Io.File.stdin().isTty(io) catch false, .reader = &in.interface, .fd = if (comptime builtin.os.tag == .windows) null else std.posix.STDIN_FILENO },
         .engines = engines,
         .signals = true,
     };
@@ -153,6 +153,8 @@ fn readLine(ctx: *const Context) error{Unavailable}!?[]const u8 {
 
 /// A hidden-echo read on a terminal, restored before returning and by a second Ctrl-C.
 fn readSecret(ctx: *const Context) error{Unavailable}!?[]const u8 {
+    // termios is void on Windows. The token is read without hiding echo.
+    if (comptime builtin.os.tag == .windows) return readLine(ctx);
     const fd = ctx.input.fd orelse return readLine(ctx);
     const saved = std.posix.tcgetattr(fd) catch return readLine(ctx);
     var quiet = saved;
@@ -350,7 +352,8 @@ fn run(ctx: *const Context, args: Args) !u8 {
             try std.fmt.allocPrint(a, "This run passes no drafter: {s}.", .{uncached});
     }
     const dest = if (args.output) |o| try expand(ctx, o) else blk: {
-        _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, bench_dir, .fromMode(0o700)) catch {};
+        const perm: std.Io.File.Permissions = if (comptime builtin.os.tag == .windows) .default_dir else .fromMode(0o700);
+        _ = std.Io.Dir.cwd().createDirPathStatus(ctx.io, bench_dir, perm) catch {};
         break :blk try std.fmt.allocPrint(a, "{s}/{s}.json", .{ bench_dir, &run_id });
     };
     if (!try receipt.writable(a, ctx.io, dest, &problem)) return fail(ctx, try std.fmt.allocPrint(a, "{s}; choose another --output", .{problem}));

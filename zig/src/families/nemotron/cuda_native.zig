@@ -124,8 +124,8 @@ const Peer = struct {
     stage: [1]cuda.HostBuffer,
 
     fn deinit(p: *Peer) void {
-        p.stage[0].free();
         p.e.deinit();
+        p.stage[0].free();
         p.ctx.deinit();
         p.gpa.destroy(p);
     }
@@ -167,58 +167,73 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         };
         std.process.exit(0);
     };
+    if (o.split and (o.drafts or o.slide or o.segments != 1 or o.vision != null)) return error.SplitUnsupportedOptions;
     const carve = try openCarveout(gpa, ctx);
     errdefer if (carve) |c| closeCarveout(gpa, c);
-    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{ .context = o.context, .mtp = o.drafts, .graphs = true, .sampling = null, .segments = o.segments, .carveout = carve, .slide = o.slide, .vision = o.vision, .precision = o.precision });
+    // A split's range must be known before the load, or rank 0 would read the whole checkpoint. The layer count
+    // comes from the config, read here rather than inside the engine.
+    const layers = if (o.split) (try @import("config.zig").Config.read(gpa, io, dir)).layers else 0;
+    const mid = splitAt(layers);
+    const range: @import("cuda_weights.zig").Range = if (o.split) .{ .first = 0, .last = mid, .embed = true, .head = true, .norm_f = false, .seam_norm = mid } else .all;
+    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{ .context = o.context, .mtp = o.drafts, .graphs = !o.split, .sampling = null, .segments = o.segments, .carveout = carve, .slide = o.slide, .vision = o.vision, .precision = o.precision, .range = range });
     errdefer e.deinit();
     const head: ?*Head = if (o.drafts) try Head.init(e) else null;
     errdefer if (head) |h| h.deinit();
-    if (head) |h| try h.capture();
-    if (!o.drafts) try e.captureWindows(); // the one-row window: Engine.init captures windows only when drafting
-    // the sampled mode's sets: a placeholder rule now, each stream's own uploaded at its prefill
-    try e.setSampling(.{ .seed = 0, .temperature = 1.0 });
-    try e.captureWindows();
-    if (head) |h| try h.capture();
-    try e.setSampling(null);
+    // A layer split runs eagerly: a graph captures one device's kernels and cannot span the seam, and the seam's
+    // synchronize is not permitted inside a capture.
+    if (!o.split) {
+        if (head) |h| try h.capture();
+        if (!o.drafts) try e.captureWindows(); // the one-row window: Engine.init captures windows only when drafting
+        // the sampled mode's sets: a placeholder rule now, each stream's own uploaded at its prefill
+        try e.setSampling(.{ .seed = 0, .temperature = 1.0 });
+        try e.captureWindows();
+        if (head) |h| try h.capture();
+        try e.setSampling(null);
+    }
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.* = .{ .gpa = gpa, .e = e, .head = head, .lanes = try Lanes.init(gpa, e, head), .target = .{ .e = e, .head = head }, .carve = carve };
     errdefer own.lanes.deinit();
-    own.living = try slide.loadLiving(gpa, io, e, dir); // before the lanes' costs are measured: they decode through it
+    own.living = if (o.split) null else try slide.loadLiving(gpa, io, e, dir); // before the lanes' costs are measured: they decode through it
     errdefer if (own.living) |*s| s.deinit();
     // A layer split: rank 1 on the other internal device, with its own context and engine. Rank 0 keeps the
-    // embedding, the final norm, the head and the MTP head, so the lane backend above the seam is unchanged.
+    // embedding, the head and the sample, so the lane backend above the seam is unchanged.
     if (o.split) {
         const pair = (try splitPair(ctx.d)) orelse return error.SplitNeedsTwoDevices;
         if (pair[0] != ctx.device_ordinal) return error.SplitRankZeroNotFirst;
-        const mid = splitAt(e.c.layers);
         const p = try gpa.create(Peer);
         errdefer gpa.destroy(p);
         p.gpa = gpa;
         p.ctx = try cuda.Context.init(ctx.d, pair[1]);
         errdefer p.ctx.deinit();
+        try p.ctx.makeCurrent();
         p.e = try engine.Engine.init(gpa, io, &p.ctx, dir, kernels, .{
             .context = o.context,
             .mtp = false, // the head stays on rank 0
             .graphs = false, // a graph captures one device's kernels and cannot span the seam
             .sampling = null,
             .segments = 1,
-            .range = .{ .first = mid, .last = e.c.layers, .embed = false, .head = false },
-            .norm_done = true,
+            .precision = o.precision,
+            .range = .{ .first = mid, .last = layers, .embed = false, .head = false, .norm_f = true },
         });
-        errdefer p.e.deinit();
-        // The seam's staging: h and y are rows*hidden*2 bf16, xs is rows*(hidden/64)*4 fp32.
-        const rows = state.max_rows;
+        errdefer {
+            p.ctx.makeCurrent() catch {};
+            p.e.deinit();
+        }
+        try ctx.makeCurrent();
+        // The seam's staging: h and y are rows*hidden*2 bf16, xs is rows*(hidden/64)*4 fp32. Sized for the widest
+        // prompt pass, the widest thing that crosses: a window is at most state.max_rows rows.
+        const rows = state.pass_rows;
         const need = 2 * rows * e.c.hidden * 2 + rows * (e.c.hidden / 64) * 4;
         p.stage[0] = try cuda.HostBuffer.allocMapped(ctx.d, need);
         errdefer p.stage[0].free();
-        // Rank 0's own range and seam: the embedding, its blocks, and the receiving block's norm.
-        e.range = .{ .first = 0, .last = mid, .embed = true, .head = true, .seam_norm = mid };
-        e.tail = true;
         e.peer = p.e;
         e.stage = p.stage;
         own.peer = p;
+        const floor: usize = 1536 << 20;
+        if ((try p.ctx.memInfo()).free < floor or (try ctx.memInfo()).free < floor) return error.SplitMemoryFloor;
     }
+    try ctx.makeCurrent();
     try own.lanes.measure(io, dir);
     own.taps = .{@import("cuda_lanes.zig").finalTap(e.c)};
     e.prefill_counts = .{}; // requests' prompt rows only: the cost measurement's passes are not counted
@@ -265,11 +280,20 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
 
 fn release(p: *anyopaque) void {
     const own: *Owned = @ptrCast(@alignCast(p));
+    if (own.peer != null) {
+        own.e.ctx.makeCurrent() catch {};
+        own.e.stream.synchronize() catch {};
+    }
     own.lanes.deinit();
     if (own.living) |*s| s.deinit();
     if (own.head) |h| h.deinit();
     // The peer first: rank 0's engine holds a pointer to it and its staging.
-    if (own.peer) |peer| peer.deinit();
+    own.e.peer = null;
+    if (own.peer) |peer| {
+        peer.ctx.makeCurrent() catch {};
+        peer.deinit();
+        own.e.ctx.makeCurrent() catch {};
+    }
     own.e.deinit();
     if (own.carve) |c| closeCarveout(own.gpa, c);
     own.gpa.destroy(own);

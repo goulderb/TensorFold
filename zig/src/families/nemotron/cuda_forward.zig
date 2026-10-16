@@ -28,8 +28,12 @@ pub const Seg = struct { b: *const state.Buffers, row0: usize, rows: usize, samp
 /// Structured output: a segment's rows' grammar bits (device-readable, `words` a row); bits 0: no grammar.
 pub const Mask = struct { bits: u64 = 0, words: usize = 0 };
 
+/// Where a walk's residual starts: the token embedding, or (a layer split's receiving rank) the handed-over residual,
+/// its first block's norm already run by the sender.
+pub const Input = union(enum) { tokens, normalized: u64 };
+
 /// A prompt chunk carries rows, position, residual delta and mixer positions between blocks.
-pub const Walk = struct { rows: usize, pos: usize, x: u64 = 0, delta: Delta = .none, mj: usize = 0, aj: usize = 0 };
+pub const Walk = struct { rows: usize, pos: usize, input: Input = .tokens, x: u64 = 0, delta: Delta = .none, mj: usize = 0, aj: usize = 0 };
 
 /// A window's kernel classes as a profile names them: each mark closes the span since the one before.
 pub const Class = enum { embed, norm, mamba_in, conv_scan, gnorm, mamba_out, qkv, attention, attn_o, route, plan, experts_up, experts_down, shared_wait, head, sample };
@@ -72,17 +76,6 @@ pub const Forward = struct {
     vision: ?*const @import("cuda_vision.zig").Vision = null, // a prompt pass's image rows, spliced after its embeds
     /// The blocks this rank runs, as a half-open range of global layer numbers. A single device runs `all`.
     range: Range = .all,
-    /// The receiving rank's first block skips its norm: the sender ran it, so the handoff already carries h, y and xs.
-    norm_done: bool = false,
-    /// Whether this rank runs the embedding. A receiving rank does not: its rows arrive in the handoff.
-    embed_rows: bool = true,
-    /// Whether this rank runs the final norm, the head and the sample. A sending rank does not.
-    tail: bool = true,
-    /// Where a sending rank leaves the seam residual h: the buffer the seam norm wrote, for the caller to hand off.
-    /// A receiving rank reads it as its starting x. 0: not a split.
-    seam_h: u64 = 0,
-    /// A sending rank writes the buffer holding the seam residual here, so the caller knows what to hand off.
-    seam_out: ?*u64 = null,
 
     pub fn init(c: Config, w: *const weights.Weights, b: *const state.Buffers, ops: kern.Ops, max_len: usize, nch: usize, sampled: bool) Forward {
         return .{
@@ -173,72 +166,110 @@ pub const Forward = struct {
         try routed.windowRows(segs);
     }
 
-    /// The layer split's window: this rank runs its blocks, the residual crosses to the peer, and the peer runs the
-    /// rest and the tail. `peer` is the other rank's Forward, built over its own weights, buffers and stream.
+    /// The layer split's window: this rank runs its blocks and the receiving block's norm, the residual crosses to
+    /// the peer, the peer runs the rest and the final norm, and its normed rows come back for the head and the
+    /// sample, which stay on this rank. `peer` is the other rank's Forward, over its own weights, buffers and stream.
     ///
-    /// The seam carries three buffers. The sender runs the receiving block's norm, so it hands over the residual h
-    /// (which the receiver's next norm would otherwise re-derive), the normed rows y and their 64-group sums xs
-    /// (which the receiving block's projections read, since its norm is skipped).
+    /// The handoff carries the residual h, the normed rows y and their 64-group sums xs (the receiving block's
+    /// projections read them, since its norm already ran). One stream a rank: paired lane allocation is not built.
     pub fn windowSplit(f: *const Forward, peer: *const Forward, segs: []const Seg, stage: []cuda.HostBuffer) !void {
-        const c = f.c;
-        const rows = segs[0].rows;
-        const h_bytes = rows * c.hidden * 2;
-        const xs_bytes = rows * (c.hidden / 64) * 4;
-        const need = 2 * h_bytes + xs_bytes;
-        if (stage.len < 3 or stage[0].bytes.len < need) return error.SeamStageTooSmall;
-
-        // This rank's blocks, then the receiving block's norm, which leaves h where seam_out names it.
-        var h: u64 = 0;
-        var sender = f.*;
-        sender.seam_out = &h;
-        try sender.windowSegs(segs);
-        if (h == 0) return error.SeamNoResidual;
-        try f.ops.s.synchronize();
-
-        // h, y and xs to the peer's device. Each copy runs under the context that owns its buffer: the driver's
-        // copy calls address the current context's device.
+        if (segs.len != 1 or segs[0].row0 != 0 or segs[0].b != f.b) return error.SplitSingleStream;
+        try f.ctx.makeCurrent();
+        defer f.ctx.makeCurrent() catch {};
+        var routed = f.*;
+        routed.segs = segs;
+        routed.untaught = segs[0].untaught;
+        if (routed.route.count == 0) routed.route.later(segs[0].row0, segs[0].rows, segs[0].slot);
+        var w = try routed.windowBlocks(segs, .tokens);
+        try f.norm(&w.x, w.delta, f.w.seam_norm, w.rows, true);
+        try f.handoff(peer, w.x, w.rows, stage);
+        // the window's meta row (position, parity, previous keep) is the peer's too: its kernels read it there
         const st = stage[0].bytes;
         try f.ctx.makeCurrent();
-        try f.ops.k.d.check(f.ops.k.d.api.cuMemcpyDtoH_v2(st.ptr, h, h_bytes), "cuMemcpyDtoH");
-        try f.ops.k.d.check(f.ops.k.d.api.cuMemcpyDtoH_v2(st.ptr + h_bytes, f.b.y, h_bytes), "cuMemcpyDtoH");
-        try f.ops.k.d.check(f.ops.k.d.api.cuMemcpyDtoH_v2(st.ptr + 2 * h_bytes, f.b.xs, xs_bytes), "cuMemcpyDtoH");
+        try f.ops.download(st[0..16], f.b.meta);
+        try f.ops.s.synchronize();
         try peer.ctx.makeCurrent();
-        try peer.ops.k.d.check(peer.ops.k.d.api.cuMemcpyHtoD_v2(peer.seam_h, st.ptr, h_bytes), "cuMemcpyHtoD");
-        try peer.ops.k.d.check(peer.ops.k.d.api.cuMemcpyHtoD_v2(peer.b.y, st.ptr + h_bytes, h_bytes), "cuMemcpyHtoD");
-        try peer.ops.k.d.check(peer.ops.k.d.api.cuMemcpyHtoD_v2(peer.b.xs, st.ptr + 2 * h_bytes, xs_bytes), "cuMemcpyHtoD");
+        try peer.ops.upload(peer.b.meta, st[0..16]);
+        const receiver = [_]Seg{.{ .b = peer.b, .row0 = 0, .rows = w.rows, .sampled = false, .slot = segs[0].slot, .untaught = segs[0].untaught }};
+        var other = peer.*;
+        other.segs = &receiver;
+        other.untaught = segs[0].untaught;
+        if (other.route.count == 0) other.route.later(0, w.rows, segs[0].slot);
+        var pw = try other.windowBlocks(&receiver, .{ .normalized = peer.b.h[0] });
+        try peer.norm(&pw.x, pw.delta, peer.w.norm_f, pw.rows, true);
+        try f.returnRows(peer, w.rows, stage);
+        try routed.tailOnly(segs, w.rows);
+    }
 
-        // The peer's blocks and the tail. Its Forward already carries range, norm_done, embed_rows and tail.
-        var receiver = peer.*;
-        try receiver.windowSegs(segs);
+    /// The seam's handoff: h, y and xs from this rank to the peer through the pinned stage. Each copy runs under the
+    /// context that owns its buffer, since the driver's copy calls address the current context's device.
+    fn handoff(f: *const Forward, peer: *const Forward, h: u64, rows: usize, stage: []cuda.HostBuffer) !void {
+        const bytes = rows * f.c.hidden * 2;
+        const sums = rows * (f.c.hidden / 64) * 4;
+        if (stage.len != 1 or stage[0].bytes.len < 2 * bytes + sums) return error.SeamStageTooSmall;
+        const st = stage[0].bytes;
+        try f.ctx.makeCurrent();
+        try f.ops.download(st[0..bytes], h);
+        try f.ops.download(st[bytes..][0..bytes], f.b.y);
+        try f.ops.download(st[2 * bytes ..][0..sums], f.b.xs);
+        try f.ops.s.synchronize();
+        try peer.ctx.makeCurrent();
+        try peer.ops.upload(peer.b.h[0], st[0..bytes]);
+        try peer.ops.upload(peer.b.y, st[bytes..][0..bytes]);
+        try peer.ops.upload(peer.b.xs, st[2 * bytes ..][0..sums]);
+        try peer.ops.s.synchronize();
+    }
+
+    /// The peer's final-normed rows y and their sums xs back to this rank, whose head and sample read them.
+    fn returnRows(f: *const Forward, peer: *const Forward, rows: usize, stage: []cuda.HostBuffer) !void {
+        const bytes = rows * f.c.hidden * 2;
+        const sums = rows * (f.c.hidden / 64) * 4;
+        const st = stage[0].bytes;
+        try peer.ctx.makeCurrent();
+        try peer.ops.download(st[0..bytes], peer.b.y);
+        try peer.ops.download(st[bytes..][0..sums], peer.b.xs);
+        try peer.ops.s.synchronize();
+        try f.ctx.makeCurrent();
+        try f.ops.upload(f.b.y, st[0..bytes]);
+        try f.ops.upload(f.b.xs, st[bytes..][0..sums]);
+        try f.ops.s.synchronize();
     }
 
     fn windowRows(f: *const Forward, segs: []const Seg) !void {
+        var w = try f.windowBlocks(segs, .tokens);
+        try f.norm(&w.x, w.delta, f.w.norm_f, w.rows, true);
+        try f.tailOnly(segs, w.rows);
+    }
+
+    /// The window's embedding (or the handed-over residual) and this rank's blocks; the walk's residual is left
+    /// for the caller's last norm.
+    fn windowBlocks(f: *const Forward, segs: []const Seg, input: Input) !Walk {
+        var rows: usize = 0;
+        for (segs) |s| rows += s.rows;
+        if (rows == 0 or rows > state.max_rows) return error.WindowTooWide;
+        var w: Walk = .{ .rows = rows, .pos = 0, .input = input };
+        switch (input) {
+            .tokens => {
+                for (segs) |s| try f.embed(s.b.ids, f.b.emb + s.row0 * @as(u64, f.c.hidden) * 2, s.rows);
+                w.x = f.b.emb;
+                try f.mark(.embed);
+            },
+            .normalized => |h| w.x = h,
+        }
+        const start = f.counters();
+        w.mj = start.mj;
+        w.aj = start.aj;
+        const last = @min(f.range.last, f.c.layers);
+        try f.runBlocks(segs, rows, &w.x, &w.delta, &w.mj, &w.aj, f.range.first, last, input == .normalized);
+        return w;
+    }
+
+    /// The window's tail: b.y holds every row's final-normed state; the head, grammar masks and the sample.
+    fn tailOnly(f: *const Forward, segs: []const Seg, rows: usize) !void {
         const c = f.c;
         const b = f.b;
         const o = f.ops;
         const D: u64 = c.hidden;
-        var rows: usize = 0;
-        for (segs) |s| rows += s.rows;
-        if (rows > state.max_rows) return error.WindowTooWide;
-        if (f.embed_rows) for (segs) |s| try f.embed(s.b.ids, b.emb + s.row0 * D * 2, s.rows);
-        try f.mark(.embed);
-        // A receiving rank starts from the handed-off residual; a single device or a sender starts at the embedding.
-        var x = if (!f.embed_rows and f.seam_h != 0) f.seam_h else b.emb;
-        var delta: Delta = .none;
-        const start = f.counters();
-        var mj: usize = start.mj;
-        var aj: usize = start.aj;
-        const last = @min(f.range.last, f.c.layers);
-        try f.runBlocks(segs, rows, &x, &delta, &mj, &aj, f.range.first, last, f.norm_done);
-        if (!f.tail) {
-            // A sending rank runs the receiving rank's first block norm here, so the handoff carries the residual
-            // h alone and the receiver starts with its norm already done. The seam norm is the receiver's first
-            // block's norm weight, which this rank loaded as w.seam_norm.
-            try f.norm(&x, delta, f.w.seam_norm, rows, true);
-            if (f.seam_out) |out| out.* = x; // the norm moved x to the buffer holding h
-            return;
-        }
-        try f.norm(&x, delta, f.w.norm_f, rows, true);
         for (segs) |s| try o.copy(s.b.hidden, b.y + s.row0 * D * 2, s.rows * c.hidden * 2);
         try o.dense(b.y, b.xs, f.w.head, b.logits, rows);
         try f.mark(.head);
@@ -317,7 +348,7 @@ pub const Forward = struct {
                 },
                 .moe => if (blk.moe.latent != null) {
                     try latent.run(f, blk.moe, rows);
-                    delta = .dense;
+                    delta.* = .dense;
                 } else {
                     try f.experts(blk.moe, rows, false);
                     delta.* = .moe;
@@ -429,20 +460,49 @@ pub const Forward = struct {
     pub fn chunk(f: *const Forward, rows: usize, pos: usize) !void {
         var w: Walk = .{ .rows = rows, .pos = pos };
         try f.chunkBegin(&w);
-        for (0..f.w.blocks.len) |i| {
-            try f.chunkPre(&w, i);
-            try f.chunkMixer(&w, i);
-            try f.chunkPost(&w, i);
-        }
+        try f.chunkBlocks(&w);
         try f.chunkFinish(&w);
+    }
+
+    /// This rank's blocks of a chunk (all of them on a single device).
+    fn chunkBlocks(f: *const Forward, w: *Walk) !void {
+        for (f.range.first..@min(f.range.last, f.c.layers)) |i| {
+            try f.chunkPre(w, i);
+            try f.chunkMixer(w, i);
+            try f.chunkPost(w, i);
+        }
+    }
+
+    /// The layer split's prompt chunk: this rank's blocks and the seam norm, the handoff, the peer's blocks and
+    /// final norm, then the normed rows back here for the head and the sample.
+    pub fn chunkSplit(f: *const Forward, peer: *const Forward, rows: usize, pos: usize, stage: []cuda.HostBuffer) !void {
+        try f.ctx.makeCurrent();
+        defer f.ctx.makeCurrent() catch {};
+        var w: Walk = .{ .rows = rows, .pos = pos };
+        try f.chunkBegin(&w);
+        try f.chunkBlocks(&w);
+        try f.seamNorm(&w);
+        try f.handoff(peer, w.x, rows, stage);
+        try peer.ctx.makeCurrent();
+        var pw: Walk = .{ .rows = rows, .pos = pos, .input = .{ .normalized = peer.b.h[0] } };
+        try peer.chunkBegin(&pw);
+        try peer.chunkBlocks(&pw);
+        try peer.finalNorm(&pw);
+        try f.returnRows(peer, rows, stage);
+        try f.chunkTail(&w);
     }
 
     /// A chunk's embedding, from p_ids.
     pub fn chunkBegin(f: *const Forward, w: *Walk) !void {
         const b = f.b;
-        try f.embed(b.p_ids, b.emb, w.rows);
-        if (f.vision) |v| try v.splice(f.ops.s, w.pos, w.pos + w.rows, b.emb);
-        w.x = b.emb;
+        switch (w.input) {
+            .tokens => {
+                try f.embed(b.p_ids, b.emb, w.rows);
+                if (f.vision) |v| try v.splice(f.ops.s, w.pos, w.pos + w.rows, b.emb);
+                w.x = b.emb;
+            },
+            .normalized => |h| w.x = h,
+        }
     }
 
     /// Block i up to its mixer: the norm, then the Mamba input projection or attention's q, k and v.
@@ -450,7 +510,7 @@ pub const Forward = struct {
         const blk = f.w.blocks[i];
         const b = f.b;
         // the receiving rank's first block: the sender already ran this norm and handed over the residual
-        if (!(f.norm_done and i == f.range.first)) try f.norm(&w.x, w.delta, blk.norm, w.rows, false);
+        if (!(w.input == .normalized and i == f.range.first)) try f.norm(&w.x, w.delta, blk.norm, w.rows, false);
         switch (blk.kind) {
             .mamba => try f.ops.prefillDense(b.y, blk.mamba.in_proj, b.proj, w.rows),
             .attention => {
@@ -537,22 +597,30 @@ pub const Forward = struct {
         }
     }
 
+    /// A sending rank's last norm: the receiving rank's first block norm, so the handoff carries the residual and
+    /// the receiver starts with its norm already done. The seam norm is that block's norm weight.
+    pub fn seamNorm(f: *const Forward, w: *Walk) !void {
+        try f.norm(&w.x, w.delta, f.w.seam_norm, w.rows, false);
+    }
+
     /// The chunk's last norm alone: w.x then holds the residual it read, b.y every row's normed hidden state.
-    ///
-    /// A sending rank runs the receiving rank's first block norm here instead, so the handoff carries the residual
-    /// and the receiver starts with its norm already done. The seam norm is that block's norm weight.
     pub fn finalNorm(f: *const Forward, w: *Walk) !void {
-        if (!f.tail) return f.norm(&w.x, w.delta, f.w.seam_norm, w.rows, false);
         try f.norm(&w.x, w.delta, f.w.norm_f, w.rows, false);
     }
 
     /// The chunk's last norm, its rows' hidden states for the MTP head, and the token after its last row.
     pub fn chunkFinish(f: *const Forward, w: *Walk) !void {
+        try f.finalNorm(w);
+        try f.chunkTail(w);
+    }
+
+    /// The chunk's tail alone: b.y holds every row's final-normed state. A layer split's sender runs this after the
+    /// peer hands its normed rows back, since the head and the sample live here.
+    pub fn chunkTail(f: *const Forward, w: *Walk) !void {
         const c = f.c;
         const b = f.b;
         const o = f.ops;
         const rows = w.rows;
-        try f.norm(&w.x, w.delta, f.w.norm_f, rows, false);
         try o.copy(b.p_hidden, b.y, @as(usize, rows) * c.hidden * 2);
         try o.prefillDense(b.y + @as(u64, rows - 1) * c.hidden * 2, f.w.head, b.p_logits, 1);
         try o.fill32(b.p_meta, @intCast(w.pos + rows - 1), 4); // sample_last: the chunk's last row is at pos + rows - 1

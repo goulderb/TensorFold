@@ -195,7 +195,7 @@ const Host = struct {
 
     pub fn bind(p: *anyopaque) *Host {
         const h: *Host = @ptrCast(@alignCast(p));
-        if (h.gpu) |g| if (bound != &g.ctx) {
+        if (h.gpu) |g| if (bound != &g.ctx or splitRequested()) {
             g.ctx.makeCurrent() catch |e| std.log.err("cuCtxSetCurrent on the lane thread: {s}", .{@errorName(e)});
             bound = &g.ctx;
         };
@@ -416,6 +416,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     var probe: Probe = .{ .a = a, .io = io, .ctx = &g.ctx, .held = held0, .problem = problem };
     const split = splitRequested();
+    if (split and (o.drafts or o.slide or o.learn != null or segments != 1 or disk_config != null or (o.prompt_cache_gib orelse 0) != 0 or (o.lanes_fixed and o.lanes != 1))) {
+        problem.* = "TENSORFOLD_SPLIT is a single-stream layer-split trial, not TP: use --no-drafts --parallel 1 --prompt-cache-gib 0 without learning, spill or segments";
+        return null;
+    }
     var opts: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments, .slide = o.slide };
     if (@hasField(F.Options, "split")) opts.split = split;
     if (o.vision) |vo| {
@@ -485,7 +489,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     const model = cuda.usage(false).device - held0;
     const after = try pool(a, io, &g.ctx, problem) orelse return null;
-    var room = after.room(model) -| loaded.learn_bytes;
+    // a split's model bytes span both devices: this one's room is its free memory less the larger of the reserve and
+    // the 1536 MiB floor (the peer checked its own floor at open)
+    var room = if (split) after.free -| @max(after.reserve, 1536 << 20) else after.room(model) -| loaded.learn_bytes;
     var low: []const u8 = ""; // names the rank whose room bounds the streams, when it is not this one
     if (@hasField(@TypeOf(loaded), "peer_room")) if (loaded.peer_room) |pr| if (pr.bytes < room) {
         room = pr.bytes;
@@ -497,7 +503,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         problem.* = try std.fmt.allocPrint(a, "this CUDA cache supports at most {d} lanes; lower --parallel {d}", .{ lane_limit, o.lanes });
         return null;
     };
-    const streams = budget.admit(room, loaded.stream_bytes, free, asked, o.lanes_fixed) catch |e| {
+    const streams: u32 = if (split) 1 else budget.admit(room, loaded.stream_bytes, free, asked, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
             error.NoStream => try std.fmt.allocPrint(a, no_stream, .{
                 window,
@@ -518,7 +524,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         };
         return null;
     };
-    const cache = budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free));
+    const cache = if (split) 0 else budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free));
     const store_cache = if (@hasDecl(F, "snap_save")) try snaps.cacheBudget(F, loaded.target, cache) else 0;
     // Mamba spares are prepaid; the tier reservation is charged once inside the remaining Store budget.
     const disk: ?*nspill.Disk = if (F != nemotron.native) null else if (disk_config) |*c| (try openDisk(F, a, gpa, io, g, loaded, c, &model_files.?, &exe_files.?, kernels, segments, store_cache, problem)) orelse return null else null;

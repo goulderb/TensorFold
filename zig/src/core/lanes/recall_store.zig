@@ -1,5 +1,6 @@
 //! Recall's record on disk: one tokenizer's ids in chunk files of a 0700 directory, the oldest dropped past the cap.
 const std = @import("std");
+const windows = @import("builtin").os.tag == .windows;
 const recall = @import("recall.zig");
 const rr = recall.record;
 const Admission = @import("learned_disk.zig").Admission;
@@ -121,7 +122,7 @@ pub const Store = struct {
             return null;
         }
         if (s.writes) s.takeLock();
-        errdefer if (s.lock_fd >= 0) {
+        errdefer if (comptime !windows) if (s.lock_fd >= 0) {
             _ = std.c.close(s.lock_fd);
         };
         try s.load();
@@ -130,7 +131,9 @@ pub const Store = struct {
 
     pub fn close(s: *Store) void {
         s.closeFile();
-        if (s.lock_fd >= 0) _ = std.c.close(s.lock_fd);
+        if (comptime !windows) {
+            if (s.lock_fd >= 0) _ = std.c.close(s.lock_fd);
+        }
         s.shared.record.deinit();
         s.gpa.free(s.name);
         s.gpa.free(s.dir);
@@ -138,6 +141,7 @@ pub const Store = struct {
     }
 
     fn closeFile(s: *Store) void {
+        if (comptime windows) return;
         if (s.file < 0) return;
         _ = std.c.fsync(s.file);
         _ = std.c.close(s.file);
@@ -187,6 +191,7 @@ pub const Store = struct {
 
     /// The directory's lock: a second server with the same record reads it as it was and writes nothing.
     fn takeLock(s: *Store) void {
+        if (comptime windows) return s.readOnly();
         var buf: [1100]u8 = undefined;
         const path = std.fmt.bufPrintSentinel(&buf, "{s}/lock", .{s.dir}, 0) catch return s.readOnly();
         const fd = std.c.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .NOFOLLOW = true }, @as(std.c.mode_t, 0o600));
@@ -224,6 +229,7 @@ pub const Store = struct {
 
     /// One chunk file's ids into the record a segment at a time; its count of ids (error: a bad header or id).
     fn readChunk(s: *Store, seq: u64, pending: *std.ArrayList(u32), ids: []u32) !usize {
+        if (comptime windows) return error.RecallRead;
         var buf: [1100]u8 = undefined;
         const path = try s.chunkPath(&buf, seq);
         const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
@@ -254,6 +260,7 @@ pub const Store = struct {
 
     /// The files cut to what the record read: the last one's torn tail truncated, the files after it deleted.
     fn cut(s: *Store, seqs: []const u64) void {
+        if (comptime windows) return;
         const r = &s.shared.record;
         const chunks: usize = (@as(usize, r.end) + rr.chunk_tokens - 1) / rr.chunk_tokens;
         for (seqs, 0..) |seq, k| {
@@ -278,6 +285,7 @@ pub const Store = struct {
 
     /// The chunk files' numbers, ascending.
     fn listChunks(s: *Store, out: *std.ArrayList(u64)) !void {
+        if (comptime windows) return error.RecallRead;
         const d = std.c.opendir(s.dir) orelse return error.RecallRead;
         defer _ = std.c.closedir(d);
         while (std.c.readdir(d)) |ent| {
@@ -390,6 +398,7 @@ pub const Store = struct {
 
     /// The file for record chunk `k`, open to append: the one on disk, or a new one with its header.
     fn fileFor(s: *Store, k: u32) bool {
+        if (comptime windows) return false;
         if (s.file >= 0 and s.file_chunk == k) return true;
         s.closeFile();
         var buf: [1100]u8 = undefined;
@@ -488,6 +497,7 @@ pub const Store = struct {
 
 /// `dir` and its missing parents, each made 0700.
 fn makePath(dir: [:0]const u8) !void {
+    if (comptime windows) return error.RecallDir;
     var buf: [1100]u8 = undefined;
     if (dir.len >= buf.len) return error.RecallDir;
     @memcpy(buf[0..dir.len], dir);
@@ -502,6 +512,7 @@ fn makePath(dir: [:0]const u8) !void {
 }
 
 fn readSmall(a: Allocator, path: [:0]const u8) ![]u8 {
+    if (comptime windows) return error.RecallRead;
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
     if (fd < 0) return if (std.c.errno(fd) == .NOENT) error.FileNotFound else error.RecallRead;
     defer _ = std.c.close(fd);
@@ -514,6 +525,7 @@ fn readSmall(a: Allocator, path: [:0]const u8) ![]u8 {
 
 /// `bytes` as the file at `path` (0600), written whole under another name first.
 fn writeSmall(path: [:0]const u8, bytes: []const u8) !void {
+    if (comptime windows) return error.RecallWrite;
     var buf: [1200]u8 = undefined;
     const part = try std.fmt.bufPrintSentinel(&buf, "{s}.part", .{path}, 0);
     const flags: std.c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true };
@@ -528,6 +540,7 @@ fn writeSmall(path: [:0]const u8, bytes: []const u8) !void {
 }
 
 fn writeAll(fd: c_int, bytes: []const u8) !void {
+    if (comptime windows) return error.RecallWrite;
     var done: usize = 0;
     while (done < bytes.len) {
         const n = std.c.write(fd, bytes.ptr + done, bytes.len - done);
@@ -537,6 +550,7 @@ fn writeAll(fd: c_int, bytes: []const u8) !void {
 }
 
 fn readAt(fd: c_int, dest: []u8, at: u64) bool {
+    if (comptime windows) return false;
     var done: usize = 0;
     while (done < dest.len) {
         const n = std.c.pread(fd, dest.ptr + done, dest.len - done, @intCast(at + done));

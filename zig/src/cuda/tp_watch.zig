@@ -1,5 +1,6 @@
 //! Ranks' liveness lines: a TCP line from each rank to rank 0, open before NCCL, carrying ready and error records.
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 
 /// One record on a line: ready, or an error and its name.
@@ -34,6 +35,8 @@ fn address() !posix.sockaddr.in {
 
 /// A stream socket whose peer's host vanishing (no FIN) shows within about 20 s: 10 s idle, then 3 probes 3 s apart.
 fn socket() !posix.socket_t {
+    // Expert-rank liveness is a POSIX socket. Windows serves the layer split, which has no NCCL ranks.
+    if (comptime builtin.os.tag == .windows) return error.SocketFailed;
     const rc = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
     if (posix.errno(rc) != .SUCCESS) return error.SocketFailed;
     const fd: posix.socket_t = @intCast(rc);
@@ -48,6 +51,7 @@ fn socket() !posix.socket_t {
 
 /// Rank 0 takes a line from each other rank within 5 minutes, and they connect to it; then every line is watched.
 pub fn start(io: std.Io, rank: usize, world: usize) !void {
+    if (comptime builtin.os.tag == .windows) return error.SocketFailed;
     if (world < 2) return;
     if (world > max_lines + 1) return error.TooManyRanks;
     my_rank = rank;
@@ -85,6 +89,7 @@ pub fn start(io: std.Io, rank: usize, world: usize) !void {
 }
 
 fn send(r: Record) void {
+    if (comptime builtin.os.tag == .windows) return;
     for (lines[0..line_count]) |fd| {
         const b = std.mem.asBytes(&r);
         var at: usize = 0;
@@ -132,6 +137,7 @@ fn stop() noreturn {
 
 /// A line's records; it closing or carrying an error stops this rank unless it ends on purpose.
 fn watch(fd: posix.socket_t, line: usize) void {
+    if (comptime builtin.os.tag == .windows) return;
     var r: Record = undefined;
     while (true) {
         const b = std.mem.asBytes(&r);

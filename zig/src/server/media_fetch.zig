@@ -253,6 +253,7 @@ fn readInto(a: std.mem.Allocator, io: Io, r: *Io.Reader, data: *std.ArrayList(u8
 
 /// A TCP connection to the checked address on port 443, its connect bounded by `ms` (std's connect has no timeout).
 fn connect(addr: net.IpAddress, ms: i64, f: *Failure) Error!net.Stream {
+    if (comptime @import("builtin").os.tag == .windows) return error.Media;
     const c = std.c;
     const failed = "image download failed or timed out";
     var storage: c.sockaddr.storage = undefined;

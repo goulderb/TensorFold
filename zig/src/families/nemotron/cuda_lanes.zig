@@ -254,7 +254,8 @@ pub const Cuda = struct {
         const gop = try self.lanes.getOrPut(self.gpa, s);
         if (gop.found_existing) self.drop(gop.value_ptr.*);
         // the engine's own sequence while it is free: its rounds replay the captured graphs
-        const own = self.own_free and e.serial != null and !s.untaught; // the own graphs carry the pocket
+        // the own graphs carry the pocket; a layer split has no graphs but only the own sequence, on both ranks
+        const own = self.own_free and (e.serial != null or e.peer != null) and !s.untaught;
         gop.value_ptr.* = .{ .own = own, .stats = e.stats, .seq = if (own) &e.own else e.newSeq() catch |err| {
             self.lanes.removeByPtr(gop.key_ptr);
             return err;

@@ -38,6 +38,7 @@ var lib_failed = false;
 var lib_mutex: std.atomic.Mutex = .unlocked;
 
 fn load() ?Fns {
+    if (comptime builtin.os.tag == .windows) return null;
     while (!lib_mutex.tryLock()) std.atomic.spinLoopHint();
     defer lib_mutex.unlock();
     if (lib) |l| return l;

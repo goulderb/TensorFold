@@ -31,6 +31,7 @@ pub fn prefillWith(e: *Engine, prompt: []const u32, dump: ?*Dump, head: ?*Head, 
 
 /// prefill from `from` (0 resets; else a state restored at that row), in passes of up to 4,096 rows from there.
 pub fn prefillFrom(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, head: ?*Head, cancel: ?Cancel, keep: ?Keep) !u32 {
+    if (e.peer != null and (from != 0 or keep != null or head != null)) return error.SplitUnsupportedReuse;
     if (prompt.len == 0) return error.EmptyPrompt;
     if (from >= prompt.len) return error.BadReuse;
     if (prompt.len + state.max_rows > e.max_len) return error.ContextFull;
@@ -102,7 +103,9 @@ pub fn serialChunks(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, 
         try e.ops().upload(e.b.p_ids, std.mem.sliceAsBytes(host));
         try e.copied.record(e.stream);
         e.prefill_counts.submitted_rows += chunk.len;
-        try f.chunk(@intCast(chunk.len), e.pos);
+        if (e.peer) |p| {
+            try f.chunkSplit(&p.forward(null), @intCast(chunk.len), e.pos, &e.stage);
+        } else try f.chunk(@intCast(chunk.len), e.pos);
         if (shared) |ad| if (f.route.decision(0) != null) try e.trainOps().latch(ad.score, ad.need, ad.latch, e.slot, true);
         e.pos += @intCast(chunk.len);
         const known = @min(chunk.len, prompt.len - 1 - s);

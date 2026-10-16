@@ -1,7 +1,18 @@
 // Vision towers' glue (cuda/vit.zig; LFM2-VL's SigLIP2, RADIO): LayerNorm, Linear epilogues, activations, unshuffle.
 
 #include <cuda_bf16.h>
+// MSVC's math.h hides the POSIX constants unless this is set first. The values match glibc.
+#define _USE_MATH_DEFINES
 #include <math.h>
+#ifndef M_SQRT2
+#define M_SQRT2 1.41421356237309504880
+#endif
+#ifndef M_2_SQRTPI
+#define M_2_SQRTPI 1.12837916709551257390
+#endif
+#ifndef M_SQRT1_2
+#define M_SQRT1_2 0.707106781186547524401
+#endif
 #include <stdint.h>
 
 #include "glue_math.cuh"

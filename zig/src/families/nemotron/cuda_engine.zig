@@ -41,10 +41,6 @@ pub const Options = struct {
     /// A layer split's rank: which blocks this engine loads and runs, and which of the embedding, the seam norm and
     /// the tail. `all` is a single device.
     range: weights.Range = .all,
-    /// The receiving rank's first block skips its norm: the sender ran it and handed over the residual.
-    norm_done: bool = false,
-    /// Where a receiving rank reads the handed-off residual. 0: it runs the embedding instead.
-    seam_h: u64 = 0,
 };
 
 /// Asked before each prompt chunk (or segmented call): true stops the prompt with error.Cancelled.
@@ -147,13 +143,9 @@ pub const Engine = struct {
     vision: ?*@import("cuda_vision.zig").Vision = null, // --vision: the tower and a prompt pass's image rows
     /// A layer split's rank: which blocks this engine runs, and which of the embedding, the seam norm and the tail.
     range: @import("cuda_forward.zig").Range = .all,
-    norm_done: bool = false,
-    embed_rows: bool = true,
-    tail: bool = true,
-    seam_h: u64 = 0,
     /// The other rank of a layer split, when this engine is one. null: a single device.
     peer: ?*Engine = null,
-    /// The seam's host staging: one pinned buffer, sized for the widest window's h, y and xs.
+    /// The seam's host staging: one pinned buffer, sized for the widest prompt pass's h, y and xs.
     stage: [1]cuda.HostBuffer = undefined,
 
     /// Loads the checkpoint into the Python engine's layouts and sizes the caches; `triton_dir` null: our own glue.
@@ -207,10 +199,6 @@ pub const Engine = struct {
         }) else chunks;
         e.w = try weights.loadRange(gpa, io, e.ops(), model_dir, e.c, opts.mtp, opts.range);
         e.range = .{ .first = opts.range.first, .last = opts.range.last };
-        e.norm_done = opts.norm_done;
-        e.embed_rows = opts.range.embed;
-        e.tail = opts.range.head;
-        e.seam_h = opts.seam_h;
         errdefer e.w.deinit();
         if (opts.vision) |lim| {
             var problem: []const u8 = "";
@@ -332,6 +320,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        e.ctx.makeCurrent() catch {};
         if (e.tp != null) @import("cuda_worker.zig").end(e) catch {}; // the other ranks leave their job loops
         e.stream.synchronize() catch {};
         e.spares.deinit();
@@ -366,6 +355,7 @@ pub const Engine = struct {
 
     /// A zeroed sequence for another stream (its own caches, state, head caches and settings).
     pub fn newSeq(e: *Engine) !*state.Seq {
+        if (e.peer != null) return error.SplitSingleStream;
         const s = try e.gpa.create(state.Seq);
         errdefer e.gpa.destroy(s);
         var head: [head_fields.len]usize = undefined;
@@ -421,16 +411,17 @@ pub const Engine = struct {
         f.tp = if (e.tp) |*g| g else null;
         f.vision = e.vision;
         f.range = e.range;
-        f.norm_done = e.norm_done;
-        f.embed_rows = e.embed_rows;
-        f.tail = e.tail;
-        f.seam_h = e.seam_h;
         if (dump == null and e.c.experts <= 128 and e.c.slots() <= 8) f.side = e.side; // tf_plan_routed's bounds
         return f;
     }
 
     /// Engine.reset: zeroed caches and state, position 0.
     pub fn reset(e: *Engine) !void {
+        if (e.peer) |p| {
+            try p.ctx.makeCurrent();
+            try p.reset();
+            try e.ctx.makeCurrent();
+        }
         try e.b.reset(e.ops());
         e.pos = 0;
         e.parity = 0;
@@ -450,7 +441,7 @@ pub const Engine = struct {
 
     /// Any block's change, for the buffers every block shares (null: no lesson is attached).
     pub fn lessons(e: *const Engine) ?weights.Adapter {
-        for (e.w.blocks) |blk| switch (blk.kind) {
+        for (e.w.blocks[e.range.first..@min(e.range.last, e.c.layers)]) |blk| switch (blk.kind) {
             .mamba => if (blk.mamba.adapter) |ad| return ad,
             .attention => if (blk.attn.adapter) |ad| return ad,
             .moe => if (blk.moe.adapter) |ad| return ad,
@@ -520,6 +511,7 @@ pub const Engine = struct {
 
     /// Several streams' windows in one forward (eager): each stream's rows read its own caches, state and rule.
     pub fn verifyShared(e: *Engine, parts: []const Shared) !void {
+        if (e.peer != null) return error.SplitSingleStream;
         if (parts.len < 1 or parts.len > max_streams) return error.BadWindow;
         var total: usize = 0;
         for (parts) |p| {

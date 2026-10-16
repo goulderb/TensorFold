@@ -27,7 +27,7 @@ var lib_mutex: std.atomic.Mutex = .unlocked;
 fn load(io: std.Io, a: Allocator) ?Fns {
     // libtfgrammar is built as a .so or .dylib only, and Zig 0.17's std.DynLib is a compile error on Windows:
     // structured output stays refused there, as the vision helper is (docs/windows-port.md).
-    if (builtin.os.tag == .windows) return null;
+    if (comptime builtin.os.tag == .windows) return null;
     while (!lib_mutex.tryLock()) std.atomic.spinLoopHint();
     defer lib_mutex.unlock();
     if (lib) |l| return l;

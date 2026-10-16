@@ -44,7 +44,8 @@ pub const Recorder = struct {
         defer root.close(io);
         var k: u32 = 0;
         while (true) : (k += 1) {
-            const name = try std.fmt.allocPrint(gpa, "{d}-{d}", .{ std.c.getpid(), k });
+            const pid: u32 = if (comptime @import("builtin").os.tag == .windows) std.os.windows.GetCurrentProcessId() else @intCast(std.c.getpid());
+            const name = try std.fmt.allocPrint(gpa, "{d}-{d}", .{ pid, k });
             errdefer gpa.free(name);
             root.createDir(io, name, .default_dir) catch |e| switch (e) {
                 error.PathAlreadyExists => {
