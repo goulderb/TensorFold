@@ -65,7 +65,8 @@ const Root = struct {
 
     fn make() !Root {
         const tmp = std.testing.tmpDir(.{});
-        return .{ .tmp = tmp, .path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path}) };
+        // a root the tier makes (and makes private): the test directory itself inherits its parent's access
+        return .{ .tmp = tmp, .path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/tier", .{tmp.sub_path}) };
     }
 
     fn deinit(r: *Root) void {
@@ -150,6 +151,7 @@ test "a state written before a restart is found for a prompt that extends it and
 }
 
 test "a cut write leaves only a partial file, deleted at the next start; a file whose size disagrees is deleted" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX files, modes, links or paths
     var root = try Root.make();
     defer root.deinit();
     var tok: [100]u32 = undefined;
@@ -183,6 +185,7 @@ test "a cut write leaves only a partial file, deleted at the next start; a file 
 extern "c" fn chown(path: [*:0]const u8, owner: std.c.uid_t, group: std.c.gid_t) c_int;
 
 test "a spill directory that is a link, another user's, or writable by others is refused at start" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX files, modes, links or paths
     var root = try Root.make();
     defer root.deinit();
     const s = root.settings(1 << 20);
@@ -219,6 +222,7 @@ test "a spill directory that is a link, another user's, or writable by others is
 }
 
 test "a write never follows a link planted where a partial file or the start stamp goes" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX files, modes, links or paths
     var root = try Root.make();
     defer root.deinit();
     var tok: [40]u32 = undefined;
@@ -296,6 +300,7 @@ test "another identity's or another rank's file is never read: a copy into this 
 }
 
 test "a corrupt payload byte fails its read after the copy, and the file goes" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX files, modes, links or paths
     var root = try Root.make();
     defer root.deinit();
     var tok: [50]u32 = undefined;
@@ -392,6 +397,7 @@ fn sizeOf(fd: c_int) u64 {
 }
 
 test "the free-disk floor: stored states go until a write leaves the floor free, else the write is refused" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX files, modes, links or paths
     var root = try Root.make();
     defer root.deinit();
     var tok: [3][40]u32 = undefined;
@@ -420,6 +426,7 @@ test "the free-disk floor: stored states go until a write leaves the floor free,
 }
 
 test "the free-disk floor counts only the bytes a deletion gives back: a state being read keeps its blocks" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX files, modes, links or paths
     var root = try Root.make();
     defer root.deinit();
     var tok: [2][40]u32 = undefined;
@@ -511,6 +518,7 @@ test "a start keeps the newest other builds' directories and deletes the older o
 }
 
 test "settings come from TENSORFOLD_SPILL_*: off without a size, GLM's defaults, bad values refused" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX files, modes, links or paths
     const Env = struct {
         vars: []const [2][]const u8,
         pub fn get(e: @This(), name: [:0]const u8) ?[]const u8 {
@@ -623,6 +631,7 @@ const FullDisk = struct {
 };
 
 test "actual injected ENOSPC after a payload chunk releases the source and removes the partial write" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX files, modes, links or paths
     if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
     var root = try Root.make();
     defer root.deinit();
@@ -758,6 +767,7 @@ test "a queued follower copy returns NotStored without waiting for its blocked w
 }
 
 test "settings refuse non-finite, negative and overflowing numbers before any conversion" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX files, modes, links or paths
     const Env = struct {
         vars: []const [2][]const u8,
         pub fn get(e: @This(), name: [:0]const u8) ?[]const u8 {
@@ -802,4 +812,218 @@ test "waitDone returns once the write is final, after its source was copied" {
     j.waitDone();
     try std.testing.expect(j.copied() and j.done() and j.ok);
     j.waitDone(); // already final: returns at once
+}
+
+// -- the memory level (TENSORFOLD_SPILL_RAM_GIB) --------------------------------------------------------------------
+
+/// A state handed over whole: its payload copied into tier-owned memory.
+fn hold(t: *Tier, tokens: []const u32, at: u32, meta: []const u8, payload: []const u8) !Name {
+    const name = Name.of(tokens[0..at], at);
+    const owned = try t.ramAlloc(payload.len);
+    @memcpy(owned, payload);
+    try t.adopt(name, tokens[0..at], meta, owned);
+    return name;
+}
+
+test "a held state is found and read back byte for byte from memory, and written behind to disk" {
+    var root = try Root.make();
+    defer root.deinit();
+    var tok: [300]u32 = undefined;
+    const tokens = tokensOf(&tok, 11);
+    var pay: [20_000]u8 = undefined;
+    const payload = payloadOf(&pay, 9);
+    var s = root.settings(1 << 20);
+    s.ram_cap = 1 << 20;
+    const t = try Tier.open(gpa, io, s, "flashnext", identity_a, 0, 1);
+    defer t.deinit();
+    t.chunk = 4096;
+    const name = try hold(t, tokens, 200, "held", payload);
+    try std.testing.expect(t.has(name));
+    try std.testing.expect(t.stored(name, tokens[0..200]));
+    const hit = t.best(tokens, 0, {}, anyAt).?;
+    try std.testing.expectEqual(@as(u32, 200), hit.name.at);
+    var meta: [64]u8 = undefined;
+    const got = try readBack(t, name, &meta);
+    defer gpa.free(got);
+    try std.testing.expectEqualSlices(u8, payload, got);
+    try std.testing.expectEqualStrings("held", meta[0..4]);
+    try std.testing.expect(t.drain(10));
+    const info = t.info();
+    try std.testing.expectEqual(@as(u64, 1), info.stats.ram_adopted);
+    try std.testing.expectEqual(@as(u64, 1), info.stats.ram_loaded); // memory served it, whatever the writer reached
+    try std.testing.expectEqual(@as(usize, 1), info.ram_entries); // still held with its file in place
+    try std.testing.expectEqual(@as(u64, 20_000), info.ram_bytes);
+    try std.testing.expectEqual(@as(u64, 1), info.stats.written);
+    try std.testing.expectEqual(@as(u64, 4096 + 4096 + 20_000), info.stored_bytes);
+    try std.testing.expectError(error.AlreadyStored, hold(t, tokens, 200, "again", payload));
+}
+
+test "past the memory cap the least recently used held state leaves memory for its file, and a restart finds them all" {
+    var root = try Root.make();
+    defer root.deinit();
+    var tok: [3][100]u32 = undefined;
+    var pay: [3][10_000]u8 = undefined;
+    var names: [3]Name = undefined;
+    var s = root.settings(1 << 20);
+    s.ram_cap = 25_000; // two of the three
+    {
+        const t = try Tier.open(gpa, io, s, "flashnext", identity_a, 0, 1);
+        defer t.deinit();
+        for (0..3) |i| {
+            names[i] = try hold(t, tokensOf(&tok[i], @intCast(100 * i + 1)), 90, "m", payloadOf(&pay[i], @intCast(i + 1)));
+            try std.testing.expect(t.drain(10));
+        }
+        const info = t.info();
+        try std.testing.expectEqual(@as(usize, 2), info.ram_entries);
+        try std.testing.expectEqual(@as(u64, 20_000), info.ram_bytes);
+        try std.testing.expectEqual(@as(u64, 1), info.stats.ram_released);
+        try std.testing.expectEqual(@as(usize, 3), info.entries);
+        try std.testing.expectEqual(@as(u64, 3), info.stats.written);
+        // the oldest went to disk and reads back from there
+        var meta: [64]u8 = undefined;
+        const got = try readBack(t, names[0], &meta);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(u8, &pay[0], got);
+        try std.testing.expectEqual(@as(u64, 0), t.info().stats.ram_loaded);
+    }
+    const t = try Tier.open(gpa, io, s, "flashnext", identity_a, 0, 1);
+    defer t.deinit();
+    for (names) |n| try std.testing.expect(t.has(n)); // every one was written behind
+    try std.testing.expectEqual(@as(usize, 0), t.info().ram_entries); // memory went with the process
+}
+
+test "a held state outlives an abrupt end: its file was written behind before the process went" {
+    var root = try Root.make();
+    defer root.deinit();
+    var tok: [100]u32 = undefined;
+    var pay: [10_000]u8 = undefined;
+    var s = root.settings(1 << 20);
+    s.ram_cap = 1 << 20;
+    const name = blk: {
+        const t = try Tier.open(gpa, io, s, "flashnext", identity_a, 0, 1);
+        defer t.deinit(); // no flushRam: as a kill leaves it, after the writer's queue emptied
+        const n = try hold(t, tokensOf(&tok, 7), 90, "m", payloadOf(&pay, 7));
+        try std.testing.expect(t.drain(10));
+        break :blk n;
+    };
+    const t = try Tier.open(gpa, io, s, "flashnext", identity_a, 0, 1);
+    defer t.deinit();
+    var meta: [64]u8 = undefined;
+    const got = try readBack(t, name, &meta);
+    defer gpa.free(got);
+    try std.testing.expectEqualSlices(u8, &pay, got);
+}
+
+test "a held state the disk has no room for leaves memory, and the owner hears of it" {
+    var root = try Root.make();
+    defer root.deinit();
+    var tok: [2][100]u32 = undefined;
+    var pay: [2][10_000]u8 = undefined;
+    var s = root.settings(4096); // smaller than any file
+    s.ram_cap = 15_000;
+    const t = try Tier.open(gpa, io, s, "flashnext", identity_a, 0, 1);
+    defer t.deinit();
+    var f: Forgot = .{};
+    defer f.names.deinit(gpa);
+    t.setHook(f.hook());
+    const first = try hold(t, tokensOf(&tok[0], 1), 90, "m", payloadOf(&pay[0], 1));
+    _ = try hold(t, tokensOf(&tok[1], 2), 90, "m", payloadOf(&pay[1], 2));
+    try std.testing.expect(!t.has(first));
+    try std.testing.expectEqual(@as(usize, 1), f.names.items.len);
+    try std.testing.expect(f.names.items[0].eql(first));
+    try std.testing.expectEqual(@as(u64, 1), t.info().stats.ram_dropped);
+}
+
+test "a held state read while it goes on to disk reads whole; forgetting one on its way leaves no file" {
+    var root = try Root.make();
+    defer root.deinit();
+    var tok: [3][100]u32 = undefined;
+    var pay: [3][10_000]u8 = undefined;
+    var s = root.settings(1 << 20);
+    s.ram_cap = 15_000;
+    const t = try Tier.open(gpa, io, s, "flashnext", identity_a, 0, 1);
+    defer t.deinit();
+    const a = try hold(t, tokensOf(&tok[0], 1), 90, "m", payloadOf(&pay[0], 1));
+    var r = try t.read(a); // a reader holds a's memory
+    _ = try hold(t, tokensOf(&tok[1], 2), 90, "m", payloadOf(&pay[1], 2)); // a goes on to disk
+    try std.testing.expect(t.drain(10));
+    var c: Collect = .{};
+    defer c.out.deinit(gpa);
+    try r.pump(c.sink());
+    r.close();
+    try std.testing.expectEqualSlices(u8, &pay[0], c.out.items);
+    // b goes on to disk for c's room and is forgotten at once: whatever the writer reached, no file stays
+    const b = Name.of(tok[1][0..90], 90);
+    _ = try hold(t, tokensOf(&tok[2], 3), 90, "m", payloadOf(&pay[2], 3));
+    t.forget(b);
+    try std.testing.expect(t.drain(10));
+    try std.testing.expect(!t.has(b));
+    var p: [512]u8 = undefined;
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, root.file(&p, identity_a, 0, b), .{}));
+}
+
+test "a clean stop writes every held state, and the next start finds them all" {
+    var root = try Root.make();
+    defer root.deinit();
+    var tok: [3][100]u32 = undefined;
+    var pay: [3][10_000]u8 = undefined;
+    var names: [3]Name = undefined;
+    var s = root.settings(1 << 20);
+    s.ram_cap = 1 << 20;
+    {
+        const t = try Tier.open(gpa, io, s, "flashnext", identity_a, 0, 1);
+        defer t.deinit();
+        for (0..3) |i| names[i] = try hold(t, tokensOf(&tok[i], @intCast(100 * i + 1)), 90, "m", payloadOf(&pay[i], @intCast(i + 1)));
+        t.flushRam();
+        try std.testing.expect(t.drain(10));
+        const info = t.info();
+        try std.testing.expectEqual(@as(u64, 3), info.stats.written);
+    }
+    const t = try Tier.open(gpa, io, s, "flashnext", identity_a, 0, 1);
+    defer t.deinit();
+    for (names, 0..) |n, i| {
+        var meta: [64]u8 = undefined;
+        const got = try readBack(t, n, &meta);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(u8, &pay[i], got);
+    }
+}
+
+test "settings take TENSORFOLD_SPILL_RAM_GIB and an absolute directory on this OS" {
+    const Env = struct {
+        dir: []const u8,
+        ram: ?[]const u8,
+        pub fn get(e: @This(), name: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "TENSORFOLD_SPILL_GIB")) return "2";
+            if (std.mem.eql(u8, name, "TENSORFOLD_SPILL_DIR")) return e.dir;
+            if (std.mem.eql(u8, name, "TENSORFOLD_SPILL_RAM_GIB")) return e.ram;
+            return null;
+        }
+    };
+    const abs = if (@import("builtin").os.tag == .windows) "C:/spill" else "/spill";
+    const s = (try spill.Settings.fromEnv(gpa, Env{ .dir = abs, .ram = "1.5" })).?;
+    defer gpa.free(s.dir);
+    try std.testing.expectEqual(@as(u64, 3 << 29), s.ram_cap);
+    const off = (try spill.Settings.fromEnv(gpa, Env{ .dir = abs, .ram = null })).?;
+    defer gpa.free(off.dir);
+    try std.testing.expectEqual(@as(u64, 0), off.ram_cap);
+    try std.testing.expectError(error.BadSpillSetting, spill.Settings.fromEnv(gpa, Env{ .dir = abs, .ram = "-1" }));
+    try std.testing.expectError(error.SpillDirNotAbsolute, spill.Settings.fromEnv(gpa, Env{ .dir = "spill", .ram = null }));
+}
+
+test "Windows: a root others may change is refused; the tier's own directories are private" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest; // POSIX: the mode test above
+    var root = try Root.make();
+    defer root.deinit();
+    // the test directory inherits its parent's access: on a dev checkout, Authenticated Users may change it
+    var pb: [512]u8 = undefined;
+    const parent = try std.fmt.bufPrint(&pb, ".zig-cache/tmp/{s}", .{root.tmp.sub_path});
+    var s = root.settings(1 << 20);
+    const t = try Tier.open(gpa, io, s, "flashnext", identity_a, 0, 1); // made here, so private
+    t.deinit();
+    s.dir = parent;
+    if (Tier.open(gpa, io, s, "flashnext", identity_a, 0, 1)) |x| {
+        x.deinit();
+        return error.SkipZigTest; // a parent no one else may change (not a shared checkout): nothing to refuse
+    } else |err| try std.testing.expectEqual(error.SpillDirUnsafe, err);
 }

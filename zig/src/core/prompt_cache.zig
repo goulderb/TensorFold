@@ -228,6 +228,7 @@ pub const Store = struct {
             }
         }.newer);
         for (order) |e| s.spillOut(e);
+        t.flushRam(); // the states the tier holds in memory alone: their files, before the writers drain
         return t.drain(seconds);
     }
 

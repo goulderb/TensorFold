@@ -21,8 +21,9 @@ pub const Copy = struct {
     peer: ?*Copy = null, // two-GPU TP: the same state's share on the other rank
 };
 
-/// Two-GPU TP: the peer's target (its engine, no head) once its host view is rank 0's; null when not TP.
-fn peerOf(t: *const Target) ?Target {
+/// Two-GPU TP: the peer's target (its engine, no head) once its host view is rank 0's, its context current; null
+/// when not TP. `backTo` makes rank 0's current again.
+pub fn peerOf(t: *const Target) ?Target {
     const e = t.e;
     if (e.tp_link == null) return null;
     e.syncPeer();
@@ -31,7 +32,7 @@ fn peerOf(t: *const Target) ?Target {
     return .{ .e = p, .head = null };
 }
 
-fn backTo(t: *const Target) void {
+pub fn backTo(t: *const Target) void {
     t.e.ctx.makeCurrent() catch {};
 }
 
@@ -51,9 +52,16 @@ pub fn shape(t: *const Target, at: usize) Shape {
     return .{ .layers = t.e.c.count(.attention), .row = state.kvRowBytes(t.e.c), .head = t.head != null, .kv = kvBytes(t.e.c, at, t.head != null), .mamba = m[0] + m[1] };
 }
 
-/// A whole kept state of `at` tokens, its buffers empty for a disk read to fill (`fill`).
+/// A whole kept state of `at` tokens, its buffers empty for a disk read to fill (`fill`); under TP the peer's share
+/// too (`Copy.peer`), which a read fills through the peer's target.
 pub fn blank(t: *const Target, at: usize) !*Copy {
-    return alloc(t, at, true);
+    const copy = try alloc(t, at, true);
+    errdefer drop(@constCast(t), copy);
+    if (peerOf(t)) |pt| {
+        defer backTo(t);
+        copy.peer = try alloc(&pt, at, true);
+    }
+    return copy;
 }
 
 /// `host` to or from (`out`) bytes [off, off + host.len) of a kept state's key and value buffer or its Mamba buffer.
@@ -78,6 +86,10 @@ pub fn setWords(saved: *anyopaque, w: [2]u64) void {
     const copy: *Copy = @ptrCast(@alignCast(saved));
     copy.parity = @intCast(w[0]);
     copy.rows = @intCast(w[1]);
+    if (copy.peer) |pc| { // both ranks' shares stand where rank 0's does
+        pc.parity = copy.parity;
+        pc.rows = copy.rows;
+    }
 }
 
 /// `len` bytes at `live` in the bound sequence's planes; `mamba`: the SSM or conv state, which an armed chunk writes.

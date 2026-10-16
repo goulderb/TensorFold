@@ -14,8 +14,34 @@ const api = @import("engine_api");
 const spill = api.prompt_cache.spill;
 const Identity = api.spill_resume.Identity;
 
-/// The file identity below is Linux's: statx, pread and a raw fd. Elsewhere the tier refuses, as `openRead` says.
+/// The file identity below: statx, pread and a raw fd on Linux; the handle's volume, file index, size and times on
+/// Windows. Elsewhere the tier refuses, as `openRead` says.
 const is_linux = builtin.os.tag == .linux;
+const is_windows = builtin.os.tag == .windows;
+const Fd = if (is_windows) *anyopaque else c_int;
+
+const win = struct {
+    const ByHandleInfo = extern struct {
+        attributes: u32,
+        creation: [2]u32,
+        access: [2]u32,
+        write: [2]u32,
+        volume_serial: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    };
+    const Overlapped = extern struct { internal: usize = 0, internal_high: usize = 0, offset: u32, offset_high: u32, event: ?*anyopaque = null };
+    const ERROR_HANDLE_EOF: u32 = 38;
+    extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, security: ?*anyopaque, disposition: u32, flags: u32, template: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn ReadFile(h: *anyopaque, buf: [*]u8, n: u32, read: *u32, overlapped: ?*Overlapped) callconv(.winapi) i32;
+    extern "kernel32" fn CloseHandle(h: *anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn GetFileInformationByHandle(h: *anyopaque, info: *ByHandleInfo) callconv(.winapi) i32;
+    extern "kernel32" fn GetModuleFileNameW(module: ?*anyopaque, buf: [*]u16, n: u32) callconv(.winapi) u32;
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+};
 
 pub const Config = struct {
     tier: spill.Settings, // `dir` allocated
@@ -47,7 +73,13 @@ const Meta = struct {
     mtime: [2]i64,
     ctime: [2]i64,
 
-    fn of(fd: c_int) !Meta {
+    fn of(fd: Fd) !Meta {
+        if (is_windows) {
+            var info: win.ByHandleInfo = undefined;
+            if (win.GetFileInformationByHandle(fd, &info) == 0) return error.SpillArtifactStat;
+            // the volume and file index name the file as dev and inode do; the write time changes with its bytes
+            return .{ .dev_major = info.volume_serial, .dev_minor = 0, .ino = @as(u64, info.index_high) << 32 | info.index_low, .size = @as(u64, info.size_high) << 32 | info.size_low, .mtime = .{ info.write[1], info.write[0] }, .ctime = .{ info.creation[1], info.creation[0] } };
+        }
         if (!is_linux) return error.Unsupported;
         const linux = std.os.linux;
         var sx: linux.Statx = undefined;
@@ -60,19 +92,32 @@ const Meta = struct {
     }
 };
 
-fn openRead(path: [:0]const u8) !c_int {
+fn openRead(path: [:0]const u8) !Fd {
+    if (is_windows) {
+        var w: [1024:0]u16 = undefined;
+        const n = std.unicode.utf8ToUtf16Le(w[0..1023], path) catch return error.SpillArtifactOpen;
+        w[n] = 0;
+        const h = win.CreateFileW(&w, 0x80000000, 0x1, null, 3, 0, null) orelse return error.SpillArtifactOpen; // read, share read
+        return if (@intFromPtr(h) == std.math.maxInt(usize)) error.SpillArtifactOpen else h;
+    }
     if (!is_linux) return error.Unsupported;
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
     return if (fd < 0) error.SpillArtifactOpen else fd;
 }
 
 /// `std.c.close` takes a pointer on Windows, so the Linux-only callers close through here.
-fn closeRead(fd: c_int) void {
-    if (is_linux) _ = std.c.close(fd);
+fn closeRead(fd: Fd) void {
+    if (is_windows) _ = win.CloseHandle(fd) else if (is_linux) _ = std.c.close(fd);
 }
 
 /// A positional read of `buf` at `off`; only the Linux tier reaches this.
-fn preadRead(fd: c_int, buf: []u8, off: u64) isize {
+fn preadRead(fd: Fd, buf: []u8, off: u64) isize {
+    if (is_windows) {
+        var ov: win.Overlapped = .{ .offset = @truncate(off), .offset_high = @truncate(off >> 32) };
+        var n: u32 = 0;
+        if (win.ReadFile(fd, buf.ptr, @intCast(@min(buf.len, 1 << 30)), &n, &ov) == 0) return if (win.GetLastError() == win.ERROR_HANDLE_EOF) 0 else -1;
+        return @intCast(n);
+    }
     if (!is_linux) return -1;
     return std.c.pread(fd, buf.ptr, buf.len, @intCast(off));
 }
@@ -163,7 +208,7 @@ pub const Artifacts = struct {
 /// AOT kernel set's files, stat'ed now.
 pub fn executable(gpa: std.mem.Allocator, io: std.Io, kernels: ?[]const u8) !Artifacts {
     const paths = try gpa.alloc([:0]u8, 1);
-    paths[0] = gpa.dupeSentinel(u8, "/proc/self/exe", 0) catch |e| {
+    paths[0] = selfPath(gpa) catch |e| {
         gpa.free(paths);
         return e;
     };
@@ -175,6 +220,15 @@ pub fn executable(gpa: std.mem.Allocator, io: std.Io, kernels: ?[]const u8) !Art
         for (files) |f| try a.add(gpa, f);
     }
     return a;
+}
+
+/// The running executable's path: /proc/self/exe on Linux, the module's own file on Windows.
+fn selfPath(gpa: std.mem.Allocator) ![:0]u8 {
+    if (!is_windows) return gpa.dupeSentinel(u8, "/proc/self/exe", 0);
+    var w: [1024]u16 = undefined;
+    const n = win.GetModuleFileNameW(null, &w, w.len);
+    if (n == 0 or n >= w.len) return error.SpillArtifactOpen;
+    return std.unicode.utf16LeToUtf8AllocZ(gpa, w[0..n]);
 }
 
 /// A captured kernel set's files as `cuda.aot.Set.load` reads them: aot.json and each kernel's cubin.
@@ -220,6 +274,8 @@ pub const Facts = struct {
     grid: u32,
     lookahead: u32,
     segments: u32,
+    kv: []const u8 = "bf16", // the key and value rows' precision ("fp8-e4m3": calibrated per-layer scales)
+    tp: u32 = 1, // two-GPU TP: each file holds both ranks' shares
 
     /// The tier's identity: equal only for the same weights, executable, kernels, device class and state layout.
     pub fn identity(f: Facts) ![32]u8 {
@@ -233,8 +289,8 @@ pub const Facts = struct {
         const layout = try std.fmt.bufPrint(&buf, "nemotron_h planes={d},{d},{d},{d},{d},{d},{d} head={d} max_len={d} grid={d} lookahead={d}", .{ f.planes[0], f.planes[1], f.planes[2], f.planes[3], f.planes[4], f.planes[5], f.planes[6], f.head, f.max_len, f.grid, f.lookahead });
         const l = hexDigest(layout, &lh);
         var db: [96]u8 = undefined;
-        const dtype = try std.fmt.bufPrint(&db, "weights={s} kv=bf16 ssm=f32 conv=bf16 dt=f32 head=bf16", .{f.format});
-        return (Identity{ .weights = f.weights, .runtime = r, .layout = l, .dtype = dtype, .tp = 1 }).digest();
+        const dtype = try std.fmt.bufPrint(&db, "weights={s} kv={s} ssm=f32 conv=bf16 dt=f32 head=bf16", .{ f.format, f.kv });
+        return (Identity{ .weights = f.weights, .runtime = r, .layout = l, .dtype = dtype, .tp = f.tp }).digest();
     }
 };
 

@@ -10,18 +10,21 @@ const cuda = @import("cuda");
 const api = @import("engine_api");
 const nemotron = @import("nemotron");
 const pc = api.prompt_cache;
+const kept = @import("nemotron").native.kept_states;
 const spill = pc.spill;
 const N = nemotron.native;
 
 pub const lookahead: u32 = 1;
 
-/// Logical KV bytes per token (including the head), recurrent bytes and the source window.
+/// Logical KV bytes per token (including the head), recurrent bytes and the source window, a rank; `ranks` 2 for
+/// two-GPU TP, whose files hold both ranks' shares after the words (each rank's are the same size).
 pub const Layout = struct {
     kv_row: u64,
     mamba: u64,
     head: bool,
     max_len: u64,
     grid: u32,
+    ranks: u32 = 1,
 
     pub fn of(sh: N.SpillShape, grid: u32) !Layout {
         const l: Layout = .{ .kv_row = sh.kv_row, .mamba = sh.mamba, .head = sh.head, .max_len = sh.max_len, .grid = grid };
@@ -35,10 +38,20 @@ pub const Layout = struct {
         return l.kv_row * at; // checked at max_len during admission
     }
 
+    /// The same layout over `ranks` ranks.
+    pub fn over(l: Layout, ranks: u32) !Layout {
+        if (ranks != 1 and ranks != 2) return error.BadLayout;
+        var x = l;
+        x.ranks = ranks;
+        _ = try x.payload();
+        return x;
+    }
+
     pub fn payloadAt(l: Layout, at: u64) !u64 {
         if (at > l.max_len) return error.BadLayout;
         const kv = std.math.mul(u64, l.kv_row, at) catch return error.BadLayout;
-        return std.math.add(u64, std.math.add(u64, kv, l.mamba) catch return error.BadLayout, 16) catch error.BadLayout;
+        const one = std.math.add(u64, kv, l.mamba) catch return error.BadLayout;
+        return std.math.add(u64, std.math.mul(u64, one, l.ranks) catch return error.BadLayout, 16) catch error.BadLayout;
     }
 
     /// The worst-case slot reservation. A file writes only payloadAt(its position).
@@ -50,6 +63,15 @@ pub const Layout = struct {
         const kv = l.kvBytes(at);
         return .{ .{ .off = 0, .len = 16 }, .{ .off = 16, .len = kv }, .{ .off = 16 + kv, .len = l.mamba } };
     }
+
+    /// A rank's share at `at`: its key and value rows, then its Mamba states, at their payload offsets.
+    const Share = struct { kv: u64, mamba: u64, kv_len: u64 };
+
+    fn share(l: Layout, at: u64, rank: u32) Share {
+        const kv = l.kvBytes(at);
+        const off = 16 + @as(u64, rank) * (kv + l.mamba);
+        return .{ .kv = off, .mamba = off + kv, .kv_len = kv };
+    }
 };
 
 // ---- the private codec: fixed little-endian fields, nothing from struct memory ------------------------------------
@@ -57,6 +79,7 @@ pub const Layout = struct {
 const magic = "NEMOCU02";
 const codec_version: u32 = 2;
 const flag_head: u32 = 1;
+const flag_tp2: u32 = 2; // two ranks' shares (Layout.ranks 2)
 /// magic, version, length, flags, grid, lookahead; KV row, Mamba bytes, window, payload, position.
 pub const meta_len: usize = 8 + 4 * 5 + 8 * 5;
 pub const Scalars = struct { pos: u64 };
@@ -90,7 +113,7 @@ pub fn encode(l: Layout, scalar: Scalars, out: *[meta_len]u8) void {
     w.bytes(magic);
     w.int(u32, codec_version);
     w.int(u32, meta_len);
-    w.int(u32, if (l.head) flag_head else 0);
+    w.int(u32, (if (l.head) flag_head else 0) | (if (l.ranks == 2) flag_tp2 else 0));
     w.int(u32, l.grid);
     w.int(u32, lookahead);
     w.int(u64, l.kv_row);
@@ -108,8 +131,8 @@ pub fn decode(l: Layout, m: []const u8, name: spill.Name) !Scalars {
     if (r.int(u32) != codec_version) return error.SpillMetaVersion;
     if (r.int(u32) != meta_len) return error.SpillMetaLength;
     const flags = r.int(u32);
-    if (flags & ~flag_head != 0) return error.SpillMetaFlags;
-    if ((flags & flag_head != 0) != l.head) return error.SpillLayout;
+    if (flags & ~(flag_head | flag_tp2) != 0) return error.SpillMetaFlags;
+    if ((flags & flag_head != 0) != l.head or (flags & flag_tp2 != 0) != (l.ranks == 2)) return error.SpillLayout;
     if (r.int(u32) != l.grid or r.int(u32) != lookahead) return error.SpillLayout;
     if (r.int(u64) != l.kv_row or r.int(u64) != l.mamba or r.int(u64) != l.max_len) return error.SpillLayout;
     const bytes = r.int(u64);
@@ -148,6 +171,7 @@ pub const Counts = struct {
     capture_ns: u64 = 0, // owner time fencing the stream and downloading states
     read_ok: u64 = 0, // states read back whole
     read_failed: u64 = 0, // reads refused or failed (not counting NotStored)
+    held: u64 = 0, // states captured whole into the tier's memory level (Tier.adopt), no slot involved
 };
 
 const retired_most = 4;
@@ -230,6 +254,9 @@ pub const Disk = struct {
     flush_s: f64,
     target: ?*N.Target = null, // the Target `attach` bound (unbound at close)
     flush: ?Flush = null, // set only inside `close`
+    /// whether the reservation comes out of the prompt cache's budget: where host memory is the device's (unified);
+    /// a discrete GPU's cache is device memory the host reservation never takes
+    charged: bool = true,
 
     /// The host reservation for a layout's payload and a tier's chunk: slot, transfer buffers, control.
     pub fn reservationFor(payload: u64, chunk: usize) !u64 {
@@ -246,20 +273,29 @@ pub const Disk = struct {
         return r;
     }
 
-    /// The tier under `settings` for the loaded engine `identity`, and its slot, within `host_ceiling` bytes.
-    /// `settings.dir` passes to the Disk. Fails before any allocation it cannot account.
+    /// Whether the tier's memory level holds a max-window state: then every state is captured straight into it and
+    /// no slot is made.
+    pub fn slotless(payload: u64, settings: spill.Settings) bool {
+        return settings.ram_cap >= payload;
+    }
+
+    /// The tier under `settings` for the loaded engine `identity`, and its slot (none when the memory level holds a
+    /// max-window state), within `host_ceiling` bytes. `settings.dir` passes to the Disk. Fails before any allocation
+    /// it cannot account.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, copy_gpa: std.mem.Allocator, device: Device, layout: Layout, settings: spill.Settings, identity: [32]u8, host_ceiling: u64) !*Disk {
         const payload = try layout.payload();
-        const reservation = try reservationFor(payload, 64 << 20);
+        const slot_bytes: u64 = if (slotless(payload, settings)) 0 else payload;
+        const reservation = try reservationFor(slot_bytes, 64 << 20);
         if (reservation > host_ceiling) return error.SpillHostCeiling;
         const d = try gpa.create(Disk);
         errdefer gpa.destroy(d);
         const q = try gpa.create(Quota);
         errdefer gpa.destroy(q);
         q.* = .{ .parent = gpa, .limit = tierQuota(64 << 20, control_bytes) };
-        const slot = try gpa.alloc(u8, @intCast(payload));
+        const slot = try gpa.alloc(u8, @intCast(slot_bytes));
         errdefer gpa.free(slot);
         const t = try spill.Tier.open(q.allocator(), io, settings, "nemotron_h", identity, 0, 1);
+        t.ram_gpa = gpa; // held states are the memory level's bytes, under its own cap, not the tier's buffer quota
         d.* = .{ .gpa = gpa, .copy_gpa = copy_gpa, .device = device, .layout = layout, .payload = payload, .tier = t, .quota = q, .dir = @constCast(settings.dir), .slot = slot, .reservation = reservation, .flush_s = settings.flush_s };
         return d;
     }
@@ -325,6 +361,50 @@ pub const Disk = struct {
         if (!c.whole) return error.Incomplete;
         if (c.kv.len < d.layout.kvBytes(c.pos) or c.mamba.len < d.layout.mamba or c.head != d.layout.head) return error.SpillLayout;
         if (c.parity != 0 or c.rows > N.max_rows) return error.SpillScalars;
+        if (d.layout.ranks == 2) {
+            const p = c.peer orelse return error.SpillNoPeer;
+            if (!p.whole) return error.Incomplete;
+            if (p.pos != c.pos or p.kv.len < d.layout.kvBytes(c.pos) or p.mamba.len < d.layout.mamba) return error.SpillLayout;
+        } else if (c.peer != null) return error.SpillLayout;
+    }
+
+    /// Payload bytes [at_off, at_off + buf.len) between `buf` and kept state `c` (`out`: state to buf): the words,
+    /// then each rank's key and value rows and Mamba states through that rank's own target and stream (TP's peer
+    /// made current in turn), every copy settled before it returns.
+    fn copyParts(d: *Disk, target: *N.Target, c: *N.Copy, at_off: u64, buf: []u8, out: bool) !void {
+        const lo = at_off;
+        const hi = at_off + buf.len;
+        if (lo < 16) { // the words: the parity and row count where the state stood
+            var w = kept.words(c);
+            const n: usize = @intCast(@min(hi, 16) - lo);
+            if (out) @memcpy(buf[0..n], std.mem.asBytes(&w)[@intCast(lo)..][0..n]) else {
+                @memcpy(std.mem.asBytes(&w)[@intCast(lo)..][0..n], buf[0..n]);
+                kept.setWords(c, w);
+            }
+        }
+        for (0..d.layout.ranks) |r| {
+            const sh = d.layout.share(c.pos, @intCast(r));
+            if (hi <= sh.kv or lo >= sh.kv + sh.kv_len + d.layout.mamba) continue;
+            var rt: N.Target = if (r == 0) target.* else kept.peerOf(target) orelse return error.SpillNoPeer;
+            defer if (r != 0) kept.backTo(target);
+            const rc: *N.Copy = if (r == 0) c else c.peer orelse return error.SpillNoPeer;
+            for ([2]struct { off: u64, len: u64, mamba: bool }{ .{ .off = sh.kv, .len = sh.kv_len, .mamba = false }, .{ .off = sh.mamba, .len = d.layout.mamba, .mamba = true } }) |part| {
+                const a = @max(lo, part.off);
+                const b = @min(hi, part.off + part.len);
+                if (a >= b) continue;
+                try kept.hostCopy(&rt, rc, part.mamba, @intCast(a - part.off), buf[@intCast(a - lo)..@intCast(b - lo)], out);
+            }
+            try kept.settle(&rt);
+        }
+    }
+
+    /// The whole state into `out` (payloadAt(c.pos) bytes): upstream's image for one rank, both ranks' shares for TP.
+    fn gather(d: *Disk, target: *N.Target, c: *const N.Copy, out: []u8) !void {
+        if (d.layout.ranks == 1) {
+            const ranges = d.layout.ranges(c.pos);
+            return d.image.gather(target, @ptrCast(@constCast(c)), &ranges, out);
+        }
+        try d.copyParts(target, @constCast(c), 0, out, true);
     }
 
     /// Store's spill_write: the state captured into the slot, then queued; a busy slot is a counted skip.
@@ -343,7 +423,8 @@ pub const Disk = struct {
             }
         } else {
             d.reap();
-            if (d.job != null) {
+            const held = tier.holds(d.layout.payloadAt(@as(*const N.Copy, @ptrCast(@alignCast(saved))).pos) catch 0);
+            if (!held and d.job != null) {
                 d.counts.skipped_busy += 1;
                 tier.unwritten(.incomplete);
                 return;
@@ -368,15 +449,28 @@ pub const Disk = struct {
         try d.device.ctx.makeCurrent();
         try d.device.stream.synchronize();
         const bytes = try d.layout.payloadAt(c.pos);
-        const ranges = d.layout.ranges(c.pos);
-        d.image.gather(target, @ptrCast(@constCast(c)), &ranges, d.slot[0..@intCast(bytes)]) catch |err| {
+        var meta: [meta_len]u8 = undefined;
+        encode(d.layout, .{ .pos = c.pos }, &meta);
+        if (tier.holds(bytes)) { // straight into the memory level: the tier owns the bytes, no slot waits
+            const buf = try tier.ramAlloc(@intCast(bytes));
+            d.gather(target, c, buf) catch |err| {
+                d.device.stream.synchronize() catch {};
+                tier.ram_gpa.?.free(buf);
+                return err;
+            };
+            @memset(buf[8..16], 0); // a previous window's row count is rewritten before any reader
+            d.counts.capture_ns += @intCast(@max(0, std.Io.Clock.awake.now(tier.io).toNanoseconds() - t0));
+            try tier.adopt(name, tokens, &meta, buf);
+            d.counts.held += 1;
+            return;
+        }
+        if (d.slot.len < bytes) return error.SpillNoSlot;
+        d.gather(target, c, d.slot[0..@intCast(bytes)]) catch |err| {
             d.device.stream.synchronize() catch {};
             return err;
         };
         @memset(d.slot[8..16], 0); // a previous window's row count is rewritten before any reader
         d.counts.capture_ns += @intCast(@max(0, std.Io.Clock.awake.now(tier.io).toNanoseconds() - t0));
-        var meta: [meta_len]u8 = undefined;
-        encode(d.layout, .{ .pos = c.pos }, &meta);
         d.active_payload = bytes;
         d.job = try tier.write(name, tokens, &meta, bytes, .{ .ptr = d, .read = sourceRead });
         d.counts.submitted += 1;
@@ -421,6 +515,13 @@ pub const Disk = struct {
             const u: *Upload = @ptrCast(@alignCast(p));
             const total = try u.disk.layout.payloadAt(u.at);
             if (offset > total or bytes.len > total - offset) return error.SpillSourceRange;
+            if (u.disk.layout.ranks == 2) {
+                const c: *N.Copy = @ptrCast(@alignCast(u.saved));
+                return u.disk.copyParts(u.target, c, offset, @constCast(bytes), false) catch |err| {
+                    u.disk.device.stream.synchronize() catch {};
+                    return err;
+                };
+            }
             for (u.disk.layout.ranges(u.at)) |part| {
                 const lo = @max(offset, part.off);
                 const hi = @min(offset + bytes.len, part.off + part.len);
@@ -506,7 +607,8 @@ pub fn spillRead(p: *anyopaque, tier: *spill.Tier, name: spill.Name) anyerror!pc
 
 /// The host reservation, inside the cache's budget for as long as the tier is open.
 pub fn spare(p: *anyopaque) u64 {
-    return if (maybeDisk(p)) |d| d.reservation else 0;
+    const d = maybeDisk(p) orelse return 0;
+    return if (d.charged) d.reservation else 0;
 }
 
 /// The reservation cannot shrink; finished writes are reaped.
