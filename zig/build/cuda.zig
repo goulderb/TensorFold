@@ -47,6 +47,9 @@ const kernels = [_]Kernel{
     .{ .name = "glm_kda", .flags = &.{ "-O3", "--fmad=false" } }, // GLM: the Python family's glm5_next/cuda/kda.cu
     .{ .name = "glm_glue", .flags = &.{"-O3"} }, // ours: the Python family's Triton glue by hand, its PTX op for op
     .{ .name = "glm_ops", .flags = &.{"-O3"} }, // ours: GLM's integer work the Python family did in torch (the DSA token lists)
+    .{ .name = "glm_exl3", .flags = &.{"-O3"} },
+    .{ .name = "dflash_qmm", .flags = &.{"-O3"} },
+    .{ .name = "dflash_ops", .flags = torch_ops },
     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
     .{ .name = "glm_vision_ops", .flags = &.{ "-O3", "--fmad=false" } },
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
@@ -134,6 +137,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     cli.addOptions("build_options", build_options);
     cli.addImport("checkpoint_cli", checkpointCli(b, target, optimize, strip, native.engines, mods.core));
     b.installArtifact(b.addExecutable(.{ .name = "tensorfold", .root_module = cli }));
+    b.getInstallStep().dependOn(&b.addInstallDirectory(.{ .source_dir = b.path("zig/kernels/dflash2-aot"), .install_dir = .prefix, .install_subdir = "share/tensorfold/dflash2/sm121" }).step);
     const runner = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
     runner.addImport("cuda", cuda);
     runner.addImport("lanes", mods.lanes);
@@ -218,7 +222,9 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         return exe;
     }
     const install = b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = "native/bin" } } });
-    b.step("native", "tensorfold-native with the CUDA engines into zig-out/native/bin").dependOn(&install.step);
+    const native_step = b.step("native", "tensorfold-native with the CUDA engines into zig-out/native/bin");
+    native_step.dependOn(&install.step);
+    native_step.dependOn(&b.addInstallDirectory(.{ .source_dir = b.path("zig/kernels/dflash2-aot"), .install_dir = .prefix, .install_subdir = "native/share/tensorfold/dflash2/sm121" }).step);
     return exe;
 }
 

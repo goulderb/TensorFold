@@ -8,6 +8,12 @@ pub const max_parities = 1024;
 pub const max_meta = header_bytes + max_parities;
 const no_owner = std.math.maxInt(u32);
 
+pub fn withDraftBytes(target_bytes: u64, draft_bytes: u64) !u64 {
+    if (draft_bytes == 0) return target_bytes;
+    const padded = (try std.math.add(u64, target_bytes, 255)) & ~@as(u64, 255);
+    return std.math.add(u64, padded, draft_bytes);
+}
+
 pub const Shape = struct {
     layout: layout.Layout,
     format: cache.Format,
@@ -17,6 +23,8 @@ pub const Shape = struct {
     world: u32,
     grid: u32,
     parities: usize,
+    draft_bytes: u64 = 0,
+    draft_identity: [32]u8 = @splat(0),
 
     pub fn digest(s: Shape) [32]u8 {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
@@ -31,7 +39,13 @@ pub const Shape = struct {
         hashInt(&h, s.world);
         hashInt(&h, s.grid);
         hashInt(&h, s.parities);
+        hashInt(&h, s.draft_bytes);
+        h.update(&s.draft_identity);
         return h.finalResult();
+    }
+
+    pub fn payloadBytes(s: Shape, target_bytes: u64) !u64 {
+        return withDraftBytes(target_bytes, s.draft_bytes);
     }
 
     fn check(s: Shape, pos: u64, mtp_len: u64, owner: ?u32) !usize {
@@ -42,7 +56,7 @@ pub const Shape = struct {
         if (s.sharded != (owner != null)) return error.SpillOwner;
         if (owner) |r| if (r >= s.world) return error.SpillOwner;
         const plan = try s.layout.snapshot(.{ .main = @intCast(pos), .mtp = @intCast(mtp_len) });
-        return plan.bytesFor(owner == null or owner.? == s.rank);
+        return s.payloadBytes(plan.bytesFor(owner == null or owner.? == s.rank));
     }
 };
 
@@ -142,4 +156,24 @@ test "codec refuses partial metadata, geometry changes and invalid owner before 
     try std.testing.expectError(error.SpillOwner, encode(shape, 2048, 0, 0, &.{1}, &out));
     try std.testing.expectError(error.SpillPosition, encode(shape, 2048, 2048, null, &.{1}, &out));
     try std.testing.expectError(error.SpillPosition, encode(shape, 8192, 0, null, &.{1}, &out));
+}
+
+test "DFlash ring tail is budgeted and incompatible drafter state is rejected" {
+    const l = try layout.Layout.init(.{ 256, 0, 0, 0, 0, 0, 0, 0 }, 8192, 2048, 1, .bf16, 512, 128);
+    const control: Shape = .{ .layout = l, .format = .bf16, .mtp = false, .sharded = false, .rank = 0, .world = 2, .grid = 2048, .parities = 1 };
+    var shape = control;
+    shape.draft_bytes = 22_282_240;
+    shape.draft_identity = @splat(7);
+    const target = (try l.snapshot(.{ .main = 2048, .mtp = 0 })).byteCount();
+    const total = std.mem.alignForward(u64, target, 256) + 22_282_240;
+    try std.testing.expectEqual(total, try shape.payloadBytes(target));
+    var out: [max_meta]u8 = undefined;
+    const meta = try encode(shape, 2048, 0, null, &.{0}, &out);
+    const saved = try decode(shape, meta, 2048, total);
+    try std.testing.expectEqual(total, saved.bytes);
+    try std.testing.expectError(error.SpillShape, decode(control, meta, 2048, total));
+    var other = shape;
+    other.draft_identity[0] = 8;
+    try std.testing.expectError(error.SpillShape, decode(other, meta, 2048, total));
+    try std.testing.expectError(error.SpillPayloadLength, decode(shape, meta, 2048, target));
 }

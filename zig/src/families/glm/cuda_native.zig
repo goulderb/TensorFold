@@ -101,7 +101,6 @@ fn visionReady(ptr: *anyopaque, valid: bool) !bool {
 }
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
-    _ = kernels; // our own kernels: a captured set is not used
     const p = try place();
     if (p.world > 1 and std.c.getenv("NCCL_COMM_ID") == null) return error.NoCommId;
     var problem: []const u8 = "";
@@ -124,7 +123,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     try own.lib.check(own.lib.api.ncclCommInitRank(&own.comm, @intCast(p.world), id, @intCast(p.rank)), "ncclCommInitRank");
     errdefer _ = own.lib.api.ncclCommDestroy(own.comm);
     const cap = capacity(o.context);
-    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.lib, own.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set, .room = o.room });
+    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.lib, own.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set, .room = o.room, .draft_kernels = ranks.environment("TF_GLM_DFLASH_KERNELS") orelse kernels });
     errdefer own.e.deinit();
     own.link = try follow.Link.init(gpa, ctx.d, &own.lib, own.comm, own.e.stream, cap);
     errdefer own.link.deinit();
@@ -189,7 +188,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .facts = own.lanes.facts(),
         .rows = glm_lanes.max_rows,
         .stream_bytes = own.e.seqBytes(), // each stream past the first makes its own sequence on every rank
-        .lane_limit = if (own.e.pool != null) @import("cuda_kv_extent.zig").max_slots else std.math.maxInt(u32),
+        .lane_limit = if (own.e.dflash != null) engine.max_shared else if (own.e.pool != null) @import("cuda_kv_extent.zig").max_slots else std.math.maxInt(u32),
         .free_streams = 1, // the first is the sequence the engine made
         .ctx = own,
         .deinit = close,

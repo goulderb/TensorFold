@@ -19,6 +19,12 @@ const q4 = @import("cuda_q4.zig");
 const state = @import("cuda_state.zig");
 const shared = @import("cuda_shared.zig");
 const vision_binding = @import("cuda_vision_binding.zig");
+const taps = @import("cuda_taps.zig");
+const mia = @import("cuda_experts_mia.zig");
+
+test {
+    _ = taps;
+}
 
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
@@ -42,10 +48,12 @@ pub const Modules = struct {
     quant: quant.Kernels,
     q4: q4.Kernels,
     affine4: cuda.qlinear.Affine4Kernels,
+    mia: ?mia.Kernels = null,
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
         var m: Modules = undefined;
+        m.mia = null;
         var n: usize = 0;
         errdefer for (m.mods[0..n]) |*x| x.unload();
         for (&m.mods, [_][]const u8{ k.glm_kda, k.glm_ops, k.experts, k.affine4_pack, k.glm_quant, k.qmm_group, k.glm_glue, k.qmm_prefill, k.lane_gemv }) |*x, image| {
@@ -85,6 +93,7 @@ pub const Modules = struct {
     }
 
     pub fn deinit(m: *Modules) void {
+        if (m.mia) |*k| k.unload();
         for (&m.mods) |*x| x.unload();
         m.affine4.deinit();
         m.lane.unload();
@@ -277,7 +286,7 @@ pub const Forward = struct {
     }
 
     fn moeKernels(f: *const Forward) moe.Kernels {
-        return .{ .set = f.set(), .experts = &f.m.experts, .put_slot = f.m.put_slot };
+        return .{ .set = f.set(), .experts = &f.m.experts, .put_slot = f.m.put_slot, .mia_kernels = if (f.m.mia) |*k| k else null };
     }
 
     const Site = enum { mixer, ffn };
@@ -392,6 +401,7 @@ pub const Forward = struct {
         const layers = r.w.layers;
         try f.postRows(r, lo, hi, g);
         if (site == .mixer) return f.preRows(r, layers[j].ffn_hc, layers[j].post_norm, lo, hi);
+        try f.captureTap(r, j, lo, hi);
         if (j + 1 < layers.len) return f.preRows(r, layers[j + 1].attn_hc, layers[j + 1].in_norm, lo, hi);
         try glue.streamMean(f.set(), f.stream, r.b.x + lo * c.hc * c.hidden * 2, r.b.hidden + lo * c.hidden * 2, hi - lo, c.hidden, c.hc);
     }
@@ -424,6 +434,10 @@ pub const Forward = struct {
                     for (f.ranks) |to| if (to.w.share.rank != from.w.share.rank) {
                         const at = (lo + mine[0]) * D * 2;
                         try f.copy(p.side, (if (last) to.b.hidden else to.b.normed) + at, (if (last) from.b.hidden else from.b.normed) + at, bytes);
+                        if (site == .ffn) if (taps.index(j)) |plane| if (from.b.taps) |source| {
+                            const destination = to.b.taps orelse return error.BadTapView;
+                            try f.copy(p.side, destination.ptr + plane * to.b.rows * D * 2 + at, source.ptr + plane * from.b.rows * D * 2 + at, bytes);
+                        };
                     };
                 },
                 .nccl => |x| {
@@ -436,6 +450,11 @@ pub const Forward = struct {
                         const theirs = share(n, world, peer);
                         try x.lib.check(x.lib.api.ncclSend(rows_of + (lo + mine[0]) * D * 2, (mine[1] - mine[0]) * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclSend");
                         try x.lib.check(x.lib.api.ncclRecv(rows_of + (lo + theirs[0]) * D * 2, (theirs[1] - theirs[0]) * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclRecv");
+                        if (site == .ffn) if (taps.index(j)) |plane| if (r.b.taps) |storage| {
+                            const base = storage.ptr + plane * r.b.rows * D * 2;
+                            try x.lib.check(x.lib.api.ncclSend(base + (lo + mine[0]) * D * 2, (mine[1] - mine[0]) * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclSend tap");
+                            try x.lib.check(x.lib.api.ncclRecv(base + (lo + theirs[0]) * D * 2, (theirs[1] - theirs[0]) * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclRecv tap");
+                        };
                     };
                     try x.lib.check(x.lib.api.ncclGroupEnd(), "ncclGroupEnd");
                 },
@@ -517,13 +536,24 @@ pub const Forward = struct {
                 try f.ffn(r, l, R, slot(r, R));
             }
             try f.gather(R);
-            for (f.ranks) |r| try f.post(r, R);
+            for (f.ranks) |r| {
+                try f.post(r, R);
+                try f.captureTap(r, j, 0, R);
+            }
             switch (f.ranks[0].w.layers[j].mixer) {
                 .kda => li += 1,
                 .mla => di += 1,
             }
         }
         for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, R, c.hidden, c.hc);
+    }
+
+    fn captureTap(f: *const Forward, r: Rank, layer: usize, lo: usize, hi: usize) !void {
+        const storage = r.b.taps orelse return;
+        const plane = taps.index(layer) orelse return;
+        const c = &r.w.config;
+        if (c.hidden != taps.hidden or hi > r.b.rows or lo > hi) return error.BadTapView;
+        try glue.streamMean(f.set(), f.stream, r.b.x + lo * c.hc * c.hidden * 2, storage.ptr + (plane * r.b.rows + lo) * c.hidden * 2, hi - lo, c.hidden, c.hc);
     }
 
     /// The final norm and this rank's rows of the head (a prompt buffer's last row only).

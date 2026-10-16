@@ -164,7 +164,7 @@ pub const Leader = struct {
     }
 
     fn failed(x: Leader, err: anyerror) void {
-        if (x.e.pool == null) return;
+        if (x.e.pool == null and x.e.dflash == null) return;
         switch (err) {
             error.Cancelled, error.KeptStateRefused => {},
             else => x.e.pair_failure(err),
@@ -281,10 +281,10 @@ pub const Leader = struct {
         try x.complete(x.e.keep(n));
     }
 
-    pub fn draft(x: Leader, from_prompt: bool, follow_ids: []const u32, depth: usize, out: []u32) !void {
+    pub fn draft(x: Leader, from_prompt: bool, follow_ids: []const u32, depth: usize, out: []u32) !usize {
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.draft), .depth = @intCast(depth), .flags = @intFromBool(from_prompt) }, follow_ids);
-        try x.complete(x.e.draft(from_prompt, follow_ids, depth, out));
+        return x.complete(x.e.draft(from_prompt, follow_ids, depth, out));
     }
 
     /// The other ranks leave their loops.
@@ -432,7 +432,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
             .draft => {
                 const ids = try e.gpa.dupe(u32, step.ids);
                 defer e.gpa.free(ids);
-                try e.draft(h.flags & 1 != 0, ids, h.depth, &drafts);
+                _ = try e.draft(h.flags & 1 != 0, ids, h.depth, &drafts);
             },
             .drop => for (step.ids) |id| e.dropState(id),
             .release => e.release(h.slot),

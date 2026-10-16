@@ -31,7 +31,7 @@ pub const Layer = struct { index: u32, attn_hc: Hc, ffn_hc: Hc, in_norm: u64, po
 pub const Mtp = struct { enorm: u64, hnorm: u64, eh: b16.Proj, norm: u64, layer: Layer, draft: ?q4.Q4 };
 
 /// The kernels a load runs: affine4_pack's tf_pack_dense, and for the MTP head the quantizers and the 4-bit tiling.
-pub const Tools = struct { pack_dense: cuda.Function, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null, affine4: ?*const cuda.qlinear.Affine4Kernels = null, modelopt: ?*const cuda.modelopt.Packer = null, precision: @import("cuda_weight_precision.zig").Settings = .{} };
+pub const Tools = struct { pack_dense: cuda.Function, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null, affine4: ?*const cuda.qlinear.Affine4Kernels = null, modelopt: ?*const cuda.modelopt.Packer = null, precision: @import("cuda_weight_precision.zig").Settings = .{}, exl3_routed: @import("cuda_experts_mia.zig").Mode = .generic };
 
 /// A loaded tensor by the Python family's attribute path, for digests against its weights.
 pub const Named = struct { name: []u8, ptr: u64, len: usize };
@@ -395,6 +395,7 @@ pub const Loader = struct {
     fn moeLayer(L: *Loader, i: u32) !moe.Layer {
         var routed_name: [192]u8 = undefined;
         if (L.w.exl3 or L.ck.has(try std.fmt.bufPrint(&routed_name, prefix ++ "layers.{d}.mlp.experts.0.gate_proj.trellis", .{i}))) return x3.moe(L, i);
+        if (L.tools.exl3_routed == .mia_mcg4) return error.MiaNeedsMcg4Experts;
         const c = &L.w.config;
         const d: usize = c.hidden;
         const cut = L.w.share.moe;

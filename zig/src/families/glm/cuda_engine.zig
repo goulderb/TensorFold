@@ -15,6 +15,8 @@ const cache_pool = @import("cuda_kv_pool.zig");
 const modelopt = @import("core").modelopt;
 const vision_binding = @import("cuda_vision_binding.zig");
 const vision_runtime = @import("cuda_vision_runtime.zig");
+const dflash_mod = @import("cuda_dflash.zig");
+const mia = @import("cuda_experts_mia.zig");
 pub const persistence = @import("cuda_persistence.zig");
 pub const spill_payload = @import("cuda_spill_payload.zig");
 
@@ -25,6 +27,7 @@ pub const Options = struct {
     capacity: usize, // tokens a sequence holds
     mtp: bool, // load the MTP head (drafts)
     settings: ranks.Settings,
+    draft_kernels: ?[]const u8 = null,
 };
 
 fn validateKdaProjection(c: *const config.Config, world: usize, converted: bool) !void {
@@ -124,6 +127,7 @@ pub const Engine = struct {
     slot: u32 = 0,
     capacity: usize,
     mtp: bool,
+    dflash: ?*dflash_mod.DFlash = null,
     pool: ?cache_pool.Pool = null,
     pair_failure: *const fn (anyerror) void = owner_kv.failPair,
     heat_gate: heat.Gate, // upstream's bands (off unless set), read before each prompt chunk on the gathered maximum
@@ -151,7 +155,24 @@ pub const Engine = struct {
         const c = try config.parse(gpa, text);
         var stream = try cuda.Stream.init(d, false);
         errdefer stream.deinit();
-        const fp = ranks.Fingerprint.of(world, rank, o.settings, o.capacity, try ranks.hashFile(a, io, cfg_path), try ranks.hashFile(a, io, "/proc/self/exe"), checkpoint);
+        var settings = o.settings;
+        var startup_problem: ?anyerror = null;
+        settings.draft = ranks.effectiveDraft(settings.draft, o.mtp) catch |err| blk: {
+            startup_problem = err;
+            break :blk settings.draft;
+        };
+        if (settings.draft == .dflash2 and startup_problem == null) {
+            if (world != 2 or c.hidden != 4096 or c.hc != 4 or c.vocab != 154880 or (settings.layers != 0 and settings.layers != c.layers)) startup_problem = error.UnsupportedDFlashTarget;
+            if (startup_problem == null) settings.draft_checkpoint = ranks.hashDraftCheckpoint(gpa, io, settings.draft_dir orelse return error.NoDraftCheckpoint) catch |err| blk: {
+                startup_problem = err;
+                break :blk @splat(0);
+            };
+        }
+        const startup = try a.alloc(u32, world);
+        try ranks.gather(u32, d, lib, comm, stream, rank, @intFromBool(startup_problem == null), startup);
+        for (startup) |ready| if (ready == 0) return startup_problem orelse error.PeerStartupRefused;
+        const with_mtp = settings.draft == .mtp;
+        const fp = ranks.Fingerprint.of(world, rank, settings, o.capacity, try ranks.hashFile(a, io, cfg_path), try ranks.hashFile(a, io, "/proc/self/exe"), checkpoint);
         try ranks.agree(d, lib, comm, stream, fp, try a.alloc(ranks.Fingerprint, world));
         if (o.settings.kv_pool_tokens > 0) {
             if (o.settings.kv_shard and (world != 2 or c.mla_heads % 2 != 0)) return error.KvShardNeedsTp2;
@@ -160,26 +181,29 @@ pub const Engine = struct {
         }
         try validateKdaProjection(&c, world, o.settings.weight_dense.get(.kda) != .bf16);
         const share = try shard.Share.of(&c, rank, world);
+        if (settings.exl3_routed == .mia_mcg4) try mia.validate(c.hidden, share.moe.len(), c.experts, c.topk + 1);
         const spans = try gpa.alloc(shard.Span, world);
         errdefer gpa.free(spans);
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
         var m = try fw.Modules.load(d, ctx);
         errdefer m.deinit();
+        if (settings.exl3_routed == .mia_mcg4) m.mia = try mia.Kernels.load(d, cuda.kernels.glm_exl3);
         m.experts.exl3.decode = o.settings.exl3_decode;
         var pieces = try fw.Pieces.init(d, o.settings.pieces);
         errdefer pieces.deinit();
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .mtp = o.mtp };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .mtp = with_mtp };
         var wt = e.m.tools();
         wt.precision = .{ .dense = o.settings.weight_dense, .head = o.settings.weight_head };
+        wt.exl3_routed = settings.exl3_routed;
         if (rank == 0) {
             var policy_text: [128]u8 = undefined;
             const policy_hash = o.settings.weight_dense.digest();
             std.log.info("GLM dense conversion policy v1: {s}; head={s}; scope=bf16-source-only; digest={s}", .{ try o.settings.weight_dense.format(&policy_text), @tagName(o.settings.weight_head), std.fmt.bytesToHex(policy_hash, .lower) });
         }
-        e.w = try weights.load(gpa, io, d, stream, wt, checkpoint, c, share, layers, o.mtp);
+        e.w = try weights.load(gpa, io, d, stream, wt, checkpoint, c, share, layers, with_mtp);
         errdefer e.w.deinit();
         try e.bind(0);
         errdefer {
@@ -192,14 +216,39 @@ pub const Engine = struct {
         errdefer e.bd.deinit();
         e.bm = if (o.settings.kv_shard) try fw.Buffers.initOwned(d, &e.w, fw.window_rows, false, o.capacity) else try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bm.deinit();
-        if (o.mtp) e.bs = if (o.settings.kv_shard) try fw.Buffers.initSharedOwned(d, &e.w, shared_rows, o.capacity) else try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
+        if (with_mtp or settings.draft == .dflash2) e.bs = if (o.settings.kv_shard) try fw.Buffers.initSharedOwned(d, &e.w, shared_rows, o.capacity) else try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
+        if (settings.draft == .dflash2) {
+            try e.bp.enableTaps(d);
+            try e.bd.enableTaps(d);
+            if (e.bs) |*b| try b.enableTaps(d);
+        }
+        if (settings.exl3_routed == .mia_mcg4) {
+            try e.bp.enableMia(d, &e.w);
+            try e.bd.enableMia(d, &e.w);
+            try e.bm.enableMia(d, &e.w);
+            if (e.bs) |*b| try b.enableMia(d, &e.w);
+        }
         e.pairs = try cuda.DeviceBuffer.alloc(d, 8 * world);
         errdefer e.pairs.free();
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
         errdefer e.smp.deinit();
         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
         errdefer e.shared_buf.free();
+        if (settings.draft == .dflash2) {
+            var draft_problem: ?anyerror = null;
+            e.dflash = dflash_mod.DFlash.open(gpa, io, checkpoint, settings.draft_dir.?, max_shared, o.capacity, .{ .driver = d, .context = ctx, .stream = stream, .embed = e.w.embed, .lib = lib, .comm = comm, .rank = rank, .world = world, .kernels_dir = o.draft_kernels }) catch |err| blk: {
+                draft_problem = err;
+                break :blk null;
+            };
+            errdefer if (e.dflash) |drafter| drafter.deinit();
+            if (!try e.pairedReady(draft_problem == null)) return draft_problem orelse error.PeerDFlashOpen;
+            e.dflash.?.prepare() catch |err| {
+                e.pair_failure(err);
+                return err;
+            };
+        }
+        errdefer if (e.dflash) |drafter| drafter.deinit();
         errdefer if (e.pool) |*p| p.deinit();
         if (o.settings.kv_pool_tokens > 0) {
             const shape = try cache_pool.Shape.init(o.settings.kv_pool_tokens, if (o.settings.kv_shard) 2 else 1, e.cur.st.caches.len + 1, o.settings.kv);
@@ -226,6 +275,7 @@ pub const Engine = struct {
         while (it.next()) |s| e.freeSnap(s);
         e.snaps.deinit(e.gpa);
         e.dropped.deinit(e.gpa);
+        if (e.dflash) |drafter| drafter.deinit();
         e.shared_buf.free();
         e.smp.deinit();
         e.pairs.free();
@@ -256,6 +306,7 @@ pub const Engine = struct {
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
     pub fn bind(e: *Engine, slot: u32) !void {
+        if (e.settings.draft == .dflash2 and slot >= max_shared) return error.BadDraftSlot;
         if (e.settings.kv_pool_tokens > 0 and slot >= cache_pool.extent.max_slots) return error.BadKvRequest;
         if (slot >= e.seqs.items.len) try e.seqs.appendNTimes(e.gpa, null, slot + 1 - e.seqs.items.len);
         if (e.seqs.items[slot] == null) {
@@ -316,6 +367,7 @@ pub const Engine = struct {
 
     /// Frees slot `slot`'s sequence (slot 0 stays: the first stream's, made at init) and binds slot 0.
     pub fn release(e: *Engine, slot: u32) void {
+        if (e.dflash) |drafter| drafter.release(slot);
         if (e.pool) |*p| p.regions.release(slot);
         if (e.settings.vision and slot < e.seqs.items.len) {
             e.stream.synchronize() catch {};
@@ -371,6 +423,7 @@ pub const Engine = struct {
         e.cur.sampling = sampler.check(sampling);
         e.cur.in_head = 0;
         try e.cur.st.reset(e.stream);
+        if (e.dflash) |drafter| try drafter.reset(e.slot);
     }
 
     /// decode.prefill: `ids` in 2,048-row chunks, then the first token from the last row; `from` restores a kept state.
@@ -418,6 +471,10 @@ pub const Engine = struct {
             }
         }
         try f.commit(rows);
+        if (e.dflash) |drafter| {
+            errdefer e.pair_failure(error.DFlashCommitFailed);
+            try drafter.acceptPrompt(e.slot, e.bp.taps.?.ptr, e.bp.rows, rows, start);
+        }
         return first;
     }
 
@@ -452,12 +509,16 @@ pub const Engine = struct {
     /// Device bytes retained at a prompt mark; MTP has absorbed the same prefix at these marks.
     pub fn snapshotBytes(e: *const Engine, at: usize) u64 {
         const plan = e.cur.st.layout.snapshot(.{ .main = at, .mtp = if (e.mtp) at else 0 }) catch return std.math.maxInt(u64);
-        return plan.byteCount();
+        return e.payloadBytes(plan.byteCount()) catch return std.math.maxInt(u64);
+    }
+
+    fn payloadBytes(e: *const Engine, target_bytes: u64) !u64 {
+        return spill_payload.withDraftBytes(target_bytes, if (e.dflash) |drafter| drafter.snapshotBytes() else 0);
     }
 
     pub fn spillShape(e: *const Engine) spill_payload.Shape {
         const st = &e.seqs.items[0].?.st;
-        return .{ .layout = st.layout, .format = e.settings.kv, .mtp = e.mtp, .sharded = e.settings.kv_shard, .rank = @intCast(e.share.rank), .world = @intCast(e.share.world), .grid = prompt_rows, .parities = st.cur.len };
+        return .{ .layout = st.layout, .format = e.settings.kv, .mtp = e.mtp, .sharded = e.settings.kv_shard, .rank = @intCast(e.share.rank), .world = @intCast(e.share.world), .grid = prompt_rows, .parities = st.cur.len, .draft_bytes = if (e.dflash) |drafter| drafter.snapshotBytes() else 0, .draft_identity = e.settings.draft_checkpoint };
     }
 
     pub const HostSnapshot = struct { bytes: []u8, meta: [spill_payload.max_meta]u8, meta_len: usize };
@@ -554,13 +615,16 @@ pub const Engine = struct {
         if (e.snaps.contains(id)) return error.StateKept;
         const st = &e.cur.st;
         if (st.pending != 0 or e.cur.in_head != 0 or st.mtp_len != (if (e.mtp) st.pos else 0)) return error.NotAtMark;
+        if (e.dflash) |drafter| if (!drafter.snapshotReady(e.slot, st.pos)) return error.NotAtMark;
         const plan = try st.layout.snapshot(.{ .main = st.pos, .mtp = st.mtp_len });
         const owner = if (st.layout.external_planes) st.mtp_caches.owner else null;
         const resident = owner == null or owner.? == e.share.rank;
-        var buf = try cuda.DeviceBuffer.alloc(e.d, plan.bytesFor(resident));
+        const target_bytes = plan.bytesFor(resident);
+        var buf = try cuda.DeviceBuffer.alloc(e.d, @intCast(try e.payloadBytes(target_bytes)));
         errdefer buf.free();
         var it = plan.rangesFor(resident);
         while (it.next()) |r| try e.copy(buf.ptr + r.saved, st.address(r), r.bytes);
+        if (e.dflash) |drafter| try drafter.save(e.slot, buf.ptr + std.mem.alignForward(usize, target_bytes, 256));
         try e.stream.synchronize();
         const cur = try e.gpa.dupe(u1, e.cur.st.cur);
         errdefer e.gpa.free(cur);
@@ -587,7 +651,7 @@ pub const Engine = struct {
                     break :blk null;
                 };
                 source_resident = saved.owner == null or saved.owner.? == e.share.rank;
-                if (plan != null and (plan.?.bytesFor(source_resident) != saved.buf.len or saved.pos > st.capacity or saved.mtp_len > st.capacity or (saved.owner == null) != (destination_owner == null))) problem = error.BadKeptState;
+                if (plan != null and ((e.payloadBytes(plan.?.bytesFor(source_resident)) catch 0) != saved.buf.len or saved.pos > st.capacity or saved.mtp_len > st.capacity or (saved.owner == null) != (destination_owner == null))) problem = error.BadKeptState;
             }
         } else problem = error.NoKeptState;
         if (destination_owner != null) {
@@ -596,7 +660,7 @@ pub const Engine = struct {
             if (!try e.pairedReady(problem == null)) return error.KeptStateRefused;
         }
         if (problem) |err| return err;
-        errdefer if (st.layout.external_planes) e.pair_failure(error.PairedRestoreFailed);
+        errdefer if (st.layout.external_planes or e.dflash != null) e.pair_failure(error.PairedRestoreFailed);
         const saved = s.?;
         var full = plan.?.ranges();
         var local = plan.?.rangesFor(source_resident);
@@ -608,6 +672,7 @@ pub const Engine = struct {
                 try e.copy(st.address(r), saved.buf.ptr + from.?.saved, r.bytes);
             }
         }
+        if (e.dflash) |drafter| try drafter.restore(e.slot, saved.buf.ptr + std.mem.alignForward(usize, plan.?.bytesFor(source_resident), 256), saved.pos);
         try e.stream.synchronize();
         try st.restoreHost(e.stream, saved.pos, saved.mtp_len, saved.cur);
         e.cur.in_head = 0;
@@ -693,6 +758,7 @@ pub const Engine = struct {
         const at = e.cur.st.pos;
         try f.run(@ptrCast(ids));
         try e.retainRows(e.bd.fnormed, ids.len);
+        if (e.dflash) |drafter| try drafter.stageWindow(e.slot, e.bd.taps.?.ptr, e.bd.rows, 0, ids.len, at);
         if (masked) try e.drawMasked(e.bd.logits, ids.len, at + 1, out) else try e.draw(e.bd.logits, ids.len, at + 1, out);
     }
 
@@ -717,6 +783,7 @@ pub const Engine = struct {
         for (parts, segs[0..parts.len]) |p, g| {
             try e.bind(p.slot);
             e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
+            if (e.dflash) |drafter| try drafter.stageWindow(p.slot, b.taps.?.ptr, b.rows, g.row0, g.rows, g.st.pos);
             try e.draw(b.logits + g.row0 * e.share.vocab.len() * 2, g.rows, g.st.pos + 1, p.out);
         }
     }
@@ -726,6 +793,10 @@ pub const Engine = struct {
         var one: [1]fw.Rank = undefined;
         const f = e.view(&e.bd, &one);
         try f.commit(n);
+        if (e.dflash) |drafter| {
+            errdefer e.pair_failure(error.DFlashCommitFailed);
+            try drafter.accept(e.slot, n, e.cur.st.pos);
+        }
     }
 
     fn retainRows(e: *Engine, source: u64, rows: usize) !void {
@@ -741,7 +812,13 @@ pub const Engine = struct {
     }
 
     /// decode.draft: the MTP head absorbs the kept rows (committed first) with `follow`, then chains `depth` drafts.
-    pub fn draft(e: *Engine, from_prompt: bool, follow: []const u32, depth: usize, out: []u32) !void {
+    pub fn drafting(e: *const Engine) bool {
+        return e.mtp or e.dflash != null;
+    }
+
+    pub fn draft(e: *Engine, from_prompt: bool, follow: []const u32, depth: usize, out: []u32) !usize {
+        if (depth > max_drafts or depth > out.len or follow.len == 0) return error.BadDraftRequest;
+        if (e.dflash) |drafter| return drafter.propose(e.slot, follow[follow.len - 1], e.cur.sampling, out[0..depth]);
         if (!e.mtp) return error.NoDraftHead;
         if (depth > max_drafts) return error.TooDeep;
         var one: [1]fw.Rank = undefined;
@@ -765,6 +842,7 @@ pub const Engine = struct {
                 e.cur.in_head += 1;
             }
         }
+        return depth;
     }
 
     /// `rows` logits rows of this rank's vocabulary -> the tokens at positions first, first + 1, ...
@@ -824,6 +902,7 @@ test "prompt snapshot estimates follow the requested mark and MTP setting" {
     seq.st.pos = 0;
     seq.st.mtp_len = 0;
     var e: Engine = undefined;
+    e.dflash = null;
     e.cur = &seq;
     e.mtp = true;
     const at = 2048;
@@ -844,6 +923,7 @@ test "snapshot capture refuses uncommitted windows and mismatched MTP marks befo
     seq.st.mtp_len = 2048;
     seq.in_head = 0;
     var e: Engine = undefined;
+    e.dflash = null;
     e.snaps = .empty;
     e.cur = &seq;
     e.mtp = true;
@@ -863,6 +943,7 @@ test "prompt resume refuses a saved position that differs from its requested mar
     seq.st.capacity = 8192;
     seq.st.layout = try @import("cuda_layout.zig").Layout.init(.{ 4, 0, 0, 0, 0, 0, 0, 0 }, 8192, fw.prefill_rows, 0, .bf16, 512, 128);
     var e: Engine = undefined;
+    e.dflash = null;
     e.cur = &seq;
     e.snaps = .empty;
     defer e.snaps.deinit(std.testing.allocator);
@@ -936,6 +1017,7 @@ test "engine snapshot save and restore preserve visible state through reused sto
         try seq.st.setPos(stream, 2115);
         try seq.st.setMtpLen(stream, if (mtp) 2115 else 0);
         var e: Engine = undefined;
+        e.dflash = null;
         e.d = &d;
         e.gpa = std.testing.allocator;
         e.stream = stream;
@@ -976,6 +1058,7 @@ test "spill snapshot roundtrip checks metadata and discards failed imports witho
         var cur = [_]u1{1};
         seq.st.cur = &cur;
         var e: Engine = undefined;
+        e.dflash = null;
         e.gpa = std.testing.allocator;
         e.d = &d;
         e.stream = .{ .d = &d, .handle = null };
@@ -1140,6 +1223,7 @@ test "owner-only snapshots carry main and MTP prefixes to a new owner and refuse
             f.seq.st.mtp_pos_dev = f.seq.st.arena.buf.ptr + layout.mtp_pos;
             f.seq.st.pending = 0;
             f.e = undefined;
+            f.e.dflash = null;
             f.e.d = d;
             f.e.lib = lib;
             f.e.comm = @ptrCast(endpoint);
@@ -1256,6 +1340,7 @@ test "owner-only snapshots carry main and MTP prefixes to a new owner and refuse
 
 test "pooled engine refuses out-of-range slots before reading state or metadata" {
     var e: Engine = undefined;
+    e.dflash = null;
     e.settings = .{ .kv_pool_tokens = 8192 };
     e.pool = @as(cache_pool.Pool, undefined);
     e.slot = cache_pool.extent.max_slots;
@@ -1268,6 +1353,7 @@ test "MTP hidden rows survive other sequences reusing prompt and verify scratch"
     const M = @import("cuda_test_driver.zig").Memory;
     var d = M.driver();
     var e: Engine = undefined;
+    e.dflash = null;
     e.d = &d;
     e.stream = .{ .d = &d, .handle = null };
     e.c.hidden = 2;

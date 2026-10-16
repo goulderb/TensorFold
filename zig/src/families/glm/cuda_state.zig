@@ -96,6 +96,8 @@ pub fn mixedPartBytes(w: *const weights.Weights, rows: usize) usize {
 pub const Buffers = struct {
     arena: Arena,
     rows: usize,
+    taps: ?cuda.DeviceBuffer = null,
+    mia_storage: ?cuda.DeviceBuffer = null,
     prefill: bool,
     part_rows: usize, // rows one dense attention call takes
     nch: usize, // the dense pass's most 512-key chunks
@@ -259,7 +261,25 @@ pub const Buffers = struct {
         };
     }
 
+    pub fn enableTaps(b: *Buffers, d: *const cuda.Driver) !void {
+        if (b.taps != null) return;
+        b.taps = try cuda.DeviceBuffer.alloc(d, b.rows * @import("cuda_taps.zig").layers.len * @import("cuda_taps.zig").hidden * 2);
+    }
+
+    pub fn enableMia(b: *Buffers, d: *const cuda.Driver, w: *const weights.Weights) !void {
+        if (b.mia_storage != null) return;
+        const mia = @import("cuda_experts_mia.zig");
+        const slots = w.config.topk + 1;
+        const width = w.share.moe.len();
+        var storage = try cuda.DeviceBuffer.alloc(d, try mia.Scratch.bytes(b.rows, @min(b.rows, 32), slots, w.config.hidden, width));
+        errdefer storage.free();
+        b.moe.mia_scratch = try mia.Scratch.fromBase(storage.ptr, b.rows, @min(b.rows, 32), slots, w.config.hidden, width);
+        b.mia_storage = storage;
+    }
+
     pub fn deinit(b: *Buffers) void {
+        if (b.taps) |*t| t.free();
+        if (b.mia_storage) |*storage| storage.free();
         b.arena.buf.free();
         b.* = undefined;
     }

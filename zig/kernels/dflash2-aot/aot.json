@@ -1,0 +1,1708 @@
+{
+  "kernels": [
+    {
+      "fn": "_dattn_seg_kernel",
+      "hash": "8dcb5f08f1162759dee17398f6f93a6729c450d17b0a0ee1099e40b2a3b9eadc",
+      "name": "_dattn_seg_kernel",
+      "num_warps": 4,
+      "num_ctas": 1,
+      "shared": 77824,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "Q",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "K",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "V",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "OUT",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "POS",
+          "type": "*i64",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "SLOT",
+          "type": "*i64",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "window",
+          "type": "i32",
+          "div16": false,
+          "nospec": false
+        },
+        {
+          "name": "scale",
+          "type": "fp32",
+          "div16": false,
+          "nospec": false
+        },
+        {
+          "name": "L",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "SLOT_ROWS",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "N": {
+          "int": 8
+        },
+        "G": {
+          "int": 4
+        },
+        "NH": {
+          "int": 16
+        },
+        "HD": {
+          "int": 128
+        },
+        "CAP": {
+          "int": 2176
+        },
+        "BK": {
+          "int": 64
+        },
+        "CAUSAL": {
+          "int": 0
+        },
+        "RING": {
+          "int": 1
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.dflash2_multi._dattn_seg_kernel",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/dflash2_multi.py",
+        "line": 39
+      },
+      "cubin_sha256": "7b432a0fadfd9b93588ed2defc1fd7bd68c2fb6ede6e26e84e7ce750bb0d63bb"
+    },
+    {
+      "fn": "_dattn_seg_kernel",
+      "hash": "f6a439d0582a7e6dd073c60802c64d6ecf0e4c4daf390d01e7629f92a9567104",
+      "name": "_dattn_seg_kernel",
+      "num_warps": 4,
+      "num_ctas": 1,
+      "shared": 77824,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "Q",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "K",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "V",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "OUT",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "POS",
+          "type": "*i64",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "SLOT",
+          "type": "*i64",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "window",
+          "type": "i32",
+          "div16": false,
+          "nospec": false
+        },
+        {
+          "name": "scale",
+          "type": "fp32",
+          "div16": false,
+          "nospec": false
+        },
+        {
+          "name": "L",
+          "type": "i32",
+          "div16": false,
+          "nospec": false
+        },
+        {
+          "name": "SLOT_ROWS",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "N": {
+          "int": 8
+        },
+        "G": {
+          "int": 4
+        },
+        "NH": {
+          "int": 16
+        },
+        "HD": {
+          "int": 128
+        },
+        "CAP": {
+          "int": 2176
+        },
+        "BK": {
+          "int": 64
+        },
+        "CAUSAL": {
+          "int": 0
+        },
+        "RING": {
+          "int": 1
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.dflash2_multi._dattn_seg_kernel",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/dflash2_multi.py",
+        "line": 39
+      },
+      "cubin_sha256": "7b432a0fadfd9b93588ed2defc1fd7bd68c2fb6ede6e26e84e7ce750bb0d63bb"
+    },
+    {
+      "fn": "_dconv_kernel",
+      "hash": "08b04587a4e37c8ec012ab98a2074e564d5cdc918ac2928bbbd78501761575d0",
+      "name": "_dconv_kernel",
+      "num_warps": 4,
+      "num_ctas": 1,
+      "shared": 0,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "X",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "DYN",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "BASE",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "RES",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "OUT",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "D": {
+          "int": 4096
+        },
+        "G": {
+          "int": 256
+        },
+        "GS": {
+          "int": 16
+        },
+        "BRANCH": {
+          "int": 1
+        },
+        "HAS_RES": {
+          "int": 1
+        },
+        "BLOCK": {
+          "int": 1024
+        },
+        "SEG": {
+          "int": 8
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.dflash2._dconv_kernel",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/dflash2.py",
+        "line": 52
+      },
+      "cubin_sha256": "e682f5d22853a7a5d18c474a4ab76df6e67b8e9b8c5a847240969de1de0a5a04"
+    },
+    {
+      "fn": "_dconv_kernel",
+      "hash": "392d3c3fb4b084240d51121d729b0d6ffab7b784edca6899a6a8c565e6e1a383",
+      "name": "_dconv_kernel",
+      "num_warps": 4,
+      "num_ctas": 1,
+      "shared": 0,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "X",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "DYN",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "BASE",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "RES",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "OUT",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "D": {
+          "int": 4096
+        },
+        "G": {
+          "int": 256
+        },
+        "GS": {
+          "int": 16
+        },
+        "BRANCH": {
+          "int": 0
+        },
+        "HAS_RES": {
+          "int": 0
+        },
+        "BLOCK": {
+          "int": 1024
+        },
+        "SEG": {
+          "int": 0
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.dflash2._dconv_kernel",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/dflash2.py",
+        "line": 52
+      },
+      "cubin_sha256": "4506feb100984e62431de6d94340a946f83562e7918380f50632f8ab18fe4e31"
+    },
+    {
+      "fn": "_dconv_kernel",
+      "hash": "960246046efe54dce67bca329f7d8ecab96c719b61b7e6478d9d415463d61d4d",
+      "name": "_dconv_kernel",
+      "num_warps": 4,
+      "num_ctas": 1,
+      "shared": 0,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "X",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "DYN",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "BASE",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "RES",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "OUT",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "D": {
+          "int": 4096
+        },
+        "G": {
+          "int": 256
+        },
+        "GS": {
+          "int": 16
+        },
+        "BRANCH": {
+          "int": 1
+        },
+        "HAS_RES": {
+          "int": 1
+        },
+        "BLOCK": {
+          "int": 1024
+        },
+        "SEG": {
+          "int": 0
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.dflash2._dconv_kernel",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/dflash2.py",
+        "line": 52
+      },
+      "cubin_sha256": "62680823b164cb21b316d2d6128df5ea1ad00940325d6b01ab40ba65db3ef476"
+    },
+    {
+      "fn": "_dconv_kernel",
+      "hash": "c8dc76d671c0a16e4b07c2700a831160d6ba2ddd44a78e055a451b1806758be3",
+      "name": "_dconv_kernel",
+      "num_warps": 4,
+      "num_ctas": 1,
+      "shared": 0,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "X",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "DYN",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "BASE",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "RES",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "OUT",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "D": {
+          "int": 4096
+        },
+        "G": {
+          "int": 256
+        },
+        "GS": {
+          "int": 16
+        },
+        "BRANCH": {
+          "int": 0
+        },
+        "HAS_RES": {
+          "int": 0
+        },
+        "BLOCK": {
+          "int": 1024
+        },
+        "SEG": {
+          "int": 8
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.dflash2._dconv_kernel",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/dflash2.py",
+        "line": 52
+      },
+      "cubin_sha256": "043756dab360f3322c71d90026c8e4dd52f6976d30d386034f07e2b5aa88e109"
+    },
+    {
+      "fn": "_embed_b16",
+      "hash": "076465dc4c83edb8834accb20cdd5576ba9f7fbdcfa2862bce8cb8965c570bb6",
+      "name": "_embed_b16",
+      "num_warps": 1,
+      "num_ctas": 1,
+      "shared": 0,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "IDS",
+          "type": "*i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "W",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "OUT",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "D": {
+          "int": 4096
+        },
+        "COPIES": {
+          "int": 1
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.glue._embed_b16",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/glue.py",
+        "line": 33
+      },
+      "cubin_sha256": "64a1a37997cf6fd46ed5f59d04ee2bec4b6ac7a1379026ca9338ff3cfb2507d7"
+    },
+    {
+      "fn": "_embed_b16",
+      "hash": "43d676f97a1432cdbf2693b84dd4ddf10f865bb3ea6c8bd0831359187f1c072e",
+      "name": "_embed_b16",
+      "num_warps": 1,
+      "num_ctas": 1,
+      "shared": 0,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "IDS",
+          "type": "*i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "W",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "OUT",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "D": {
+          "int": 4096
+        },
+        "COPIES": {
+          "int": 4
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.glue._embed_b16",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/glue.py",
+        "line": 33
+      },
+      "cubin_sha256": "3ebe8d2898628767bbc9838bc60186a3e9e61b51ece69f99b05ef201ba9222ec"
+    },
+    {
+      "fn": "_group_sums",
+      "hash": "1354789dda340695148448edfea9d31a88fca85beace31de0228d62f3826056e",
+      "name": "_group_sums",
+      "num_warps": 2,
+      "num_ctas": 1,
+      "shared": 64,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "X",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "XS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "x_stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "K": {
+          "int": 4096
+        },
+        "GB": {
+          "int": 16
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.qmm._group_sums",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/qmm.py",
+        "line": 105
+      },
+      "cubin_sha256": "79231e44b121bfbcb942f2c01fa3edf0005b8a3e6b4d5ba7f71f8a31ddaaf56a"
+    },
+    {
+      "fn": "_group_sums",
+      "hash": "5cd90b80b6723a2eeff7747d27d9969a1e96ac40cc5323dd4c18c31cdc989199",
+      "name": "_group_sums",
+      "num_warps": 2,
+      "num_ctas": 1,
+      "shared": 64,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "X",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "XS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "x_stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "K": {
+          "int": 2048
+        },
+        "GB": {
+          "int": 16
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.qmm._group_sums",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/qmm.py",
+        "line": 105
+      },
+      "cubin_sha256": "5c3cd8d341e7f8b43dffade9db3830f4939caffbfbebab7a0cef02e4be24de25"
+    },
+    {
+      "fn": "_group_sums",
+      "hash": "62dd24bcf35428e828d38eac270b11ac74a2980962088e52dd2d61d090c724c9",
+      "name": "_group_sums",
+      "num_warps": 2,
+      "num_ctas": 1,
+      "shared": 64,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "X",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "XS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "x_stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "K": {
+          "int": 128
+        },
+        "GB": {
+          "int": 16
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.qmm._group_sums",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/qmm.py",
+        "line": 105
+      },
+      "cubin_sha256": "2258c07a3e4438f852021ca7b70233d5e672e16f81fbaf5300eaa87215e13bef"
+    },
+    {
+      "fn": "_group_sums",
+      "hash": "77fc73d57fbbf33695e979ad31d7c414f3b237472ceb3705ece64fa9a0b02ec4",
+      "name": "_group_sums",
+      "num_warps": 2,
+      "num_ctas": 1,
+      "shared": 64,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "X",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "XS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "x_stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "K": {
+          "int": 20480
+        },
+        "GB": {
+          "int": 16
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.qmm._group_sums",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/qmm.py",
+        "line": 105
+      },
+      "cubin_sha256": "89f3973a13312ad7fb055bbe1a9c38ac8388c7c1e5ed2875bae0c18e5a4200a0"
+    },
+    {
+      "fn": "_group_sums",
+      "hash": "9836036c40e1e88bc10eda36a75df740ff636410921ee809edfa798aed3288a5",
+      "name": "_group_sums",
+      "num_warps": 2,
+      "num_ctas": 1,
+      "shared": 64,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "X",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "XS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "x_stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "K": {
+          "int": 8192
+        },
+        "GB": {
+          "int": 16
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.qmm._group_sums",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/qmm.py",
+        "line": 105
+      },
+      "cubin_sha256": "2e777cefa8ce92265b3904f8883d0c08c8fb2e57172a53e7534625ee982b1767"
+    },
+    {
+      "fn": "_prep_kernel",
+      "hash": "0a3625fcc3d25304e782284d25e311e2d2f187a87be1678770fb8c4d4b1b0715",
+      "name": "_prep_kernel",
+      "num_warps": 1,
+      "num_ctas": 1,
+      "shared": 0,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "QKV",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "QN",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "KN",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "COS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "SIN",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "QO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "KO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "VO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "L",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "eps",
+          "type": "fp32",
+          "div16": false,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "H": {
+          "int": 0
+        },
+        "HKV": {
+          "int": 4
+        },
+        "HALF": {
+          "int": 64
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.dflash2._prep_kernel",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/dflash2.py",
+        "line": 81
+      },
+      "cubin_sha256": "80477e078d06974f2222e0080dba9b5d49171d433c5089b0043ab74485857ff6"
+    },
+    {
+      "fn": "_prep_kernel",
+      "hash": "12e1f02393b3d517b72a1aedbdcae62e09921e71b9a2b66c285c98a081513e53",
+      "name": "_prep_kernel",
+      "num_warps": 1,
+      "num_ctas": 1,
+      "shared": 0,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "QKV",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "QN",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "KN",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "COS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "SIN",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "QO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "KO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "VO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "L",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "eps",
+          "type": "fp32",
+          "div16": false,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "H": {
+          "int": 16
+        },
+        "HKV": {
+          "int": 4
+        },
+        "HALF": {
+          "int": 64
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.dflash2._prep_kernel",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/dflash2.py",
+        "line": 81
+      },
+      "cubin_sha256": "505cd8b19263ac9805a4f4b10dfcc59c154f164640f9a22498ff6b49c3abd60f"
+    },
+    {
+      "fn": "_prep_kernel",
+      "hash": "7d3cdc8e1cb17a6824a84a230c0e12ad89984af8910f238b75a7a613a3ee83d6",
+      "name": "_prep_kernel",
+      "num_warps": 1,
+      "num_ctas": 1,
+      "shared": 0,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "QKV",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "QN",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "KN",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "COS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "SIN",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "QO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "KO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "VO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "L",
+          "type": "i32",
+          "div16": false,
+          "nospec": false
+        },
+        {
+          "name": "stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "eps",
+          "type": "fp32",
+          "div16": false,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "H": {
+          "int": 16
+        },
+        "HKV": {
+          "int": 4
+        },
+        "HALF": {
+          "int": 64
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.dflash2._prep_kernel",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/dflash2.py",
+        "line": 81
+      },
+      "cubin_sha256": "505cd8b19263ac9805a4f4b10dfcc59c154f164640f9a22498ff6b49c3abd60f"
+    },
+    {
+      "fn": "_prep_kernel",
+      "hash": "a1e02f512f8ba725366024ba1c2e61f32b3a612a5371dff7df8af47b2872b08f",
+      "name": "_prep_kernel",
+      "num_warps": 1,
+      "num_ctas": 1,
+      "shared": 0,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "QKV",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "QN",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "KN",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "COS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "SIN",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "QO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "KO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "VO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "eps",
+          "type": "fp32",
+          "div16": false,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "L": {
+          "int": 1
+        },
+        "H": {
+          "int": 0
+        },
+        "HKV": {
+          "int": 4
+        },
+        "HALF": {
+          "int": 64
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.dflash2._prep_kernel",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/dflash2.py",
+        "line": 81
+      },
+      "cubin_sha256": "b83083767f87e908d4626645b8c3302c338a15971bf7f61b49e77660023ba347"
+    },
+    {
+      "fn": "_prep_kernel",
+      "hash": "c46158e9ca06ae269d40516d6a6110b322a1384175e7d25adbe956dc06067359",
+      "name": "_prep_kernel",
+      "num_warps": 1,
+      "num_ctas": 1,
+      "shared": 0,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "QKV",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "QN",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "KN",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "COS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "SIN",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "QO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "KO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "VO",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "L",
+          "type": "i32",
+          "div16": false,
+          "nospec": false
+        },
+        {
+          "name": "stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "eps",
+          "type": "fp32",
+          "div16": false,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "H": {
+          "int": 0
+        },
+        "HKV": {
+          "int": 4
+        },
+        "HALF": {
+          "int": 64
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.dflash2._prep_kernel",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/dflash2.py",
+        "line": 81
+      },
+      "cubin_sha256": "80477e078d06974f2222e0080dba9b5d49171d433c5089b0043ab74485857ff6"
+    },
+    {
+      "fn": "_rmsnorm",
+      "hash": "14e582a8230e78e0bc11992687f511e77c13782014c6f7eb4b54142065002438",
+      "name": "_rmsnorm",
+      "num_warps": 8,
+      "num_ctas": 1,
+      "shared": 32,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "X",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "x_stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "W",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "OUT",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "o_stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "XS",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "eps",
+          "type": "fp32",
+          "div16": false,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "D": {
+          "int": 4096
+        },
+        "BLOCK": {
+          "int": 4096
+        },
+        "SUMS": {
+          "int": 0
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.glue._rmsnorm",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/glue.py",
+        "line": 59
+      },
+      "cubin_sha256": "ff39928af9a20d5c59a7da2667f20541471fdb56d207303128e478c13a47f1f0"
+    },
+    {
+      "fn": "_rmsnorm",
+      "hash": "6c10dc68271c091c29c5544c28c2432e708552662261defeff8797ba4538da91",
+      "name": "_rmsnorm",
+      "num_warps": 8,
+      "num_ctas": 1,
+      "shared": 256,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "X",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "x_stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "W",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "OUT",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "o_stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "XS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "eps",
+          "type": "fp32",
+          "div16": false,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "D": {
+          "int": 4096
+        },
+        "BLOCK": {
+          "int": 4096
+        },
+        "SUMS": {
+          "int": 1
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.glue._rmsnorm",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/glue.py",
+        "line": 59
+      },
+      "cubin_sha256": "3f2fac0094caed58e3b979565d68fa39c9e92dcd74a23380c4cfef450ff3def1"
+    },
+    {
+      "fn": "_rmsnorm",
+      "hash": "917b8fd568079cc8ab3300feea1bd3a33fa56d9212598505fd69c1841956a3c9",
+      "name": "_rmsnorm",
+      "num_warps": 4,
+      "num_ctas": 1,
+      "shared": 32,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "X",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "x_stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "W",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "OUT",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "o_stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "XS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "eps",
+          "type": "fp32",
+          "div16": false,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "D": {
+          "int": 512
+        },
+        "BLOCK": {
+          "int": 512
+        },
+        "SUMS": {
+          "int": 1
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.glue._rmsnorm",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/glue.py",
+        "line": 59
+      },
+      "cubin_sha256": "2f8db85afe09f06425a56432638ba76e48371828a3a42dd54511f599952d1209"
+    },
+    {
+      "fn": "_rmsnorm",
+      "hash": "b8997b95bd2893357669a89d641936b7a19b09b42a85ca927c68a7ff918c3e04",
+      "name": "_rmsnorm",
+      "num_warps": 4,
+      "num_ctas": 1,
+      "shared": 128,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "X",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "x_stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "W",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "OUT",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "o_stride",
+          "type": "i32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "XS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "eps",
+          "type": "fp32",
+          "div16": false,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "D": {
+          "int": 1536
+        },
+        "BLOCK": {
+          "int": 2048
+        },
+        "SUMS": {
+          "int": 1
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.glue._rmsnorm",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/glue.py",
+        "line": 59
+      },
+      "cubin_sha256": "d642e0e1f435d493a9c9b4b18a85e98f1e26657697ba3ff02b8682c2ff6b6788"
+    },
+    {
+      "fn": "_swiglu",
+      "hash": "4501bc97eab5fe280ad0a95e66861d41da1e1444c0d85eab9f7ea0bd0373d412",
+      "name": "_swiglu",
+      "num_warps": 4,
+      "num_ctas": 1,
+      "shared": 32,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "GU",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "OUT",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "XS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "LIMIT",
+          "type": "fp32",
+          "div16": false,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "W": {
+          "int": 6144
+        },
+        "BLOCK": {
+          "int": 512
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.glue._swiglu",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/glue.py",
+        "line": 365
+      },
+      "cubin_sha256": "b09832a05030f726c2f702fb106007129b54cb9aa28d7104c0e26bf6349f32d1"
+    },
+    {
+      "fn": "_swiglu",
+      "hash": "6276feeb834335b74942f61bad16c895c881e7036dbe6c3a9c3f1076d30cbd84",
+      "name": "_swiglu",
+      "num_warps": 4,
+      "num_ctas": 1,
+      "shared": 32,
+      "global_scratch": 0,
+      "global_align": 1,
+      "profile_scratch": 0,
+      "pdl": false,
+      "params": [
+        {
+          "name": "GU",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "OUT",
+          "type": "*bf16",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "XS",
+          "type": "*fp32",
+          "div16": true,
+          "nospec": false
+        },
+        {
+          "name": "LIMIT",
+          "type": "fp32",
+          "div16": false,
+          "nospec": false
+        }
+      ],
+      "consts": {
+        "W": {
+          "int": 1024
+        },
+        "BLOCK": {
+          "int": 512
+        }
+      },
+      "function": "tensorfold.families.glm5_next.cuda.glue._swiglu",
+      "source": {
+        "file": "/usr/local/lib/python3.12/dist-packages/tensorfold/families/glm5_next/cuda/glue.py",
+        "line": 365
+      },
+      "cubin_sha256": "22288e2b611d15bfce92c801bc2b83fdc5634b4d44d92102085852f38ba6c38f"
+    }
+  ]
+}

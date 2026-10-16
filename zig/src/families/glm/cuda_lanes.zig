@@ -52,6 +52,7 @@ pub const Lanes = struct {
         .verify = verifyFn,
         .keep = keepFn,
         .draft = draftFn,
+        .tree = draftShapeFn,
         .release = releaseFn,
     };
     const steps_vt: be.Backend.VTable = vt: {
@@ -62,7 +63,7 @@ pub const Lanes = struct {
 
     /// Round loop facts: windows up to max_rows, drafts with the head loaded, shared windows unless TF_GLM_SHARED=0.
     pub fn facts(self: *const Lanes) lanes.Model {
-        const drafting = self.x.e.mtp;
+        const drafting = self.x.e.drafting();
         const sharing = drafting and !self.alone;
         return .{
             .exact_width = if (drafting) max_rows else 1,
@@ -211,6 +212,13 @@ pub const Lanes = struct {
         @memcpy(out, l.held[0..out.len]);
     }
 
+    fn draftShapeFn(ptr: *anyopaque, s: *lanes.Stream, _: std.mem.Allocator) anyerror!?lanes.stream.Held {
+        const self = of(ptr);
+        if (self.x.e.dflash == null) return null;
+        const lane = self.lanes.getPtr(s) orelse return error.UnknownStream;
+        return .{ .count = @intCast(lane.held_n) };
+    }
+
     fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
         _ = ptr;
         _ = s;
@@ -294,7 +302,7 @@ pub const Lanes = struct {
 
     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const self = of(ptr);
-        if (!self.x.e.mtp) return error.NoDraftHead;
+        if (!self.x.e.drafting()) return error.NoDraftHead;
         for (requests) |r| {
             const l = try self.bind(r.stream, if (r.rows) |rows| rows.len else null);
             if (r.position != self.x.e.pos() + 1) return error.PositionMismatch;
@@ -302,12 +310,11 @@ pub const Lanes = struct {
             const depth = @min(r.depth, engine.max_drafts);
             if (r.rows) |rows| {
                 for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
-                try self.x.draft(false, r.follow[0..rows.len], depth, &l.held);
+                l.held_n = try self.x.draft(false, r.follow[0..rows.len], depth, &l.held);
             } else {
                 const first = self.value(r.first orelse return error.NoFirstToken);
-                try self.x.draft(true, &.{first}, depth, &l.held);
+                l.held_n = try self.x.draft(true, &.{first}, depth, &l.held);
             }
-            l.held_n = depth;
         }
     }
 
@@ -321,4 +328,21 @@ pub const Lanes = struct {
 
 comptime {
     std.debug.assert(max_rows <= fw.window_rows);
+}
+
+test "DFlash publishes the actual held count through the existing lane shape callback" {
+    var e: engine.Engine = undefined;
+    e.gpa = std.testing.allocator;
+    e.dflash = @ptrFromInt(256);
+    var link: follow.Link = undefined;
+    var backend: Lanes = .{ .x = .{ .e = &e, .link = &link } };
+    defer backend.deinit();
+    var stream: lanes.Stream = undefined;
+    try backend.lanes.put(e.gpa, &stream, .{ .slot = 0, .held_n = 2 });
+    const b = backend.backend();
+    try std.testing.expectEqual(@as(u32, 2), (try b.vtable.tree.?(b.ptr, &stream, e.gpa)).?.count);
+    backend.lanes.getPtr(&stream).?.held_n = 0;
+    try std.testing.expectEqual(@as(u32, 0), (try b.vtable.tree.?(b.ptr, &stream, e.gpa)).?.count);
+    e.dflash = null;
+    try std.testing.expectEqual(@as(?lanes.stream.Held, null), try b.vtable.tree.?(b.ptr, &stream, e.gpa));
 }

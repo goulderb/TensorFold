@@ -5,12 +5,14 @@ const cuda = @import("cuda");
 const glue = @import("cuda_glue.zig");
 const experts = @import("cuda_experts.zig");
 const b16 = @import("cuda_b16.zig");
+const mia = @import("cuda_experts_mia.zig");
 
 /// One MoE layer on a rank: router (bf16) and fp32 bias, routed experts, shared [gate | up] (or EXL3's two) and down.
 pub const Layer = struct {
     router: u64,
     bias: u64,
     routed: cuda.experts.Layer,
+    mia_routed: ?mia.Experts = null,
     count: usize,
     shared_gu: u64,
     shared_gu_q: ?cuda.qlinear.Weight = null,
@@ -37,10 +39,11 @@ pub const Scratch = struct {
     sxs: u64, // fp32 [rows][shared / 64]
     sy: u64, // fp32 [rows][dims]
     mm_part: u64, // fp32 split-K partials of the shared expert's matmuls
+    mia_scratch: ?mia.Scratch = null,
 };
 
 /// The kernels the block runs: the captured Triton set, the grouped NVFP4 experts, the plan, and glm_ops.
-pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, put_slot: cuda.Function };
+pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, put_slot: cuda.Function, mia_kernels: ?*const mia.Kernels = null };
 
 /// forward.moe_block: out [rows][dims] fp32 partial; `prompt`: 64-pair items, the prompt kernels, bf16 slot rows.
 pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool, out: u64) !void {
@@ -57,6 +60,9 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     try glue.select(k.set, stream, s.mlog, l.bias, s.pick, s.wts, rows, l.top_k, l.count, l.scale, l.norm);
     const plan: experts.Plan = .{ .route = s.plan, .slots = slots, .experts = l.count + 1, .prompt = prompt };
     try experts.route(k.experts, stream, s.pick, rows * slots, plan);
+    if (l.mia_routed) |m| {
+        return mia.routed(k.mia_kernels orelse return error.MiaKernelsMissing, stream, m, s.plan, s.mia_scratch orelse return error.MiaScratchMissing, x, x_stride, s.pick, rows, prompt, l.routed.limit, s.ey);
+    }
     try experts.run(k.experts, stream, .gate_up, l.routed, plan, x, x_stride, rows, s.eact, shared_id);
     try experts.run(k.experts, stream, if (prompt) .down else .down_f32, l.routed, plan, s.eact, l.routed.width, rows, s.ey, shared_id);
 }

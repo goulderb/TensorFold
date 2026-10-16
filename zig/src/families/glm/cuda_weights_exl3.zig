@@ -6,6 +6,107 @@ const core = @import("core");
 const shard = @import("cuda_shard.zig");
 const W = @import("cuda_weights.zig");
 const projections = @import("cuda_weights_projs.zig");
+const mia = @import("cuda_experts_mia.zig");
+
+fn putBytes(L: *W.Loader, bytes: []const u8, i: u32, comptime part: []const u8) !u64 {
+    try L.host.appendSlice(L.gpa, bytes);
+    return L.put("layers.{d}.moe.mia." ++ part, .{i});
+}
+
+const MiaMatrix = struct {
+    trellis: std.ArrayList(u8) = .empty,
+    suh: std.ArrayList(u8) = .empty,
+    svh: std.ArrayList(u8) = .empty,
+
+    fn deinit(m: *MiaMatrix, gpa: std.mem.Allocator) void {
+        m.trellis.deinit(gpa);
+        m.suh.deinit(gpa);
+        m.svh.deinit(gpa);
+    }
+
+    fn append(m: *MiaMatrix, L: *W.Loader, name: []const u8, klo: usize, khi: usize, spans: []const shard.Span, expected_k: usize, expected_n: usize) !void {
+        var halves: std.ArrayList(u8) = .empty;
+        defer halves.deinit(L.gpa);
+        const q = try gather(L.ck, L.gpa, name, klo, khi, spans, &m.trellis, &halves);
+        if (q.bits != 4 or q.codebook != .mcg or q.k != expected_k or q.n != expected_n) return error.UnsupportedMiaWeights;
+        try m.appendHalves(L.gpa, halves.items, q.k, q.n);
+    }
+
+    fn appendHalves(m: *MiaMatrix, gpa: std.mem.Allocator, halves: []const u8, k: usize, n: usize) !void {
+        if (halves.len != 2 * (k + n)) return error.UnexpectedExl3Scales;
+        try m.suh.appendSlice(gpa, halves[0 .. k * 2]);
+        try m.svh.appendSlice(gpa, halves[k * 2 ..]);
+    }
+};
+
+test "Mia input and output halves remain separate across experts" {
+    var gate: MiaMatrix = .{};
+    defer gate.deinit(std.testing.allocator);
+    var up: MiaMatrix = .{};
+    defer up.deinit(std.testing.allocator);
+    try gate.appendHalves(std.testing.allocator, &.{ 1, 2, 3, 4, 5, 6 }, 2, 1);
+    try up.appendHalves(std.testing.allocator, &.{ 7, 8, 9, 10, 11, 12 }, 2, 1);
+    try gate.appendHalves(std.testing.allocator, &.{ 13, 14, 15, 16, 17, 18 }, 2, 1);
+    try up.appendHalves(std.testing.allocator, &.{ 19, 20, 21, 22, 23, 24 }, 2, 1);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 13, 14, 15, 16 }, gate.suh.items);
+    try std.testing.expectEqualSlices(u8, &.{ 5, 6, 17, 18 }, gate.svh.items);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 8, 9, 10, 19, 20, 21, 22 }, up.suh.items);
+    try std.testing.expectEqualSlices(u8, &.{ 11, 12, 23, 24 }, up.svh.items);
+    try std.testing.expectError(error.UnexpectedExl3Scales, gate.appendHalves(std.testing.allocator, &.{ 1, 2 }, 2, 1));
+}
+
+fn miaMoe(L: *W.Loader, i: u32) !@import("cuda_moe.zig").Layer {
+    const c = &L.w.config;
+    const cut = L.w.share.moe;
+    const sh = L.w.share.shared;
+    try mia.validate(c.hidden, cut.len(), c.experts, c.topk + 1);
+    if (L.w.exl3) return error.MiaFullExl3SharedUnsupported;
+    try L.whole(try L.get("layers.{d}.mlp.gate.weight", .{i}), .bf16);
+    const router = try L.put("layers.{d}.moe.router", .{i});
+    try L.whole(try L.get("layers.{d}.mlp.gate.e_score_correction_bias", .{i}), .f32);
+    const bias = try L.put("layers.{d}.moe.bias", .{i});
+    var mats: [3]MiaMatrix = .{ .{}, .{}, .{} };
+    defer for (&mats) |*m| m.deinit(L.gpa);
+    var nb: [192]u8 = undefined;
+    for (0..c.experts) |e| {
+        inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |part, j| {
+            const name = try std.fmt.bufPrint(&nb, W.prefix ++ "layers.{d}.mlp.experts.{d}.{s}", .{ i, e, part });
+            if (j < 2) try mats[j].append(L, name, 0, 0, &.{cut}, c.hidden, cut.len()) else try mats[j].append(L, name, cut.lo, cut.hi, &.{.{ .lo = 0, .hi = c.hidden }}, cut.len(), c.hidden);
+        }
+    }
+    const weights: mia.Experts = .{
+        .gate_trellis = try putBytes(L, mats[0].trellis.items, i, "gate_trellis"),
+        .up_trellis = try putBytes(L, mats[1].trellis.items, i, "up_trellis"),
+        .down_trellis = try putBytes(L, mats[2].trellis.items, i, "down_trellis"),
+        .gate_suh = try putBytes(L, mats[0].suh.items, i, "gate_suh"),
+        .up_suh = try putBytes(L, mats[1].suh.items, i, "up_suh"),
+        .down_suh = try putBytes(L, mats[2].suh.items, i, "down_suh"),
+        .gate_svh = try putBytes(L, mats[0].svh.items, i, "gate_svh"),
+        .up_svh = try putBytes(L, mats[1].svh.items, i, "up_svh"),
+        .down_svh = try putBytes(L, mats[2].svh.items, i, "down_svh"),
+        .dims = c.hidden,
+        .width = cut.len(),
+        .count = c.experts,
+    };
+    inline for (.{ "gate_proj", "up_proj" }) |proj| try L.rows(try L.get("layers.{d}.mlp.shared_experts." ++ proj ++ ".weight", .{i}), sh.lo, sh.hi, c.shared_inter, .bf16);
+    const gu = try projections.finish(L, .shared, "layers.{d}.moe.shared.gu", .{i}, 2 * sh.len(), c.hidden);
+    try L.cols(try L.get("layers.{d}.mlp.shared_experts.down_proj.weight", .{i}), sh.lo, sh.hi, .bf16);
+    const down = try projections.finish(L, .shared, "layers.{d}.moe.shared.down", .{i}, c.hidden, sh.len());
+    return .{
+        .router = router,
+        .bias = bias,
+        .routed = .{ .format = .exl3, .up = 0, .down = 0, .width = cut.len(), .dims = c.hidden, .experts = c.experts, .limit = c.swiglu_limit },
+        .mia_routed = weights,
+        .count = c.experts,
+        .shared_gu = if (gu == .b16) gu.b16 else 0,
+        .shared_gu_q = if (gu == .q) gu.q else null,
+        .shared_down = down,
+        .shared = sh.len(),
+        .top_k = c.topk,
+        .scale = c.routed_scale,
+        .norm = c.norm_topk,
+    };
+}
 
 /// EXL3 matrix `name`'s share: inputs [klo, khi) (khi 0: all), `spans`' columns; tiles to `tiles`, suh+svh `scales`.
 pub fn gather(ck: *core.Checkpoint, gpa: std.mem.Allocator, name: []const u8, klo: usize, khi: usize, spans: []const shard.Span, tiles: *std.ArrayList(u8), scales: *std.ArrayList(u8)) !cuda.exl3_linear.Matrix {
@@ -94,6 +195,7 @@ pub fn kda(L: *W.Loader, i: u32) !@import("cuda_kda_block.zig").Layer {
 
 /// Loader.moeLayer on EXL3: experts as exl3_experts stacks, gate and up by the rank's columns, down by its inputs.
 pub fn moe(L: *W.Loader, i: u32) !@import("cuda_moe.zig").Layer {
+    if (L.tools.exl3_routed == .mia_mcg4) return miaMoe(L, i);
     const c = &L.w.config;
     const d: usize = c.hidden;
     const cut = L.w.share.moe;

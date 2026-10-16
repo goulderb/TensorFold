@@ -5,7 +5,14 @@ const cuda = @import("cuda");
 const heat = @import("heat");
 const cache = @import("cuda_cache.zig");
 const precision = @import("cuda_weight_precision.zig");
+const mia = @import("cuda_experts_mia.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
+pub const Drafter = enum(u8) { off, mtp, dflash2 };
+
+pub fn effectiveDraft(mode: Drafter, enabled: bool) !Drafter {
+    if (mode == .dflash2 and !enabled) return error.DFlashNeedsDrafts;
+    return if (enabled) mode else .off;
+}
 
 /// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
 pub const Settings = struct {
@@ -13,6 +20,10 @@ pub const Settings = struct {
     weight_dense: precision.DensePolicy = .{},
     weight_head: precision.Head = .bf16,
     exl3_decode: cuda.exl3_experts.Decode = .scalar,
+    exl3_routed: mia.Mode = .generic,
+    draft: Drafter = .mtp,
+    draft_dir: ?[]const u8 = null,
+    draft_checkpoint: [32]u8 = @splat(0),
     vision: bool = false,
     kv_pool_tokens: u32 = 0,
     kv_shard: bool = false,
@@ -24,8 +35,12 @@ pub const Settings = struct {
     spill: [32]u8 = @splat(0),
 
     pub fn hashNumerics(s: Settings, digest: *Sha256) void {
+        digest.update("glm-numerics-mia-f1ee79a6-v1\x00");
         s.weight_dense.hash(digest);
-        for ([_][]const u8{ @tagName(s.weight_head), @tagName(s.exl3_decode) }) |value| {
+        digest.update(@tagName(s.draft));
+        digest.update("\x00");
+        digest.update(&s.draft_checkpoint);
+        for ([_][]const u8{ @tagName(s.weight_head), @tagName(s.exl3_decode), @tagName(s.exl3_routed) }) |value| {
             digest.update(value);
             digest.update("\x00");
         }
@@ -34,6 +49,23 @@ pub const Settings = struct {
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
         var s: Settings = .{};
+        if (get("TF_GLM_EXL3_ROUTED")) |v| {
+            s.exl3_routed = if (std.mem.eql(u8, v, "generic")) .generic else if (std.mem.eql(u8, v, "mia-mcg4")) .mia_mcg4 else {
+                problem.* = "TF_GLM_EXL3_ROUTED: generic or mia-mcg4";
+                return error.BadSetting;
+            };
+        }
+        if (get("TF_GLM_DRAFTER")) |v| {
+            s.draft = std.meta.stringToEnum(Drafter, v) orelse {
+                problem.* = "TF_GLM_DRAFTER: off, mtp or dflash2";
+                return error.BadSetting;
+            };
+        }
+        s.draft_dir = get("TF_GLM_DFLASH_DIR");
+        if (s.draft == .dflash2 and (s.draft_dir == null or s.draft_dir.?.len == 0)) {
+            problem.* = "TF_GLM_DFLASH_DIR is required for dflash2";
+            return error.BadSetting;
+        }
         if (get("TF_GLM_EXL3_DECODE")) |v| {
             s.exl3_decode = std.meta.stringToEnum(cuda.exl3_experts.Decode, v) orelse {
                 problem.* = "TF_GLM_EXL3_DECODE: scalar or tensor";
@@ -123,7 +155,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 11,
+    layout: u32 = 12,
     world: u32,
     rank: u32,
     split: u32,
@@ -134,6 +166,9 @@ pub const Fingerprint = extern struct {
     weight_dense: [32]u8 = @splat(0),
     weight_head: u32 = 0,
     exl3_decode: u32 = 0,
+    exl3_routed: u32 = 0,
+    draft: u32 = 0,
+    draft_checkpoint: [32]u8 = @splat(0),
     vision: u32 = 0,
     kv_pool_tokens: u32,
     kv_shard: u32,
@@ -145,7 +180,7 @@ pub const Fingerprint = extern struct {
     program: [32]u8, // sha256 of this executable
     checkpoint: [64]u8, // the checkpoint folder's last name (the snapshot's revision), zero padded
 
-    pub const Field = enum { layout, rank, world, split, kda_wide, pieces, layers, kv, weight_dense, weight_head, exl3_decode, vision, kv_pool_tokens, kv_shard, spill, capacity, heat_high, heat_low, config, program, checkpoint };
+    pub const Field = enum { layout, rank, world, split, kda_wide, pieces, layers, kv, weight_dense, weight_head, exl3_decode, exl3_routed, draft, draft_checkpoint, vision, kv_pool_tokens, kv_shard, spill, capacity, heat_high, heat_low, config, program, checkpoint };
 
     pub fn of(world: usize, rank: usize, s: Settings, capacity: usize, config: [32]u8, program: [32]u8, checkpoint_dir: []const u8) Fingerprint {
         var f: Fingerprint = .{ .world = @intCast(world), .rank = @intCast(rank), .split = @intFromBool(s.split), .kda_wide = @intFromBool(s.kda_wide), .pieces = s.pieces, .layers = s.layers, .kv = @backingInt(s.kv), .kv_pool_tokens = s.kv_pool_tokens, .kv_shard = @intFromBool(s.kv_shard), .capacity = capacity, .heat_high = if (s.heat) |b| b.high_c else 0, .heat_low = if (s.heat) |b| b.low_c else 0, .config = config, .program = program, .checkpoint = @splat(0) };
@@ -153,6 +188,9 @@ pub const Fingerprint = extern struct {
         f.weight_dense = s.weight_dense.digest();
         f.weight_head = @backingInt(s.weight_head);
         f.exl3_decode = @backingInt(s.exl3_decode);
+        f.exl3_routed = @backingInt(s.exl3_routed);
+        f.draft = @backingInt(s.draft);
+        f.draft_checkpoint = s.draft_checkpoint;
         f.vision = @intFromBool(s.vision);
         const name = std.fs.path.basename(std.mem.trimEnd(u8, checkpoint_dir, "/"));
         const n = @min(name.len, f.checkpoint.len);
@@ -168,7 +206,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
     for (all, 0..) |f, r| {
         if (f.layout != all[0].layout) return .{ .field = .layout, .rank = r };
         if (f.rank != r) return .{ .field = .rank, .rank = r };
-        inline for (.{ "world", "split", "kda_wide", "pieces", "layers", "kv", "weight_dense", "weight_head", "exl3_decode", "vision", "kv_pool_tokens", "kv_shard", "spill", "capacity", "heat_high", "heat_low", "config", "program", "checkpoint" }) |name| {
+        inline for (.{ "world", "split", "kda_wide", "pieces", "layers", "kv", "weight_dense", "weight_head", "exl3_decode", "exl3_routed", "draft", "draft_checkpoint", "vision", "kv_pool_tokens", "kv_shard", "spill", "capacity", "heat_high", "heat_low", "config", "program", "checkpoint" }) |name| {
             if (!std.mem.eql(u8, std.mem.asBytes(&@field(f, name)), std.mem.asBytes(&@field(all[0], name))))
                 return .{ .field = @field(Fingerprint.Field, name), .rank = r };
         }
@@ -187,6 +225,84 @@ pub fn hashBytes(bytes: []const u8) [32]u8 {
     var out: [32]u8 = undefined;
     Sha256.hash(bytes, &out, .{});
     return out;
+}
+
+pub fn hashDraftCheckpoint(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) ![32]u8 {
+    var h = Sha256.init(.{});
+    h.update("glm-dflash2-checkpoint-v1\x00");
+    const scratch = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(scratch);
+    for ([_][]const u8{ "config.json", "model.safetensors" }) |name| {
+        h.update(name);
+        h.update("\x00");
+        const path = try std.fs.path.join(gpa, &.{ dir, name });
+        defer gpa.free(path);
+        var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+        defer file.close(io);
+        var offset: u64 = 0;
+        while (true) {
+            const n = try file.readPositionalAll(io, scratch, offset);
+            if (n == 0) break;
+            h.update(scratch[0..n]);
+            offset = try std.math.add(u64, offset, n);
+        }
+        var size: [8]u8 = undefined;
+        std.mem.writeInt(u64, &size, offset, .little);
+        h.update(&size);
+    }
+    return h.finalResult();
+}
+
+test "DFlash requires an explicit checkpoint and speculative backend" {
+    const Env = struct {
+        fn get(name: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "TF_GLM_DRAFTER")) return "dflash2";
+            if (std.mem.eql(u8, name, "TF_GLM_DFLASH_DIR")) return "/draft";
+            return null;
+        }
+        fn missing(name: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, name, "TF_GLM_DRAFTER")) "dflash2" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    const selected = try Settings.read(Env.get, &problem);
+    try std.testing.expectEqual(Drafter.dflash2, selected.draft);
+    try std.testing.expectEqualStrings("/draft", selected.draft_dir.?);
+    try std.testing.expectError(error.BadSetting, Settings.read(Env.missing, &problem));
+    try std.testing.expectError(error.DFlashNeedsDrafts, effectiveDraft(.dflash2, false));
+    try std.testing.expectEqual(Drafter.off, try effectiveDraft(.mtp, false));
+    try std.testing.expectEqual(Drafter.mtp, try effectiveDraft(.mtp, true));
+    const h: [32]u8 = @splat(0);
+    var all = [_]Fingerprint{ Fingerprint.of(2, 0, selected, 8192, h, h, "target"), Fingerprint.of(2, 1, selected, 8192, h, h, "target") };
+    all[1].draft_checkpoint[0] = 1;
+    try std.testing.expectEqual(Fingerprint.Field.draft_checkpoint, mismatch(&all).?.field);
+    all[1].draft_checkpoint = h;
+    all[1].draft = @backingInt(Drafter.mtp);
+    try std.testing.expectEqual(Fingerprint.Field.draft, mismatch(&all).?.field);
+}
+
+test "Mia expert selection parses once and separates rank and spill identities" {
+    const Env = struct {
+        fn miaChoice(name: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, name, "TF_GLM_EXL3_ROUTED")) "mia-mcg4" else null;
+        }
+        fn unknown(name: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, name, "TF_GLM_EXL3_ROUTED")) "mcg" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    const selected = try Settings.read(Env.miaChoice, &problem);
+    try std.testing.expectEqual(mia.Mode.mia_mcg4, selected.exl3_routed);
+    try std.testing.expectError(error.BadSetting, Settings.read(Env.unknown, &problem));
+    try std.testing.expectEqualStrings("TF_GLM_EXL3_ROUTED: generic or mia-mcg4", problem);
+    const h: [32]u8 = @splat(0);
+    const all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, h, h, "target"), Fingerprint.of(2, 1, selected, 8192, h, h, "target") };
+    try std.testing.expectEqual(Fingerprint.Field.exl3_routed, mismatch(&all).?.field);
+    var a = Sha256.init(.{});
+    var b = Sha256.init(.{});
+    (Settings{}).hashNumerics(&a);
+    selected.hashNumerics(&b);
+    try std.testing.expect(!std.mem.eql(u8, &a.finalResult(), &b.finalResult()));
 }
 
 /// Every rank's `mine` in rank order, over one ncclAllGather.
@@ -222,6 +338,9 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .weight_dense => "TF_GLM_DENSE and TF_GLM_DENSE_{KDA,DSA,MLP,SHARED,MTP_EH}",
         .weight_head => "TF_GLM_HEAD",
         .exl3_decode => "TF_GLM_EXL3_DECODE",
+        .exl3_routed => "TF_GLM_EXL3_ROUTED",
+        .draft => "TF_GLM_DRAFTER",
+        .draft_checkpoint => "DFlash checkpoint contents",
         .vision => "TF_GLM_VISION",
         .kv_pool_tokens => "TF_GLM_KV_POOL_TOKENS",
         .kv_shard => "TF_GLM_KV_SHARD",
