@@ -25,6 +25,36 @@ pub const width: usize = 4096;
 pub const streams: usize = 4;
 pub const DType = enum { bf16, f32 };
 
+pub fn traceEnabled() bool {
+    const value = std.c.getenv("TF_GLM_VISION_TRACE") orelse return false;
+    return std.mem.eql(u8, std.mem.span(value), "1");
+}
+
+fn deviceSha256(buffer: cuda.DeviceBuffer, offset: usize, len: usize) ![32]u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var bytes: [64 * 1024]u8 = undefined;
+    var at: usize = 0;
+    while (at < len) {
+        const n = @min(bytes.len, len - at);
+        try buffer.download(offset + at, bytes[0..n]);
+        hash.update(bytes[0..n]);
+        at += n;
+    }
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    return digest;
+}
+
+pub fn traceFeatureTable(table: *const Table) !void {
+    if (!traceEnabled()) return;
+    try table.stream.synchronize();
+    const digest = try deviceSha256(table.features, 0, table.features.len);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    std.debug.print("[DEBUG-glm-vision-window] phase=features rank={d} replica={d} rows={d} bytes={d} ptr={x} first_position={d} last_position={d} sha256={s}\n", .{
+        table.rank, table.replica, table.rows, table.features.len, table.features.ptr, table.positions[0], table.positions[table.positions.len - 1], &hex,
+    });
+}
+
 /// Stable address required. Owner must clear ready BEFORE reuse/cleanup and never mutate while borrowed.
 /// ready certifies native encoder/copy completion. Every TP rank owns a complete, identical feature table;
 /// replica identifies the same request, not a device-content checksum or physical-TP agreement protocol.
@@ -167,6 +197,25 @@ pub fn inject(b: Binding, target: Target, ids: []const i32) !void {
         for (0..p.streams) |s| {
             const output = p.output + (row.window * p.streams + s) * p.row_bytes;
             try target.stream.d.check(target.stream.d.api.cuMemcpyDtoDAsync_v2(output, source, p.row_bytes, target.stream.handle), "cuMemcpyDtoDAsync");
+        }
+    }
+    if (traceEnabled()) {
+        try target.stream.synchronize();
+        std.debug.print("[DEBUG-glm-vision-window] phase=inject rank={d} replica={d} start={d} window={d} matched={d} feature_ptr={x} embedding_ptr={x}\n", .{
+            target.rank, b.owner.replica, target.start, ids.len, p.count, p.source, p.output,
+        });
+        if (p.count != 0) {
+            const selected = [_]Row{ p.rows[0], p.rows[p.count - 1] };
+            for (selected, 0..) |row, selected_index| {
+                for (0..p.streams) |shard| {
+                    const at = (row.window * p.streams + shard) * p.row_bytes;
+                    const digest = try deviceSha256(target.embedding, at, p.row_bytes);
+                    const hex = std.fmt.bytesToHex(digest, .lower);
+                    std.debug.print("[DEBUG-glm-vision-window] phase=embedding rank={d} replica={d} selected={d} prompt_position={d} feature_row={d} shard={d} sha256={s}\n", .{
+                        target.rank, b.owner.replica, selected_index, target.start + row.window, row.table, shard, &hex,
+                    });
+                }
+            }
         }
     }
 }
