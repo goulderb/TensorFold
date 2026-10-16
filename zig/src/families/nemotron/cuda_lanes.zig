@@ -26,7 +26,8 @@ const row_slots = engine.max_streams * state.max_rows + 1;
 const ring = 1024;
 
 /// A stream's sequence (`own`: the engine's, the graphs' buffers) and its first token's logprob row from prefill.
-const Lane = struct { seq: *state.Seq, own: bool = false, pending_rows: ?usize = null, first: ?LogRow = null, stats: seq_graphs.Stats = .{}, keep: usize = 0, taps: Taps = .{} };
+/// `fill`: the row a prompt pass run a chunk a call (prefillStepFn) stands at between its calls; null outside one.
+const Lane = struct { seq: *state.Seq, own: bool = false, pending_rows: ?usize = null, first: ?LogRow = null, stats: seq_graphs.Stats = .{}, keep: usize = 0, taps: Taps = .{}, fill: ?usize = null };
 
 /// A recorded stream's rows: its prompt's on the host until its first verify, then where its last verify started.
 const Taps = struct { prompt: std.ArrayList(u8) = .empty, from: usize = 0, verified: ?u64 = null };
@@ -84,8 +85,12 @@ pub const Cuda = struct {
         self.prompt_out.free();
     }
 
+    /// Two-GPU TP runs prompts a chunk a call between the other streams' rounds (prefillStepFn); else whole.
     pub fn backend(self: *Cuda) be.Backend {
-        return .{ .ptr = self, .vtable = &.{
+        return .{ .ptr = self, .vtable = if (self.e.tp_link != null) &steps_vt else &whole_vt };
+    }
+
+    const whole_vt: be.Backend.VTable = .{
             .prefill = prefillFn,
             .first = firstFn,
             .queue = queueFn,
@@ -100,8 +105,13 @@ pub const Cuda = struct {
             .prepare_features = prepareFeaturesFn,
             .features = featuresFn,
             .prompt_rows = true,
-        } };
-    }
+    };
+
+    const steps_vt: be.Backend.VTable = vt: {
+        var v = whole_vt;
+        v.prefill_step = prefillStepFn;
+        break :vt v;
+    };
 
     /// Structured output's bits for rows from `slot` (a forward's rows; a first token's: the last slot), device-read.
     pub fn putBits(self: *Cuda, slot: usize, masks: []const u32) !engine.Mask {
@@ -300,25 +310,8 @@ pub const Cuda = struct {
         const self = of(ptr);
         const e = self.e;
         const ids = s.prompt();
-        if (ids.len == 0 or ids.len + s.max_new + state.max_rows > e.max_len) return error.PromptTooLong;
-        self.takePromise();
-        const gop = try self.lanes.getOrPut(self.gpa, s);
-        if (gop.found_existing) self.drop(gop.value_ptr.*);
-        // the engine's own sequence while it is free: its rounds replay the captured graphs
-        // the own graphs carry the pocket; a layer split has no graphs but only the own sequence, on both ranks
-        const own = self.own_free and (e.serial != null or e.peer != null) and !s.untaught;
-        gop.value_ptr.* = .{ .own = own, .stats = e.stats, .seq = if (own) &e.own else e.newSeq() catch |err| {
-            self.lanes.removeByPtr(gop.key_ptr);
-            return err;
-        } };
-        if (own) self.own_free = false;
-        gop.value_ptr.seq.untaught = s.untaught;
-        e.bind(gop.value_ptr.seq);
-        // a decision row only where lessons route on it: else the prompt's chunks stay as plain serving cuts them
-        e.decide = if (s.decide != null and e.lessons() != null) s.decide.? else lesson_route.none;
-        try e.setSampling(s.sampling);
-        s.cached = 0;
-        const from = if (s.prompt_logprobs != null) 0 else self.restoreKept(s, ids.len); // prompt rows need every row
+        const from = try self.opening(s);
+        const gop = self.lanes.getEntry(s).?;
         const keep: ?engine.Keep = if (s.reuse.marks.len == 0) null else .{ .at = s.reuse.marks, .ctx = s, .call = keptAt };
         var sink: PromptSink = .{ .gpa = self.gpa, .s = s };
         s.prompt_rows.clearRetainingCapacity();
@@ -340,15 +333,74 @@ pub const Cuda = struct {
         if (self.tapped != null) e.taps = .{ .ctx = &tap, .call = TapSink.take };
         defer e.taps = null;
         const first = try e.prefillFrom(ids, from, null, self.head, .{ .ptr = s, .check = cancelled, .yields = s.yield_check != null }, keep);
+        try self.opened(s, gop.value_ptr, first);
+    }
+
+    /// One chunk of the stream's prompt a call, so the other streams' rounds run between its chunks (lane_host
+    /// fillOne): a pass of e.pass rows stalls them, not the whole prompt. A prompt whose pass carries more than its
+    /// sequence's state from chunk to chunk (prompt rows, pictures, taps, the head, lessons) runs whole at once.
+    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
+        const self = of(ptr);
+        const e = self.e;
+        const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
+        if (going == null and (s.prompt_logprobs != null or s.images.len > 0 or self.tapped != null or self.head != null or e.lessons() != null)) {
+            try prefillFn(ptr, s);
+            return true;
+        }
+        const at = if (going) |g| blk: {
+            e.bind(self.lanes.getPtr(s).?.seq); // the rounds between chunks bound their own sequences
+            break :blk g;
+        } else try self.opening(s);
+        const l = self.lanes.getPtr(s).?;
+        l.fill = null; // set again while the pass stands part way
+        try e.setSampling(s.sampling); // the prompt's first token draws under its rule, which a round's may have replaced
+        const keep: ?engine.Keep = if (s.reuse.marks.len == 0) null else .{ .at = s.reuse.marks, .ctx = s, .call = keptAt };
+        const first = try e.prefillStep(s.prompt(), at, going == null, .{ .ptr = s, .check = cancelled, .yields = s.yield_check != null }, keep) orelse {
+            l.fill = e.pos;
+            return false;
+        };
+        try self.opened(s, l, first);
+        return true;
+    }
+
+    /// A prompt pass begins: the stream's lane on a fresh sequence, bound with its sampling; the row the pass starts
+    /// at (a kept state restored there, else 0).
+    fn opening(self: *Cuda, s: *lanes.Stream) !usize {
+        const e = self.e;
+        const ids = s.prompt();
+        if (ids.len == 0 or ids.len + s.max_new + state.max_rows > e.max_len) return error.PromptTooLong;
+        self.takePromise();
+        const gop = try self.lanes.getOrPut(self.gpa, s);
+        if (gop.found_existing) self.drop(gop.value_ptr.*);
+        // the engine's own sequence while it is free: its rounds replay the captured graphs
+        // the own graphs carry the pocket; a layer split has no graphs but only the own sequence, on both ranks
+        const own = self.own_free and (e.serial != null or e.peer != null) and !s.untaught;
+        gop.value_ptr.* = .{ .own = own, .stats = e.stats, .seq = if (own) &e.own else e.newSeq() catch |err| {
+            self.lanes.removeByPtr(gop.key_ptr);
+            return err;
+        } };
+        if (own) self.own_free = false;
+        gop.value_ptr.seq.untaught = s.untaught;
+        e.bind(gop.value_ptr.seq);
+        // a decision row only where lessons route on it: else the prompt's chunks stay as plain serving cuts them
+        e.decide = if (s.decide != null and e.lessons() != null) s.decide.? else lesson_route.none;
+        try e.setSampling(s.sampling);
+        s.cached = 0;
+        return if (s.prompt_logprobs != null) 0 else self.restoreKept(s, ids.len); // prompt rows need every row
+    }
+
+    /// The prompt is whole: its first token drawn, the last row where a window's waits, the first row's logprobs.
+    fn opened(self: *Cuda, s: *lanes.Stream, l: *Lane, first: u32) !void {
+        const e = self.e;
         // the head's first draft reads the prompt's last row (its hidden row waits where a window's would)
-        const last = ids.len - 1 - e.last_chunk;
+        const last = s.prompt().len - 1 - e.last_chunk;
         try e.ops().copy(e.b.hidden, e.b.p_hidden + last * @as(u64, e.c.hidden) * 2, e.c.hidden * 2);
         _ = self.take(first);
         if (s.logprobs) |k| {
             const at = (row_slots - 1) * row_words;
             try e.ops().logprobRows(e.b.p_logits, e.c.vocab, e.b.p_sampled, k, false, self.rows_dev + at * 4, 1);
             try e.stream.synchronize();
-            gop.value_ptr.first = LogRow.fromWords(self.rows_out.slice(u32)[at..][0..row_words], first, k);
+            l.first = LogRow.fromWords(self.rows_out.slice(u32)[at..][0..row_words], first, k);
         }
     }
 

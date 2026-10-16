@@ -45,13 +45,36 @@ pub fn prefillFrom(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, h
         try segs.prefill(e, try e.segmentSet(), prompt, head, e.segments, cancel);
     } else try e.serialChunks(prompt, from, dump, head, cancel, keep);
     if (e.heat_gate.waited_s > waited) heat.note(e.heat_gate.waited_s - waited);
+    e.prefill_counts.completed_rows += prompt.len - from;
+    return sampled(e);
+}
+
+/// The prompt's first token, drawn by its last chunk; one more prompt call counted.
+fn sampled(e: *Engine) !u32 {
     const host = e.pinned.slice(u32)[pin_sampled..][0..1];
     try e.ops().download(std.mem.sliceAsBytes(host), e.b.p_sampled);
     try e.stream.synchronize();
-    e.prefill_counts.completed_rows += prompt.len - from;
     e.prefill_counts.passes += 1;
     if (e.trace) e.traceLessons();
     return host[0];
+}
+
+/// One chunk of the bound sequence's prompt from `at` (`first`: the call's start, which resets the sequence at 0;
+/// else the row the last chunk left it at): the first token once the prompt is whole, else null. Between two calls
+/// other sequences may run, so nothing past the sequence's own state carries over: no head, prompt rows, taps,
+/// segments or lessons (prefillFrom keeps those).
+pub fn prefillStep(e: *Engine, prompt: []const u32, at: usize, first: bool, cancel: ?Cancel, keep: ?Keep) !?u32 {
+    if (e.peer != null and e.tp_link == null) return error.SplitUnsupportedReuse;
+    if (e.prompt_rows != null or e.taps != null or e.lessons() != null or e.decide != lesson_route.none) return error.StepUnsupported;
+    if (prompt.len == 0) return error.EmptyPrompt;
+    if (at >= prompt.len) return error.BadReuse;
+    if (prompt.len + state.max_rows > e.max_len) return error.ContextFull;
+    if (first and at == 0) try e.reset() else if (e.pos != at) return error.BadReuse;
+    const waited = e.heat_gate.waited_s;
+    const end = try e.chunksFrom(prompt, at, null, null, cancel, keep, 1);
+    if (e.heat_gate.waited_s > waited) heat.note(e.heat_gate.waited_s - waited);
+    e.prefill_counts.completed_rows += end - at;
+    return if (end == prompt.len) try sampled(e) else null;
 }
 
 /// The prompt's next token at `position` drawn again under a grammar's bits (structured output's first token).
@@ -73,13 +96,19 @@ pub fn beforeChunk(e: *Engine, cancel: ?Cancel) !void {
 
 /// The prompt's chunks one after another on the engine's stream, starting at `from`.
 pub fn serialChunks(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, head: ?*Head, cancel: ?Cancel, keep: ?Keep) !void {
+    _ = try e.chunksFrom(prompt, from, dump, head, cancel, keep, std.math.maxInt(usize));
+}
+
+/// Up to `most` of the prompt's chunks from `from` on the engine's stream; the row the sequence stands at after them.
+pub fn chunksFrom(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, head: ?*Head, cancel: ?Cancel, keep: ?Keep, most: usize) !usize {
     var f = e.forward(dump);
     const shared = e.lessons();
     if (shared) |ad| try e.trainOps().latch(ad.score, ad.need, ad.latch, e.slot, false); // no lesson acts until it decides
     const wide = dump == null and shared == null and e.decide == lesson_route.none; // passes of up to pass_rows (rows equal at any cut)
     const background = Cancel.background(cancel);
     var s: usize = from;
-    while (s < prompt.len) {
+    var ran: usize = 0;
+    while (s < prompt.len and ran < most) : (ran += 1) {
         if (background) try e.stream.synchronize(); // one chunk in flight: a request that arrives waits for that one alone
         if (Cancel.now(cancel)) {
             if (background and s > from) if (keep) |k| k.call(k.ctx, @intCast(s)); // what it prefilled stays for the next turn
@@ -128,6 +157,7 @@ pub fn serialChunks(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, 
         s = end;
         if (keep) |k| if (s <= std.math.maxInt(u32) and std.mem.indexOfScalar(u32, k.at, @intCast(s)) != null) k.call(k.ctx, @intCast(s));
     }
+    return s;
 }
 
 /// The keep marks strictly inside rows [s, end).

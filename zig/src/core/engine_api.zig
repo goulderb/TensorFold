@@ -254,6 +254,9 @@ pub const Info = struct {
     startup: []const u8 = "",
     /// A prompt-only request (max_tokens 0) keeps its end state: the server prefills each reply for the next turn.
     warm_turns: bool = false,
+    /// Prompts a chunk a call fill in admission order, not the fewest tokens first: a long prompt (a late agent turn)
+    /// is never starved by shorter ones that keep arriving, while every other stream still decodes between chunks.
+    fill_arrival: bool = false,
     /// The engine decodes plain whatever a request asks: no drafter loaded, or this chip is faster plain.
     plain_only: bool = false,
     /// The immutable retained-prefix plan applied at startup, not a process memory limit or current cache occupancy.
