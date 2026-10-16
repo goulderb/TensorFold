@@ -30,5 +30,13 @@ pub fn run(gpu: check.Gpu, checkpoint: []const u8, image_path: []const u8, outpu
     try stream.synchronize();
     try table.features.download(0, bytes);
     try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = output_path, .data = bytes });
-    std.debug.print("RESULT GLM vision rows={d} width=4096 dtype=bf16 bytes={d} output={s}\n", .{ rows, bytes.len, output_path });
+    var image_hash: [32]u8 = undefined;
+    var patches_hash: [32]u8 = undefined;
+    var output_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(image, &image_hash, .{});
+    std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(encoded.request.images[0].pixels), &patches_hash, .{});
+    std.crypto.hash.sha2.Sha256.hash(bytes, &output_hash, .{});
+    std.debug.print("RESULT GLM vision rows={d} width=4096 dtype=bf16 bytes={d} image_sha256={s} patches_sha256={s} output_sha256={s} output={s}\n", .{
+        rows, bytes.len, &std.fmt.bytesToHex(image_hash, .lower), &std.fmt.bytesToHex(patches_hash, .lower), &std.fmt.bytesToHex(output_hash, .lower), output_path,
+    });
 }
