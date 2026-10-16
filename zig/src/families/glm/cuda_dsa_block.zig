@@ -14,11 +14,14 @@ pub const prompt_att_rows = 512;
 /// The indexer's weights, replicated: [wk | weights_proj] [d + heads][dims], gate, key LayerNorm, pool bias, wq_b.
 pub const Index = struct { kw: u64, kw_q: ?cuda.qlinear.Weight = null, gate: u64, ln_w: u64, ln_b: u64, ape: u64, qb: b16.Proj, heads: usize, d: usize };
 
-/// One DSA layer on a rank of `heads` heads: proj (or EXL3's q_a and kv_a), norms, q_b, kv_b as wk/wv, o, indexer.
+pub const InputProjection = union(enum) {
+    combined_bf16: u64,
+    separate: struct { qa: b16.Proj, kva: b16.Proj },
+};
+
+/// One DSA layer on a rank of `heads` heads: input projection, norms, q_b, kv_b as wk/wv, o, indexer.
 pub const Layer = struct {
-    proj: u64,
-    q_a: ?cuda.qlinear.Weight = null,
-    kv_a: ?cuda.qlinear.Weight = null,
+    input: InputProjection,
     q_norm: u64,
     kv_norm: u64,
     q_b: b16.Proj,
@@ -95,17 +98,19 @@ pub fn sparseRows(l: Layer, host_pos: usize, rows: usize) bool {
 /// The block's row-by-row part for a shared window: projections, norms, q_b, indexer, absorbed query, `qi`'s query.
 pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool) !void {
     const width = l.q_lora + l.lw;
-    if (l.q_a) |qa| {
-        // EXL3: q_a's rows, then kv_a's, apart in s.dp
+    switch (l.input) {
+      .separate => |pair| {
         const kv = s.dp + rows * l.q_lora * 2;
-        try b16.proj(set, stream, x, x_stride, .{ .q = qa }, s.dp, s.mm_part, rows, l.q_lora, l.dims, false);
-        try b16.proj(set, stream, x, x_stride, .{ .q = l.kv_a orelse return error.MissingKvA }, kv, s.mm_part, rows, l.lw, l.dims, false);
+        try b16.proj(set, stream, x, x_stride, pair.qa, s.dp, s.mm_part, rows, l.q_lora, l.dims, false);
+        try b16.proj(set, stream, x, x_stride, pair.kva, kv, s.mm_part, rows, l.lw, l.dims, false);
         try glue.rmsnorm(set, stream, s.dp, l.q_lora, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
         try glue.rmsnorm(set, stream, kv, l.lw, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
-    } else {
-        try b16.matmul(set, stream, x, x_stride, l.proj, s.dp, s.mm_part, rows, width, l.dims, false);
+      },
+      .combined_bf16 => |proj| {
+        try b16.matmul(set, stream, x, x_stride, proj, s.dp, s.mm_part, rows, width, l.dims, false);
         try glue.rmsnorm(set, stream, s.dp, width, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
         try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
+      },
     }
     try b16.proj(set, stream, s.qr, l.q_lora, l.q_b, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
     const ix = l.index;

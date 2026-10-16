@@ -130,9 +130,9 @@ pub fn moe(L: *W.Loader, i: u32) !@import("cuda_moe.zig").Layer {
     const sh = L.w.share.shared;
     if (!L.w.exl3) {
         inline for (.{ "gate_proj", "up_proj" }) |proj| try L.rows(try L.get("layers.{d}.mlp.shared_experts." ++ proj ++ ".weight", .{i}), sh.lo, sh.hi, c.shared_inter, .bf16);
-        const gu = try projections.finish(L, "layers.{d}.moe.shared.gu", .{i}, 2 * sh.len(), d);
+        const gu = try projections.finish(L, .shared, "layers.{d}.moe.shared.gu", .{i}, 2 * sh.len(), d);
         try L.cols(try L.get("layers.{d}.mlp.shared_experts.down_proj.weight", .{i}), sh.lo, sh.hi, .bf16);
-        const down = try projections.finish(L, "layers.{d}.moe.shared.down", .{i}, d, sh.len());
+        const down = try projections.finish(L, .shared, "layers.{d}.moe.shared.down", .{i}, d, sh.len());
         return .{
             .router = router,
             .bias = bias,

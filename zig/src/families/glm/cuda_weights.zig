@@ -31,7 +31,7 @@ pub const Layer = struct { index: u32, attn_hc: Hc, ffn_hc: Hc, in_norm: u64, po
 pub const Mtp = struct { enorm: u64, hnorm: u64, eh: b16.Proj, norm: u64, layer: Layer, draft: ?q4.Q4 };
 
 /// The kernels a load runs: affine4_pack's tf_pack_dense, and for the MTP head the quantizers and the 4-bit tiling.
-pub const Tools = struct { pack_dense: cuda.Function, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null, affine4: ?*const cuda.qlinear.Affine4Kernels = null, precision: @import("cuda_weight_precision.zig").Settings = .{} };
+pub const Tools = struct { pack_dense: cuda.Function, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null, affine4: ?*const cuda.qlinear.Affine4Kernels = null, modelopt: ?*const cuda.modelopt.Packer = null, precision: @import("cuda_weight_precision.zig").Settings = .{} };
 
 /// A loaded tensor by the Python family's attribute path, for digests against its weights.
 pub const Named = struct { name: []u8, ptr: u64, len: usize };
@@ -161,11 +161,11 @@ pub const Loader = struct {
         inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
         inline for (.{ "f_a", "g_a" }) |x| try L.whole(try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i}), .bf16);
         try L.rows(try L.get("layers.{d}.self_attn.b_proj.weight", .{i}), h.lo, h.hi, c.kda_heads, .bf16);
-        const proj = try projections.finish(L, "layers.{d}.kda.proj", .{i}, 3 * h.len() * dk + 2 * dk + h.len(), c.hidden);
+        const proj = try projections.finish(L, .kda, "layers.{d}.kda.proj", .{i}, 3 * h.len() * dk + 2 * dk + h.len(), c.hidden);
         try L.rows(try L.get("layers.{d}.self_attn.f_b_proj.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
-        const fb = try projections.finish(L, "layers.{d}.kda.fb", .{i}, h.len() * dk, dk);
+        const fb = try projections.finish(L, .kda, "layers.{d}.kda.fb", .{i}, h.len() * dk, dk);
         try L.rows(try L.get("layers.{d}.self_attn.g_b_proj.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
-        const gb = try projections.finish(L, "layers.{d}.kda.gb", .{i}, h.len() * dk, dk);
+        const gb = try projections.finish(L, .kda, "layers.{d}.kda.gb", .{i}, h.len() * dk, dk);
         inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_conv1d.weight", .{i}), h.lo * dk, h.hi * dk, all, .f32);
         const conv = try L.put("layers.{d}.kda.conv", .{i});
         try L.rows(try L.get("layers.{d}.self_attn.A_log", .{i}), h.lo, h.hi, c.kda_heads, .f32);
@@ -175,7 +175,7 @@ pub const Loader = struct {
         try L.whole(try L.get("layers.{d}.self_attn.o_norm.weight", .{i}), .bf16);
         const norm = try L.put("layers.{d}.kda.norm", .{i});
         try L.cols(try L.get("layers.{d}.self_attn.o_proj.weight", .{i}), h.lo * dk, h.hi * dk, .bf16);
-        const o = try projections.finish(L, "layers.{d}.kda.o", .{i}, c.hidden, h.len() * dk);
+        const o = try projections.finish(L, .kda, "layers.{d}.kda.o", .{i}, c.hidden, h.len() * dk);
         return .{ .proj = if (proj == .b16) proj.b16 else 0, .proj_q = if (proj == .q) proj.q else null, .fb = if (fb == .b16) fb.b16 else 0, .fb_q = if (fb == .q) fb.q else null, .gb = if (gb == .b16) gb.b16 else 0, .gb_q = if (gb == .q) gb.q else null, .o = o, .conv_w = conv, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
     }
 
@@ -185,28 +185,26 @@ pub const Loader = struct {
         const h = L.w.share.mla;
         const qk = c.nope;
         const ex = L.w.exl3;
-        var q_a: ?cuda.qlinear.Weight = null;
-        var kv_a: ?cuda.qlinear.Weight = null;
-        var proj: u64 = 0;
-        if (ex) {
-            q_a = try x3.whole(L, "layers.{d}.self_attn.q_a_proj", i);
-            kv_a = try x3.whole(L, "layers.{d}.self_attn.kv_a_proj_with_mqa", i);
-        } else if (L.tools.precision.dense != .bf16) {
+        const input: dsa_block.InputProjection = if (ex) .{ .separate = .{
+            .qa = .{ .q = try x3.whole(L, "layers.{d}.self_attn.q_a_proj", i) },
+            .kva = .{ .q = try x3.whole(L, "layers.{d}.self_attn.kv_a_proj_with_mqa", i) },
+        } } else if (L.tools.precision.dense.get(.dsa) != .bf16) blk: {
             try L.whole(try L.get("layers.{d}.self_attn.q_a_proj.weight", .{i}), .bf16);
-            q_a = (try projections.finish(L, "layers.{d}.dsa.qa", .{i}, c.q_lora, c.hidden)).q;
+            const qa = try projections.finish(L, .dsa, "layers.{d}.dsa.qa", .{i}, c.q_lora, c.hidden);
             try L.whole(try L.get("layers.{d}.self_attn.kv_a_proj_with_mqa.weight", .{i}), .bf16);
-            kv_a = (try projections.finish(L, "layers.{d}.dsa.kva", .{i}, c.kv_lora, c.hidden)).q;
-        } else {
+            const kva = try projections.finish(L, .dsa, "layers.{d}.dsa.kva", .{i}, c.kv_lora, c.hidden);
+            break :blk .{ .separate = .{ .qa = qa, .kva = kva } };
+        } else blk: {
             inline for (.{ "q_a_proj", "kv_a_proj_with_mqa" }) |x| try L.whole(try L.get("layers.{d}.self_attn." ++ x ++ ".weight", .{i}), .bf16);
-            proj = try L.put("layers.{d}.dsa.proj", .{i});
-        }
+            break :blk .{ .combined_bf16 = try L.put("layers.{d}.dsa.proj", .{i}) };
+        };
         try L.whole(try L.get("layers.{d}.self_attn.q_a_layernorm.weight", .{i}), .bf16);
         const q_norm = try L.put("layers.{d}.dsa.q_norm", .{i});
         try L.whole(try L.get("layers.{d}.self_attn.kv_a_layernorm.weight", .{i}), .bf16);
         const kv_norm = try L.put("layers.{d}.dsa.kv_norm", .{i});
         const q_b: b16.Proj = if (ex) .{ .q = try x3.layerMatrix(L, "layers.{d}.self_attn.q_b_proj", i, 0, 0, &.{.{ .lo = h.lo * qk, .hi = h.hi * qk }}) } else blk: {
             try L.rows(try L.get("layers.{d}.self_attn.q_b_proj.weight", .{i}), h.lo * qk, h.hi * qk, c.mla_heads * qk, .bf16);
-            break :blk try projections.finish(L, "layers.{d}.dsa.q_b", .{i}, h.len() * qk, c.q_lora);
+            break :blk try projections.finish(L, .dsa, "layers.{d}.dsa.q_b", .{i}, h.len() * qk, c.q_lora);
         };
         const kv_b = try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i});
         const per = qk + c.v_dim; // a head's kv_b rows: its keys, then its values
@@ -217,13 +215,13 @@ pub const Loader = struct {
         const wv = try L.put("layers.{d}.dsa.absorb.wv", .{i});
         const o: b16.Proj = if (ex) .{ .q = try x3.layerMatrix(L, "layers.{d}.self_attn.o_proj", i, h.lo * c.v_dim, h.hi * c.v_dim, &.{.{ .lo = 0, .hi = c.hidden }}) } else blk: {
             try L.cols(try L.get("layers.{d}.self_attn.o_proj.weight", .{i}), h.lo * c.v_dim, h.hi * c.v_dim, .bf16);
-            break :blk try projections.finish(L, "layers.{d}.dsa.o", .{i}, c.hidden, h.len() * c.v_dim);
+            break :blk try projections.finish(L, .dsa, "layers.{d}.dsa.o", .{i}, c.hidden, h.len() * c.v_dim);
         };
         inline for (.{ "wk", "weights_proj" }) |x| try L.whole(try L.get("layers.{d}.self_attn.indexer." ++ x ++ ".weight", .{i}), .bf16);
-        const kw = try projections.finish(L, "layers.{d}.dsa.index.kw", .{i}, c.i_dim + c.i_heads, c.hidden);
+        const kw = try projections.finish(L, .dsa, "layers.{d}.dsa.index.kw", .{i}, c.i_dim + c.i_heads, c.hidden);
         const qb: b16.Proj = if (ex) .{ .q = try x3.whole(L, "layers.{d}.self_attn.indexer.wq_b", i) } else blk: {
             try L.whole(try L.get("layers.{d}.self_attn.indexer.wq_b.weight", .{i}), .bf16);
-            break :blk try projections.finish(L, "layers.{d}.dsa.index.qb", .{i}, c.i_heads * c.i_dim, c.q_lora);
+            break :blk try projections.finish(L, .dsa, "layers.{d}.dsa.index.qb", .{i}, c.i_heads * c.i_dim, c.q_lora);
         };
         try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.weight", .{i}), .bf16);
         const ln_w = try L.put("layers.{d}.dsa.index.ln_w", .{i});
@@ -234,9 +232,7 @@ pub const Loader = struct {
         try L.whole(try L.get("layers.{d}.self_attn.indexer.index_kpool_compress_ape", .{i}), .bf16);
         const ape = try L.put("layers.{d}.dsa.index.ape", .{i});
         return .{
-            .proj = proj,
-            .q_a = q_a,
-            .kv_a = kv_a,
+            .input = input,
             .q_norm = q_norm,
             .kv_norm = kv_norm,
             .q_b = q_b,
@@ -327,7 +323,7 @@ pub const Loader = struct {
         const t = try L.get("layers.{d}.mlp." ++ proj ++ ".weight", .{i});
         if (t.rank != 2 or (t.dtype != .bf16 and t.dtype != .f32) or hi > t.dim(0) or khi > t.dim(1)) return error.UnexpectedTensor;
         for (lo..hi) |row| try L.add(t, row * t.dim(1) + klo, row * t.dim(1) + khi, .bf16);
-        return projections.finish(L, "layers.{d}.mlp." ++ proj, .{i}, hi - lo, khi - klo);
+        return projections.finish(L, .mlp, "layers.{d}.mlp." ++ proj, .{i}, hi - lo, khi - klo);
     }
 
     /// One device allocation the loader frees itself (staging for the GPU's quantizers).
@@ -449,9 +445,9 @@ pub const Loader = struct {
         }
         const sh = L.w.share.shared;
         inline for (.{ "gate_proj", "up_proj" }) |x| try L.rows(try L.get("layers.{d}.mlp.shared_experts." ++ x ++ ".weight", .{i}), sh.lo, sh.hi, c.shared_inter, .bf16);
-        const gu = try projections.finish(L, "layers.{d}.moe.shared.gu", .{i}, 2 * sh.len(), d);
+        const gu = try projections.finish(L, .shared, "layers.{d}.moe.shared.gu", .{i}, 2 * sh.len(), d);
         try L.cols(try L.get("layers.{d}.mlp.shared_experts.down_proj.weight", .{i}), sh.lo, sh.hi, .bf16);
-        const sd = try projections.finish(L, "layers.{d}.moe.shared.down", .{i}, d, sh.len());
+        const sd = try projections.finish(L, .shared, "layers.{d}.moe.shared.down", .{i}, d, sh.len());
         return .{
             .router = router,
             .bias = bias,
@@ -491,7 +487,7 @@ pub const Loader = struct {
         for (&out, [_][]const u8{ "enorm.weight", "hnorm.weight", "eh_proj.weight", "shared_head.norm.weight" }, [_][]const u8{ "enorm", "hnorm", "eh", "norm" }) |*p, name, what| {
             try L.whole(try L.ck.get(try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.{s}", .{ i, name })), .bf16);
             if (std.mem.eql(u8, what, "eh")) {
-                eh = try projections.finish(L, "mtp.eh", .{}, c.hidden, 2 * c.hidden);
+                eh = try projections.finish(L, .mtp_eh, "mtp.eh", .{}, c.hidden, 2 * c.hidden);
                 p.* = 0;
             } else p.* = try L.put("mtp.{s}", .{what});
         }

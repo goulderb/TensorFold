@@ -67,11 +67,11 @@ fn dense(r: *Rig, modules: *const glm.forward.Modules, set: glm.glue.Set, n: usi
     var model: glm.weights.Weights = .{ .gpa = r.gpu.gpa, .config = undefined, .share = undefined };
     defer model.deinit();
     var tools = modules.tools();
-    tools.precision.dense = .q4;
+    tools.precision.dense = .uniform(.q4);
     var loader: glm.weights.Loader = .{ .gpa = r.gpu.gpa, .d = r.gpu.d, .stream = r.s, .pack_dense = modules.pack_dense, .tools = tools, .w = &model, .ck = undefined };
     defer loader.host.deinit(r.gpu.gpa);
     try loader.host.appendSlice(r.gpu.gpa, std.mem.sliceAsBytes(weights));
-    const projection = try glm.weights.projections.finish(&loader, "synthetic", .{}, n, k);
+    const projection = try glm.weights.projections.finish(&loader, .mlp, "synthetic", .{}, n, k);
     const view = projection.q.affine4;
     var physical: usize = 0;
     for (model.buffers.items) |buffer| physical += buffer.len;
@@ -114,12 +114,12 @@ fn fp8Projection(r: *Rig, modules: *const glm.forward.Modules, set: glm.glue.Set
     model.share.vocab = .{ .lo = 0, .hi = n };
     var tools = modules.tools();
     tools.precision.head = .fp8;
-    tools.precision.dense = if (dense_projection) .fp8 else .bf16;
+    tools.precision.dense = .uniform(if (dense_projection) .fp8 else .bf16);
     var loader: glm.weights.Loader = .{ .gpa = r.gpu.gpa, .d = r.gpu.d, .stream = r.s, .pack_dense = modules.pack_dense, .tools = tools, .w = &model, .ck = undefined };
     defer loader.host.deinit(r.gpu.gpa);
     try loader.host.appendSlice(r.gpu.gpa, std.mem.sliceAsBytes(weights));
     if (dense_projection) {
-        model.head = try glm.weights.projections.finish(&loader, "dense", .{}, n, k);
+        model.head = try glm.weights.projections.finish(&loader, .mlp, "dense", .{}, n, k);
     } else {
         model.head = .{ .b16 = try loader.put("head", .{}) };
         try glm.weights.projections.head(&loader);
@@ -139,6 +139,48 @@ fn fp8Projection(r: *Rig, modules: *const glm.forward.Modules, set: glm.glue.Set
     check.pass("FP8 row128 conversion, upstream packing and projection", .{});
 }
 
+fn nvfp4Projection(r: *Rig, modules: *const glm.forward.Modules, set: glm.glue.Set, n: usize) !void {
+    const k = 64;
+    const weights = try r.a.alloc(u16, n * k);
+    const codes = try r.a.alloc(u8, n * k / 2);
+    const scales = try r.a.alloc(u8, n * k / 16);
+    for (0..n) |row| {
+        const kind = row % 3;
+        @memset(weights[row * k ..][0..k], bf16(if (kind == 0) 1 else if (kind == 1) -1 else 0));
+        @memset(codes[row * k / 2 ..][0 .. k / 2], if (kind == 0) 0x77 else if (kind == 1) 0xff else 0);
+        @memset(scales[row * k / 16 ..][0 .. k / 16], if (kind == 2) 0 else 0x7e);
+    }
+    const global: f32 = 1.0 / 2688.0;
+    var model: glm.weights.Weights = .{ .gpa = r.gpu.gpa, .config = undefined, .share = undefined };
+    defer model.deinit();
+    var tools = modules.tools();
+    tools.precision.dense = .uniform(.nvfp4);
+    var loader: glm.weights.Loader = .{ .gpa = r.gpu.gpa, .d = r.gpu.d, .stream = r.s, .pack_dense = modules.pack_dense, .tools = tools, .w = &model, .ck = undefined };
+    defer loader.host.deinit(r.gpu.gpa);
+    try loader.host.appendSlice(r.gpu.gpa, std.mem.sliceAsBytes(weights));
+    const projection = try glm.weights.projections.finish(&loader, .shared, "literal-nvfp4", .{}, n, k);
+    const view = projection.q.nvfp4;
+    try check.expect(view.mode == .fp4 and view.scale == global, "NVFP4 global scale follows the staged tensor", .{});
+    const npad = cuda.nvfp4.padded(n);
+    var physical: usize = 0;
+    for (model.buffers.items) |buffer| physical += buffer.len;
+    try check.expect(model.buffers.items.len == 2 and physical == npad * k / 2 + npad * k / 16, "NVFP4 loader owns only two packed physical buffers", .{});
+    const words = try r.a.alloc(u32, npad * k / 8);
+    cuda.nvfp4.packWords(words, codes, n, k);
+    const tiles = try r.a.alloc(u8, npad * k / 16);
+    cuda.nvfp4.packScales(tiles, scales, n, k);
+    try check.sameBytes("NVFP4 literal code nibbles and padded lane words", try r.back(view.codes, npad * k / 2), std.mem.sliceAsBytes(words));
+    try check.sameBytes("NVFP4 literal e4m3 scales and padded tiles", try r.back(view.scales, tiles.len), tiles);
+    const values = try r.a.alloc(f64, n * k);
+    try core.quant.nvfp4.reference(.{
+        .weight = .{ .dtype = .u8, .rank = 2, .shape = .{ n, k / 2, 1, 1, 1 }, .bytes = codes },
+        .scale = .{ .dtype = .f8_e4m3, .rank = 2, .shape = .{ n, k / 16, 1, 1, 1 }, .bytes = scales },
+        .global = &.{global},
+    }, values);
+    try products(r, set, .{ .nvfp4 = view }, values);
+    check.pass("NVFP4 BF16 conversion, literal bytes, global scale and fp64 projection [{d},64]", .{n});
+}
+
 pub fn run(gpu: check.Gpu) !void {
     var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
     defer arena.deinit();
@@ -152,12 +194,13 @@ pub fn run(gpu: check.Gpu) !void {
     }
     var modules = try glm.forward.Modules.load(gpu.d, gpu.ctx);
     defer modules.deinit();
-    const linear: cuda.qlinear.Linear = .{ .affine4 = &modules.affine4, .lane = &modules.lane };
+    const linear: cuda.qlinear.Linear = .{ .affine4 = &modules.affine4, .lane = &modules.lane, .nvfp4_prompt = &modules.prompt };
     const set: glm.glue.Set = .{ .glue = &modules.glue, .linear = linear };
     try dense(&r, &modules, set, 130, 128);
     try dense(&r, &modules, set, 128, 1024);
     try fp8Projection(&r, &modules, set, false, 130, 256);
     try fp8Projection(&r, &modules, set, true, 130, 4096);
+    for ([_]usize{ 1, 65, 130 }) |n| try nvfp4Projection(&r, &modules, set, n);
     check.pass("glm-precision: packed bytes and float64 products pass, worst {d:.3} of declared tolerance", .{r.worst});
 }
 

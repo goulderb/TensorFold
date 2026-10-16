@@ -137,6 +137,12 @@ pub const Engine = struct {
             _ = try cache_pool.extent.Pool.init(o.settings.kv_pool_tokens, if (o.settings.kv_shard) 2 else 1);
         }
         const share = try shard.Share.of(&c, rank, world);
+        if (o.settings.weight_dense.get(.kda) != .bf16) {
+            const heads = share.kda.len();
+            const n = heads * c.kda_dim;
+            const width = 3 * n + 2 * c.kda_dim + heads;
+            if (width % 8 != 0 or (3 * n) % 8 != 0 or (3 * n + c.kda_dim) % 8 != 0) return error.UnalignedKdaProjection;
+        }
         const spans = try gpa.alloc(shard.Span, world);
         errdefer gpa.free(spans);
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
@@ -151,6 +157,11 @@ pub const Engine = struct {
         e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = o.settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = o.settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .mtp = o.mtp };
         var wt = e.m.tools();
         wt.precision = .{ .dense = o.settings.weight_dense, .head = o.settings.weight_head };
+        if (rank == 0) {
+            var policy_text: [128]u8 = undefined;
+            const policy_hash = o.settings.weight_dense.digest();
+            std.log.info("GLM dense conversion policy v1: {s}; head={s}; scope=bf16-source-only; digest={s}", .{ try o.settings.weight_dense.format(&policy_text), @tagName(o.settings.weight_head), std.fmt.bytesToHex(policy_hash, .lower) });
+        }
         e.w = try weights.load(gpa, io, d, stream, wt, checkpoint, c, share, layers, o.mtp);
         errdefer e.w.deinit();
         try e.bind(0);

@@ -3,6 +3,7 @@ const cuda = @import("cuda");
 const W = @import("cuda_weights.zig");
 const b16 = @import("cuda_b16.zig");
 const quant = @import("cuda_quant.zig");
+const precision = @import("cuda_weight_precision.zig");
 
 fn owned(L: *W.Loader, name: []const u8, suffix: []const u8, bytes: usize) !u64 {
     const label = try std.fmt.allocPrint(L.gpa, "{s}.{s}", .{ name, suffix });
@@ -26,16 +27,54 @@ fn fp8Projection(L: *W.Loader, name: []const u8, n: usize, k: usize, source: u64
     return .{ .q = .{ .fp8g = cuda.fp8.weight(codes, scales, n, k) } };
 }
 
-pub fn finish(L: *W.Loader, comptime fmt: []const u8, args: anytype, n: usize, k: usize) !b16.Proj {
-    if (L.tools.precision.dense == .bf16) return .{ .b16 = try L.put(fmt, args) };
-    if (n == 0 or k == 0 or k % 64 != 0 or (L.tools.precision.dense == .fp8 and k % 128 != 0) or L.host.items.len != n * k * 2) return error.InvalidDenseShape;
+fn nvfp4Projection(L: *W.Loader, name: []const u8, n: usize, k: usize, source: u64) !b16.Proj {
+    const qk = L.tools.quant orelse return error.NoQuantizer;
+    const pack = L.tools.modelopt orelse return error.NoModeloptPacker;
+    var codes = try cuda.DeviceBuffer.alloc(L.d, n * k / 2);
+    defer codes.free();
+    var scales = try cuda.DeviceBuffer.alloc(L.d, n * k / 16);
+    defer scales.free();
+    var global = try cuda.DeviceBuffer.alloc(L.d, @sizeOf(f32));
+    defer global.free();
+    var launched = false;
+    defer if (launched) L.stream.synchronize() catch {};
+    launched = true;
+    try quant.nvfp4(qk, L.stream, source, 1, n, k, codes.ptr, scales.ptr, global.ptr);
+    const npad = cuda.nvfp4.padded(n);
+    const words = try owned(L, name, "words", npad * k / 2);
+    const tiles = try owned(L, name, "scales", npad * k / 16);
+    try pack.fp4Lane(L.stream, codes.ptr, scales.ptr, words, tiles, n, k);
+    try L.stream.synchronize();
+    launched = false;
+    var scale: f32 = undefined;
+    try global.download(0, std.mem.asBytes(&scale));
+    if (!std.math.isFinite(scale) or scale <= 0) return error.InvalidNvfp4Scale;
+    return .{ .q = .{ .nvfp4 = cuda.nvfp4.weight(words, tiles, scale, n, k) } };
+}
+
+pub fn finish(L: *W.Loader, group: precision.Group, comptime fmt: []const u8, args: anytype, n: usize, k: usize) !b16.Proj {
+    const selected = L.tools.precision.dense.get(group);
+    if (selected == .bf16) return .{ .b16 = try L.put(fmt, args) };
+    const elements = std.math.mul(usize, n, k) catch return error.InvalidDenseShape;
+    const source_bytes = std.math.mul(usize, elements, 2) catch return error.InvalidDenseShape;
+    if (n == 0 or k == 0 or n > std.math.maxInt(i32) or k > std.math.maxInt(i32) or k % 64 != 0 or (selected == .fp8 and k % 128 != 0) or L.host.items.len != source_bytes) return error.InvalidDenseShape;
+    if (selected == .nvfp4) {
+        if (L.tools.modelopt == null) return error.NoModeloptPacker;
+        for (0..elements) |i| {
+            const bits = @as(u16, L.host.items[i * 2]) | (@as(u16, L.host.items[i * 2 + 1]) << 8);
+            if ((bits & 0x7f80) == 0x7f80) return error.NonfiniteDenseSource;
+        }
+        const npad = cuda.nvfp4.padded(n);
+        _ = std.math.mul(usize, npad, k) catch return error.InvalidDenseShape;
+    }
     const qk = L.tools.quant orelse return error.NoQuantizer;
     const name = try std.fmt.allocPrint(L.gpa, fmt, args);
     defer L.gpa.free(name);
     var source = try cuda.DeviceBuffer.fromHost(L.d, L.host.items);
     defer source.free();
     L.host.clearRetainingCapacity();
-    if (L.tools.precision.dense == .fp8) return fp8Projection(L, name, n, k, source.ptr);
+    if (selected == .fp8) return fp8Projection(L, name, n, k, source.ptr);
+    if (selected == .nvfp4) return nvfp4Projection(L, name, n, k, source.ptr);
     const pack = L.tools.affine4 orelse return error.NoQuantizer;
     var raw: [3]cuda.DeviceBuffer = undefined;
     var made: usize = 0;
@@ -95,7 +134,7 @@ test "default precision uploads BF16 bytes without a quantizer" {
     defer loader.host.deinit(std.testing.allocator);
     const original = [_]u16{ 0x3f80, 0xbf00, 0x0000, 0x4040 };
     try loader.host.appendSlice(std.testing.allocator, std.mem.sliceAsBytes(&original));
-    const projection = try finish(&loader, "plain", .{}, 2, 2);
+    const projection = try finish(&loader, .kda, "plain", .{}, 2, 2);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&original), M.slice(projection.b16, 8));
     try std.testing.expectEqual(@as(usize, 1), model.buffers.items.len);
     try std.testing.expectEqual(@as(usize, 8), model.buffers.items[0].len);
@@ -104,12 +143,27 @@ test "default precision uploads BF16 bytes without a quantizer" {
 
 test "Q4 rejects an unsupported shape before uploading" {
     var loader: W.Loader = undefined;
-    loader.tools = .{ .pack_dense = undefined, .precision = .{ .dense = .q4 } };
-    try std.testing.expectError(error.InvalidDenseShape, finish(&loader, "invalid", .{}, 4, 63));
+    loader.tools = .{ .pack_dense = undefined, .precision = .{ .dense = .uniform(.q4) } };
+    try std.testing.expectError(error.InvalidDenseShape, finish(&loader, .kda, "invalid", .{}, 4, 63));
 }
 
 test "FP8 dense rejects an unsupported input tile before driver access" {
     var loader: W.Loader = undefined;
-    loader.tools = .{ .pack_dense = undefined, .precision = .{ .dense = .fp8 } };
-    try @import("std").testing.expectError(error.InvalidDenseShape, finish(&loader, "invalid", .{}, 4, 64));
+    loader.tools = .{ .pack_dense = undefined, .precision = .{ .dense = .uniform(.fp8) } };
+    try @import("std").testing.expectError(error.InvalidDenseShape, finish(&loader, .kda, "invalid", .{}, 4, 64));
+}
+
+test "NVFP4 rejects unsupported shape and nonfinite source before driver access" {
+    var loader: W.Loader = undefined;
+    loader.tools = .{ .pack_dense = undefined, .precision = .{ .dense = .uniform(.nvfp4) } };
+    loader.host = .empty;
+    defer loader.host.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InvalidDenseShape, finish(&loader, .shared, "invalid", .{}, 1, 32));
+    try loader.host.appendNTimes(std.testing.allocator, 0, 128);
+    try std.testing.expectError(error.NoModeloptPacker, finish(&loader, .shared, "missing", .{}, 1, 64));
+    var pack: cuda.modelopt.Packer = undefined;
+    loader.tools.modelopt = &pack;
+    loader.host.items[1] = 0x7f;
+    loader.host.items[0] = 0x80;
+    try std.testing.expectError(error.NonfiniteDenseSource, finish(&loader, .shared, "nonfinite", .{}, 1, 64));
 }

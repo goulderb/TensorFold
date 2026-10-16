@@ -15,6 +15,7 @@ const moe = @import("cuda_moe.zig");
 const glue = @import("cuda_glue.zig");
 const mlp = @import("cuda_mlp.zig");
 const kda_block = @import("cuda_kda_block.zig");
+const precision = @import("cuda_weight_precision.zig");
 
 /// A prompt chunk's rows (decode.PREFILL_ROWS).
 pub const prefill_rows = 2048;
@@ -48,26 +49,47 @@ fn arena(d: *const cuda.Driver, sizes: []const usize, out: []u64) !Arena {
 }
 
 /// A rank's B16 matmul shapes ([n, k]) whose split-K partials the buffers hold.
-fn fp8PartBytes(rows: usize, n: usize, k: usize) usize {
+fn lanePartBytes(rows: usize, n: usize, k: usize) usize {
     const m = @min(rows, cuda.qmmf.fused_rows - 1);
     const plan = cuda.qmmf.plan(m, n, k, false);
     return if (plan.reduce) @as(usize, plan.sk) * m * n * 4 else 0;
 }
 
-fn b16Shapes(w: *const weights.Weights) [13][2]usize {
+pub const Shape = struct { group: precision.Group, n: usize, k: usize };
+
+pub fn projectionShapes(w: *const weights.Weights) [16]Shape {
     const c = &w.config;
     const s = &w.share;
     const n = s.kda.len() * c.kda_dim;
     const kw = 3 * n + 2 * c.kda_dim + s.kda.len();
     return .{
-        .{ kw, c.hidden },                   .{ n, c.kda_dim },                    .{ c.hidden, n },
-        .{ c.q_lora + c.kv_lora, c.hidden }, .{ s.mla.len() * c.nope, c.q_lora },  .{ c.i_dim + c.i_heads, c.hidden },
-        .{ c.i_heads * c.i_dim, c.q_lora },  .{ c.hidden, s.mla.len() * c.v_dim }, .{ 2 * s.shared.len(), c.hidden },
-        .{ c.hidden, 2 * c.hidden }, // the MTP head's eh_proj
-        .{ 2 * c.kda_dim + s.kda.len(), c.hidden }, // EXL3: [f_a | g_a | b] apart from qkv
-        .{ s.dense.len(), c.hidden },
-        .{ c.hidden, s.dense.len() },
+        .{ .group = .kda, .n = kw, .k = c.hidden },
+        .{ .group = .kda, .n = n, .k = c.kda_dim },
+        .{ .group = .kda, .n = c.hidden, .k = n },
+        .{ .group = .dsa, .n = c.q_lora + c.kv_lora, .k = c.hidden },
+        .{ .group = .dsa, .n = c.q_lora, .k = c.hidden },
+        .{ .group = .dsa, .n = c.kv_lora, .k = c.hidden },
+        .{ .group = .dsa, .n = s.mla.len() * c.nope, .k = c.q_lora },
+        .{ .group = .dsa, .n = c.i_dim + c.i_heads, .k = c.hidden },
+        .{ .group = .dsa, .n = c.i_heads * c.i_dim, .k = c.q_lora },
+        .{ .group = .dsa, .n = c.hidden, .k = s.mla.len() * c.v_dim },
+        .{ .group = .shared, .n = 2 * s.shared.len(), .k = c.hidden },
+        .{ .group = .shared, .n = c.hidden, .k = s.shared.len() },
+        .{ .group = .mtp_eh, .n = c.hidden, .k = 2 * c.hidden },
+        .{ .group = .kda, .n = 2 * c.kda_dim + s.kda.len(), .k = c.hidden },
+        .{ .group = .mlp, .n = s.dense.len(), .k = c.hidden },
+        .{ .group = .mlp, .n = c.hidden, .k = s.dense.len() },
     };
+}
+
+pub fn mixedPartBytes(w: *const weights.Weights, rows: usize) usize {
+    var mm: usize = 4;
+    for (projectionShapes(w)) |shape| {
+        mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), shape.n, shape.k));
+        mm = @max(mm, rows * (shape.k / 64) * 4);
+        mm = @max(mm, lanePartBytes(rows, shape.n, shape.k));
+    }
+    return mm;
 }
 
 /// Scratch for windows of up to `rows` rows (the Python family's Buffers): a prompt buffer (`prefill`) or a decode's.
@@ -139,15 +161,7 @@ pub const Buffers = struct {
         const nch = latent.chunksFor(@min(capacity, dense_reach) + seg);
         const partial_rows = @max(nch * part_rows, latent.chunksFor(sparse.width) * seg); // dense calls, or one sparse
         const np_max = capacity / sparse.pool;
-        var mm: usize = 4;
-        // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
-        for (b16Shapes(w)) |sh_| mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), sh_[0], sh_[1]));
-        if (w.precision.dense == .q4) for (b16Shapes(w)) |shape| {
-            mm = @max(mm, rows * (shape[1] / 64) * 4);
-        };
-        if (w.precision.dense == .fp8) for (b16Shapes(w)) |shape| {
-            mm = @max(mm, fp8PartBytes(rows, shape[0], shape[1]));
-        };
+        const mm = mixedPartBytes(w, rows);
         const hist_len = if (pairs > cuda.grouped.small) (pairs + cuda.grouped.small - 1) / cuda.grouped.small * (count + 1) else 1;
         const sizes = [_]usize{
             rows * 4,     rows * S * D * 2, rows * D * 2,           rows * (D / 64) * 4,
@@ -381,7 +395,36 @@ pub const State = struct {
 };
 
 test "FP8 projection scratch covers decode and unfused prompt tails without clusters" {
-    try std.testing.expectEqual(@as(usize, 4096), fp8PartBytes(1, 128, 4096));
-    try std.testing.expectEqual(@as(usize, 2097152), fp8PartBytes(32, 4096, 4096));
-    try std.testing.expectEqual(@as(usize, 1044480), fp8PartBytes(2048, 128, 4096));
+    try std.testing.expectEqual(@as(usize, 4096), lanePartBytes(1, 128, 4096));
+    try std.testing.expectEqual(@as(usize, 2097152), lanePartBytes(32, 4096, 4096));
+    try std.testing.expectEqual(@as(usize, 1044480), lanePartBytes(2048, 128, 4096));
+}
+
+test "TP2 mixed scratch covers every projection and subrow count" {
+    const c: @import("config.zig").Config = .{};
+    const share = try @import("cuda_shard.zig").Share.of(&c, 0, 2);
+    const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = share };
+    const shapes = projectionShapes(&w);
+    try std.testing.expectEqual(@as(usize, 16), shapes.len);
+    try std.testing.expectEqual(Shape{ .group = .dsa, .n = 1536, .k = 4096 }, shapes[4]);
+    try std.testing.expectEqual(Shape{ .group = .dsa, .n = 512, .k = 4096 }, shapes[5]);
+    try std.testing.expectEqual(Shape{ .group = .shared, .n = 4096, .k = 1024 }, shapes[11]);
+    try std.testing.expectEqual(Shape{ .group = .mtp_eh, .n = 4096, .k = 8192 }, shapes[12]);
+    for ([_]struct { rows: usize, bytes: usize }{
+        .{ .rows = 8, .bytes = 524288 },
+        .{ .rows = 32, .bytes = 2097152 },
+        .{ .rows = 2048, .bytes = 16711680 },
+    }) |sample| {
+        const budget = mixedPartBytes(&w, sample.rows);
+        try std.testing.expectEqual(sample.bytes, budget);
+        for (1..sample.rows + 1) |m| for (shapes) |shape| {
+            const bf_need = b16.partBytes(m, shape.n, shape.k);
+            const q4_need = m * (shape.k / 64) * 4;
+            const plan = cuda.qmmf.plan(m, shape.n, shape.k, false);
+            const lane_need = if (plan.reduce) @as(usize, plan.sk) * m * shape.n * 4 else 0;
+            try std.testing.expect(budget >= bf_need);
+            try std.testing.expect(budget >= q4_need);
+            try std.testing.expect(budget >= lane_need);
+        };
+    }
 }

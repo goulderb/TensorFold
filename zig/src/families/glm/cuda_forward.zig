@@ -32,6 +32,7 @@ pub const Modules = struct {
     kda: kda.Kernels,
     lane: cuda.qmmf.Lane, // the NVFP4 linears' decode rows (qlinear)
     prompt: cuda.nvfp4.Prompt, // and their prompt rows
+    modelopt: cuda.modelopt.Packer,
     exl3_mod: cuda.Module,
     exl3: cuda.exl3_linear.Kernels, // EXL3 checkpoints' projections (qlinear)
     experts: experts.Kernels,
@@ -55,6 +56,8 @@ pub const Modules = struct {
         errdefer m.lane.unload();
         m.prompt = try cuda.nvfp4.Prompt.load(d);
         errdefer m.prompt.unload();
+        m.modelopt = try cuda.modelopt.Packer.load(d);
+        errdefer m.modelopt.unload();
         m.exl3_mod = try cuda.Module.load(d, k.exl3);
         errdefer m.exl3_mod.unload();
         m.exl3 = try cuda.exl3_linear.Kernels.resolve(d, m.exl3_mod, 16384);
@@ -74,7 +77,7 @@ pub const Modules = struct {
 
     /// What weights.load runs: the dense packing, and for the MTP head the quantizers and the 4-bit tiling.
     pub fn tools(m: *const Modules) weights.Tools {
-        return .{ .pack_dense = m.pack_dense, .quant = &m.quant, .q4 = &m.q4, .affine4 = &m.affine4 };
+        return .{ .pack_dense = m.pack_dense, .quant = &m.quant, .q4 = &m.q4, .affine4 = &m.affine4, .modelopt = &m.modelopt };
     }
 
     pub fn ops(m: *const Modules) cuda.Module {
@@ -86,6 +89,7 @@ pub const Modules = struct {
         m.affine4.deinit();
         m.lane.unload();
         m.prompt.unload();
+        m.modelopt.unload();
         m.exl3.deinit();
         m.exl3_mod.unload();
         m.experts.unload();
