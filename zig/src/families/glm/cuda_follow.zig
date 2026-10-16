@@ -8,9 +8,11 @@ const Engine = engine.Engine;
 const vision_runtime = @import("cuda_vision_runtime.zig");
 const vision_binding = @import("cuda_vision_binding.zig");
 
-test { _ = @import("cuda_spill_order_test.zig"); }
+test {
+    _ = @import("cuda_spill_order_test.zig");
+}
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve, spill_write, spill_read, spill_forget, vision };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve, spill_write, spill_read, spill_forget, vision, redraw_masked, verify_masked };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -107,6 +109,13 @@ pub const Link = struct {
 
     pub fn features(l: *Link, buffer: cuda.DeviceBuffer) !void {
         try l.lib.check(l.lib.api.ncclBroadcast(buffer.ptr, buffer.ptr, buffer.len, .u8, 0, l.comm, l.stream.handle), "ncclBroadcast vision features");
+        try l.stream.synchronize();
+    }
+
+    pub fn grammarBits(l: *Link, s: *sampler.Sampler, rows: usize) !void {
+        if (rows == 0 or rows > s.rows) return error.InvalidGrammarMasks;
+        const bytes = rows * ((s.vocab + 31) / 32) * 4;
+        try l.lib.check(l.lib.api.ncclBroadcast(s.bits.ptr, s.bits.ptr, bytes, .u8, 0, l.comm, l.stream.handle), "ncclBroadcast grammar masks");
         try l.stream.synchronize();
     }
 };
@@ -230,6 +239,25 @@ pub const Leader = struct {
         try x.complete(x.e.verify(ids, out));
     }
 
+    pub fn firstMasked(x: Leader, position: u64, bits: []const u32) !u32 {
+        try sampler.validateMasks(bits, 1, x.e.c.vocab);
+        try x.flush();
+        try x.e.smp.bits.uploadAsync(0, std.mem.sliceAsBytes(bits), x.e.stream.handle);
+        try x.send(.{ .kind = @backingInt(Kind.redraw_masked), .a = position }, &.{});
+        try x.complete(x.link.grammarBits(&x.e.smp, 1));
+        return x.complete(x.e.redrawFirst(position));
+    }
+
+    pub fn verifyMasked(x: Leader, ids: []const u32, out: []u32, bits: []const u32) !void {
+        if (ids.len > engine.max_drafts + 1) return error.WindowTooWide;
+        try sampler.validateMasks(bits, ids.len, x.e.c.vocab);
+        try x.flush();
+        try x.e.smp.bits.uploadAsync(0, std.mem.sliceAsBytes(bits), x.e.stream.handle);
+        try x.send(.{ .kind = @backingInt(Kind.verify_masked) }, ids);
+        try x.complete(x.link.grammarBits(&x.e.smp, ids.len));
+        try x.complete(x.e.verifyMasked(ids, out));
+    }
+
     /// Several streams' windows in one forward on every rank (Engine.verifyShared): parts' slots and rows, then ids.
     pub fn verifyShared(x: Leader, parts: []const engine.Part) !void {
         if (parts.len == 0 or parts.len > engine.max_shared) return error.WindowTooWide;
@@ -318,7 +346,10 @@ pub fn follow(e: *Engine, link: *Link) !void {
             if (failure == null) {
                 var at: usize = 0;
                 for (ids, 0..) |id, i| if (id == h.seed) {
-                    if (at >= rows) { failure = error.BadVisionPositions; break; }
+                    if (at >= rows) {
+                        failure = error.BadVisionPositions;
+                        break;
+                    }
                     positions[at] = @intCast(i);
                     at += 1;
                 };
@@ -367,6 +398,14 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 };
             },
             .verify => try e.verify(step.ids, sampled[0..step.ids.len]),
+            .redraw_masked => {
+                try link.grammarBits(&e.smp, 1);
+                _ = try e.redrawFirst(h.a);
+            },
+            .verify_masked => {
+                try link.grammarBits(&e.smp, step.ids.len);
+                try e.verifyMasked(step.ids, sampled[0..step.ids.len]);
+            },
             .reserve, .spill_write, .spill_read, .spill_forget, .vision => unreachable,
             .shared => {
                 const k = h.depth;

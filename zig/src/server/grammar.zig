@@ -101,3 +101,22 @@ pub fn refusal(cx: *Cx, body: Value) errors.Refused!void {
     if (tools != null and tools.?.truthy() and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice")))
         return cx.fail(.request, "{s} cannot be combined with tool_choice \"required\" or a named function: send one", .{s.field});
 }
+
+test "response formats keep UTF8 schema literals and reject unsupported constraints before compilation" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const raw = (try json.parse(cx.a,
+        \\{"response_format":{"type":"json_schema","json_schema":{"name":"city","strict":true,"schema":{"const":"東京"}}}}
+    )).ok;
+    const result = (try spec(&cx, raw)).?;
+    try std.testing.expectEqual(Kind.json_schema, result.kind);
+    try std.testing.expect(std.mem.indexOf(u8, result.text, "東京") != null);
+    const object = (try json.parse(cx.a, "{\"response_format\":{\"type\":\"json_object\"}}")).ok;
+    try std.testing.expectEqual(Kind.json, (try spec(&cx, object)).?.kind);
+    const bad = (try json.parse(cx.a, "{\"stream\":true,\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"strict\":true,\"schema\":{\"type\":\"string\",\"format\":\"email\"}}}}")).ok;
+    try std.testing.expectError(error.Refused, spec(&cx, bad));
+    try std.testing.expect(std.mem.indexOf(u8, cx.message, "format") != null);
+    const malformed = (try json.parse(cx.a, "{\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"strict\":\"yes\",\"schema\":{}}}}")).ok;
+    try std.testing.expectError(error.Refused, spec(&cx, malformed));
+}

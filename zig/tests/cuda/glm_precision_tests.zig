@@ -206,3 +206,38 @@ pub fn oracle(gpu: check.Gpu, dir: []const u8) !void {
     try check.sameBytes("production FP8 scales", try r.back(dscales, expected_scales.len * 4), std.mem.sliceAsBytes(expected_scales));
     check.pass("GLM weight conversions [{d},{d}] equal production qmm.py GPU oracle bytes", .{ n, k });
 }
+
+pub fn grammar(gpu: check.Gpu) !void {
+    var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
+    defer arena.deinit();
+    var stream = try cuda.Stream.init(gpu.d, false);
+    defer stream.deinit();
+    var rng = std.Random.DefaultPrng.init(53);
+    var r: Rig = .{ .gpu = gpu, .a = arena.allocator(), .s = stream, .rng = rng.random() };
+    defer {
+        for (r.bufs.items) |*buffer| buffer.free();
+        r.bufs.deinit(gpu.gpa);
+    }
+    var modules = try glm.forward.Modules.load(gpu.d, gpu.ctx);
+    defer modules.deinit();
+    const vocab = 65;
+    const rows = 5;
+    var sampler = try glm.sampler.Sampler.init(gpu.d, vocab, rows);
+    defer sampler.deinit();
+    var logits: [rows * vocab]u16 = undefined;
+    for (&logits, 0..) |*value, i| value.* = bf16(@floatFromInt(vocab - i % vocab));
+    const input = try r.dev(std.mem.sliceAsBytes(&logits));
+    const wanted = [_]u32{ 64, 32, 7, 0, 63 };
+    var masks: [rows * 3]u32 = @splat(0);
+    for (wanted, 0..) |token, row| masks[row * 3 + token / 32] |= @as(u32, 1) << @as(u5, @intCast(token % 32));
+    for (0..rows) |row| masks[row * 3 + 2] |= 0xfffffffe;
+    for ([_]usize{ 1, 3, rows }) |count| for ([_]bool{ false, true }) |sampled| {
+        try glm.sampler.validateMasks(masks[0 .. count * 3], count, vocab);
+        try sampler.bits.uploadAsync(0, std.mem.sliceAsBytes(masks[0 .. count * 3]), stream.handle);
+        var got: [rows]u32 = undefined;
+        const rule: ?glm.sampler.Rule = if (sampled) glm.sampler.rule(.{ .seed = 73, .temperature = 0.8 }) else null;
+        try sampler.masked(stream, .local, &.{.{ .lo = 0, .hi = vocab }}, &.{.{ .rank = 0, .logits = input }}, count, 17, rule, modules.glue.top1, got[0..count]);
+        try check.sameBytes("masked GLM draw excludes larger forbidden logits", std.mem.sliceAsBytes(got[0..count]), std.mem.sliceAsBytes(wanted[0..count]));
+    };
+    check.pass("glm-grammar: first and multirow masks govern greedy and sampled draws", .{});
+}

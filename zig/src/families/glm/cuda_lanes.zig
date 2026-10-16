@@ -45,6 +45,8 @@ pub const Lanes = struct {
     const whole_vt: be.Backend.VTable = .{
         .prefill = prefillFn,
         .first = firstFn,
+        .first_masked = firstMaskedFn,
+        .held = heldFn,
         .queue = queueFn,
         .read = readFn,
         .verify = verifyFn,
@@ -196,6 +198,19 @@ pub const Lanes = struct {
         return self.next - 1;
     }
 
+    fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, bits: []const u32) anyerror!u64 {
+        const self = of(ptr);
+        if (position != s.prompt_len) return error.PositionMismatch;
+        _ = try self.bind(s, null);
+        return self.take(try self.x.firstMasked(position, bits));
+    }
+
+    fn heldFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
+        const l = of(ptr).lanes.getPtr(s) orelse return error.UnknownStream;
+        if (out.len > l.held_n) return error.NoHeldDrafts;
+        @memcpy(out, l.held[0..out.len]);
+    }
+
     fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
         _ = ptr;
         _ = s;
@@ -213,7 +228,10 @@ pub const Lanes = struct {
     /// Each window in its own forward on its stream's sequence (the core sends one when no forward is shared).
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const self = of(ptr);
-        if (windows.len > 1) return self.verifyShared(windows, out);
+        const constrained = for (windows) |w| {
+            if (w.masks.len > 0) break true;
+        } else false;
+        if (windows.len > 1 and !constrained) return self.verifyShared(windows, out);
         for (windows, out) |w, *o| {
             if (w.parents != null) return error.TreesNotBuilt;
             const l = try self.bind(w.stream, null);
@@ -227,7 +245,7 @@ pub const Lanes = struct {
             const drafts = if (w.held > 0) l.held[0..w.held] else w.tokens;
             @memcpy(ids[1..][0..drafts.len], drafts);
             var sampled: [max_rows]u32 = undefined;
-            try self.x.verify(ids[0..rows], sampled[0..rows]);
+            if (w.masks.len > 0) try self.x.verifyMasked(ids[0..rows], sampled[0..rows], w.masks) else try self.x.verify(ids[0..rows], sampled[0..rows]);
             @memcpy(o.sampled[0..rows], sampled[0..rows]);
             @memcpy(o.drafts[0..drafts.len], drafts);
             l.pending_rows = rows;

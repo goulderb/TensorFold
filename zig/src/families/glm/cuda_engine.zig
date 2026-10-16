@@ -649,13 +649,21 @@ pub const Engine = struct {
 
     /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
     pub fn verify(e: *Engine, ids: []const u32, out: []u32) !void {
+        return e.verifyWithMask(ids, out, false);
+    }
+
+    pub fn verifyMasked(e: *Engine, ids: []const u32, out: []u32) !void {
+        return e.verifyWithMask(ids, out, true);
+    }
+
+    fn verifyWithMask(e: *Engine, ids: []const u32, out: []u32, masked: bool) !void {
         if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
         var one: [1]fw.Rank = undefined;
         const f = e.view(&e.bd, &one);
         const at = e.cur.st.pos;
         try f.run(@ptrCast(ids));
         e.cur.rows_at = e.bd.fnormed;
-        try e.draw(e.bd.logits, ids.len, at + 1, out);
+        if (masked) try e.drawMasked(e.bd.logits, ids.len, at + 1, out) else try e.draw(e.bd.logits, ids.len, at + 1, out);
     }
 
     /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
@@ -721,6 +729,18 @@ pub const Engine = struct {
     fn draw(e: *Engine, logits: u64, rows: usize, first: u64, out: []u32) !void {
         if (e.cur.sampling) |s| return e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
         for (0..rows) |r| out[r] = try e.greedy(logits + r * e.share.vocab.len() * 2);
+    }
+
+    /// The prompt's target logits survive MTP absorption; redraw them once the lane supplies its first mask.
+    pub fn redrawFirst(e: *Engine, position: u64) !u32 {
+        var out: [1]u32 = undefined;
+        try e.drawMasked(e.bp.logits, 1, position, &out);
+        return out[0];
+    }
+
+    fn drawMasked(e: *Engine, logits: u64, rows: usize, first: u64, out: []u32) !void {
+        const rule: ?sampler.Rule = if (e.cur.sampling) |s| sampler.rule(s) else null;
+        try e.smp.masked(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, rule, e.m.glue.top1, out);
     }
 
     /// decode.sample_rows' greedy pick: per-rank top-1 (tf_glm_top1), all-gathered, largest value then lowest id.
@@ -1005,7 +1025,9 @@ test "paired spill imports refuse missing corrupt and mismatched owner halves be
             f.e.shared_buf.free();
         }
         fn run(f: *@This()) void {
-            f.e.persist(.{ .operation = .read, .id = 7, .key = 1, .at = 2048 }) catch |err| { f.failed = err; };
+            f.e.persist(.{ .operation = .read, .id = 7, .key = 1, .at = 2048 }) catch |err| {
+                f.failed = err;
+            };
         }
     };
     var d = M.driver();

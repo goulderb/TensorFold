@@ -15,10 +15,42 @@ fn isType(value: json.Value) bool {
     return false;
 }
 
+fn matchesType(value: json.Value, kind: json.Value) bool {
+    if (kind == .array) return for (kind.array) |item| {
+        if (matchesType(value, item)) break true;
+    } else false;
+    if (kind != .string) return false;
+    if (std.mem.eql(u8, kind.string, "number")) return value == .int or value == .float;
+    if (std.mem.eql(u8, kind.string, "integer")) return value == .int or (value == .float and @floor(value.float) == value.float);
+    const name: []const u8 = switch (value) {
+        .null => "null",
+        .bool => "boolean",
+        .string => "string",
+        .array => "array",
+        .object => "object",
+        else => "",
+    };
+    return std.mem.eql(u8, kind.string, name);
+}
+
 fn node(cx: *errors.Cx, value: json.Value, depth: usize, count: *usize) errors.Refused!void {
     count.* += 1;
     if (depth > 64 or count.* > 4096) return cx.refuse("JSON schema exceeds the supported nesting or node limit");
     if (value != .object) return cx.refuse("each JSON schema must be an object");
+    const selected: ?[]const u8 = if (value.has("const")) "const" else if (value.has("enum")) "enum" else if (value.has("anyOf")) "anyOf" else null;
+    if (selected) |selector| {
+        for (value.object.keys()) |key| {
+            if (std.mem.eql(u8, key, selector) or std.mem.eql(u8, key, "title") or std.mem.eql(u8, key, "description") or std.mem.eql(u8, key, "$schema")) continue;
+            if (std.mem.eql(u8, key, "type") and !std.mem.eql(u8, selector, "anyOf")) continue;
+            return cx.fail(.request, "JSON schema {s} combined with {s} is not supported; the constraint cannot be enforced", .{ selector, key });
+        }
+        if (value.get("type")) |kind| {
+            if (value.get("const")) |literal| if (!matchesType(literal, kind)) return cx.refuse("JSON schema const does not match its type");
+            if (value.get("enum")) |choices| if (choices == .array) {
+                for (choices.array) |literal| if (!matchesType(literal, kind)) return cx.refuse("JSON schema enum does not match its type");
+            };
+        }
+    }
     for (value.object.keys(), value.object.values()) |key, v| {
         if (std.mem.eql(u8, key, "type")) {
             if (v == .array) {
@@ -29,12 +61,17 @@ fn node(cx: *errors.Cx, value: json.Value, depth: usize, count: *usize) errors.R
             if (v != .object) return cx.refuse("JSON schema properties must be an object");
             for (v.object.values()) |child| try node(cx, child, depth + 1, count);
         } else if (std.mem.eql(u8, key, "required")) {
+            if (!value.has("properties") and !value.has("additionalProperties") and !value.typeIs("object")) return cx.refuse("JSON schema required needs an explicit object schema");
             if (v != .array) return cx.refuse("JSON schema required must be an array of property names");
             for (v.array) |name| if (name != .string) return cx.refuse("JSON schema required must contain only property names");
         } else if (std.mem.eql(u8, key, "additionalProperties")) {
             if (v != .bool) try node(cx, v, depth + 1, count);
         } else if (std.mem.eql(u8, key, "items")) {
             try node(cx, v, depth + 1, count);
+        } else if (std.mem.eql(u8, key, "minItems") or std.mem.eql(u8, key, "maxItems")) {
+            if (!value.typeIs("array")) return cx.refuse("JSON schema item bounds need type array");
+            const bound = v.int64() orelse return cx.refuse("JSON schema item bounds must be integers");
+            if (bound < 0 or bound > 1048576) return cx.refuse("JSON schema item bound is outside the supported range");
         } else if (std.mem.eql(u8, key, "anyOf")) {
             if (v != .array or v.array.len == 0) return cx.refuse("JSON schema anyOf must be a non-empty array of schemas");
             for (v.array) |child| try node(cx, child, depth + 1, count);
@@ -73,6 +110,10 @@ test "schema subset rejects ignored constraints at every schema nesting level" {
         "{\"type\":\"imaginary\"}",
         "{\"required\":[3]}",
         "{\"enum\":[]}",
+        "{\"type\":\"string\",\"enum\":[3]}",
+        "{\"const\":{},\"required\":[\"x\"]}",
+        "{\"type\":\"integer\",\"anyOf\":[{\"type\":\"string\"}]}",
+        "{\"required\":[\"x\"]}",
     };
     for (rejected) |text| try std.testing.expectError(error.Refused, validate(&cx, (try json.parse(cx.a, text)).ok));
 }

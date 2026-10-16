@@ -78,6 +78,7 @@ const usage =
     \\  exl3-experts [DIR]        EXL3 routed experts: FP64, SwiGLU, rows alone vs grouped, decode vs prompt; DIR a real layer
     \\  train-pack MODEL EXAMPLES [COUNT]   training passes holding several sequences against one a pass: differences, time
     \\  glm-precision             GLM Q4 MSE and FP8 row128 layout and projection references
+    \\  glm-grammar               GLM first and multirow masked greedy and sampled draws
     \\  glm-ref                   GLM projections (matmuls, router, attention, indexer, hc) against float64 (synthetic)
     \\  glm-lanes-cover <ckpt> <dc.json> <rank> <world> <idfile>  copy drafts, cancels, discards, eos and max_new on one lanes.Engine across requests
     \\  glm-lanes-concurrent <ckpt> <dc.json> <rank> <world> <idfile>  concurrent streams on one lanes.Engine, each against its solo run
@@ -140,6 +141,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "quant-ref")) return quant_ref_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-precision-oracle")) return @import("glm_precision_tests.zig").oracle(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "glm-precision")) return @import("glm_precision_tests.zig").run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-grammar")) return @import("glm_precision_tests.zig").grammar(gpu);
     if (std.mem.eql(u8, cmd, "glm-ref")) return glm_ref_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "modelopt")) return modelopt_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "exlr8")) return exlr8_tests.run(gpu);
