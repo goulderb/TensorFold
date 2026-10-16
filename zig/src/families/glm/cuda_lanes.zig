@@ -5,6 +5,7 @@ const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
 const follow = @import("cuda_follow.zig");
 const fw = @import("cuda_forward.zig");
+const vision_runtime = @import("cuda_vision_runtime.zig");
 
 const be = lanes.backend;
 
@@ -25,6 +26,7 @@ const Lane = struct {
 
 pub const Lanes = struct {
     x: follow.Leader,
+    vision: ?*vision_runtime.Service = null,
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
@@ -158,6 +160,10 @@ pub const Lanes = struct {
             try self.x.reserve(rows);
         }
         try self.x.begin(s.sampling);
+        if (s.vision) |picture| {
+            const service = self.vision orelse return error.VisionUnavailable;
+            try self.x.vision(service, picture.encoded, ids, picture.image_token, picture.replica);
+        }
         s.cached = 0;
         return self.resumeFrom(s, ids.len);
     }

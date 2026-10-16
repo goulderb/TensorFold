@@ -10,6 +10,8 @@ const ranks = @import("cuda_ranks.zig");
 const fw = @import("cuda_forward.zig");
 const config = @import("config.zig");
 const shard = @import("cuda_shard.zig");
+const vision_probe = @import("cuda_vision_probe.zig");
+const vision_runtime = @import("cuda_vision_runtime.zig");
 
 pub const model_type = "glm5_next";
 pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "exl3" };
@@ -49,6 +51,10 @@ pub const Loaded = struct {
     target: *engine.Engine, // the prompt cache keeps this engine's states (snap_*)
     admit: ?struct { ctx: *anyopaque, fits: *const fn (*anyopaque, u32, u32) bool } = null,
     peer_room: ?Peer = null, // rank 0: the server admits streams and kept states by this when it is smaller
+    vision_probe: ?struct {
+        ctx: *anyopaque,
+        rows: *const fn (*anyopaque, []const u8, usize) anyerror!u32,
+    } = null,
 };
 
 /// This rank's place: TF_GLM_RANK of TF_GLM_WORLD (both, or neither for a refusal that names them).
@@ -84,6 +90,8 @@ const Owned = struct {
     e: *engine.Engine,
     link: follow.Link,
     lanes: glm_lanes.Lanes,
+    probe: ?*vision_probe.Probe = null,
+    vision: ?*vision_runtime.Service = null,
 };
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
@@ -98,6 +106,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.gpa = gpa;
+    own.probe = null;
+    own.vision = null;
+    errdefer if (own.probe) |probe| probe.close();
+    errdefer if (own.vision) |vision| vision.close();
     own.lib = try cuda.nccl.Library.open();
     errdefer own.lib.close();
     var id: cuda.nccl.UniqueId = undefined;
@@ -123,6 +135,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         try ranks.gather([32]u8, ctx.d, &own.lib, own.comm, own.e.stream, p.rank, mine, hashes);
         for (hashes) |hash| if (!std.mem.eql(u8, &mine, &hash)) return error.SpillIdentityMismatch;
     }
+    if (p.rank == 0 and set.vision) {
+        const path = std.c.getenv("TF_GLM_VISION_CODEC") orelse return error.MissingVisionCodecPath;
+        own.probe = try vision_probe.Probe.open(gpa, io, dir, std.mem.span(path));
+        own.vision = try vision_runtime.Service.open(gpa, io, ctx.d, ctx.handle, own.e.stream, dir, own.probe.?);
+    }
     // Rank 0 admits by the smallest room of the ranks; its sizes are the largest (the first ranks take the remainder).
     const rooms = try gpa.alloc(u64, p.world);
     defer gpa.free(rooms);
@@ -147,7 +164,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
             return if (std.c.getenv(name)) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
         }
     }.get;
-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED") };
+    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .vision = own.vision, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED") };
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
@@ -159,6 +176,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .deinit = close,
         .target = own.e,
         .peer_room = peer,
+        .vision_probe = if (own.probe) |probe| .{ .ctx = probe, .rows = vision_probe.Probe.rows } else null,
         .admit = if (own.e.pool != null) .{ .ctx = own.e, .fits = fits } else null,
     };
 }
@@ -234,6 +252,8 @@ fn close(ptr: *anyopaque) void {
     const own: *Owned = @ptrCast(@alignCast(ptr));
     own.lanes.x.end() catch {};
     own.lanes.deinit();
+    if (own.vision) |v| v.close();
+    if (own.probe) |probe| probe.close();
     own.link.deinit();
     own.e.deinit();
     _ = own.lib.api.ncclCommDestroy(own.comm);

@@ -5,10 +5,12 @@ const cuda = @import("cuda");
 const engine = @import("cuda_engine.zig");
 const sampler = @import("cuda_sampler.zig");
 const Engine = engine.Engine;
+const vision_runtime = @import("cuda_vision_runtime.zig");
+const vision_binding = @import("cuda_vision_binding.zig");
 
 test { _ = @import("cuda_spill_order_test.zig"); }
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve, spill_write, spill_read, spill_forget };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve, spill_write, spill_read, spill_forget, vision };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -102,6 +104,11 @@ pub const Link = struct {
         }
         return .{ .h = h, .ids = l.ids[0..h.n] };
     }
+
+    pub fn features(l: *Link, buffer: cuda.DeviceBuffer) !void {
+        try l.lib.check(l.lib.api.ncclBroadcast(buffer.ptr, buffer.ptr, buffer.len, .u8, 0, l.comm, l.stream.handle), "ncclBroadcast vision features");
+        try l.stream.synchronize();
+    }
 };
 
 /// Rank 0's engine: every step goes to the other ranks first.
@@ -189,6 +196,18 @@ pub const Leader = struct {
         try x.complete(x.e.begin(c));
     }
 
+    pub fn vision(x: Leader, service: *vision_runtime.Service, encoded: []const []const u8, ids: []const u32, image_token: u32, replica: u64) !void {
+        if (x.e.cur.vision != null) return error.VisionAlreadyBound;
+        const state = try service.encode(encoded, ids, replica, @intCast(x.e.share.world));
+        x.e.cur.vision = .{ .leader = state };
+        errdefer x.e.release(x.e.slot);
+        const table = x.e.cur.vision.?.table();
+        if (table.image_token != image_token) return error.VisionTokenMismatch;
+        try x.send(.{ .kind = @backingInt(Kind.vision), .depth = @intCast(table.rows), .a = replica, .seed = image_token }, ids);
+        if (!try x.e.pairedReady(true)) return error.PeerVisionUnavailable;
+        try x.link.features(table.features);
+    }
+
     /// `cancel` (rank 0's), asked before each chunk, decides for every rank; `from` every rank holds; `marks` rank 0's.
     pub fn prefill(x: Leader, ids: []const u32, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !u32 {
         try x.flush();
@@ -274,6 +293,58 @@ pub fn follow(e: *Engine, link: *Link) !void {
             };
             continue;
         }
+        if (kind == .vision) {
+            try e.bind(h.slot);
+            var failure: ?anyerror = null;
+            const rows: usize = h.depth;
+            var ids: []u32 = undefined;
+            var ids_owned = false;
+            if (e.gpa.dupe(u32, step.ids)) |copy| {
+                ids = copy;
+                ids_owned = true;
+            } else |err| failure = err;
+            var positions: []u32 = undefined;
+            var positions_owned = false;
+            var features: cuda.DeviceBuffer = undefined;
+            if (failure == null) {
+                if (rows == 0 or rows > 16384 or ids.len > e.capacity or h.seed >= e.c.vocab or e.cur.vision != null) failure = error.BadVisionCommand;
+            }
+            if (failure == null) {
+                if (e.gpa.alloc(u32, rows)) |copy| {
+                    positions = copy;
+                    positions_owned = true;
+                } else |err| failure = err;
+            }
+            if (failure == null) {
+                var at: usize = 0;
+                for (ids, 0..) |id, i| if (id == h.seed) {
+                    if (at >= rows) { failure = error.BadVisionPositions; break; }
+                    positions[at] = @intCast(i);
+                    at += 1;
+                };
+                if (at != rows) failure = error.BadVisionPositions;
+            }
+            if (failure == null) {
+                features = cuda.DeviceBuffer.alloc(e.d, rows * vision_binding.width * 2) catch |err| blk: {
+                    failure = err;
+                    break :blk undefined;
+                };
+            }
+            const ready = try e.pairedReady(failure == null);
+            if (!ready) {
+                if (failure == null) features.free();
+                if (positions_owned) e.gpa.free(positions);
+                if (ids_owned) e.gpa.free(ids);
+                return failure orelse error.PeerVisionUnavailable;
+            }
+            var context: cuda.abi.Context = null;
+            try e.d.check(e.d.api.cuCtxGetCurrent(&context), "cuCtxGetCurrent");
+            e.cur.vision = .{ .follower = .{ .table = .{ .driver = e.d, .context = context, .stream = e.stream, .features = features, .positions = positions, .ids = ids, .image_token = @intCast(h.seed), .rows = rows, .ready = false, .generation = 1, .replica = h.a, .world = @intCast(e.share.world), .rank = @intCast(e.share.rank) }, .ids = ids, .positions = positions } };
+            try link.features(features);
+            e.cur.vision.?.table().ready = true;
+            _ = try e.cur.vision.?.table().binding();
+            continue;
+        }
         if (kind != .end and kind != .drop and kind != .shared and kind != .release) try e.bind(h.slot);
         switch (kind) {
             .begin => try e.begin(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null),
@@ -296,7 +367,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 };
             },
             .verify => try e.verify(step.ids, sampled[0..step.ids.len]),
-            .reserve, .spill_write, .spill_read, .spill_forget => unreachable,
+            .reserve, .spill_write, .spill_read, .spill_forget, .vision => unreachable,
             .shared => {
                 const k = h.depth;
                 if (k == 0 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadStep;

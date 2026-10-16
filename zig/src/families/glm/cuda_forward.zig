@@ -169,6 +169,7 @@ pub const Forward = struct {
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE (the Python family's default): decode windows on KDA's three-kernel chain
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
+    vision: ?@import("cuda_vision_binding.zig").Binding = null,
 
     pub fn set(f: *const Forward) glue.Set {
         return .{ .glue = &f.m.glue, .linear = f.linear(), .copy_rows = f.m.copy_rows };
@@ -474,6 +475,17 @@ pub const Forward = struct {
         }
         const c = &f.ranks[0].w.config;
         for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
+        if (f.vision) |binding| for (f.ranks) |r| try @import("cuda_vision_binding.zig").inject(binding, .{
+            .stream = f.stream,
+            .context = binding.owner.context,
+            .embedding = .{ .d = f.d, .ptr = r.b.x, .len = r.b.rows * 4 * c.hidden * 2, .borrowed = true },
+            .start = r.st.pos,
+            .capacity = r.st.capacity,
+            .window = r.b.rows,
+            .vocab = c.vocab,
+            .world = @intCast(r.w.share.world),
+            .rank = @intCast(r.w.share.rank),
+        }, ids);
         var cut: [max_pieces][2]usize = undefined;
         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
         // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too

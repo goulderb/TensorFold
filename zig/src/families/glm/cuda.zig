@@ -32,6 +32,8 @@ pub const vision_engine = @import("cuda_vision_engine.zig");
 pub const vision_pipeline = @import("cuda_vision_pipeline.zig");
 pub const vision_binding = @import("cuda_vision_binding.zig");
 pub const vision_replica = @import("cuda_vision_replica.zig");
+pub const vision_probe = @import("cuda_vision_probe.zig");
+pub const vision_runtime = @import("cuda_vision_runtime.zig");
 
 test {
     _ = @import("cuda_checkpoint.zig");
@@ -67,5 +69,7 @@ test {
     _ = vision_pipeline;
     _ = vision_binding;
     _ = vision_replica;
+    _ = vision_probe;
+    _ = vision_runtime;
     _ = @import("heat"); // upstream's heat bands, run where the GLM ranks use them
 }

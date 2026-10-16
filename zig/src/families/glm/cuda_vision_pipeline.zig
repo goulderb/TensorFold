@@ -238,6 +238,7 @@ pub const Request = struct {
         const bytes = try rowsBytes(self.rows, self.c.output);
         var ptr: cuda.abi.DevicePtr = 0;
         try d.check(d.api.cuMemAlloc_v2(&ptr, bytes), "cuMemAlloc");
+        cuda.accountExternalDevice(bytes);
         // Raw ownership permits checked free/retry, unlike DeviceBuffer.free's
         // fire-and-forget destructor. This allocation does not update its metrics.
         self.table = .{ .driver = d, .context = context, .stream = options.stream, .features = .{ .d = d, .ptr = ptr, .len = bytes, .borrowed = false }, .positions = self.positions, .ids = self.ids, .image_token = self.c.image_token, .width = self.c.output, .rows = self.rows, .ready = false, .generation = 1, .replica = options.replica, .world = options.world, .rank = options.rank };
@@ -291,7 +292,10 @@ pub const Request = struct {
             table.ready = false;
             self.state = .failed;
             try self.recover();
-            if (table.features.ptr != 0) try table.driver.check(table.driver.api.cuMemFree_v2(table.features.ptr), "cuMemFree");
+            if (table.features.ptr != 0) {
+                try table.driver.check(table.driver.api.cuMemFree_v2(table.features.ptr), "cuMemFree");
+                cuda.unaccountExternalDevice(table.features.len);
+            }
             table.features.ptr = 0;
         }
         for (self.images) |*p| p.deinit(self.a);

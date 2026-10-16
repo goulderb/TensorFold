@@ -13,6 +13,8 @@ const heat = @import("heat");
 const owner_kv = @import("cuda_kv_owner.zig");
 const cache_pool = @import("cuda_kv_pool.zig");
 const modelopt = @import("core").modelopt;
+const vision_binding = @import("cuda_vision_binding.zig");
+const vision_runtime = @import("cuda_vision_runtime.zig");
 pub const persistence = @import("cuda_persistence.zig");
 pub const spill_payload = @import("cuda_spill_payload.zig");
 
@@ -50,6 +52,19 @@ const Seq = struct {
     sampling: ?sampler.Sampling = null, // null: greedy
     in_head: usize = 0, // drafted rows the MTP caches hold past the kept ones (st.mtp_drafted)
     rows_at: u64 = 0, // its last verify's final-norm rows (bf16 [rows][hidden]), which the next draft reads
+    vision: ?VisionOwned = null,
+};
+
+pub const VisionOwned = union(enum) {
+    leader: vision_runtime.Service.Encoded,
+    follower: struct { table: vision_binding.Table, ids: []u32, positions: []u32 },
+
+    pub fn table(self: *VisionOwned) *vision_binding.Table {
+        return switch (self.*) {
+            .leader => |*state| &state.request.table.?,
+            .follower => |*state| &state.table,
+        };
+    }
 };
 
 /// One rank's copy of a kept prompt state: visible cache prefixes, raw index tails and fixed recurrent state.
@@ -210,7 +225,7 @@ pub const Engine = struct {
 
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .vision = if (b == &e.bp) if (e.cur.vision) |*vision| .{ .owner = vision.table(), .generation = vision.table().generation } else null else null };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -274,6 +289,10 @@ pub const Engine = struct {
     /// Frees slot `slot`'s sequence (slot 0 stays: the first stream's, made at init) and binds slot 0.
     pub fn release(e: *Engine, slot: u32) void {
         if (e.pool) |*p| p.regions.release(slot);
+        if (e.settings.vision and slot < e.seqs.items.len) {
+            e.stream.synchronize() catch {};
+            e.clearVision(slot);
+        }
         if (slot != 0 and slot < e.seqs.items.len) e.free(slot);
         e.cur = e.seqs.items[0].?;
         e.slot = 0;
@@ -282,9 +301,24 @@ pub const Engine = struct {
     fn free(e: *Engine, slot: usize) void {
         const q = e.seqs.items[slot] orelse return;
         e.stream.synchronize() catch {};
+        if (e.settings.vision) e.clearVision(slot);
         q.st.deinit();
         e.gpa.destroy(q);
         e.seqs.items[slot] = null;
+    }
+
+    fn clearVision(e: *Engine, slot: usize) void {
+        const q = e.seqs.items[slot] orelse return;
+        if (q.vision) |*vision| switch (vision.*) {
+            .leader => |*state| state.close() catch |err| std.log.err("vision cleanup: {s}", .{@errorName(err)}),
+            .follower => |*state| {
+                state.table.ready = false;
+                state.table.features.free();
+                e.gpa.free(state.ids);
+                e.gpa.free(state.positions);
+            },
+        };
+        q.vision = null;
     }
 
     /// Bytes one more stream's sequence takes on this rank (its state arena).
@@ -1026,6 +1060,7 @@ test "owner-only snapshots carry main and MTP prefixes to a new owner and refuse
             f.failed = null;
             f.seq = undefined;
             f.seq.in_head = 0;
+            f.seq.vision = null;
             f.seq.st = undefined;
             f.seq.st.arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, layout.total_bytes) };
             f.seq.st.layout = layout;

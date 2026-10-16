@@ -45,6 +45,20 @@ fn freed(counter: *std.atomic.Value(u64), n: usize) void {
     _ = counter.fetchSub(n, .monotonic);
 }
 
+/// Account a checked raw cuMemAlloc/cuMemFree pair whose owner must preserve
+/// the allocation when a synchronization or free fails.
+pub fn accountExternalDevice(n: usize) void { held(&device_bytes, n); }
+pub fn unaccountExternalDevice(n: usize) void { freed(&device_bytes, n); }
+
+test "checked external device allocations participate in usage and peak" {
+    const before = usage(true).device;
+    accountExternalDevice(8192);
+    defer unaccountExternalDevice(8192);
+    const during = usage(false);
+    try std.testing.expectEqual(before + 8192, during.device);
+    try std.testing.expect(during.peak >= during.device);
+}
+
 fn lockCounts() void {
     while (!counts_mutex.tryLock()) std.Thread.yield() catch {};
 }
