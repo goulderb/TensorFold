@@ -346,3 +346,46 @@ extern "C" __global__ void __launch_bounds__(256) tf_tp_sum2(const void* __restr
     const float y = b_f32 ? static_cast<const float*>(b)[i] : __bfloat162float(static_cast<const __nv_bfloat16*>(b)[i]);
     out[i] = __float2bfloat16_rn(__fadd_rn(x, y));
 }
+
+// A decode window's exchange in one kernel, with no host and no event between the two GPUs (they have no peer access):
+// this rank's partial is written as fp32 into its slot of mapped pinned host memory, fenced, and its flag raised to
+// `seq`; it then polls the peer's flag over PCIe, reads the peer's slot, and writes own + peer (fp32, rounded once)
+// as bf16. Both ranks write the same bits, since a + b is commutative. One block. A peer that never raises its flag
+// stops the poll after `limit` clock ticks and raises `failed`, so a broken pair cannot hang the GPU.
+extern "C" __global__ void __launch_bounds__(1024) tf_tp_xchg(const void* __restrict__ src, int wide, float* mine,
+                                                              const float* theirs, unsigned long long* my_flag,
+                                                              const unsigned long long* peer_flag,
+                                                              unsigned long long seq, __nv_bfloat16* __restrict__ out,
+                                                              int n, long long limit, int* failed) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = wide ? static_cast<const float*>(src)[i] : __bfloat162float(static_cast<const __nv_bfloat16*>(src)[i]);
+        mine[i] = v;
+    }
+    __syncthreads();
+    __shared__ int ok;
+    if (threadIdx.x == 0) {
+        __threadfence_system();  // the slot's writes reach host memory before the flag does
+        asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(my_flag), "l"(seq) : "memory");
+        const long long t0 = clock64();
+        unsigned long long seen = 0;
+        ok = 1;
+        while (true) {
+            asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(seen) : "l"(peer_flag) : "memory");
+            if (seen >= seq) break;
+            if (clock64() - t0 > limit) {
+                ok = 0;
+                atomicExch(failed, 1);
+                break;
+            }
+            __nanosleep(64);
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (!ok) return;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float own = wide ? static_cast<const float*>(src)[i] : __bfloat162float(static_cast<const __nv_bfloat16*>(src)[i]);
+        const float peer = *(volatile const float*)(theirs + i);
+        out[i] = __float2bfloat16_rn(__fadd_rn(own, peer));
+    }
+}

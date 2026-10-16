@@ -130,7 +130,7 @@ fn openTp(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
     }
     p.stage[0] = try cuda.HostBuffer.alloc(ctx.d, 64); // unused by TP; Peer.deinit frees it
     errdefer p.stage[0].free();
-    const link = try tp2.Link.init(gpa, .{ ctx, &p.ctx }, state.pass_rows, e.c.hidden);
+    const link = try tp2.Link.init(gpa, io, .{ ctx, &p.ctx }, state.pass_rows, e.c.hidden);
     errdefer link.deinit();
     e.peer = p.e;
     e.tp_link = link;

@@ -78,7 +78,7 @@ pub const Taps = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque, hid
 pub const lookahead = 4;
 
 /// Streams a shared window holds at most (their rows together at most state.max_rows).
-pub const max_streams = 8;
+pub const max_streams = 16; // a shared window's streams: 16 one-row windows fill its 16 rows
 
 // pinned words: the window's meta row, its ids, its sampled ids, a prompt chunk's ids, then 64 a shared window's stream
 const pin_meta = 0;
@@ -313,7 +313,16 @@ pub const Engine = struct {
         var f1 = p.forward(null);
         f1.segs = peer_parts;
         f1.untaught = f0.untaught;
-        return tp2.window(l, .{ &f0, &f1 }, .{ parts, peer_parts });
+        if (!l.profile) return tp2.window(l, .{ &f0, &f1 }, .{ parts, peer_parts });
+        const t0 = std.Io.Clock.awake.now(e.io).toNanoseconds();
+        try tp2.window(l, .{ &f0, &f1 }, .{ parts, peer_parts });
+        const t1 = std.Io.Clock.awake.now(e.io).toNanoseconds();
+        try e.stream.synchronize();
+        try p.ctx.makeCurrent();
+        try p.stream.synchronize();
+        try e.ctx.makeCurrent();
+        const t2 = std.Io.Clock.awake.now(e.io).toNanoseconds();
+        l.prof.note(parts.len, @intCast(t1 - t0), @intCast(t2 - t0));
     }
 
     /// The window's inputs on the TP peer: the same ids and meta row rank 0 uploaded, from the same pinned host words.

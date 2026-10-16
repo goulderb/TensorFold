@@ -64,6 +64,7 @@ pub const Kernels = struct {
     ep_remap: cuda.Function, // two-GPU TP: a rank's picks in its own expert table (nemotron_ops.cu)
     ep_partial: cuda.Function, // two-GPU TP: a rank's MoE partial over its own pairs, fp32
     tp_sum2: cuda.Function, // two-GPU TP: the two ranks' partials summed in fp32, rounded to bf16 once
+    tp_xchg: cuda.Function, // two-GPU TP: a decode window's whole exchange through mapped host memory
     draws: cuda.sample.Draws, // sample.cu: the keyed draws and logprob rows
     grammar_mask: cuda.Function, // structured output: disallowed tokens -inf before the draw
     torch: torch_ops.Functions,
@@ -101,6 +102,7 @@ pub const Kernels = struct {
         k.ep_remap = try k.mods[7].function("tf_ep_remap");
         k.ep_partial = try k.mods[7].function("tf_ep_partial");
         k.tp_sum2 = try k.mods[7].function("tf_tp_sum2");
+        k.tp_xchg = try k.mods[7].function("tf_tp_xchg");
         k.torch = try torch_ops.Functions.resolve(k.mods[8..14]);
         k.draws = try cuda.sample.Draws.resolve(k.mods[14]);
         k.glue = try glue.Fns.resolve(k.mods[16..21]);
@@ -305,6 +307,24 @@ pub const Ops = struct {
         a.add(out);
         a.add(@as(i64, @intCast(n)));
         try o.go(o.k.tp_sum2, .{ (n + 255) / 256, 1, 1 }, 256, 0, &a);
+    }
+
+    /// Two-GPU TP: a whole exchange of `n` values in one kernel (nemotron_ops.cu tf_tp_xchg); `mine`, `theirs` and
+    /// the flags are mapped host memory's device addresses.
+    pub fn tpXchg(o: Ops, src: u64, wide: bool, mine: u64, theirs: u64, my_flag: u64, peer_flag: u64, seq: u64, out: u64, n: usize, limit: i64, failed: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(src);
+        a.add(@as(c_int, @intFromBool(wide)));
+        a.add(mine);
+        a.add(theirs);
+        a.add(my_flag);
+        a.add(peer_flag);
+        a.add(seq);
+        a.add(out);
+        a.add(int(n));
+        a.add(limit);
+        a.add(failed);
+        try o.go(o.k.tp_xchg, .{ 1, 1, 1 }, 1024, 0, &a);
     }
 
     /// nemotron_ops' rest: y (bf16, or fp32 when `y_f32`) += r x at rows `i * row_mul + row_add` for i < rows.
