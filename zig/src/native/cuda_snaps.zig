@@ -19,8 +19,8 @@ pub fn cacheBudget(comptime F: type, target: anytype, cache: u64) !u64 {
     return if (@hasDecl(F, "snap_ready")) cache - try F.snap_ready(target, cache) else cache;
 }
 
-/// The family's `snap_*` copies (none: no prompt cache), a container-level value so the store's pointer stays valid.
-pub fn Snaps(comptime F: type) type {
+/// The family's `snap_*` copies and `image`, its disk rows (null: none); a container-level value, so the pointer holds.
+pub fn Snaps(comptime F: type, comptime image: ?*const api.prompt_cache.rows.Image) type {
     return struct {
         pub const vtable: api.prompt_cache.Snapshots.VTable = .{
             .bytes = F.snap_bytes,
@@ -30,6 +30,7 @@ pub fn Snaps(comptime F: type) type {
             .spill_write = if (@hasDecl(F, "snap_spill_write")) spillWrite else null,
             .spill_read = if (@hasDecl(F, "snap_spill_read")) spillRead else null,
             .spill_forget = if (@hasDecl(F, "snap_spill_forget")) spillForget else null,
+            .rows = image,
         };
         fn spillWrite(ptr: *anyopaque, saved: api.prompt_cache.Saved, tier: *api.prompt_cache.spill.Tier, name: api.prompt_cache.spill.Name, tokens: []const u32) anyerror!void {
             return F.snap_spill_write(ptr, saved, tier, name, tokens);
@@ -69,7 +70,15 @@ test "a family with snap_grid keeps on its chunk starts, any other at any row as
     defer arena.deinit();
     const prompt = try arena.allocator().alloc(u32, 3547);
     for (prompt, 0..) |*t, i| t.* = @intCast(i);
-    var store = api.prompt_cache.Store.init(std.testing.allocator, .{ .ptr = &unused, .vtable = &.{ .bytes = Stub.bytes, .save = Stub.save, .restore = Stub.restore, .drop = Stub.drop } }, cacheRules(Glm), 1 << 30);
+    const vtable: api.prompt_cache.Snapshots.VTable = .{
+        .bytes = Stub.bytes,
+        .save = Stub.save,
+        .restore = Stub.restore,
+        .drop = Stub.drop,
+    };
+    const copies: api.prompt_cache.Snapshots = .{ .ptr = &unused, .vtable = &vtable };
+    var store = api.prompt_cache.Store.init(std.testing.allocator, copies, cacheRules(Glm), 1 << 30);
     defer store.deinit();
-    try std.testing.expectEqualSlices(u32, &[_]u32{2048}, try store.marks(arena.allocator(), prompt, 0, 3540, &.{}, &.{}, &.{}));
+    const marks = try store.marks(arena.allocator(), prompt, 0, 3540, &.{}, &.{}, &.{});
+    try std.testing.expectEqualSlices(u32, &[_]u32{2048}, marks);
 }

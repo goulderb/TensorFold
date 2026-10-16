@@ -1,7 +1,7 @@
 //! The server: one engine and tokenizer behind the HTTP routes, one thread a connection.
 const std = @import("std");
 const api = @import("engine_api");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const fields = @import("fields.zig");
 const auth = @import("auth.zig");
@@ -31,6 +31,8 @@ const Allocator = std.mem.Allocator;
 /// auto compacts near the window. fraction compacts past that share of it.
 pub const CompactAt = union(enum) { auto, fraction: f64 };
 
+pub const Identity = @import("identity.zig").Identity;
+
 pub const Config = struct {
     served_name: []const u8,
     model_dir: []const u8 = "",
@@ -47,6 +49,8 @@ pub const Config = struct {
     /// Sampling when a request names none (generation_config.json and the serve flags), or null for greedy.
     default_sampling: ?Value = null,
     use_drafts: bool = true,
+    /// --vision-urls: image parts may name public HTTPS URLs, fetched before admission (media_fetch.zig).
+    vision_urls: bool = false,
     seed_salt: i64 = 0,
     /// TENSORFOLD_REQUEST_LOG: where chat and completion bodies are appended; null: nowhere.
     request_log: ?[]const u8 = null,
@@ -60,11 +64,17 @@ pub const Config = struct {
     slide: bool = false,
     /// --slide-graph: the file holding the Sliding Weights fact graph; null keeps the graph in memory.
     slide_graph: ?[]const u8 = null,
+    /// A fact whose check a delete fails, to test its put-back (0: none); only -Dslide-test-hooks builds set it.
+    slide_forget_fail: u32 = 0,
     /// --cortheon: Cortheon's program and server-run web research for chat requests; off changes no reply.
     cortheon: bool = false,
     /// BRAVE_SEARCH_API_KEY: Cortheon searches through Brave instead of DuckDuckGo.
     cortheon_search_key: ?[]const u8 = null,
+    /// --learn-conversations: /v1/imprint answers; without it each of its routes refuses and names the flag.
+    saved_conversations: bool = false,
     timeouts: http_conn.Timeouts = .{},
+    /// The open /health names these after its other keys; empty fields are left out.
+    identity: Identity = .{},
 };
 
 pub const Server = struct {
@@ -80,6 +90,7 @@ pub const Server = struct {
     markers: reply_text.Markers = reply_text.think_markers,
     chunks: chunk_plan.Plan = .{},
     effort_levels: []const []const u8 = &.{},
+    thinking_switch: bool = false,
     eos: []const u32 = &.{},
     think_close: []const u32 = &.{},
     think_close_end: ?u32 = null,
@@ -99,13 +110,24 @@ pub const Server = struct {
     /// The facts the learner was taught and whether the weights recall them.
     slide: slide_graph.Graph,
     teacher: slide_lesson.Teacher, // what every Sliding Weights lesson shares: keep prompts, the turn's end
+    /// The folder's snapshot made or hashed whole by this process (under teacher.learning): later lessons trust it.
+    snapshot_checked: bool = false,
     /// Cortheon's web reader and what replies hid from their clients; null without --cortheon.
     cortheon: ?*cortheon.State = null,
+    /// Recall's record (--recall), which GET and DELETE /v1/recall read and empty; main opens and closes it.
+    recall: ?*api.recall_store.Store = null,
+    /// TENSORFOLD_QUAL_IDS_DIR: each completed non-streamed reply's generated ids, recorded for qualification.
+    qual_ids: ?*@import("qual_ids.zig").QualIds = null,
 
     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
-        const srv = try gpa.create(Server);
-        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
+        const qual_ids = try @import("qual_ids.zig").QualIds.fromEnv(gpa, config.model_dir);
+        if (qual_ids) |q| log.line("qualification: generated ids of completed non-streamed replies go to {s}", .{q.path});
+        const srv = gpa.create(Server) catch |err| {
+            if (qual_ids) |q| q.deinit(gpa);
+            return err;
+        };
+        srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa), .qual_ids = qual_ids };
         errdefer srv.deinit(); // a later step's failure stops the keepalive before the caller closes the engine
         if (config.cortheon) srv.cortheon = try cortheon.State.init(gpa, io, "TensorFold-Cortheon (+https://github.com/ashhart/TensorFold)", config.cortheon_search_key);
         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
@@ -117,9 +139,12 @@ pub const Server = struct {
         const a = srv.arena.allocator();
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
-        srv.effort_levels = try fields.effortLevels(a, text.templateSource());
+        const source = text.templateSource();
+        srv.effort_levels = try fields.effortLevels(a, source);
+        srv.thinking_switch = std.mem.indexOf(u8, source, "enable_thinking") != null or
+            std.mem.indexOf(u8, source, "thinking_mode") != null;
         srv.late_system = try lateSystem(a, text);
-        srv.needs_user_after_tool = needsUserAfterTool(text.templateSource());
+        srv.needs_user_after_tool = needsUserAfterTool(source);
         if (text.tokenId("</think>")) |end| {
             const lead = try text.encode(a, "\n", false);
             const trail = try text.encode(a, "\n\n", false);
@@ -143,6 +168,7 @@ pub const Server = struct {
         srv.slide.deinit();
         srv.teacher.deinit();
         if (srv.cortheon) |c| c.deinit();
+        if (srv.qual_ids) |q| q.deinit(srv.gpa);
         srv.gpa.destroy(srv);
     }
 
@@ -301,7 +327,10 @@ pub const Server = struct {
     /// Accepts connections until ``stop`` is set, each on its own thread.
     pub fn serve(srv: *Server, listener: listener_mod.Listener, stop: *const std.atomic.Value(bool)) void {
         while (listener.accept(stop)) |c| {
+            // counted before its thread runs, so a zero count once this loop ends means no connection is left
+            _ = srv.open_connections.fetchAdd(1, .acq_rel);
             const t = std.Thread.spawn(.{ .stack_size = 8 << 20 }, connection, .{ srv, c }) catch {
+                _ = srv.open_connections.fetchSub(1, .acq_rel);
                 sock.close(c.fd);
                 continue;
             };
@@ -310,7 +339,6 @@ pub const Server = struct {
     }
 
     fn connection(srv: *Server, accepted: listener_mod.Listener.Accepted) void {
-        _ = srv.open_connections.fetchAdd(1, .acq_rel);
         defer _ = srv.open_connections.fetchSub(1, .acq_rel);
         defer sock.close(accepted.fd);
         var peer_buf: [64]u8 = undefined;

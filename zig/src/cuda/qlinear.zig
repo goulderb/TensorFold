@@ -8,6 +8,7 @@ const stream_ = @import("stream.zig");
 const qmmf = @import("qmmf.zig");
 const nvfp4 = @import("nvfp4.zig");
 const exl3 = @import("exl3_linear.zig");
+const ck = @import("ck.zig");
 
 const Driver = driver.Driver;
 const Module = module.Module;
@@ -65,6 +66,16 @@ pub const Linear = struct {
     lane: ?*const qmmf.Lane = null, // decode rows of every lane format; fp8g and bf16 prompt rows too
     nvfp4_prompt: ?*const nvfp4.Prompt = null, // the prompt GEMM: nvfp4 and fp8 prompt rows (linear.py's prefill)
     exl3: ?*const exl3.Kernels = null, // decode rows 16 a window; prompt rows on the tensor units
+    ck: ?*const ck.Ck = null, // the checkpoint's own math: an fp8 weight with an input scale takes e4m3 rows
+    ck_rows: u64 = 0, // its e4m3 rows (at least rows * k bytes), and slice partials where no cluster meets them
+    ck_part: u64 = 0,
+
+    /// e4m3 rows of x times an fp8 weight under its input scale, bf16 out: decode and prompt rows alike (row-exact).
+    fn checkpoint(l: Linear, s: Stream, c: *const ck.Ck, q: qmmf.Weight, in: Rows, out: u64, rows: usize) !void {
+        if (l.ck_rows == 0) return error.NoCheckpointRows;
+        try c.quant8(s, in.x, if (in.ldx == 0) q.k else in.ldx, rows, q.k, q.act, l.ck_rows);
+        return c.lane8(s, l.ck_rows, rows, q, q.act, out, if (l.ck_part != 0) l.ck_part else in.part);
+    }
 
     /// Decode rows: out (rows, n) bf16, each row's bits the same at every row count the format takes.
     pub fn decode(l: Linear, s: Stream, w: Weight, in: Rows, out: u64, rows: usize) !void {
@@ -76,7 +87,7 @@ pub const Linear = struct {
             },
             .fp8g => |q| return l.onLane(s, q, .fp8g, in, out, rows),
             .nvfp4 => |q| return l.onLane(s, q, .fp4, in, out, rows),
-            .fp8 => |q| return l.onLane(s, q, .fp8, in, out, rows),
+            .fp8 => |q| return if (q.act != 0 and l.ck != null) l.checkpoint(s, l.ck.?, q, in, out, rows) else l.onLane(s, q, .fp8, in, out, rows),
             .bf16 => |q| return l.onLane(s, q, .bf16, in, out, rows),
             .exl3 => |q| return l.onExl3(s, q, in, out, rows),
         }
@@ -91,7 +102,7 @@ pub const Linear = struct {
             },
             .fp8g => |q| return l.onLane(s, q, .fp8g, in, out, rows),
             .nvfp4 => |q| return l.onPrompt(s, q, .fp4, in, out, rows),
-            .fp8 => |q| return l.onPrompt(s, q, .fp8, in, out, rows),
+            .fp8 => |q| return if (q.act != 0 and l.ck != null) l.checkpoint(s, l.ck.?, q, in, out, rows) else l.onPrompt(s, q, .fp8, in, out, rows),
             .bf16 => |q| return l.onLane(s, q, .bf16, in, out, rows),
             .exl3 => |q| return (l.exl3 orelse return error.FormatNotLoaded).prompt(s, in.x, if (in.ldx == 0) q.k else in.ldx, q, out, rows, false),
         }
@@ -130,7 +141,16 @@ pub const Linear = struct {
         return l.onPromptAs(s, q, mode, in, out, .bf16, rows);
     }
 
-    fn onPromptAs(l: Linear, s: Stream, q: qmmf.Weight, mode: qmmf.Mode, in: Rows, out: u64, kind: qmmf.Out, rows: usize) !void {
+    fn onPromptAs(
+        l: Linear,
+        s: Stream,
+        q: qmmf.Weight,
+        mode: qmmf.Mode,
+        in: Rows,
+        out: u64,
+        kind: qmmf.Out,
+        rows: usize,
+    ) !void {
         const p = l.nvfp4_prompt orelse return error.FormatNotLoaded;
         if (q.mode != mode) return error.FormatMismatch;
         return p.matmulOut(s, in.x, if (in.ldx == 0) q.k else in.ldx, rows, q, out, kind);
@@ -140,7 +160,16 @@ pub const Linear = struct {
         return l.onLaneAs(s, q, mode, in, out, .bf16, rows);
     }
 
-    fn onLaneAs(l: Linear, s: Stream, q: qmmf.Weight, mode: qmmf.Mode, in: Rows, out: u64, kind: qmmf.Out, rows: usize) !void {
+    fn onLaneAs(
+        l: Linear,
+        s: Stream,
+        q: qmmf.Weight,
+        mode: qmmf.Mode,
+        in: Rows,
+        out: u64,
+        kind: qmmf.Out,
+        rows: usize,
+    ) !void {
         const lane = l.lane orelse return error.FormatNotLoaded;
         if (q.mode != mode) return error.FormatMismatch;
         return lane.matmulOut(s, in.x, if (in.ldx == 0) q.k else in.ldx, rows, q, out, kind, in.part);

@@ -29,7 +29,7 @@ extern "kernel32" fn GetStdHandle(which: u32) callconv(.winapi) ?*anyopaque;
 
 const win_invalid_handle = std.math.maxInt(usize);
 
-/// Appends `bytes` to the file at `path`, created 0644 if absent, in one write. A failure is silent: the caller logs
+/// Appends `bytes` to the file at `path`, created 0600 if absent, in one write. A failure is silent: the caller logs
 /// nothing it could not write anyway.
 pub fn appendFile(a: Allocator, path: []const u8, bytes: []const u8) void {
     if (builtin.os.tag == .windows) {
@@ -43,7 +43,7 @@ pub fn appendFile(a: Allocator, path: []const u8, bytes: []const u8) void {
         return;
     }
     const pathz = a.dupeSentinel(u8, path, 0) catch return;
-    const fd = std.posix.openatZ(std.posix.AT.FDCWD, pathz, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true }, 0o644) catch return;
+    const fd = std.posix.openatZ(std.posix.AT.FDCWD, pathz, .{ .ACCMODE = .WRONLY, .APPEND = true, .CREAT = true }, 0o600) catch return;
     defer _ = std.posix.system.close(fd);
     _ = std.posix.system.write(fd, bytes.ptr, bytes.len);
 }

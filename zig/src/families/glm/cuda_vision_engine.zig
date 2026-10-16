@@ -94,7 +94,7 @@ pub const Engine = struct {
         var linear_workspace: usize = 0;
         for (0..24) |layer| for (block_specs) |spec| {
             const bias = try weights.block(@intCast(layer), spec.bias);
-            linears[initialized] = try lt.Linear.initBias(r.linear, rows, spec.n, spec.k, linearSpan(bias), options.workspace_limit);
+            linears[initialized] = try lt.Linear.initEpilogueChecked(r.linear, rows, spec.n, spec.k, .bf16, options.workspace_limit, .bias, linearSpan(bias));
             linear_workspace = @max(linear_workspace, linears[initialized].workspace_need);
             initialized += 1;
         };

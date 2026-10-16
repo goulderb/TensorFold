@@ -1,6 +1,6 @@
 //! TENSORFOLD_REQUEST_LOG: each chat and completion body appended as one JSON line, images redacted, for replays.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const platform = @import("platform");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
@@ -41,6 +41,28 @@ pub fn append(a: Allocator, path: []const u8, body: Value) void {
     const line = json.stringify(a, redact(a, body) catch return, .{}) catch return;
     const framed = std.mem.concat(a, u8, &.{ line, "\n" }) catch return;
     platform.appendFile(a, path, framed);
+}
+
+test "the request log is created owner-only and keeps image URLs out" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/requests.jsonl", .{tmp.sub_path});
+    const url = try json.newObject(a);
+    try url.put(a, "url", .{ .string = "https://example.test/private.png" });
+    const part = try json.newObject(a);
+    try part.put(a, "type", .{ .string = "image_url" });
+    try part.put(a, "image_url", .{ .object = url });
+    const body = try json.newObject(a);
+    try body.put(a, "messages", .{ .array = try a.dupe(Value, &.{.{ .object = part }}) });
+    append(a, path, .{ .object = body });
+    const st = try std.Io.Dir.cwd().statFile(std.testing.io, path, .{}); // Linux's libc has no stat for std.c
+    try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(st.permissions.toMode())) & 0o777);
+    const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, a, .limited(1 << 16));
+    try std.testing.expect(std.mem.indexOf(u8, text, "<redacted>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "example.test") == null);
 }
 
 test "a video part's URL is redacted, as an image part's is" {

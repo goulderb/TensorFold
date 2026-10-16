@@ -62,6 +62,9 @@ const State = struct {
     heuristic_count: c_int = 1,
     heuristic_state: c_int = 0,
     heuristic_workspace: usize = 256,
+    check_workspace: usize = 256,
+    check_state: c_int = 0,
+    check_status: c_int = 0,
     matmul_count: usize = 0,
     dispatch: Dispatch = undefined,
 };
@@ -167,6 +170,11 @@ fn heuristic(handle: lt.Handle, desc: lt.MatmulDesc, a: lt.Layout, b: lt.Layout,
     }
     return status;
 }
+fn algoCheck(_: lt.Handle, _: lt.MatmulDesc, _: lt.Layout, _: lt.Layout, _: lt.Layout, _: lt.Layout, algo: *const lt.Algo, result: *lt.Heuristic) callconv(.c) c_int {
+    const status = step();
+    result.* = .{ .algo = algo.*, .workspace_size = state.check_workspace, .state = state.check_state, .waves_count = 1, .reserved = @splat(0) };
+    return if (status != 0) status else state.check_status;
+}
 fn matmul(handle: lt.Handle, desc: lt.MatmulDesc, alpha: CPtr, a: u64, a_layout: lt.Layout, b: u64, b_layout: lt.Layout, beta: CPtr, c: u64, c_layout: lt.Layout, result_ptr: u64, d_layout: lt.Layout, algo: ?*const lt.Algo, scratch: u64, workspace_len: usize, stream: abi.Stream) callconv(.c) c_int {
     state.matmul_count += 1;
     state.dispatch = .{
@@ -205,6 +213,7 @@ fn library() lt.Library {
         .cublasLtMatmulPreferenceDestroy = destroyPref,
         .cublasLtMatmulPreferenceSetAttribute = prefAttribute,
         .cublasLtMatmulAlgoGetHeuristic = heuristic,
+        .cublasLtMatmulAlgoCheck = algoCheck,
         .cublasLtMatmul = matmul,
     } };
 }
@@ -241,7 +250,7 @@ fn expectCleaned() !void {
 
 test "cublaslt target CUDA13.3 enums and ABI sizes use independent header literals" {
     try testing.expectEqual(@as(c_int, 7), lt.desc_epilogue);
-    try testing.expectEqual(@as(u32, 4), lt.epilogue_bias);
+    try testing.expectEqual(@as(u32, 4), @backingInt(lt.Epilogue.bias));
     try testing.expectEqual(@as(c_int, 8), lt.desc_bias_pointer);
     try testing.expectEqual(@as(c_int, 26), lt.desc_bias_data_type);
     try testing.expectEqual(@as(c_int, 14), @backingInt(lt.DataType.bf16));
@@ -258,13 +267,13 @@ test "cublaslt target CUDA13.3 enums and ABI sizes use independent header litera
     try testing.expectEqual(@as(usize, 72), @offsetOf(lt.Heuristic, "state"));
     try testing.expectEqual(@as(usize, 76), @offsetOf(lt.Heuristic, "waves_count"));
     try testing.expectEqual(@as(usize, 80), @offsetOf(lt.Heuristic, "reserved"));
-    try testing.expectEqual(@as(usize, 15), @typeInfo(lt.Api).@"struct".field_names.len);
+    try testing.expectEqual(@as(usize, 16), @typeInfo(lt.Api).@"struct".field_names.len);
 }
 
 test "cublaslt bias dtype pointer payload and column-major layouts precede heuristic" {
     state = .{};
     const lib = library();
-    var linear = try lt.Linear.initBias(&lib, 3, 5, 7, bias, 512);
+    var linear = try lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 512, .bias, bias);
     defer linear.deinit();
     try testing.expectEqual(@as(c_int, 68), state.compute);
     try testing.expectEqual(@as(c_int, 0), @backingInt(state.scale));
@@ -292,7 +301,7 @@ test "cublaslt bias dtype pointer payload and column-major layouts precede heuri
 test "cublaslt checked bias dispatch is one fused matmul with fp32 alpha beta and BF16 D" {
     state = .{};
     const lib = library();
-    var linear = try lt.Linear.initBias(&lib, 3, 5, 7, bias, 512);
+    var linear = try lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 512, .bias, bias);
     const attrs_before = state.attr_count;
     const stream: abi.Stream = @ptrFromInt(0x600000);
     try linear.runChecked(x, w, d, workspace, stream);
@@ -324,7 +333,7 @@ test "cublaslt checked bias dispatch is one fused matmul with fp32 alpha beta an
 test "cublaslt bias pointer-only legacy dispatch cannot bypass span checks" {
     state = .{};
     const lib = library();
-    var linear = try lt.Linear.initBias(&lib, 3, 5, 7, bias, 512);
+    var linear = try lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 512, .bias, bias);
     defer linear.deinit();
     try testing.expectError(error.Invalid, linear.run(x.ptr, w.ptr, d.ptr, workspace.ptr, workspace.len, null));
     try testing.expectEqual(@as(usize, 0), state.matmul_count);
@@ -340,7 +349,7 @@ test "cublaslt dimensions and byte products refuse zero signed overflow and wrap
     const lib = library();
     for (shapes) |shape| {
         state = .{};
-        try testing.expectError(error.Invalid, lt.Linear.initBias(&lib, shape[0], shape[1], shape[2], bias, 512));
+        try testing.expectError(error.Invalid, lt.Linear.initEpilogueChecked(&lib, shape[0], shape[1], shape[2], .bf16, 512, .bias, bias));
         try testing.expectEqual(@as(usize, 0), state.operations);
         try testing.expectError(error.Invalid, lt.Linear.init(&lib, shape[0], shape[1], shape[2], .f32, 512));
         try testing.expectEqual(@as(usize, 0), state.operations);
@@ -355,12 +364,12 @@ test "cublaslt borrowed BF16 bias requires nonzero aligned full span and nonwrap
     const lib = library();
     for (invalid) |bad| {
         state = .{};
-        try testing.expectError(error.Invalid, lt.Linear.initBias(&lib, 3, 5, 7, bad, 512));
+        try testing.expectError(error.Invalid, lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 512, .bias, bad));
         try testing.expectEqual(@as(usize, 0), state.operations);
     }
     state = .{};
     // A larger allocation is valid; only its first n BF16 elements are read.
-    var linear = try lt.Linear.initBias(&lib, 3, 5, 7, span(bias.ptr, 128), 512);
+    var linear = try lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 512, .bias, span(bias.ptr, 128));
     linear.deinit();
     try expectCleaned();
 }
@@ -368,14 +377,14 @@ test "cublaslt borrowed BF16 bias requires nonzero aligned full span and nonwrap
 test "cublaslt every biased initializer failure unwinds exactly its created owners in reverse" {
     const lib = library();
     state = .{};
-    var success = try lt.Linear.initBias(&lib, 3, 5, 7, bias, 512);
+    var success = try lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 512, .bias, bias);
     const total = state.operations;
     success.deinit();
     try testing.expectEqual(@as(usize, 20), total);
     for (1..total + 1) |fault| {
         for ([_]bool{ false, true }) |sets_handle| {
             state = .{ .fail_at = fault, .fail_create_sets_handle = sets_handle };
-            try testing.expectError(error.CublasFailed, lt.Linear.initBias(&lib, 3, 5, 7, bias, 512));
+            try testing.expectError(error.CublasFailed, lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 512, .bias, bias));
             try testing.expectEqual(fault, state.operations);
             try expectCleaned();
         }
@@ -387,7 +396,7 @@ test "cublaslt successful-null handle descriptor layouts and preference refuse a
     const create_operations = [_]usize{ 1, 2, 8, 9, 10, 14 };
     for (create_operations) |fault| {
         state = .{ .null_at = fault };
-        try testing.expectError(error.CublasFailed, lt.Linear.initBias(&lib, 3, 5, 7, bias, 512));
+        try testing.expectError(error.CublasFailed, lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 512, .bias, bias));
         try testing.expectEqual(fault, state.operations);
         try expectCleaned();
     }
@@ -401,7 +410,7 @@ test "cublaslt heuristic count status and workspace above limit refuse without r
     };
     for (variants) |variant| {
         state = variant;
-        try testing.expectError(error.NoAlgorithm, lt.Linear.initBias(&lib, 3, 5, 7, bias, 512));
+        try testing.expectError(error.NoAlgorithm, lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 512, .bias, bias));
         try expectCleaned();
         try testing.expectEqual(@as(usize, 6), state.destroy_count);
         try testing.expectEqual(@as(usize, 0), state.matmul_count);
@@ -411,7 +420,7 @@ test "cublaslt heuristic count status and workspace above limit refuse without r
 test "cublaslt checked X W D and workspace reject short null misaligned and wrapped spans before dispatch" {
     state = .{};
     const lib = library();
-    var linear = try lt.Linear.initBias(&lib, 3, 5, 7, bias, 512);
+    var linear = try lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 512, .bias, bias);
     defer linear.deinit();
     const valid = [_]lt.DeviceSpan{ x, w, d, workspace };
     for (0..valid.len) |index| {
@@ -436,7 +445,7 @@ test "cublaslt checked X W D and workspace reject short null misaligned and wrap
 test "cublaslt checked output and workspace may not alias X W bias or each other" {
     state = .{};
     const lib = library();
-    var linear = try lt.Linear.initBias(&lib, 3, 5, 7, bias, 512);
+    var linear = try lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 512, .bias, bias);
     defer linear.deinit();
     for ([_]u64{ x.ptr, w.ptr, bias.ptr, workspace.ptr, x.ptr + x.len - 2 }) |ptr| {
         try testing.expectError(error.Invalid, linear.runChecked(x, w, span(ptr, d.len), workspace, null));
@@ -451,7 +460,7 @@ test "cublaslt exact workspace limit and zero-workspace algorithms are supported
     const lib = library();
     for ([_]usize{ 0, 256 }) |need| {
         state = .{ .heuristic_workspace = need };
-        var linear = try lt.Linear.initBias(&lib, 3, 5, 7, bias, need);
+        var linear = try lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, need, .bias, bias);
         const ws = if (need == 0) span(0, 0) else span(workspace.ptr, need);
         try linear.runChecked(x, w, d, ws, null);
         try testing.expectEqual(need, state.dispatch.workspace_len);
@@ -460,7 +469,7 @@ test "cublaslt exact workspace limit and zero-workspace algorithms are supported
         try expectCleaned();
     }
     state = .{ .heuristic_workspace = 0 };
-    var linear = try lt.Linear.initBias(&lib, 3, 5, 7, bias, 0);
+    var linear = try lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 0, .bias, bias);
     defer linear.deinit();
     try linear.runChecked(x, w, d, workspace, null);
     try testing.expectEqual(@as(u64, 0), state.dispatch.workspace);
@@ -521,7 +530,7 @@ test "cublaslt unbiased checked path honors default heuristic matrix alignment a
 test "cublaslt matmul errors propagate with owner resources still live until deinit" {
     state = .{};
     const lib = library();
-    var linear = try lt.Linear.initBias(&lib, 3, 5, 7, bias, 512);
+    var linear = try lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 512, .bias, bias);
     state.fail_at = state.operations + 1;
     try testing.expectError(error.CublasFailed, linear.runChecked(x, w, d, workspace, null));
     try testing.expectEqual(@as(usize, 0), state.destroy_count);
@@ -558,7 +567,7 @@ test "cublaslt unit dimensions and adjacent disjoint spans dispatch safely" {
     state = .{ .heuristic_workspace = 0 };
     const lib = library();
     // Two-byte alignment and half-open overlap checks permit adjacent BF16 vectors.
-    var linear = try lt.Linear.initBias(&lib, 1, 1, 1, span(0x100002, 2), 0);
+    var linear = try lt.Linear.initEpilogueChecked(&lib, 1, 1, 1, .bf16, 0, .bias, span(0x100002, 2));
     defer linear.deinit();
     try linear.runChecked(span(0x100004, 2), span(0x100006, 2), span(0x100008, 2), span(0, 0), null);
     try testing.expectEqual(@as(usize, 1), state.matmul_count);
@@ -579,4 +588,59 @@ test "cublaslt no-GPU Windows availability and public body compilation" {
     std.mem.doNotOptimizeAway(&lt.Library.open);
     std.mem.doNotOptimizeAway(&lt.Library.openPath);
     std.mem.doNotOptimizeAway(&lt.Library.close);
+}
+
+test "cublaslt optional upstream epilogue keeps fusion and fallback contracts" {
+    const lib = library();
+    const variants = [_]State{
+        .{}, .{ .check_workspace = 513 }, .{ .check_status = 7 }, .{ .check_state = 7 },
+    };
+    for (variants, 0..) |variant, index| {
+        state = variant;
+        var linear = try lt.Linear.initEpilogue(&lib, 3, 5, 7, .bf16, 512, .bias);
+        try testing.expectEqual(if (index == 0) lt.Epilogue.bias else lt.Epilogue.none, linear.epilogue);
+        if (index == 0) {
+            try linear.runBias(0x200000, 0x300000, bias.ptr, 0x400000, workspace.ptr, workspace.len, null);
+            const attr = state.attrs[state.attr_count - 1];
+            try testing.expectEqual(lt.desc_bias_pointer, attr.id);
+            try testing.expectEqual(bias.ptr, attr.value(u64));
+        } else {
+            try testing.expectError(error.Invalid, linear.runBias(0x200000, 0x300000, bias.ptr, 0x400000, workspace.ptr, workspace.len, null));
+            const attr = state.attrs[state.attr_count - 1];
+            try testing.expectEqual(lt.desc_epilogue, attr.id);
+            try testing.expectEqual(@as(u32, 1), attr.value(u32));
+            try linear.run(0x200000, 0x300000, 0x400000, workspace.ptr, workspace.len, null);
+        }
+        try testing.expectEqual(@as(usize, 1), state.matmul_count);
+        linear.deinit();
+        try expectCleaned();
+    }
+}
+
+test "cublaslt bound epilogue rejects mismatched dtype and cannot mutate its bias through runBias" {
+    state = .{};
+    const lib = library();
+    try testing.expectError(error.Invalid, lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .f32, 512, .bias, bias));
+    try testing.expectError(error.Invalid, lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 512, .none, bias));
+    try testing.expectEqual(@as(usize, 0), state.operations);
+    var linear = try lt.Linear.initEpilogueChecked(&lib, 3, 5, 7, .bf16, 512, .bias, bias);
+    defer linear.deinit();
+    const operations = state.operations;
+    try testing.expectError(error.Invalid, linear.runBias(x.ptr, w.ptr, bias.ptr, d.ptr, workspace.ptr, workspace.len, null));
+    try testing.expectEqual(operations, state.operations);
+    try testing.expectEqual(lt.Epilogue.bias, linear.epilogue);
+}
+
+test "cublaslt optional fusion raises workspace need and attribute failures unwind" {
+    const lib = library();
+    state = .{ .check_workspace = 512 };
+    var linear = try lt.Linear.initEpilogue(&lib, 3, 5, 7, .bf16, 512, .bias);
+    try testing.expectEqual(@as(usize, 512), linear.workspace_need);
+    linear.deinit();
+    try expectCleaned();
+    for ([_]usize{ 11, 13 }) |fault| {
+        state = .{ .fail_at = fault, .check_state = 7 };
+        try testing.expectError(error.CublasFailed, lt.Linear.initEpilogue(&lib, 3, 5, 7, .bf16, 512, .bias));
+        try expectCleaned();
+    }
 }

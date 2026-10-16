@@ -140,6 +140,7 @@ pub const Engine = struct {
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
+        if (world > ranks.max_world) return error.TooManyRanks; // before anything is allocated
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -163,10 +164,14 @@ pub const Engine = struct {
         };
         if (settings.draft == .dflash2 and startup_problem == null) {
             if (world != 2 or c.hidden != 4096 or c.hc != 4 or c.vocab != 154880 or (settings.layers != 0 and settings.layers != c.layers)) startup_problem = error.UnsupportedDFlashTarget;
-            if (startup_problem == null) settings.draft_checkpoint = ranks.hashDraftCheckpoint(gpa, io, settings.draft_dir orelse return error.NoDraftCheckpoint) catch |err| blk: {
-                startup_problem = err;
-                break :blk @splat(0);
-            };
+            if (startup_problem == null) {
+                if (settings.draft_dir) |draft_dir| {
+                    settings.draft_checkpoint = ranks.hashDraftCheckpoint(gpa, io, draft_dir) catch |err| blk: {
+                        startup_problem = err;
+                        break :blk @splat(0);
+                    };
+                } else startup_problem = error.NoDraftCheckpoint;
+            }
         }
         const startup = try a.alloc(u32, world);
         try ranks.gather(u32, d, lib, comm, stream, rank, @intFromBool(startup_problem == null), startup);
@@ -218,6 +223,7 @@ pub const Engine = struct {
         errdefer e.bm.deinit();
         if (with_mtp or settings.draft == .dflash2) e.bs = if (o.settings.kv_shard) try fw.Buffers.initSharedOwned(d, &e.w, shared_rows, o.capacity) else try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
+        errdefer if (e.dflash) |drafter| drafter.deinit();
         if (settings.draft == .dflash2) {
             try e.bp.enableTaps(d);
             try e.bd.enableTaps(d);
@@ -241,14 +247,12 @@ pub const Engine = struct {
                 draft_problem = err;
                 break :blk null;
             };
-            errdefer if (e.dflash) |drafter| drafter.deinit();
             if (!try e.pairedReady(draft_problem == null)) return draft_problem orelse error.PeerDFlashOpen;
             e.dflash.?.prepare() catch |err| {
                 e.pair_failure(err);
                 return err;
             };
         }
-        errdefer if (e.dflash) |drafter| drafter.deinit();
         errdefer if (e.pool) |*p| p.deinit();
         if (o.settings.kv_pool_tokens > 0) {
             const shape = try cache_pool.Shape.init(o.settings.kv_pool_tokens, if (o.settings.kv_shard) 2 else 1, e.cur.st.caches.len + 1, o.settings.kv);
@@ -874,7 +878,7 @@ pub const Engine = struct {
         try cuda.launch.launch(e.m.glue.top1, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, e.stream, &a);
         try e.lib.check(e.lib.api.ncclAllGather(e.pairs.ptr + e.share.rank * 8, e.pairs.ptr, 2, .u32, e.comm, e.stream.handle), "ncclAllGather");
         try e.stream.synchronize();
-        var all: [16][2]u32 = undefined;
+        var all: [ranks.max_world][2]u32 = undefined; // Engine.init refuses a larger world
         try e.d.check(e.d.api.cuMemcpyDtoH_v2(&all, e.pairs.ptr, world * 8), "cuMemcpyDtoH");
         var pick = all[0];
         for (all[1..world]) |p| {

@@ -9,7 +9,7 @@ The prior GLM candidate is preserved at `archive/glm53-before-mia-20261016`.
 
 This imports numerical components into the existing `glm` family. The current
 Engine, rank link, target sampler, lane acceptance, vision and persistent store
-remain the execution path. The shared v1.0.12 trunk has separate source pins.
+remain the execution path. The GLM branch now integrates the shared v1.0.12 base.
 
 ## Runtime controls
 
@@ -28,8 +28,8 @@ current lane interface. The returned count can be smaller. The target sampler
 and acceptance loop decide which proposals to keep. Checkpoint configuration
 and weight contents enter paired startup and spill identity.
 
-`mia-mcg4` requires routed 4-bit MCG EXL3, hidden size4096 and local expert
-width1024. Unsupported books, widths, full-EXL3 shared experts and non-EXL3
+`mia-mcg4` requires routed 4-bit MCG EXL3, hidden size 4096 and local expert
+width 1024. Unsupported books, widths, full-EXL3 shared experts and non-EXL3
 routed weights are refused. The existing shared expert fill remains in use.
 Generic scalar and tensor EXL3 remain available on separate loads.
 
@@ -41,7 +41,7 @@ identity from the generic expert path.
 
 ## Accepted state and persistence
 
-Target forwards capture post-layer stream means at zero-based layers5,14,24,33 and42.
+Target forwards capture post-layer stream means at zero-based layers 5, 14, 24, 33 and 42.
 Whole, shared and pieced forwards use the allocated plane stride. Split
 prefills exchange rank-owned tap slices with the normalized row slices.
 Each lane retains its own pending window before shared scratch is reused.
@@ -57,7 +57,7 @@ snapshots and NVMe payloads carry the new geometry and checkpoint identity.
 
 ## Captured kernels and attribution
 
-`zig/kernels/dflash2-aot` contains the finite24-variant subset needed by DFlash2.
+`zig/kernels/dflash2-aot` contains the finite 24-variant subset needed by DFlash2.
 `provenance.json` records the donor archive and every file SHA256. Runtime
 loading checks the manifest and cubins against compiled hashes. CUDA build
 outputs install these assets beside both CLI and native-server binaries.
@@ -80,3 +80,13 @@ Device numerical parity, target tap parity across split prefills, DFlash
 acceptance, routed outputs, eight-lane memory, ring wrap and live NVMe resume
 require an authorized GPU trial. Compilation and CPU copies do not establish
 production quality or a speedup. Both imported runtime modes remain opt-in.
+
+## v1.0.12 integration
+
+Shared server JSON, snapshot row images, observer publication and checkpoint
+math use the v1.0.12 APIs. GLM CUDA retains its encoded-image probe and rank-owner
+decoder through `Info.encoded_vision`. Other families retain upstream prepared
+image input through `Info.vision`. The two paths share the existing request
+lifetime and server boundaries. GLM spill and Nemotron compact snapshots retain
+separate family adapters over the shared tier. Imported execution modes remain
+opt-in; the integration does not establish new GPU qualification.

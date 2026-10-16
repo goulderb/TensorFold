@@ -156,6 +156,26 @@ pub const Metrics = struct {
         try gauge(w, "client_disconnections_total", "counter", "Requests a client left before the reply left the server.", snap.disconnects);
         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
         if (status.shared_prefix_waits) |n| try gauge(w, "shared_prefix_waits_total", "counter", "Distinct requests that waited for a compatible in-flight prefix.", n);
+        if (status.prefill) |pf| {
+            try gauge(w, "prefill_rows_submitted_total", "counter", "Prompt rows the primary model queued for computation (resumed rows excluded).", pf.submitted_rows);
+            try gauge(w, "prefill_rows_completed_total", "counter", "Prompt rows of prompt passes the primary model finished (resumed rows excluded).", pf.completed_rows);
+            try gauge(w, "prefill_passes_total", "counter", "Prompt passes the primary model finished.", pf.passes);
+        }
+        var sp: api.SpillStatus = undefined;
+        if (engine.spill(&sp)) {
+            try gauge(w, "spill_disk_read_states_total", "counter", "Kept states read back from the spill tier into memory (raw reads; a later restore may fail).", sp.cache.read_back);
+            try gauge(w, "spill_disk_read_tokens_total", "counter", "Prompt tokens of spill files read back, before any restore commits.", sp.tier.stats.loaded_tokens);
+            try gauge(w, "spill_restored_states_total", "counter", "Read-back states whose restore committed and a prompt pass resumed from.", sp.cache.recalled);
+            try gauge(w, "spill_restored_tokens_total", "counter", "Prompt tokens committed restores from the spill tier covered.", sp.cache.recalled_tokens);
+            try gauge(w, "spill_write_submitted_total", "counter", "States handed to the spill tier's writer (not proof of persistence).", sp.writes.submitted);
+            try gauge(w, "spill_write_written_total", "counter", "Submitted states the tier finished writing.", sp.writes.written);
+            try gauge(w, "spill_write_lost_total", "counter", "Submitted states the tier gave up.", sp.writes.lost);
+            try gauge(w, "spill_write_skipped_total", "counter", "Spill opportunities skipped while the adapter's slot was busy.", sp.writes.skipped_busy);
+            try gauge(w, "spill_write_failed_total", "counter", "Spill writes the family refused or failed.", sp.cache.write_failed);
+            try gauge(w, "spill_recall_failed_total", "counter", "Stored states that would not read back (forgotten).", sp.cache.recall_failed);
+            try gauge(w, "spill_unavailable_total", "counter", "Stored states skipped because a copy was still being written.", sp.cache.unavailable);
+            try gauge(w, "spill_status_age_ms", "gauge", "Milliseconds since the engine thread took this spill snapshot.", sp.age_ms);
+        }
     }
 };
 
@@ -363,4 +383,39 @@ test "request counter append failure frees its label" {
     m.httpRequest(std.testing.io, "client", 200);
     try std.testing.expectEqual(@as(u64, 2), m.requests.items[0].count);
     try std.testing.expectEqual(allocations, failing.allocations);
+}
+
+test "render separates raw spill reads, committed restores, write outcomes and executed prefill rows" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    const Spilling = struct {
+        stub: RenderStub = .{ .status_value = .{ .prefill = .{ .submitted_rows = 6144, .completed_rows = 4096, .passes = 2 } } },
+        fn spill(_: *anyopaque, out: *api.SpillStatus) bool {
+            out.* = .{ .tier = .{ .stats = .{ .loaded_tokens = 8192 }, .entries = 1, .pending = 0, .stored_bytes = 1, .queued_bytes = 0, .disk_free = 1, .cap = 1 }, .age_ms = 7 };
+            out.cache.read_back = 2;
+            out.cache.recalled_tokens = 4096;
+            out.writes.skipped_busy = 5;
+            out.writes.lost = 1;
+            return true;
+        }
+        fn engine(x: *@This()) api.Engine {
+            return .{ .ctx = &x.stub, .vtable = &.{ .info = RenderStub.info, .submit = RenderStub.submit, .cancel = RenderStub.cancel, .status = RenderStub.status, .memory = RenderStub.memory, .spill = spill } };
+        }
+    };
+    var x: Spilling = .{};
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.render(std.testing.io, &out.writer, x.engine(), 4096);
+    const body = out.written();
+    for ([_][]const u8{
+        "tensorfold:prefill_rows_submitted_total 6144\n",
+        "tensorfold:prefill_rows_completed_total 4096\n",
+        "tensorfold:prefill_passes_total 2\n",
+        "tensorfold:spill_disk_read_states_total 2\n",
+        "tensorfold:spill_disk_read_tokens_total 8192\n",
+        "tensorfold:spill_restored_tokens_total 4096\n",
+        "tensorfold:spill_write_skipped_total 5\n",
+        "tensorfold:spill_write_lost_total 1\n",
+        "tensorfold:spill_status_age_ms 7\n",
+    }) |want| try std.testing.expect(std.mem.indexOf(u8, body, want) != null);
 }

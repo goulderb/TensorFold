@@ -1,6 +1,6 @@
 //! Cortheon's reply loop: rounds with the model's server tool calls run between them, checks at the end, one reply.
 const std = @import("std");
-const json = @import("../json.zig");
+const json = @import("json");
 const errors = @import("../errors.zig");
 const chat = @import("../chat.zig");
 const tool_parse = @import("../tool_parse.zig");
@@ -131,7 +131,12 @@ const Filter = struct {
     const Call = struct { index: i64, server: bool, client: u32 };
 
     fn sink(f: *Filter) chat.Sink {
-        return .{ .ctx = f, .call = call };
+        return .{ .ctx = f, .call = call, .accepted = accepted };
+    }
+
+    fn accepted(ctx: *anyopaque) error{Closed}!void {
+        const f: *Filter = @ptrCast(@alignCast(ctx));
+        if (f.inner) |inner| if (inner.accepted) |accept| try accept(inner.ctx);
     }
 
     fn startRound(f: *Filter) void {

@@ -756,3 +756,50 @@ test "a queued follower copy returns NotStored without waiting for its blocked w
     defer ready.close();
     try std.testing.expectEqualSlices(u32, &tokens, ready.tokens);
 }
+
+test "settings refuse non-finite, negative and overflowing numbers before any conversion" {
+    const Env = struct {
+        vars: []const [2][]const u8,
+        pub fn get(e: @This(), name: [:0]const u8) ?[]const u8 {
+            for (e.vars) |kv| if (std.mem.eql(u8, kv[0], name)) return kv[1];
+            return null;
+        }
+    };
+    const bad = [_][2][]const u8{
+        .{ "TENSORFOLD_SPILL_GIB", "nan" },
+        .{ "TENSORFOLD_SPILL_GIB", "inf" },
+        .{ "TENSORFOLD_SPILL_GIB", "1e300" },
+        .{ "TENSORFOLD_SPILL_MIN_FREE_GIB", "nan" },
+        .{ "TENSORFOLD_SPILL_MIN_FREE_GIB", "-1" },
+        .{ "TENSORFOLD_SPILL_MIN_FREE_GIB", "1e300" },
+        .{ "TENSORFOLD_SPILL_FLUSH_S", "inf" },
+        .{ "TENSORFOLD_SPILL_FLUSH_S", "-3" },
+        .{ "TENSORFOLD_SPILL_FLUSH_S", "1e300" },
+        .{ "TENSORFOLD_SPILL_HIGHWATER", "nan" },
+    };
+    for (bad) |kv| {
+        const vars = [_][2][]const u8{ .{ "TENSORFOLD_SPILL_GIB", "1" }, .{ "TENSORFOLD_SPILL_DIR", "/x" }, kv };
+        // the later pair wins where the names match: GIB itself is replaced by the bad value
+        const got = spill.Settings.fromEnv(gpa, Env{ .vars = if (std.mem.eql(u8, kv[0], "TENSORFOLD_SPILL_GIB")) &.{ kv, .{ "TENSORFOLD_SPILL_DIR", "/x" } } else &vars });
+        if (got) |maybe| {
+            if (maybe) |st| gpa.free(st.dir);
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
+test "waitDone returns once the write is final, after its source was copied" {
+    var root = try Root.make();
+    defer root.deinit();
+    const t = try Tier.open(gpa, io, root.settings(1 << 20), "toy", identity_a, 0, 1);
+    defer t.deinit();
+    var tok: [40]u32 = undefined;
+    const tokens = tokensOf(&tok, 2);
+    var pay: [9000]u8 = undefined;
+    var m: Mem = .{ .bytes = payloadOf(&pay, 3) };
+    const j = try t.write(Name.of(tokens[0..30], 30), tokens[0..30], "", m.bytes.len, m.source());
+    defer j.release();
+    j.waitDone();
+    try std.testing.expect(j.copied() and j.done() and j.ok);
+    j.waitDone(); // already final: returns at once
+}

@@ -245,11 +245,14 @@ const LT = struct {
         out[0] = .{ .algo = .{ .data = @splat(0) }, .workspace_size = 512, .state = 0, .waves_count = 1, .reserved = @splat(0) };
         return 0;
     }
+    fn algoCheck(_: lt.Handle, _: lt.MatmulDesc, _: lt.Layout, _: lt.Layout, _: lt.Layout, _: lt.Layout, _: *const lt.Algo, _: *lt.Heuristic) callconv(.c) c_int {
+        unreachable;
+    }
     fn matmul(_: lt.Handle, _: lt.MatmulDesc, _: ?*const anyopaque, _: u64, _: lt.Layout, _: u64, _: lt.Layout, _: ?*const anyopaque, _: u64, _: lt.Layout, _: u64, _: lt.Layout, _: ?*const lt.Algo, _: u64, _: usize, _: cuda.abi.Stream) callconv(.c) c_int {
         matmuls += 1;
         return 0;
     }
-    const api: lt.Api = .{ .cublasLtCreate = handle, .cublasLtDestroy = unhandle, .cublasLtGetVersion = version, .cublasLtGetStatusName = name, .cublasLtMatmulDescCreate = desc, .cublasLtMatmulDescDestroy = undesc, .cublasLtMatmulDescSetAttribute = descAttr, .cublasLtMatrixLayoutCreate = layout, .cublasLtMatrixLayoutDestroy = unlayout, .cublasLtMatrixLayoutSetAttribute = layoutAttr, .cublasLtMatmulPreferenceCreate = pref, .cublasLtMatmulPreferenceDestroy = unpref, .cublasLtMatmulPreferenceSetAttribute = prefAttr, .cublasLtMatmulAlgoGetHeuristic = heuristic, .cublasLtMatmul = matmul };
+    const api: lt.Api = .{ .cublasLtCreate = handle, .cublasLtDestroy = unhandle, .cublasLtGetVersion = version, .cublasLtGetStatusName = name, .cublasLtMatmulDescCreate = desc, .cublasLtMatmulDescDestroy = undesc, .cublasLtMatmulDescSetAttribute = descAttr, .cublasLtMatrixLayoutCreate = layout, .cublasLtMatrixLayoutDestroy = unlayout, .cublasLtMatrixLayoutSetAttribute = layoutAttr, .cublasLtMatmulPreferenceCreate = pref, .cublasLtMatmulPreferenceDestroy = unpref, .cublasLtMatmulPreferenceSetAttribute = prefAttr, .cublasLtMatmulAlgoGetHeuristic = heuristic, .cublasLtMatmulAlgoCheck = algoCheck, .cublasLtMatmul = matmul };
 };
 var library: lt.Library = .{ .lib = undefined, .api = LT.api };
 const kernel_image: [8]u8 align(8) = @splat(0);

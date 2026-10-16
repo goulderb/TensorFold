@@ -597,3 +597,46 @@ ssh bgoulder@192.0.2.11 'docker run --rm --network none --user "$(id -u):$(id -g
 ```
 
 Record the results as a manifest in `fleet/trials/` of local-ai-server.
+
+## Nemotron CUDA adapter on v1.0.12 (GPU requalification pending)
+
+`zig/src/native/nemotron_spill.zig` binds the shared tier to native Nemotron CUDA (TP1). The adapter extends
+upstream's compact `Copy` and `cuda_disk.Image` gather/scatter implementation. The old v1.0.7 runtime qualification
+does not qualify this changed snapshot ABI. The tier stays off unless `TENSORFOLD_SPILL_GIB` is set.
+
+An enabled tier also needs `TENSORFOLD_SPILL_HOST_GIB`. Its host reservation covers one maximum-window compact
+state, two 64 MiB transfer buffers and a 64 MiB control allowance. The prompt-cache budget first pays upstream's
+Mamba spares, then charges this reservation once as the family's spare. The remaining budget must hold at least
+one page-rounded device snapshot; logical payload length is not its allocation size. Startup refuses incompatible
+budgets, invalid or orphaned spill settings, sliding context, loaded Living Weights and `--learn-conversations`.
+The last option uses upstream's own row store and must not share ownership with this tier.
+
+- Writes: the lane owner binds the context and fences the engine stream, then gathers three Image ranges: 16
+  scalar bytes, compact KV through the saved position, and recurrent Mamba state. The logical payload is
+  `16 + kv_row * position + mamba`, including head KV when present. The host slot has maximum-window capacity,
+  but only the actual payload is written. A busy slot is a counted skip (`Tier.unwritten(.incomplete)`). The
+  writer reads immutable host bytes until `copied`; its outcome and reference are settled at `done`.
+- Reads: private metadata `NEMOCU02` must match the loaded KV row, recurrent size, head flag, window, grid and
+  lookahead 1 before a Copy is allocated. The name and metadata positions must agree and lie on the configured
+  grid. Old codec files refuse. The upstream Image allocator and scatter implementation restore compact state;
+  chunk boundaries split across the three logical ranges, each scatter settles before buffer reuse, and error
+  cleanup fences outstanding work before freeing it. A Copy is published only after the payload hash and zero
+  row-count/parity checks pass. Captured row count is normalized to zero before persistence.
+- Identity: config, index, every shard and the MTP file are stat'ed before load and hashed whole afterward; a
+  changed file refuses the tier. The executable and captured AOT set, driver, compute capability, kernels,
+  segments, resolved checkpoint math (`modelopt/checkpoint`, `modelopt/full` or `mlx/full`) and layout are hashed.
+- Cache policy: enabling the tier selects grid-aligned states. With the tier off, upstream Nemotron's any-row
+  snapshot policy remains available. A capture must be complete, at the named position and canonical parity.
+- Close: after the lane thread joins, one flush pass offers kept states not on disk, most recently used first.
+  Each write waits for the slot. No new write is submitted after `TENSORFOLD_SPILL_FLUSH_S`, a lost write or a
+  refusal. Every submitted job settles to `done` before the tier, device copies and context are released. The
+  deadline limits new submissions, not settlement of work already queued.
+- Status: the engine thread publishes spill counts and executed prefill rows by value. `/health` (`spill`,
+  `prefill`) and `/metrics` (`spill_*`, `prefill_rows_*`) read that copy with its age.
+- `TENSORFOLD_QUAL_IDS_DIR` is an opt-in private 0700 directory outside the model. It records completed,
+  non-streamed generated IDs for cold/RAM/disk comparisons.
+
+CPU tests use a fake device and upstream Image callbacks to cover compact round trips, metadata/hash corruption,
+quota, page-rounded admission, busy-slot ownership and close outcomes. They do not establish GPU restore parity,
+NVMe timing or reboot durability. GPU qualification must compare IDs only after two cold runs of the same prompt
+agree; equality covers greedy decoding on the tested prompts.

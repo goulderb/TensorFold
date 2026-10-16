@@ -148,6 +148,9 @@ pub const Settings = struct {
     }
 };
 
+/// The most ranks a world holds: rank 0's greedy pick gathers every rank's top-1 into one host array of this size.
+pub const max_world = 16;
+
 /// The process environment's value of `name` (null when unset).
 pub fn environment(name: [:0]const u8) ?[]const u8 {
     return std.mem.span(std.c.getenv(name) orelse return null);
@@ -155,7 +158,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 12,
+    layout: u32 = 13,
     world: u32,
     rank: u32,
     split: u32,
@@ -306,18 +309,35 @@ test "Mia expert selection parses once and separates rank and spill identities" 
 }
 
 /// Every rank's `mine` in rank order, over one ncclAllGather.
-pub fn gather(comptime T: type, d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, rank: usize, mine: T, out: []T) !void {
+pub fn gather(
+    comptime T: type,
+    d: *const cuda.Driver,
+    lib: *const cuda.nccl.Library,
+    comm: cuda.nccl.Comm,
+    stream: cuda.Stream,
+    rank: usize,
+    mine: T,
+    out: []T,
+) !void {
     const size = @sizeOf(T);
     var dev = try cuda.DeviceBuffer.alloc(d, size * out.len);
     defer dev.free();
     try dev.uploadAsync(rank * size, std.mem.asBytes(&mine), stream.handle);
-    try lib.check(lib.api.ncclAllGather(dev.ptr + rank * size, dev.ptr, size, .u8, comm, stream.handle), "ncclAllGather");
+    const gathered = lib.api.ncclAllGather(dev.ptr + rank * size, dev.ptr, size, .u8, comm, stream.handle);
+    try lib.check(gathered, "ncclAllGather");
     try stream.synchronize();
     try dev.download(0, std.mem.sliceAsBytes(out));
 }
 
 /// All-gathers `mine` over `comm`; any disagreement is error.RankMismatch on every rank, printing what differs.
-pub fn agree(d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, mine: Fingerprint, out: []Fingerprint) !void {
+pub fn agree(
+    d: *const cuda.Driver,
+    lib: *const cuda.nccl.Library,
+    comm: cuda.nccl.Comm,
+    stream: cuda.Stream,
+    mine: Fingerprint,
+    out: []Fingerprint,
+) !void {
     try gather(Fingerprint, d, lib, comm, stream, mine.rank, mine, out);
     if (mismatch(out)) |m| {
         std.debug.print("REFUSE rank settings: rank {d}'s {s} differs from rank 0's ({s})\n", .{ m.rank, @tagName(m.field), explain(m.field) });
@@ -418,10 +438,13 @@ test "fingerprints: agreeing ranks pass; the first differing field and rank are 
     try std.testing.expectEqual(Mismatch{ .field = .split, .rank = 1 }, mismatch(&all).?);
     all[1] = Fingerprint.of(2, 0, .{}, 8192, h0, h0, "/hub/snapshots/423acf37");
     try std.testing.expectEqual(Fingerprint.Field.rank, mismatch(&all).?.field);
-    all[1] = Fingerprint.of(2, 1, .{ .heat = .{ .high_c = 92, .low_c = 88 } }, 8192, h0, h0, "/hub/snapshots/423acf37");
+    const heat_on: Settings = .{ .heat = .{ .high_c = 92, .low_c = 88 } };
+    all[1] = Fingerprint.of(2, 1, heat_on, 8192, h0, h0, "/hub/snapshots/423acf37");
     try std.testing.expectEqual(Fingerprint.Field.heat_high, mismatch(&all).?.field);
     all[1] = Fingerprint.of(2, 1, .{}, 8192, h0, h0, "/hub/snapshots/other");
     try std.testing.expectEqual(Fingerprint.Field.checkpoint, mismatch(&all).?.field);
+    all[1] = Fingerprint.of(2, 1, .{ .draft = .off }, 8192, h0, h0, "/hub/snapshots/423acf37");
+    try std.testing.expectEqual(Mismatch{ .field = .draft, .rank = 1 }, mismatch(&all).?);
 }
 
 fn cacheSetting(comptime value: []const u8) *const fn ([:0]const u8) ?[]const u8 {

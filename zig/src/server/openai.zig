@@ -1,6 +1,6 @@
 //! POST /v1/chat/completions and /v1/completions, JSON or SSE, as ``server.http`` answers them.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const fields = @import("fields.zig");
 const chat = @import("chat.zig");
@@ -117,6 +117,11 @@ const Plan = struct {
     named: []const u8,
 };
 
+/// A chat body checked as a chat completion's is, for routes that render it without a reply (/v1/imprint).
+pub fn chatInput(srv: *Server, cx: *Cx, raw: Value) errors.Refused!chat.Input {
+    return (try plan(srv, cx, true, raw)).input;
+}
+
 /// Everything checked before a reply starts (a refusal here is a 400 with no stream opened).
 fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     const body = try fields.parseNumbers(cx, raw);
@@ -129,15 +134,15 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     var input: chat.Input = .{ .fields = undefined };
     if (is_chat) {
         var source = body.get("messages");
-        if (srv.info.vision) |probe| {
+        if (srv.info.encoded_vision) |probe| {
             const prepared = try glm_image_parts.prepare(cx, source orelse .null, .{ .ctx = probe.ctx, .rows = probe.rows });
             source = prepared.messages;
             if (prepared.hasImages()) input.vision = .{ .encoded = prepared.encoded, .rows = prepared.rows };
         }
-        input.messages = try messages.normalize(cx, source, "system", srv.needs_user_after_tool);
+        input.messages = try messages.normalizeWith(cx, source, "system", srv.needs_user_after_tool, .of(srv.info.vision));
         input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
-        input.messages = try messages.normalize(cx, m, "system", srv.needs_user_after_tool);
+        input.messages = try messages.normalizeWith(cx, m, "system", srv.needs_user_after_tool, .of(srv.info.vision));
     };
     if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
     // ``body.get("max_tokens") or body.get("max_completion_tokens")``: both are ints or None by now
@@ -432,19 +437,29 @@ const Run = struct {
         run: *Run,
         tools: bool,
         opened: bool = false,
-        prompt_len: usize = 0,
+        prompt_len: usize,
+        pending: std.ArrayList(Value) = .empty,
 
         fn accepted(ctx: *anyopaque) error{Closed}!void {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
+            if (s.opened) return;
             const r = s.run;
             try r.out.vt.open(r.out.ctx, s.prompt_len);
             s.opened = true;
             if (!s.tools and r.is_chat) try r.emit(r.chunk(roleDelta(r.a) catch return error.Closed, null) catch return error.Closed);
+            var pending = s.pending;
+            s.pending = .empty;
+            defer pending.deinit(r.a);
+            for (pending.items) |delta| try call(s, delta);
         }
 
         fn call(ctx: *anyopaque, delta: Value) error{Closed}!void {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
             const r = s.run;
+            if (!s.opened) {
+                s.pending.append(r.a, delta) catch return error.Closed;
+                return;
+            }
             if (!s.tools) {
                 // completions stream text only, with its logprob rows when asked
                 if (!r.is_chat and delta != .string and (delta != .object or delta.object.get("content") == null)) return;
@@ -508,6 +523,7 @@ const Run = struct {
             break :blk ready.prepared;
         };
         var sink_state: StreamSink = .{ .run = r, .tools = tools, .prompt_len = prepared.prompt_len };
+        defer sink_state.pending.deinit(a);
         const sink: chat.Sink = .{ .ctx = &sink_state, .call = StreamSink.call, .accepted = StreamSink.accepted };
         var reply = (if (r.turn) |t| cortheon.loop.stream(t, r.srv, &cx, &r.plan.input, prepared, sink, gone) else chat.generate(r.srv, &cx, prepared, sink, gone)) catch |e| {
             if (!sink_state.opened) return r.unsent(&cx, e, field);
@@ -569,4 +585,26 @@ const Run = struct {
 
 fn roleDelta(a: Allocator) Allocator.Error!Value {
     return chat.deltaOf(a, "role", "assistant");
+}
+
+test "acceptance opens one public stream and carries the prepared prompt count" {
+    const Capture = struct {
+        opens: usize = 0,
+        prompt_len: usize = 0,
+        fn open(ptr: *anyopaque, n: usize) error{Closed}!void {
+            const c: *@This() = @ptrCast(@alignCast(ptr));
+            c.opens += 1;
+            c.prompt_len = n;
+        }
+    };
+    var capture: Capture = .{};
+    var run_: Run = undefined;
+    run_.out = .{ .ctx = &capture, .vt = &.{ .open = Capture.open, .event = undefined, .reply = undefined } };
+    run_.is_chat = false;
+    run_.a = std.testing.allocator;
+    var sink: Run.StreamSink = .{ .run = &run_, .tools = false, .prompt_len = 17 };
+    try Run.StreamSink.accepted(&sink);
+    try Run.StreamSink.accepted(&sink);
+    try std.testing.expectEqual(@as(usize, 1), capture.opens);
+    try std.testing.expectEqual(@as(usize, 17), capture.prompt_len);
 }

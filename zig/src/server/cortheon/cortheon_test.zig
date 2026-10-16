@@ -1,7 +1,7 @@
 //! Cortheon end to end on a scripted engine and a stand-in web: rounds, research, streams, splices and checks.
 const std = @import("std");
 const api = @import("engine_api");
-const json = @import("../json.zig");
+const json = @import("json");
 const model_text = @import("../model_text.zig");
 const openai = @import("../openai.zig");
 const server_mod = @import("../server.zig");
@@ -63,6 +63,7 @@ const Text = struct {
 const Eng = struct {
     script: []const []const u8 = &.{},
     next: usize = 0,
+    full_at: ?usize = null,
     prompts: std.ArrayList([]u8) = .empty,
 
     fn engine(e: *Eng) api.Engine {
@@ -73,6 +74,7 @@ const Eng = struct {
     }
     fn submit(ctx: *anyopaque, id: api.Id, request: *const api.Request, sink: api.Sink) api.SubmitError!void {
         const e: *Eng = @ptrCast(@alignCast(ctx));
+        if (e.full_at) |n| if (e.next == n) return error.Full;
         const buf = gpa.alloc(u8, request.prompt.len) catch return error.Busy;
         for (request.prompt, buf) |tok, *byte| byte.* = @intCast(tok);
         e.prompts.append(gpa, buf) catch {};
@@ -121,17 +123,25 @@ const Web = struct {
 const Got = struct {
     events: std.ArrayList(Value) = .empty,
     body: ?Value = null,
+    status: ?u16 = null,
+    opens: usize = 0,
+    early_event: bool = false,
     a: Allocator,
     fn out(g: *Got) openai.Out {
         return .{ .ctx = g, .vt = &.{ .open = open, .event = event, .reply = reply } };
     }
-    fn open(_: *anyopaque, _: usize) error{Closed}!void {}
+    fn open(ctx: *anyopaque, _: usize) error{Closed}!void {
+        const g: *Got = @ptrCast(@alignCast(ctx));
+        g.opens += 1;
+    }
     fn event(ctx: *anyopaque, payload: ?Value) error{Closed}!void {
         const g: *Got = @ptrCast(@alignCast(ctx));
+        if (g.opens == 0) g.early_event = true;
         if (payload) |p| g.events.append(g.a, json.deepCopy(g.a, p) catch return error.Closed) catch return error.Closed;
     }
-    fn reply(ctx: *anyopaque, _: u16, payload: Value) void {
+    fn reply(ctx: *anyopaque, status: u16, payload: Value) void {
         const g: *Got = @ptrCast(@alignCast(ctx));
+        g.status = status;
         g.body = json.deepCopy(g.a, payload) catch null;
     }
     /// Every streamed delta's text under `key`, joined.
@@ -253,6 +263,8 @@ test "a stream hides Cortheon's calls, shows progress as reasoning, and passes t
     defer arena.deinit();
     const a = arena.allocator();
     const got = try rig.ask(a, "{\"stream\": true, \"messages\": [{\"role\": \"user\", \"content\": \"Explain my parser, see https://docs.example/x\"}], \"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"bash\", \"parameters\": {\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}}}}}]}");
+    try std.testing.expect(!got.early_event);
+    try std.testing.expectEqual(@as(usize, 1), got.opens);
     const calls = try got.streamedCalls();
     try std.testing.expect(std.mem.indexOf(u8, calls, "bash") != null);
     try std.testing.expect(std.mem.indexOf(u8, calls, "cortheon") == null);
@@ -329,4 +341,32 @@ test "the web budget ends the research and the reply still comes back without Co
     const m = message(got.body.?);
     try std.testing.expect(m.get("tool_calls") == null);
     try std.testing.expect(std.mem.indexOf(u8, m.strField("content").?, "cortheon_search") == null);
+}
+
+test "streamed research opens before progress and keeps one head across answer rounds" {
+    var rig: Rig = .{ .eng = .{ .script = &.{ "1. Zig latest release notes\n2. Zig 0.17 changelog\n", "The latest is 0.17." } } };
+    try rig.start(true);
+    defer rig.stop();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const got = try rig.ask(arena.allocator(), "{\"stream\": true, \"messages\": [{\"role\": \"user\", \"content\": \"What is the latest release of Zig?\"}]}");
+    try std.testing.expect(!got.early_event);
+    try std.testing.expectEqual(@as(usize, 1), got.opens);
+    try std.testing.expectEqual(@as(usize, 2), rig.web.searches);
+    try std.testing.expect(std.mem.indexOf(u8, try got.streamed("reasoning_content"), "Cortheon: searching the web") != null);
+    try std.testing.expectEqualStrings("The latest is 0.17.\n\nOK", try got.streamed("content"));
+}
+
+test "research progress stays unsent when the answer is refused before admission" {
+    var rig: Rig = .{ .eng = .{ .full_at = 1, .script = &.{"Zig latest release notes"} } };
+    try rig.start(true);
+    defer rig.stop();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const got = try rig.ask(arena.allocator(), "{\"stream\": true, \"messages\": [{\"role\": \"user\", \"content\": \"What is the latest release of Zig?\"}]}");
+    try std.testing.expect(rig.web.searches > 0);
+    try std.testing.expectEqual(@as(?u16, 429), got.status);
+    try std.testing.expectEqual(@as(usize, 0), got.opens);
+    try std.testing.expectEqual(@as(usize, 0), got.events.items.len);
+    try std.testing.expect(!got.early_event);
 }

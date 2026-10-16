@@ -1,6 +1,6 @@
 //! Schema features passed to the pinned xgrammar compiler. Unknown constraints fail before generation.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 
 pub fn validate(cx: *errors.Cx, value: json.Value) errors.Refused!void {

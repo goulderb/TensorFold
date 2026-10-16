@@ -1,5 +1,5 @@
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
@@ -133,7 +133,10 @@ test "a still image keeps its ordered text, expands exact marker rows and preser
     const parsed = try json.parse(cx.a,
         \\[{"role":"user","content":[{"type":"text","text":"What? "},{"type":"image_url","image_url":{"url":"data:image/png;base64,YWJj"}},{"type":"text","text":" Thanks"}]}]
     );
-    const messages = switch (parsed) { .ok => |v| v, .err => return error.TestUnexpectedResult };
+    const messages = switch (parsed) {
+        .ok => |v| v,
+        .err => return error.TestUnexpectedResult,
+    };
     const mock = struct {
         fn rows(_: *anyopaque, bytes: []const u8, images: usize) !u32 {
             try std.testing.expectEqualStrings("abc", bytes);
@@ -156,9 +159,14 @@ test "tool screenshots use the same ordered markers" {
     const parsed = try json.parse(cx.a,
         \\[{"role":"tool","tool_call_id":"t1","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,YWJj"}}]}]
     );
-    const messages = switch (parsed) { .ok => |v| v, .err => return error.TestUnexpectedResult };
+    const messages = switch (parsed) {
+        .ok => |v| v,
+        .err => return error.TestUnexpectedResult,
+    };
     const mock = struct {
-        fn rows(_: *anyopaque, _: []const u8, _: usize) !u32 { return 1; }
+        fn rows(_: *anyopaque, _: []const u8, _: usize) !u32 {
+            return 1;
+        }
     };
     var context: u8 = 0;
     const result = try prepare(&cx, messages, .{ .ctx = &context, .rows = mock.rows });
@@ -172,7 +180,10 @@ test "multiple pictures retain message order and the shared per-picture budget" 
     const parsed = try json.parse(cx.a,
         \\[{"role":"user","content":[{"type":"text","text":"First "},{"type":"image_url","image_url":{"url":"data:image/png;base64,YQ=="}}]},{"role":"tool","tool_call_id":"t1","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,Yg=="}}]}]
     );
-    const messages = switch (parsed) { .ok => |v| v, .err => return error.TestUnexpectedResult };
+    const messages = switch (parsed) {
+        .ok => |v| v,
+        .err => return error.TestUnexpectedResult,
+    };
     const mock = struct {
         fn rows(_: *anyopaque, _: []const u8, images: usize) !u32 {
             try std.testing.expectEqual(@as(usize, 2), images);

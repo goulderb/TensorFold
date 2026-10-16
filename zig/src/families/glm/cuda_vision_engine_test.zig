@@ -168,13 +168,16 @@ const LT = struct {
         out[0] = .{ .algo = .{ .data = @splat(0) }, .workspace_size = 512, .state = 0, .waves_count = 1, .reserved = @splat(0) };
         return 0;
     }
+    fn algoCheck(_: lt.Handle, _: lt.MatmulDesc, _: lt.Layout, _: lt.Layout, _: lt.Layout, _: lt.Layout, _: *const lt.Algo, _: *lt.Heuristic) callconv(.c) c_int {
+        unreachable;
+    }
     fn matmul(_: lt.Handle, _: lt.MatmulDesc, _: ?*const anyopaque, w: u64, _: lt.Layout, x: u64, _: lt.Layout, _: ?*const anyopaque, _: u64, _: lt.Layout, out: u64, _: lt.Layout, _: ?*const lt.Algo, _: u64, n: usize, _: cuda.abi.Stream) callconv(.c) c_int {
         std.debug.assert(n == 512);
         matmuls += 1;
         Trace.push(.{ .kind = .linear, .x = x, .w = w, .out = out });
         return if (matmuls == fail_matmul) 7 else 0;
     }
-    const api: lt.Api = .{ .cublasLtCreate = handle, .cublasLtDestroy = unhandle, .cublasLtGetVersion = version, .cublasLtGetStatusName = name, .cublasLtMatmulDescCreate = desc, .cublasLtMatmulDescDestroy = undesc, .cublasLtMatmulDescSetAttribute = descAttr, .cublasLtMatrixLayoutCreate = layout, .cublasLtMatrixLayoutDestroy = unlayout, .cublasLtMatrixLayoutSetAttribute = layoutAttr, .cublasLtMatmulPreferenceCreate = pref, .cublasLtMatmulPreferenceDestroy = unpref, .cublasLtMatmulPreferenceSetAttribute = prefAttr, .cublasLtMatmulAlgoGetHeuristic = heuristic, .cublasLtMatmul = matmul };
+    const api: lt.Api = .{ .cublasLtCreate = handle, .cublasLtDestroy = unhandle, .cublasLtGetVersion = version, .cublasLtGetStatusName = name, .cublasLtMatmulDescCreate = desc, .cublasLtMatmulDescDestroy = undesc, .cublasLtMatmulDescSetAttribute = descAttr, .cublasLtMatrixLayoutCreate = layout, .cublasLtMatrixLayoutDestroy = unlayout, .cublasLtMatrixLayoutSetAttribute = layoutAttr, .cublasLtMatmulPreferenceCreate = pref, .cublasLtMatmulPreferenceDestroy = unpref, .cublasLtMatmulPreferenceSetAttribute = prefAttr, .cublasLtMatmulAlgoGetHeuristic = heuristic, .cublasLtMatmulAlgoCheck = algoCheck, .cublasLtMatmul = matmul };
 };
 fn convolution(h: C.cudnnHandle_t, a: ?*const anyopaque, xd: C.cudnnTensorDescriptor_t, x: ?*const anyopaque, wd: C.cudnnFilterDescriptor_t, w: ?*const anyopaque, cd: C.cudnnConvolutionDescriptor_t, algo: C.cudnnConvolutionFwdAlgo_t, s: ?*anyopaque, n: usize, b: ?*const anyopaque, yd: C.cudnnTensorDescriptor_t, y: ?*anyopaque) callconv(.c) C.cudnnStatus_t {
     Trace.push(.{ .kind = .conv, .x = @intFromPtr(x), .w = @intFromPtr(w), .out = @intFromPtr(y) });

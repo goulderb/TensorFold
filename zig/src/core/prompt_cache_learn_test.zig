@@ -246,7 +246,9 @@ test "actual Store learn writes neither half on peer refusal, backs off, and rem
     if (fsys.open(file, .{})) |fd| {
         fsys.close(fd);
         return error.OrphanedHalf;
-    } else |_| {}
+    } else |err| {
+        if (err != error.Missing) return err;
+    }
 }
 test "under-cap disk pressure selects the same LRU victim before either half is persisted" {
     const Disk = struct {
