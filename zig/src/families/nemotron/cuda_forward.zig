@@ -265,7 +265,7 @@ pub const Forward = struct {
     }
 
     /// The window's tail: b.y holds every row's final-normed state; the head, grammar masks and the sample.
-    fn tailOnly(f: *const Forward, segs: []const Seg, rows: usize) !void {
+    pub fn tailOnly(f: *const Forward, segs: []const Seg, rows: usize) !void {
         const c = f.c;
         const b = f.b;
         const o = f.ops;
@@ -282,14 +282,21 @@ pub const Forward = struct {
     /// Blocks `from`..`to` over `rows`, carrying the residual `x`, its pending `delta` and the mixer counters.
     /// `skip_first_norm`: the caller already ran that block's norm (a layer split's receiving rank).
     fn runBlocks(f: *const Forward, segs: []const Seg, rows: usize, x: *u64, delta: *Delta, mj: *usize, aj: *usize, from: usize, to: usize, skip_first_norm: bool) !void {
+        for (f.w.blocks[from..to], from..) |blk, li| {
+            if (!(skip_first_norm and li == from)) try f.norm(x, delta.*, blk.norm, rows, true);
+            try f.blockMixer(segs, rows, blk, delta, mj, aj);
+        }
+    }
+
+    /// One window block after its norm: the mixer, leaving its output in b.delta (dense) or b.ymoe (moe).
+    pub fn blockMixer(f: *const Forward, segs: []const Seg, rows: usize, blk: weights.Block, delta: *Delta, mj: *usize, aj: *usize) !void {
         const c = f.c;
         const b = f.b;
         const o = f.ops;
         const t = f.glue;
         const ms = f.mshape(state.max_rows);
         const at = f.ashape();
-        for (f.w.blocks[from..to], from..) |blk, li| {
-            if (!(skip_first_norm and li == from)) try f.norm(x, delta.*, blk.norm, rows, true);
+        {
             switch (blk.kind) {
                 .mamba => {
                     const m = blk.mamba;
@@ -396,6 +403,36 @@ pub const Forward = struct {
             try f.mark(.experts_down);
         }
         try f.sharedRest(o, m, rows, !prompt);
+    }
+
+    /// A two-GPU TP rank's MoE (expert parallel): the whole router, the picks remapped into this rank's own expert
+    /// table, its pairs alone planned and run, and its partial (fp32 [rows, hidden]) left in `out32` for the exchange.
+    pub fn moeTp(f: *const Forward, m: weights.MoE, rows: usize, prompt: bool, out32: u64) !void {
+        const c = f.c;
+        const b = f.b;
+        const o = f.ops;
+        const ex = m.experts;
+        const pairs = rows * c.slots();
+        const own = c.ownedExperts();
+        try f.glue.route(b.y, m.router, m.bias, b.part, b.pick, b.wts, rows, c.hidden, c.experts, c.top_k, c.routed_scaling, c.norm_topk);
+        try f.mark(.route);
+        try o.epRemap(b.pick, pairs, c.slots(), c.top_k, own.first, own.count, c.tp_rank);
+        const tile: usize = if (prompt) cuda.experts.promptTile(ex.format) else 16;
+        try o.plan(b.pick, pairs, ex.experts, tile, b.plan);
+        try f.mark(.plan);
+        const items = kern.maxItems(pairs, ex.experts, tile);
+        const g = o.grouped();
+        const in = f.rowsIn(ex);
+        if (prompt) {
+            try g.prompt(o.s, .up, in[0], ex, b.plan, b.act, items, -1);
+            try g.prompt(o.s, .down_bf16, in[1], ex, b.plan, b.ymoe, items, -1);
+        } else {
+            try g.decode(o.s, .up, in[0], ex, b.plan, b.act, items, -1);
+            try f.mark(.experts_up);
+            try g.decode(o.s, .down_f32, in[1], ex, b.plan, b.ymoe, items, -1);
+            try f.mark(.experts_down);
+        }
+        try o.epPartial(b.ymoe, !prompt, b.wts, b.pick, rows, c.slots(), c.top_k, c.hidden, out32);
     }
 
     /// The pocket over the rows of sequences that read what was learned: every row, or the runs between untaught ones'.

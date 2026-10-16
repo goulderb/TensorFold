@@ -63,17 +63,89 @@ pub fn part(ck: *core.Checkpoint, pre: []const u8) !Part {
     return p;
 }
 
+/// A two-GPU TP rank's share of a projection: whole, some output rows (ranges of [start, count]), or one span of
+/// input columns [start, count]. FP8 and bf16 keep their per-tensor scale; an NVFP4 column span keeps whole 16-blocks.
+pub const Cut = union(enum) { whole, rows: []const [2]usize, cols: [2]usize };
+
+/// `p` restricted to `cut`, its bytes copied into host memory the loader keeps until its uploads finish.
+pub fn cut(L: *Loader, p: Part, c: Cut) !Part {
+    switch (c) {
+        .whole => return p,
+        .rows => |ranges| {
+            var n: usize = 0;
+            for (ranges) |r| {
+                if (r[0] + r[1] > p.n) return error.BadTpCut;
+                n += r[1];
+            }
+            var q = p;
+            q.w = try rowsOf(L, p.w, ranges, n);
+            if (p.blocks) |b| q.blocks = try rowsOf(L, b, ranges, n);
+            q.n = n;
+            return q;
+        },
+        .cols => |span| {
+            if (span[0] + span[1] > p.k) return error.BadTpCut;
+            if (span[1] % 64 != 0) return error.BadTpCut; // the lane packers read k in 64s
+            var q = p;
+            switch (p.kind) {
+                .bf16 => q.w = try colsOf(L, p.w, span[0] * 2, span[1] * 2, span[1]),
+                .fp8 => q.w = try colsOf(L, p.w, span[0], span[1], span[1]),
+                .nvfp4 => {
+                    if (span[0] % 16 != 0) return error.BadTpCut;
+                    q.w = try colsOf(L, p.w, span[0] / 2, span[1] / 2, span[1] / 2);
+                    q.blocks = try colsOf(L, p.blocks.?, span[0] / 16, span[1] / 16, span[1] / 16);
+                },
+            }
+            q.k = span[1];
+            return q;
+        },
+    }
+}
+
+/// Rows `ranges` of a 2-d tensor, `n` in all, as a host tensor.
+fn rowsOf(L: *Loader, t: Tensor, ranges: []const [2]usize, n: usize) !Tensor {
+    const row = t.bytes.len / t.dim(0);
+    const whole = try L.gpa.alloc(u8, t.bytes.len);
+    defer L.gpa.free(whole);
+    try L.src.read(whole, t.bytes);
+    const out = try L.keep(u8, n * row);
+    var at: usize = 0;
+    for (ranges) |r| {
+        @memcpy(out[at..][0 .. r[1] * row], whole[r[0] * row ..][0 .. r[1] * row]);
+        at += r[1] * row;
+    }
+    return W.made(t.dtype, n, t.dim(1), out);
+}
+
+/// Bytes [start, start + len) of every row of a 2-d tensor as a host tensor whose second dimension is `d1`.
+fn colsOf(L: *Loader, t: Tensor, start: usize, len: usize, d1: usize) !Tensor {
+    const rows = t.dim(0);
+    const row = t.bytes.len / rows;
+    const whole = try L.gpa.alloc(u8, t.bytes.len);
+    defer L.gpa.free(whole);
+    try L.src.read(whole, t.bytes);
+    const out = try L.keep(u8, rows * len);
+    for (0..rows) |r| @memcpy(out[r * len ..][0..len], whole[r * row + start ..][0..len]);
+    return W.made(t.dtype, rows, d1, out);
+}
+
 fn kernels(L: *Loader) !*const kern.Modelopt {
     return if (L.ops.k.modelopt) |*m| m else error.ModeloptNotLoaded;
 }
 
 /// Row-stacked parts (one projection, or q, k, v) of one kind and one scale as a lane weight, packed on the GPU.
 pub fn dense(L: *Loader, ck: *core.Checkpoint, label: []const u8, prefixes: []const []const u8) !kern.QLinear {
+    return denseCut(L, ck, label, prefixes, &.{});
+}
+
+/// `dense` with each part restricted to its cut (a two-GPU TP rank's share); no cuts: every part whole.
+pub fn denseCut(L: *Loader, ck: *core.Checkpoint, label: []const u8, prefixes: []const []const u8, cuts: []const Cut) !kern.QLinear {
     const m = try kernels(L);
     var parts: [3]Part = undefined;
     var n: usize = 0;
     for (prefixes, 0..) |pre, i| {
         parts[i] = try part(ck, pre);
+        if (cuts.len > 0) parts[i] = try cut(L, parts[i], cuts[i]);
         n += parts[i].n;
     }
     const first = parts[0];
@@ -163,6 +235,7 @@ pub fn moe(L: *Loader, ck: *core.Checkpoint, label: []const u8, pre: []const u8,
 }
 
 fn experts(L: *Loader, ck: *core.Checkpoint, label: []const u8, pre: []const u8, c: Config) !kern.Experts {
+    if (c.tp_world > 1) return expertsOwned(L, ck, label, pre, c);
     const m = try kernels(L);
     const E = c.experts;
     const e = E + 2;
@@ -202,6 +275,67 @@ fn experts(L: *Loader, ck: *core.Checkpoint, label: []const u8, pre: []const u8,
             try m.pack.fp4Experts(st, base, base + e * codes, out, E, n, k, 0, k, 1, 0);
             const one = Nvfp4Experts.bytes(1, n, k, 1);
             for (0..2) |h| try m.pack.fp4Experts(st, base + E * codes, base + e * codes + E * blocks, out + (E + h) * one, 1, n, 2 * k, h * k, k, 1, 0);
+            layer.down = out;
+        }
+    }
+    layer.up_scale = try scales(L, try name(&a, "{s}.experts.up_scale", .{label}), gs[0..e]);
+    layer.down_scale = try scales(L, try name(&a, "{s}.experts.down_scale", .{label}), gs[e..]);
+    return layer;
+}
+
+/// A two-GPU TP rank's experts (expert parallel): the routed experts it owns, then its half of the shared expert, as
+/// one table of owned + 1. Picks are remapped into it before the plan (Ops.epRemap); the router stays whole.
+fn expertsOwned(L: *Loader, ck: *core.Checkpoint, label: []const u8, pre: []const u8, c: Config) !kern.Experts {
+    const m = try kernels(L);
+    const own = c.ownedExperts();
+    const E = own.count;
+    const e = E + 1;
+    const half = c.tp_rank; // this rank's shared half
+    const width = c.expert_width;
+    const D = c.hidden;
+    var layer: kern.Experts = .{ .format = .nvfp4, .up = 0, .down = 0, .width = width, .dims = D, .experts = e, .relu2 = true };
+    const gs = try L.gpa.alloc(f32, 2 * e);
+    defer L.gpa.free(gs);
+    var a: [128]u8 = undefined;
+    var b: [192]u8 = undefined;
+    // the other rank's experts: marked read, so the leftover check still catches a genuinely unread tensor
+    for (0..c.experts) |i| if (i < own.first or i >= own.first + E) try ck.skip(try name(&b, "{s}experts.{d}.", .{ pre, i }));
+    for ([2]bool{ true, false }) |up| {
+        const n = if (up) width else D;
+        const k = if (up) D else width;
+        const codes = n * k / 2;
+        const blocks = n * k / 16;
+        const slots = E + 2; // room for the shared expert's whole down matrix [D, 2W] beside the routed experts
+        const base = try L.tmp(slots * (codes + blocks));
+        for (0..E) |j| {
+            const i = own.first + j;
+            const p = try part(ck, try name(&b, "{s}experts.{d}.{s}", .{ pre, i, if (up) "up_proj" else "down_proj" }));
+            if (p.kind != .nvfp4 or p.n != n or p.k != k) return error.UnexpectedTensor;
+            try L.src.upload(base + j * codes, p.w.bytes);
+            try L.src.upload(base + slots * codes + j * blocks, p.blocks.?.bytes);
+            gs[@intFromBool(!up) * e + j] = p.scale;
+        }
+        const s = try part(ck, try name(&b, "{s}shared_experts.{s}", .{ pre, if (up) "up_proj" else "down_proj" }));
+        if (s.kind != .nvfp4 or s.n != (if (up) 2 * n else n) or s.k != (if (up) k else 2 * k)) return error.SharedExpertWidth;
+        if (up) {
+            // up [2W, D]: this rank's half is rows half*W .. (half + 1)*W, contiguous in both the codes and the blocks
+            try L.src.upload(base + E * codes, s.w.bytes[half * codes ..][0..codes]);
+            try L.src.upload(base + slots * codes + E * blocks, s.blocks.?.bytes[half * blocks ..][0..blocks]);
+        } else {
+            try L.src.upload(base + E * codes, s.w.bytes); // down [D, 2W] whole: the pack takes this half's columns
+            try L.src.upload(base + slots * codes + E * blocks, s.blocks.?.bytes);
+        }
+        gs[@intFromBool(!up) * e + E] = s.scale;
+        const out = try L.alloc(try name(&a, "{s}.experts.{s}", .{ label, if (up) "up" else "down" }), Nvfp4Experts.bytes(e, n, k, 1));
+        try L.src.flush();
+        const st = L.ops.s;
+        if (up) {
+            try m.pack.fp4Experts(st, base, base + slots * codes, out, e, n, k, 0, k, 1, 0);
+            layer.up = out;
+        } else {
+            try m.pack.fp4Experts(st, base, base + slots * codes, out, E, n, k, 0, k, 1, 0);
+            const one = Nvfp4Experts.bytes(1, n, k, 1);
+            try m.pack.fp4Experts(st, base + E * codes, base + slots * codes + E * blocks, out + E * one, 1, n, 2 * k, half * k, k, 1, 0);
             layer.down = out;
         }
     }

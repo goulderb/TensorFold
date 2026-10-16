@@ -22,6 +22,7 @@ const prompt_rows = @import("cuda_prompt_rows.zig");
 const prompt_pass = @import("cuda_prompt.zig");
 const marks = @import("cuda_marks.zig");
 const latent = @import("cuda_latent.zig");
+const tp2 = @import("cuda_tp2.zig");
 const identity = @import("cuda_identity.zig");
 pub const PromptRows = prompt_rows.PromptRows;
 
@@ -41,6 +42,8 @@ pub const Options = struct {
     /// A layer split's rank: which blocks this engine loads and runs, and which of the embedding, the seam norm and
     /// the tail. `all` is a single device.
     range: weights.Range = .all,
+    /// Two-GPU tensor parallel in one process: this engine's rank (cuda_tp2.zig). null: not a TP rank.
+    tp: ?usize = null,
 };
 
 /// Asked before each prompt chunk (or segmented call): true stops the prompt with error.Cancelled.
@@ -143,8 +146,10 @@ pub const Engine = struct {
     vision: ?*@import("cuda_vision.zig").Vision = null, // --vision: the tower and a prompt pass's image rows
     /// A layer split's rank: which blocks this engine runs, and which of the embedding, the seam norm and the tail.
     range: @import("cuda_forward.zig").Range = .all,
-    /// The other rank of a layer split, when this engine is one. null: a single device.
+    /// The other rank of a layer split or a two-GPU TP, when this engine is one. null: a single device.
     peer: ?*Engine = null,
+    /// Two-GPU TP (rank 0's engine): the pair's exchange. null: a layer split or a single device.
+    tp_link: ?*tp2.Link = null,
     /// The seam's host staging: one pinned buffer, sized for the widest prompt pass's h, y and xs.
     stage: [1]cuda.HostBuffer = undefined,
 
@@ -159,6 +164,7 @@ pub const Engine = struct {
         try ctx.makeCurrent();
         e.trace = std.c.getenv("TF_SLIDE_TRACE") != null;
         e.c = try Config.read(gpa, io, model_dir);
+        if (opts.tp) |rank| e.c = try e.c.forTp(rank, tp2.world);
         try latent.place(&e.c);
         if (e.c.rank > 0) return error.RankServesExperts; // ranks past 0 run cuda_worker.serve, not an engine
         e.c.ck = try @import("cuda_latent_ck.zig").wanted(ctx, e.c, opts.precision);
@@ -283,8 +289,33 @@ pub const Engine = struct {
     /// here, so the seam is in one place.
     pub fn runWindow(e: *Engine, parts: []const @import("cuda_forward.zig").Seg) !void {
         const f = e.forward(null);
+        if (e.tp_link) |l| return e.windowTp(l, parts, null);
         if (e.peer) |p| return f.windowSplit(&p.forward(null), parts, &e.stage);
         return f.windowSegs(parts);
+    }
+
+    /// A two-GPU TP window: rank 0's rows and the peer's matching own sequence (one stream a rank for now).
+    fn windowTp(e: *Engine, l: *tp2.Link, parts: []const @import("cuda_forward.zig").Seg, dump: ?*Dump) !void {
+        if (parts.len != 1 or parts[0].row0 != 0 or parts[0].b != &e.b) return error.TpSingleStream;
+        const p = e.peer.?;
+        var f0 = e.forward(dump);
+        f0.segs = parts;
+        f0.untaught = parts[0].untaught;
+        var f1 = p.forward(null);
+        const peer_segs = [_]@import("cuda_forward.zig").Seg{.{ .b = &p.b, .row0 = 0, .rows = parts[0].rows, .sampled = false, .slot = parts[0].slot, .untaught = parts[0].untaught }};
+        f1.segs = &peer_segs;
+        f1.untaught = parts[0].untaught;
+        return tp2.window(l, .{ &f0, &f1 }, .{ parts, &peer_segs });
+    }
+
+    /// The window's inputs on the TP peer: the same ids and meta row rank 0 uploaded, from the same pinned host words.
+    fn mirrorWindow(e: *Engine, ids: []const u8, meta: []const u8) !void {
+        const p = e.peer orelse return;
+        if (e.tp_link == null) return;
+        try p.ctx.makeCurrent();
+        defer e.ctx.makeCurrent() catch {};
+        try p.ops().upload(p.b.ids, ids);
+        try p.ops().upload(p.b.meta, meta);
     }
 
     fn recordBody(e: *Engine, body: Body) !void {
@@ -487,6 +518,7 @@ pub const Engine = struct {
         @memcpy(host[pin_ids..][0..ids.len], ids);
         try e.ops().upload(e.b.ids, std.mem.sliceAsBytes(host[pin_ids..][0..ids.len]));
         try e.ops().upload(e.b.meta, std.mem.sliceAsBytes(host[pin_meta..][0..4]));
+        try e.mirrorWindow(std.mem.sliceAsBytes(host[pin_ids..][0..ids.len]), std.mem.sliceAsBytes(host[pin_meta..][0..4]));
         try e.copied.record(e.stream);
         const m: usize = @intFromBool(e.sampling != null);
         if (dump == null and mask.bits == 0 and e.windows[m][rows] != null) {

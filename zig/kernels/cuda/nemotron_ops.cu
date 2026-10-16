@@ -291,3 +291,58 @@ extern "C" __global__ void tf_add_row(void* __restrict__ y, int y_f32, const flo
         *p = __float2bfloat16(__bfloat162float(*p) + x[i]);
     }
 }
+
+// ---- Two-GPU TP (TENSORFOLD_TP=2): expert parallel MoE and the pair sum ------------------------------------------
+
+// A rank's picks in its own expert table, in place: routed experts it owns (first .. first + count) become 0 .. count,
+// its shared half (slot routed + keep) becomes count, every other pair -1 (the plan skips it).
+extern "C" __global__ void __launch_bounds__(256) tf_ep_remap(int* __restrict__ picks, int pairs, int slots, int routed,
+                                                              int first, int count, int keep) {
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= pairs) return;
+    const int s = p % slots;
+    const int id = picks[p];
+    int out = -1;
+    if (s < routed) {
+        if (id >= first && id < first + count) out = id - first;
+    } else if (s - routed == keep) {
+        out = count;
+    }
+    picks[p] = out;
+}
+
+// One rank's MoE partial, unrounded fp32: per row and hidden column, its own pairs' outputs in ascending slot order,
+// an fma by the route weight for each routed slot and an add for its shared slot (its weight is never read), then
+// routed + shared. A pair the rank does not own (pick -1) is skipped; its ymoe row is not read.
+extern "C" __global__ void __launch_bounds__(256) tf_ep_partial(const void* __restrict__ ymoe, int y_f32,
+                                                                const float* __restrict__ wts, const int* __restrict__ picks,
+                                                                int rows, int slots, int routed, int d,
+                                                                float* __restrict__ out) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<int64_t>(rows) * d) return;
+    const int64_t r = i / d;
+    const int64_t c = i % d;
+    float acc = 0.0f, shared = 0.0f;
+    for (int s = 0; s < slots; ++s) {
+        const int64_t p = r * slots + s;
+        if (picks[p] < 0) continue;
+        const int64_t at = p * d + c;
+        const float v = y_f32 ? static_cast<const float*>(ymoe)[at]
+                              : __bfloat162float(static_cast<const __nv_bfloat16*>(ymoe)[at]);
+        if (s < routed) acc = __fmaf_rn(wts[p], v, acc);
+        else shared = __fadd_rn(shared, v);
+    }
+    out[i] = __fadd_rn(acc, shared);
+}
+
+// The two ranks' partials summed in fp32 and rounded to bf16 once. a + b is exact-commutative in IEEE fp32, so both
+// ranks write the same bits from (own, peer) in either order.
+extern "C" __global__ void __launch_bounds__(256) tf_tp_sum2(const void* __restrict__ a, int a_f32,
+                                                             const void* __restrict__ b, int b_f32,
+                                                             __nv_bfloat16* __restrict__ out, int64_t n) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float x = a_f32 ? static_cast<const float*>(a)[i] : __bfloat162float(static_cast<const __nv_bfloat16*>(a)[i]);
+    const float y = b_f32 ? static_cast<const float*>(b)[i] : __bfloat162float(static_cast<const __nv_bfloat16*>(b)[i]);
+    out[i] = __float2bfloat16_rn(__fadd_rn(x, y));
+}

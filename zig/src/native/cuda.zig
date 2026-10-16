@@ -55,7 +55,18 @@ const getenv = cuda_device.getenv;
 const setting = cuda_device.setting;
 
 /// TENSORFOLD_SPLIT=1 asks for the two-GPU layer split. Unset or 0: one device, the existing path.
-fn splitRequested() bool {
+/// TENSORFOLD_TP=2: two-GPU tensor parallel in one process (cuda_tp2.zig).
+fn tpRequested() bool {
+    const v = std.c.getenv("TENSORFOLD_TP") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "2");
+}
+
+/// A layer split or two-GPU TP: either one runs one stream over two devices, with the host's per-device admission.
+fn pairRequested() bool {
+    return splitOnly() or tpRequested();
+}
+
+fn splitOnly() bool {
     const t = std.mem.trim(u8, getenv("TENSORFOLD_SPLIT") orelse return false, " ");
     return t.len > 0 and !std.mem.eql(u8, t, "0");
 }
@@ -195,7 +206,7 @@ const Host = struct {
 
     pub fn bind(p: *anyopaque) *Host {
         const h: *Host = @ptrCast(@alignCast(p));
-        if (h.gpu) |g| if (bound != &g.ctx or splitRequested()) {
+        if (h.gpu) |g| if (bound != &g.ctx or pairRequested()) {
             g.ctx.makeCurrent() catch |e| std.log.err("cuCtxSetCurrent on the lane thread: {s}", .{@errorName(e)});
             bound = &g.ctx;
         };
@@ -415,13 +426,14 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         }
     };
     var probe: Probe = .{ .a = a, .io = io, .ctx = &g.ctx, .held = held0, .problem = problem };
-    const split = splitRequested();
+    const split = pairRequested();
     if (split and (o.drafts or o.slide or o.learn != null or segments != 1 or disk_config != null or (o.prompt_cache_gib orelse 0) != 0 or (o.lanes_fixed and o.lanes != 1))) {
         problem.* = "TENSORFOLD_SPLIT is a single-stream layer-split trial, not TP: use --no-drafts --parallel 1 --prompt-cache-gib 0 without learning, spill or segments";
         return null;
     }
     var opts: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments, .slide = o.slide };
-    if (@hasField(F.Options, "split")) opts.split = split;
+    if (@hasField(F.Options, "split")) opts.split = splitOnly();
+    if (@hasField(F.Options, "tp")) opts.tp = tpRequested();
     if (o.vision) |vo| {
         if (!@hasField(F.Options, "vision")) {
             problem.* = "--vision: this CUDA family reads no images; serve it without --vision";

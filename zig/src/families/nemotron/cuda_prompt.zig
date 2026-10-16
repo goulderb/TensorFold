@@ -103,7 +103,14 @@ pub fn serialChunks(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, 
         try e.ops().upload(e.b.p_ids, std.mem.sliceAsBytes(host));
         try e.copied.record(e.stream);
         e.prefill_counts.submitted_rows += chunk.len;
-        if (e.peer) |p| {
+        if (e.tp_link) |l| {
+            const p = e.peer.?;
+            try p.ctx.makeCurrent();
+            try p.ops().upload(p.b.p_ids, std.mem.sliceAsBytes(host));
+            const f1 = p.forward(null);
+            try @import("cuda_tp2.zig").chunk(l, .{ &f, &f1 }, chunk.len, e.pos);
+            try e.ctx.makeCurrent();
+        } else if (e.peer) |p| {
             try f.chunkSplit(&p.forward(null), @intCast(chunk.len), e.pos, &e.stage);
         } else try f.chunk(@intCast(chunk.len), e.pos);
         if (shared) |ad| if (f.route.decision(0) != null) try e.trainOps().latch(ad.score, ad.need, ad.latch, e.slot, true);

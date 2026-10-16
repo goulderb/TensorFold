@@ -61,6 +61,9 @@ pub const Kernels = struct {
     pocket_in: [2]cuda.Function, // the pocket's two halves a block row a row, then tiled for a prompt chunk's rows
     pocket_out: [2]cuda.Function,
     add_row: cuda.Function,
+    ep_remap: cuda.Function, // two-GPU TP: a rank's picks in its own expert table (nemotron_ops.cu)
+    ep_partial: cuda.Function, // two-GPU TP: a rank's MoE partial over its own pairs, fp32
+    tp_sum2: cuda.Function, // two-GPU TP: the two ranks' partials summed in fp32, rounded to bf16 once
     draws: cuda.sample.Draws, // sample.cu: the keyed draws and logprob rows
     grammar_mask: cuda.Function, // structured output: disallowed tokens -inf before the draw
     torch: torch_ops.Functions,
@@ -95,6 +98,9 @@ pub const Kernels = struct {
         k.pocket_in = .{ try k.mods[7].function("tf_pocket_in"), try k.mods[7].function("tf_pocket_in_rows") };
         k.pocket_out = .{ try k.mods[7].function("tf_pocket_out"), try k.mods[7].function("tf_pocket_out_rows") };
         k.add_row = try k.mods[7].function("tf_add_row");
+        k.ep_remap = try k.mods[7].function("tf_ep_remap");
+        k.ep_partial = try k.mods[7].function("tf_ep_partial");
+        k.tp_sum2 = try k.mods[7].function("tf_tp_sum2");
         k.torch = try torch_ops.Functions.resolve(k.mods[8..14]);
         k.draws = try cuda.sample.Draws.resolve(k.mods[14]);
         k.glue = try glue.Fns.resolve(k.mods[16..21]);
@@ -266,6 +272,39 @@ pub const Ops = struct {
     /// Prompt rows of a projection on this stream, by its format's prompt GEMM.
     pub fn prefillDense(o: Ops, x: u64, q: QLinear, out: u64, rows: usize) !void {
         return o.linear().prompt(o.s, q, .{ .x = x }, out, rows);
+    }
+
+    /// Two-GPU TP: `pairs` picks (slots a row, `routed` of them routed) made this rank's: owned routed experts
+    /// first .. first + count become 0 .. count, its shared half (slot routed + keep) count, the rest -1.
+    pub fn epRemap(o: Ops, picks: u64, pairs: usize, slots: usize, routed: usize, first: usize, count: usize, keep: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(picks);
+        for ([_]usize{ pairs, slots, routed, first, count, keep }) |v| a.add(int(v));
+        try o.go(o.k.ep_remap, .{ (pairs + 255) / 256, 1, 1 }, 256, 0, &a);
+    }
+
+    /// Two-GPU TP: this rank's MoE partial (fp32 [rows, d]) over the pairs it owns, in the fused norm's order.
+    pub fn epPartial(o: Ops, ymoe: u64, y_f32: bool, wts: u64, picks: u64, rows: usize, slots: usize, routed: usize, d: usize, out: u64) !void {
+        var a: cuda.Args = .{};
+        a.add(ymoe);
+        a.add(@as(c_int, @intFromBool(y_f32)));
+        a.add(wts);
+        a.add(picks);
+        for ([_]usize{ rows, slots, routed, d }) |v| a.add(int(v));
+        a.add(out);
+        try o.go(o.k.ep_partial, .{ (rows * d + 255) / 256, 1, 1 }, 256, 0, &a);
+    }
+
+    /// Two-GPU TP: out (bf16) = a + b in fp32, each bf16 or fp32, `n` values.
+    pub fn tpSum2(o: Ops, x: u64, x_f32: bool, y: u64, y_f32: bool, out: u64, n: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(@as(c_int, @intFromBool(x_f32)));
+        a.add(y);
+        a.add(@as(c_int, @intFromBool(y_f32)));
+        a.add(out);
+        a.add(@as(i64, @intCast(n)));
+        try o.go(o.k.tp_sum2, .{ (n + 255) / 256, 1, 1 }, 256, 0, &a);
     }
 
     /// nemotron_ops' rest: y (bf16, or fp32 when `y_f32`) += r x at rows `i * row_mul + row_add` for i < rows.

@@ -349,6 +349,7 @@ pub const Loader = struct {
     }
 
     fn mamba(L: *Loader, ck: *core.Checkpoint, name: []const u8, pre: []const u8) !Mamba {
+        if (L.w.config.tp_world > 1) return L.mambaTp(ck, name, pre);
         var a: [128]u8 = undefined;
         var b: [128]u8 = undefined;
         var m: Mamba = undefined;
@@ -379,7 +380,80 @@ pub const Loader = struct {
         return m;
     }
 
+    /// A two-GPU TP rank's Mamba block: its heads and their state groups. The in projection's z, x, B, C and dt rows of
+    /// those heads and groups (in that order, as the rank's projDim lays them out), the conv taps of its x, B and C
+    /// channels, its heads' A, D and dt bias, its gated norm's channels, and the out projection's matching columns.
+    fn mambaTp(L: *Loader, ck: *core.Checkpoint, name: []const u8, pre: []const u8) !Mamba {
+        const c = L.w.config;
+        const w = c.tp_world;
+        const r = c.tp_rank;
+        const li = c.inner(); // this rank's inner width
+        const gi = li * w; // the whole model's
+        const gl = c.groups * c.state; // this rank's B (or C) rows
+        const gg = gl * w;
+        const hl = c.mamba_heads;
+        var a: [128]u8 = undefined;
+        var b: [128]u8 = undefined;
+        var m: Mamba = undefined;
+        m.out_rest = 0;
+        m.adapter = null;
+        const in_rows = [_][2]usize{ .{ r * li, li }, .{ gi + r * li, li }, .{ 2 * gi + r * gl, gl }, .{ 2 * gi + gg + r * gl, gl }, .{ 2 * gi + 2 * gg + r * hl, hl } };
+        m.in_proj = try modelopt.denseCut(L, ck, try join(&a, name, ".in_proj"), &.{try join(&b, pre, "in_proj")}, &.{.{ .rows = &in_rows }});
+        m.out_proj = try modelopt.denseCut(L, ck, try join(&a, name, ".out_proj"), &.{try join(&b, pre, "out_proj")}, &.{.{ .cols = .{ r * li, li } }});
+        // the conv's channels are x, B and C: this rank's of each, in that order
+        const ch_ranges = [_][2]usize{ .{ r * li, li }, .{ gi + r * gl, gl }, .{ gi + gg + r * gl, gl } };
+        const conv = try ck.get(try join(&b, pre, "conv1d.weight"));
+        if (conv.rank != 3 or conv.dim(1) * conv.dim(2) != 4 or @min(conv.dim(1), conv.dim(2)) != 1 or conv.dtype != .bf16) return error.UnexpectedTensor;
+        if (conv.dim(0) != gi + 2 * gg) return error.UnexpectedTensor;
+        const ch = li + 2 * gl;
+        const whole = try L.gpa.alloc(u8, conv.bytes.len);
+        defer L.gpa.free(whole);
+        try L.src.read(whole, conv.bytes);
+        const taps = std.mem.bytesAsSlice(u32, try L.staging(ch * 4 * 4));
+        var at: usize = 0;
+        for (ch_ranges) |cr| for (cr[0]..cr[0] + cr[1]) |gc| {
+            for (0..4) |t| taps[t * ch + at] = @as(u32, std.mem.readInt(u16, whole[(gc * 4 + t) * 2 ..][0..2], .little)) << 16;
+            at += 1;
+        };
+        m.conv_w = try L.alloc(try join(&a, name, ".conv_w"), L.host.items.len);
+        try L.ops.upload(m.conv_w, L.host.items);
+        m.conv_b = try L.widen(try join(&a, name, ".conv_b"), try L.vecOf(try ck.get(try join(&b, pre, "conv1d.bias")), &ch_ranges));
+        const heads = [_][2]usize{.{ r * hl, hl }};
+        const alog = try L.widened(try L.vecOf(try ck.get(try join(&b, pre, "A_log")), &heads));
+        const src = try L.tmp(alog.len);
+        try L.ops.upload(src, alog);
+        m.a = try L.alloc(try join(&a, name, ".a"), alog.len);
+        try L.ops.torch().mambaA(src, m.a, alog.len / 4);
+        m.d = try L.widen(try join(&a, name, ".d"), try L.vecOf(try ck.get(try join(&b, pre, "D")), &heads));
+        m.dt_bias = try L.widen(try join(&a, name, ".dt_bias"), try L.vecOf(try ck.get(try join(&b, pre, "dt_bias")), &heads));
+        m.gnorm = try L.raw(try join(&a, name, ".gnorm"), try L.vecOf(try ck.get(try join(&b, pre, "norm.weight")), &.{.{ r * li, li }}));
+        return m;
+    }
+
+    /// Elements `ranges` of a 1-d tensor as a host tensor (a TP rank's channels or heads).
+    fn vecOf(L: *Loader, t: Tensor, ranges: []const [2]usize) !Tensor {
+        const per = t.bytes.len / t.dim(0);
+        var n: usize = 0;
+        for (ranges) |r| {
+            if (r[0] + r[1] > t.dim(0)) return error.BadTpCut;
+            n += r[1];
+        }
+        const whole = try L.gpa.alloc(u8, t.bytes.len);
+        defer L.gpa.free(whole);
+        try L.src.read(whole, t.bytes);
+        const out = try L.keep(u8, n * per);
+        var at: usize = 0;
+        for (ranges) |r| {
+            @memcpy(out[at..][0 .. r[1] * per], whole[r[0] * per ..][0 .. r[1] * per]);
+            at += r[1] * per;
+        }
+        var v = made(t.dtype, n, 1, out);
+        v.rank = 1;
+        return v;
+    }
+
     fn attention(L: *Loader, ck: *core.Checkpoint, name: []const u8, pre: []const u8) !Attention {
+        if (L.w.config.tp_world > 1) return L.attentionTp(ck, name, pre);
         var a: [128]u8 = undefined;
         var q: [128]u8 = undefined;
         var k: [128]u8 = undefined;
@@ -387,6 +461,26 @@ pub const Loader = struct {
         const qkv = try L.dense(ck, try join(&a, name, ".qkv"), &.{ try join(&q, pre, "q_proj"), try join(&k, pre, "k_proj"), try join(&v, pre, "v_proj") });
         var att: Attention = .{ .qkv = qkv, .o = undefined };
         att.o = try L.denseRest(ck, try join(&a, name, ".o"), &.{try join(&q, pre, "o_proj")}, &att.o_rest);
+        return att;
+    }
+
+    /// A two-GPU TP rank's attention block: its query heads, its KV head, and the out projection's matching columns.
+    fn attentionTp(L: *Loader, ck: *core.Checkpoint, name: []const u8, pre: []const u8) !Attention {
+        const c = L.w.config;
+        const r = c.tp_rank;
+        const qd = c.heads * c.head_dim;
+        const kd = c.kv_heads * c.head_dim;
+        var a: [128]u8 = undefined;
+        var q: [128]u8 = undefined;
+        var k: [128]u8 = undefined;
+        var v: [128]u8 = undefined;
+        const qr = [_][2]usize{.{ r * qd, qd }};
+        const kr = [_][2]usize{.{ r * kd, kd }};
+        const qkv = try modelopt.denseCut(L, ck, try join(&a, name, ".qkv"), &.{ try join(&q, pre, "q_proj"), try join(&k, pre, "k_proj"), try join(&v, pre, "v_proj") }, &.{ .{ .rows = &qr }, .{ .rows = &kr }, .{ .rows = &kr } });
+        var att: Attention = .{ .qkv = qkv, .o = undefined };
+        att.o_rest = 0;
+        att.adapter = null;
+        att.o = try modelopt.denseCut(L, ck, try join(&a, name, ".o"), &.{try join(&q, pre, "o_proj")}, &.{.{ .cols = .{ r * qd, qd } }});
         return att;
     }
 
