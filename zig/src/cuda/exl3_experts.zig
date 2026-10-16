@@ -48,7 +48,8 @@ pub const Experts = struct {
     mod: Module,
     decode_fn: Function, // every width and codebook
     prompt_fn: Function, // prompt rows on the tensor units
-    resident: [2]usize, // blocks the grid may hold, decode and prompt: per SM times SMs
+    tensor_fn: Function, // decode-sized rows on the tensor units
+    resident: [3]usize, // scalar decode, prompt, tensor decode: per SM times SMs
     decode: Decode = .scalar,
 
     pub fn load(d: *const Driver, sms: usize) !Experts {
@@ -57,7 +58,8 @@ pub const Experts = struct {
         errdefer mod.unload();
         const decode = try mod.function("tf_exl3_experts");
         const prompt = try mod.function("tf_exl3_experts_prompt");
-        const e: Experts = .{ .mod = mod, .decode_fn = decode, .prompt_fn = prompt, .resident = .{ @max(1, try decode.occupancy(256, 0)) * sms, @max(1, try prompt.occupancy(256, 0)) * sms } };
+        const tensor = try mod.function("tf_exl3_experts_tensor_decode");
+        const e: Experts = .{ .mod = mod, .decode_fn = decode, .prompt_fn = prompt, .tensor_fn = tensor, .resident = .{ @max(1, try decode.occupancy(256, 0)) * sms, @max(1, try prompt.occupancy(256, 0)) * sms, @max(1, try tensor.occupancy(256, 0)) * sms } };
         return e;
     }
 
@@ -91,8 +93,7 @@ pub const Experts = struct {
     /// Decode rows 16 pairs at a time, prompt rows 64 on the tensor units; a row's bits are its path's at every plan.
     pub fn run(e: *const Experts, s: Stream, epi: experts.Epi, in: experts.Rows, l: experts.Layer, p: grouped.Plan, out: u64, items: usize, skip: i32, prompt: bool) !void {
         const g = try geometry(epi, l);
-        const tensor = prompt or e.decode == .tensor;
-        const pi: usize = @intFromBool(tensor);
+        const pi: usize = if (prompt) 1 else if (e.decode == .tensor) 2 else 0;
         const grid = @min(items * (g.n / 128), e.resident[pi]);
         if (grid < 1) return;
         const up = epi == .up;
@@ -106,7 +107,7 @@ pub const Experts = struct {
         a.add(if (up) l.limit else @as(f32, 0.0));
         a.add(skip);
         a.add(g);
-        try launch_.launch(if (tensor) e.prompt_fn else e.decode_fn, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &a);
+        try launch_.launch(if (prompt) e.prompt_fn else if (e.decode == .tensor) e.tensor_fn else e.decode_fn, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s, &a);
     }
 };
 
@@ -148,7 +149,7 @@ test "tensor decode preserves the grouped decode plan, F32 epilogue and shared s
     };
     var d: Driver = undefined;
     d.api.cuLaunchKernel = Mock.launch;
-    var e: Experts = .{ .mod = undefined, .decode_fn = .{ .d = &d, .handle = @ptrFromInt(1) }, .prompt_fn = .{ .d = &d, .handle = @ptrFromInt(2) }, .resident = .{ 9999, 9999 } };
+    var e: Experts = .{ .mod = undefined, .decode_fn = .{ .d = &d, .handle = @ptrFromInt(1) }, .prompt_fn = .{ .d = &d, .handle = @ptrFromInt(2) }, .tensor_fn = .{ .d = &d, .handle = @ptrFromInt(3) }, .resident = .{ 9999, 9999, 9999 } };
     const g: experts.Grouped = .{ .exl3 = &e };
     const s: Stream = .{ .d = &d, .handle = null };
     const p: grouped.Plan = .{ .items = 101, .counts = 102, .members = 103, .rank = 104, .hist = 105 };
@@ -158,7 +159,7 @@ test "tensor decode preserves the grouped decode plan, F32 epilogue and shared s
         e.decode = policy;
         for ([_]experts.Epi{ .up, .down_f32 }) |epi| {
             try g.decode(s, epi, .{ .x = 301, .stride = 4096, .slots = 9 }, l, p, 302, items, 256);
-            try std.testing.expectEqual(@as(usize, if (policy == .scalar) 1 else 2), Mock.function);
+            try std.testing.expectEqual(@as(usize, if (policy == .scalar) 1 else 3), Mock.function);
             try std.testing.expectEqual(@as(u32, @intCast(items * (if (epi == .up) @as(usize, 8) else 32))), Mock.grid);
             try std.testing.expectEqualSlices(u64, &.{ 101, 102, 103, 302 }, Mock.values[5..9]);
             try std.testing.expectEqual(@as(u64, 256), Mock.values[10]);
@@ -166,7 +167,9 @@ test "tensor decode preserves the grouped decode plan, F32 epilogue and shared s
             try std.testing.expectEqual(@as(u64, if (epi == .up) 9 else 0), Mock.values[2]);
         }
     }
-    e.decode = .scalar;
+    e.resident[2] = 13;
+    try g.decode(s, .down_f32, .{ .x = 301, .stride = 1024 }, l, p, 302, items, 256);
+    try std.testing.expectEqual(@as(u32, 13), Mock.grid);
     try g.prompt(s, .down_bf16, .{ .x = 301, .stride = 1024 }, l, p, 302, 1, 256);
     try std.testing.expectEqual(@as(usize, 2), Mock.function);
     try std.testing.expectEqual(@as(u32, 3), Mock.geom.epi);

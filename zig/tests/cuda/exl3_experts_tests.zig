@@ -156,6 +156,25 @@ fn checkLayer(c: Ctx, what: []const u8, x: Experts, d: Dev, xs: []const u16, slo
         try layerRun(c, d, xd, slots, picks, prompt, act, y, -1);
         try rig.get(act, std.mem.sliceAsBytes(act_h));
         try rig.get(y, std.mem.sliceAsBytes(y_h));
+        if (!prompt and c.g.exl3.?.decode == .tensor) {
+            var r64 = c.g.exl3.?.*;
+            r64.tensor_fn = r64.prompt_fn;
+            r64.resident[2] = r64.resident[1];
+            var ref_ctx = c;
+            ref_ctx.g.exl3 = &r64;
+            const ref_act = try rig.zeros(pairs * x.width * 2);
+            const ref_y = try rig.zeros(pairs * x.dims * 4);
+            var same_plan = try PlanBufs.init(c.gpu, c.router, c.s, picks, d.layer.experts, 16);
+            defer same_plan.deinit();
+            for ([_]Ctx{ c, ref_ctx }, [_]u64{ act, ref_act }, [_]u64{ y, ref_y }) |ctx, activation, output| {
+                try ctx.g.decode(ctx.s, .up, .{ .x = xd, .stride = x.dims, .slots = slots }, d.layer, same_plan.plan, activation, same_plan.items, -1);
+                try ctx.g.decode(ctx.s, .down_f32, .{ .x = activation, .stride = x.width }, d.layer, same_plan.plan, output, same_plan.items, -1);
+            }
+            try rig.get(act, std.mem.sliceAsBytes(act_h));
+            try rig.get(y, std.mem.sliceAsBytes(y_h));
+            try sameRows(rig, ref_act, act_h, ref_y, y_h);
+            check.pass("{s}: tensor decode equals R64 on the identical 16-pair plan, BF16 activation and F32 down bytes", .{what});
+        }
         const gy = try rig.zeros(pairs * x.width * 4);
         const uy = try rig.zeros(pairs * x.width * 4);
         try oneRun(c, d.gate, xpd, picks, gy, prompt);

@@ -163,8 +163,8 @@ extern "C" __global__ void __launch_bounds__(256) tf_exl3_experts(const __nv_bfl
   tf_exl3x_width(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, xs, zs);
 }
 
-// Prompt rows in exl3.cu's prompt arithmetic: an item's 64 pairs a block, rows rotated inline, gate and up together.
-template <int K, int M>
+// Tensor rows in exl3.cu's prompt arithmetic: R pairs a block, rows rotated inline, gate and up together.
+template <int K, int M, int R>
 __device__ __forceinline__ void tf_exl3x_prompt_unit(const __nv_bfloat16* X, int x_stride, const unsigned* xr,
                                                      const unsigned* pr, unsigned rows, const uint8_t* W, const __half* H,
                                                      void* out, float limit, unsigned e, unsigned cb,
@@ -172,32 +172,33 @@ __device__ __forceinline__ void tf_exl3x_prompt_unit(const __nv_bfloat16* X, int
   constexpr unsigned TB = 32 * K;
   const unsigned tid = threadIdx.x, sg = tid / 32, lane = tid % 32, g8 = lane / 4, t4 = lane % 4, kb = g.k / 128;
   const unsigned tiles = (rows + 15) / 16;
-  __half* xs = reinterpret_cast<__half*>(buf);  // [M][64 rows][128] during the sums, buf [64][128] fp32 after them
+  static_assert(R == 16 || R == 64, "tensor rows are a decode or prompt tile");
+  __half* xs = reinterpret_cast<__half*>(buf);  // [M][R rows][136] during the sums, buf [R][128] fp32 after them
   const uint64_t row_bytes = (uint64_t)g.tiles_n * TB;
   const uint8_t* col[M];
   const __half* suh[M];
   uint4 next[M];
-  float acc[M][4][2][4];
+  float acc[M][R / 16][2][4];
 #pragma unroll
   for (int m = 0; m < M; ++m) {
     const uint64_t at = (uint64_t)e * g.mats + m;
     col[m] = W + at * g.stride + (uint64_t)(8 * cb + sg) * TB;
     suh[m] = H + at * (g.k + g.n);
     next[m] = tf_exl3_words<K>(reinterpret_cast<const uint32_t*>(col[m]), lane);
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < R / 16; ++i)
       for (int n = 0; n < 2; ++n) acc[m][i][n][0] = acc[m][i][n][1] = acc[m][i][n][2] = acc[m][i][n][3] = 0.0f;
   }
   for (unsigned ib = 0; ib < kb; ++ib) {
 #pragma unroll
     for (int m = 0; m < M; ++m)
-      for (unsigned i = sg; i < 64; i += 8) {
+      for (unsigned i = sg; i < R; i += 8) {
         float v[4];
         for (int q = 0; q < 4; ++q) {
           const unsigned c = ib * 128 + lane + 32 * q;
           v[q] = i < rows ? __fmul_rn(__bfloat162float(X[(uint64_t)xr[i] * x_stride + c]), __half2float(suh[m][c])) : 0.0f;
         }
         tf_exl3_fwht(v, lane);
-        for (int q = 0; q < 4; ++q) xs[(m * 64 + i) * TF_EXL3_XS + lane + 32 * q] = __float2half_rn(__fmul_rn(v[q], 0.0625f));
+        for (int q = 0; q < 4; ++q) xs[(m * R + i) * TF_EXL3_XS + lane + 32 * q] = __float2half_rn(__fmul_rn(v[q], 0.0625f));
       }
     __syncthreads();
     for (unsigned r = 0; r < 8; ++r) {
@@ -209,9 +210,9 @@ __device__ __forceinline__ void tf_exl3x_prompt_unit(const __nv_bfloat16* X, int
         tf_exl3_unpack_any<K>(now, lane, g.book, w);
         const uint32_t b[2][2] = {{tf_exl3_pair(w[0], w[1]), tf_exl3_pair(w[2], w[3])}, {tf_exl3_pair(w[4], w[5]), tf_exl3_pair(w[6], w[7])}};
 #pragma unroll
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < R / 16; ++i) {
           if (i >= tiles) break;
-          const __half* x = xs + (m * 64 + 16 * i + g8) * TF_EXL3_XS + 16 * r + 2 * t4;
+          const __half* x = xs + (m * R + 16 * i + g8) * TF_EXL3_XS + 16 * r + 2 * t4;
           const uint32_t a[4] = {*reinterpret_cast<const uint32_t*>(x), *reinterpret_cast<const uint32_t*>(x + 8 * TF_EXL3_XS),
                                  *reinterpret_cast<const uint32_t*>(x + 8), *reinterpret_cast<const uint32_t*>(x + 8 * TF_EXL3_XS + 8)};
           tf_exl3_mma(acc[m][i][0], a, b[0][0], b[0][1]);
@@ -222,11 +223,11 @@ __device__ __forceinline__ void tf_exl3x_prompt_unit(const __nv_bfloat16* X, int
     __syncthreads();
   }
   // each matrix in turn: its sums into buf, a warp a row through the transform and svh times 2^-3
-  float first[8][4];
+  float first[R / 8][4];
 #pragma unroll
   for (int m = 0; m < M; ++m) {
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < R / 16; ++i)
       for (int n = 0; n < 2; ++n)
         for (int h = 0; h < 2; ++h) {
           const unsigned c = 16 * sg + 8 * n + 2 * t4, row = 16 * i + g8 + 8 * h;
@@ -236,7 +237,7 @@ __device__ __forceinline__ void tf_exl3x_prompt_unit(const __nv_bfloat16* X, int
     __syncthreads();
     const __half* svh = H + ((uint64_t)e * g.mats + m) * (g.k + g.n) + g.k;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
+    for (int j = 0; j < R / 8; ++j) {
       const unsigned i = sg + 8 * j;
       if (i >= rows) break;
       float v[4];
@@ -255,34 +256,34 @@ __device__ __forceinline__ void tf_exl3x_prompt_unit(const __nv_bfloat16* X, int
   }
 }
 
-template <int K>
+template <int K, int R>
 __device__ __forceinline__ void tf_exl3x_prompt_units(const __nv_bfloat16* X, int x_stride, int slots, const uint8_t* W,
                                                       const __half* H, const int* items, const int* counts,
                                                       const int* members, void* out, float limit, int skip,
                                                       const TfExl3Experts g, float* buf) {
   const unsigned tid = threadIdx.x, nb = g.n / 128;
   const unsigned units = (unsigned)__ldg(counts) * nb;
-  __shared__ unsigned xr[64], pr[64];
+  __shared__ unsigned xr[R], pr[R];
   for (unsigned unit = blockIdx.x; unit < units; unit += gridDim.x) {
     const unsigned it = unit / nb, cb = unit % nb;
     const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
     if (e == skip) continue;
-    for (int r0 = 0; r0 < cnt; r0 += 64) {
-      const unsigned rows = cnt - r0 < 64 ? cnt - r0 : 64;
-      if (tid < 64) {
+    for (int r0 = 0; r0 < cnt; r0 += R) {
+      const unsigned rows = cnt - r0 < R ? cnt - r0 : R;
+      if (tid < R) {
         const int p = tid < rows ? __ldg(members + first + r0 + tid) : 0;
         pr[tid] = p;
         xr[tid] = slots ? p / slots : p;
       }
       __syncthreads();
-      if (g.mats == 2) tf_exl3x_prompt_unit<K, 2>(X, x_stride, xr, pr, rows, W, H, out, limit, e, cb, g, buf);
-      else tf_exl3x_prompt_unit<K, 1>(X, x_stride, xr, pr, rows, W, H, out, limit, e, cb, g, buf);
+      if (g.mats == 2) tf_exl3x_prompt_unit<K, 2, R>(X, x_stride, xr, pr, rows, W, H, out, limit, e, cb, g, buf);
+      else tf_exl3x_prompt_unit<K, 1, R>(X, x_stride, xr, pr, rows, W, H, out, limit, e, cb, g, buf);
     }
   }
 }
 
-#define TF_EXL3X_PROMPT_CASE(B) \
-  case B: tf_exl3x_prompt_units<B>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, buf); break;
+#define TF_EXL3X_PROMPT_CASE(B, R) \
+  case B: tf_exl3x_prompt_units<B, R>(X, x_stride, slots, W, H, items, counts, members, out, limit, skip, g, buf); break;
 // One prompt kernel for every width and codebook. buf holds two matrices' fp16 rows, then fp32 sums.
 extern "C" __global__ void __launch_bounds__(256) tf_exl3_experts_prompt(const __nv_bfloat16* X, int x_stride, int slots,
                                                                         const uint8_t* W, const __half* H, const int* items,
@@ -290,8 +291,20 @@ extern "C" __global__ void __launch_bounds__(256) tf_exl3_experts_prompt(const _
                                                                         float limit, int skip, const TfExl3Experts g) {
   __shared__ __align__(16) float buf[64 * TF_EXL3_XS];
   switch (g.bits) {
-    TF_EXL3X_PROMPT_CASE(1) TF_EXL3X_PROMPT_CASE(2) TF_EXL3X_PROMPT_CASE(3) TF_EXL3X_PROMPT_CASE(4)
-    TF_EXL3X_PROMPT_CASE(5) TF_EXL3X_PROMPT_CASE(6) TF_EXL3X_PROMPT_CASE(7) TF_EXL3X_PROMPT_CASE(8)
+    TF_EXL3X_PROMPT_CASE(1, 64) TF_EXL3X_PROMPT_CASE(2, 64) TF_EXL3X_PROMPT_CASE(3, 64) TF_EXL3X_PROMPT_CASE(4, 64)
+    TF_EXL3X_PROMPT_CASE(5, 64) TF_EXL3X_PROMPT_CASE(6, 64) TF_EXL3X_PROMPT_CASE(7, 64) TF_EXL3X_PROMPT_CASE(8, 64)
+    default: break;
+  }
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_exl3_experts_tensor_decode(const __nv_bfloat16* X, int x_stride, int slots,
+                                                                               const uint8_t* W, const __half* H, const int* items,
+                                                                               const int* counts, const int* members, void* out,
+                                                                               float limit, int skip, const TfExl3Experts g) {
+  __shared__ __align__(16) float buf[16 * TF_EXL3_XS];
+  switch (g.bits) {
+    TF_EXL3X_PROMPT_CASE(1, 16) TF_EXL3X_PROMPT_CASE(2, 16) TF_EXL3X_PROMPT_CASE(3, 16) TF_EXL3X_PROMPT_CASE(4, 16)
+    TF_EXL3X_PROMPT_CASE(5, 16) TF_EXL3X_PROMPT_CASE(6, 16) TF_EXL3X_PROMPT_CASE(7, 16) TF_EXL3X_PROMPT_CASE(8, 16)
     default: break;
   }
 }
