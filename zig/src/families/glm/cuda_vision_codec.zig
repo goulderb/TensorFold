@@ -12,11 +12,11 @@ const Allocator = std.mem.Allocator;
 pub const Limits = pre.Limits;
 pub const max_encoded_bytes = 10 * 1024 * 1024;
 pub const target_png_header_version: u32 = 10643;
-pub const target_webp_version: u32 = 0x010600;
-pub const target_jpeg_abi: u32 = 62;
+pub const target_webp_version: u32 = 0x010302;
+pub const target_jpeg_abi: u32 = 80;
 pub const target_png_library_sha256 = "5aeb2bcd1675ffe64f50ba3bc7ae5cfd03997d57f6e16ae2a1d31feb28fed128";
-pub const target_jpeg_library_sha256 = "543efcabfed7699011cd724e1631429a711e780a011885a68a25fe8078861d5d";
-pub const target_webp_library_sha256 = "2e20402cfbe7a8acc8dc2bc4b8a35f76c8fb62c84604b2ecb20ce13410512e3e";
+pub const target_jpeg_library_sha256 = "d45014b67ae6df2f15c8fb3e86d37b78375deede47ef73b7c61e8b6b28c8223f";
+pub const target_webp_library_sha256 = "d921459ab6508b3239218b0e4c2e44dbd2e702aeff4273190bf25d2036373930";
 
 pub const Format = enum(u32) { png = c.TF_GLM_CODEC_PNG, jpeg = c.TF_GLM_CODEC_JPEG, webp = c.TF_GLM_CODEC_WEBP };
 pub const Paths = struct {
