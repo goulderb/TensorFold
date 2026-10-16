@@ -131,7 +131,12 @@ const Filter = struct {
     const Call = struct { index: i64, server: bool, client: u32 };
 
     fn sink(f: *Filter) chat.Sink {
-        return .{ .ctx = f, .call = call };
+        return .{ .ctx = f, .call = call, .accepted = accepted };
+    }
+
+    fn accepted(ctx: *anyopaque) error{Closed}!void {
+        const f: *Filter = @ptrCast(@alignCast(ctx));
+        if (f.inner) |inner| if (inner.accepted) |accept| try accept(inner.ctx);
     }
 
     fn startRound(f: *Filter) void {

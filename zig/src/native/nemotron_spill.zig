@@ -1,15 +1,10 @@
-//! Nemotron CUDA kept states on the spill tier (docs/spill-tier.md): an owned host copy, written by the tier's thread.
+//! Nemotron CUDA compact states on the optional spill tier (docs/spill-tier.md).
 //!
-//! One owner thread: construction, then the lane host's thread (every Store call and every Tier.write runs there),
-//! then the closing thread after that thread is joined. `spill_write` binds the context, waits for the engine's
-//! non-blocking stream (the snapshot's copies are queued there; a blocking download on the legacy stream would not
-//! wait for them), downloads the whole state and head into one host slot it owns, and only then returns. The tier's
-//! writer thread reads that slot: it never calls CUDA nor touches a Copy, a Target or a live sequence. The slot is
-//! reused once its job has `copied`; a job's outcome is read, and its reference released, once it is `done`.
-//! `spill_read` validates the file against the loaded engine before allocating, uploads with the blocking
-//! `DeviceBuffer.upload` (it synchronizes the legacy stream), and returns a Copy only after the payload hash checked.
-//! While serving, a busy slot is a skip (`Tier.unwritten(.incomplete)`), never a failed write. A clean stop instead
-//! waits for the slot, so one flush pass offers every kept state once and its counts are real outcomes, not retries.
+//! The lane owner binds the CUDA context and fences the engine stream before gathering an upstream Image into
+//! one owned host slot. The tier writer sees immutable host bytes, never CUDA or live state. The slot is reusable
+//! after `copied`; the job reference and outcome remain owned until `done`. Restore uses the same Image ranges,
+//! settles each scatter, and publishes a Copy only after its payload hash and canonical scalars pass.
+//! Busy writes are counted skips while serving; close waits for the slot and settles every submitted job.
 const std = @import("std");
 const cuda = @import("cuda");
 const api = @import("engine_api");
@@ -227,7 +222,7 @@ pub const Disk = struct {
     tier: *spill.Tier,
     quota: *Quota,
     dir: []u8, // the tier's settings directory (owned)
-    slot: []u8, // the whole state and head, captured on the owner thread
+    slot: []u8, // worst-window capacity; only the captured position's compact bytes are written
     reservation: u64, // host bytes charged against the cache's budget (spare)
     job: ?*spill.Job = null, // the write reading the slot (until copied), then its outcome until done
     retired: [retired_most]?*spill.Job = @splat(null), // copied writes waiting for their outcome

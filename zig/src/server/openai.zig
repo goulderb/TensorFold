@@ -431,6 +431,7 @@ const Run = struct {
         tools: bool,
         opened: bool = false,
         prompt_len: usize,
+        pending: std.ArrayList(Value) = .empty,
 
         fn accepted(ctx: *anyopaque) error{Closed}!void {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
@@ -439,11 +440,19 @@ const Run = struct {
             try r.out.vt.open(r.out.ctx, s.prompt_len);
             s.opened = true;
             if (!s.tools and r.is_chat) try r.emit(r.chunk(roleDelta(r.a) catch return error.Closed, null) catch return error.Closed);
+            var pending = s.pending;
+            s.pending = .empty;
+            defer pending.deinit(r.a);
+            for (pending.items) |delta| try call(s, delta);
         }
 
         fn call(ctx: *anyopaque, delta: Value) error{Closed}!void {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
             const r = s.run;
+            if (!s.opened) {
+                s.pending.append(r.a, delta) catch return error.Closed;
+                return;
+            }
             if (!s.tools) {
                 // completions stream text only, with its logprob rows when asked
                 if (!r.is_chat and delta != .string and (delta != .object or delta.object.get("content") == null)) return;
@@ -507,6 +516,7 @@ const Run = struct {
             break :blk ready.prepared;
         };
         var sink_state: StreamSink = .{ .run = r, .tools = tools, .prompt_len = prepared.prompt_len };
+        defer sink_state.pending.deinit(a);
         const sink: chat.Sink = .{ .ctx = &sink_state, .call = StreamSink.call, .accepted = StreamSink.accepted };
         var reply = (if (r.turn) |t| cortheon.loop.stream(t, r.srv, &cx, &r.plan.input, prepared, sink, gone) else chat.generate(r.srv, &cx, prepared, sink, gone)) catch |e| {
             if (!sink_state.opened) return r.unsent(&cx, e, field);
@@ -584,6 +594,7 @@ test "acceptance opens one public stream and carries the prepared prompt count" 
     var run_: Run = undefined;
     run_.out = .{ .ctx = &capture, .vt = &.{ .open = Capture.open, .event = undefined, .reply = undefined } };
     run_.is_chat = false;
+    run_.a = std.testing.allocator;
     var sink: Run.StreamSink = .{ .run = &run_, .tools = false, .prompt_len = 17 };
     try Run.StreamSink.accepted(&sink);
     try Run.StreamSink.accepted(&sink);

@@ -598,34 +598,45 @@ ssh bgoulder@192.0.2.11 'docker run --rm --network none --user "$(id -u):$(id -g
 
 Record the results as a manifest in `fleet/trials/` of local-ai-server.
 
-## Nemotron CUDA adapter (preparation, not qualified)
+## Nemotron CUDA adapter on v1.0.12 (GPU requalification pending)
 
-`zig/src/native/nemotron_spill.zig` binds the shared tier to native Nemotron CUDA (TP1). It is off unless
-`TENSORFOLD_SPILL_GIB` is set; an enabled tier also needs `TENSORFOLD_SPILL_HOST_GIB`, the host bytes its slot (one
-whole-window state and MTP head), the tier's two 64 MiB transfer buffers and a 64 MiB index allowance may use. That
-reservation is charged inside the prompt cache's budget (the family's `spare`), which must also hold one state.
-Any other `TENSORFOLD_SPILL_*` setting without GIB, NaN, infinite, negative or oversized values, `--slide` or loaded
-Living Weights refuse startup.
+`zig/src/native/nemotron_spill.zig` binds the shared tier to native Nemotron CUDA (TP1). The adapter extends
+upstream's compact `Copy` and `cuda_disk.Image` gather/scatter implementation. The old v1.0.7 runtime qualification
+does not qualify this changed snapshot ABI. The tier stays off unless `TENSORFOLD_SPILL_GIB` is set.
 
-- Writes: on the engine thread the adapter binds the context, synchronizes the engine's non-blocking stream, downloads
-  the state and head into its one host slot and queues it; the tier's writer reads only that slot. A busy slot is a
-  counted skip (`Tier.unwritten(.incomplete)`), never a failed write. A write's outcome is read once it is `done`.
-- Reads: the private metadata (`NEMOCU01`) must match the loaded layout exactly (seven planes, head, window, grid,
-  lookahead 1, a grid position equal to the name's, canonical zero parity/prev_keep/rows) before anything is
-  allocated; uploads are blocking (`DeviceBuffer.upload`); a Copy returns only after the payload hash checked.
-- Identity: config, index, every shard and the MTP file are stat'ed before the load and hashed whole after it (a file
-  changed in between refuses the tier); the executable and any captured AOT set likewise; driver version, compute
-  capability, kernels, segments, format and the layout are hashed in.
-- Close: after the lane thread joins, one flush pass offers every kept state not on disk, most recently used first;
-  each write waits for the slot (no busy skips while stopping), none is submitted after `TENSORFOLD_SPILL_FLUSH_S` or
-  after a write was lost or refused. Every submitted write is settled to `done`, and only then do the tier, the
-  store's device copies and the context go. One log line gives the stop's outcome: states written, lost, refused and
-  left unwritten. The flush deadline limits new submissions, not the wait for ones already queued.
-- Status: the engine thread publishes the store's, tier's and adapter's counts and the engine's executed prefill rows
-  by value; `/health` (`spill`, `prefill`) and `/metrics` (`spill_*`, `prefill_rows_*`) read that copy with its age.
-- `TENSORFOLD_QUAL_IDS_DIR` (opt-in, a private 0700 directory outside the model) records each completed non-streamed
-  reply's committed generated ids for cold/RAM/disk comparison.
+An enabled tier also needs `TENSORFOLD_SPILL_HOST_GIB`. Its host reservation covers one maximum-window compact
+state, two 64 MiB transfer buffers and a 64 MiB control allowance. The prompt-cache budget first pays upstream's
+Mamba spares, then charges this reservation once as the family's spare. The remaining budget must hold at least
+one page-rounded device snapshot; logical payload length is not its allocation size. Startup refuses incompatible
+budgets, invalid or orphaned spill settings, sliding context, loaded Living Weights and `--learn-conversations`.
+The last option uses upstream's own row store and must not share ownership with this tier.
 
-CPU tests cover the codec, ownership, failure and close paths with a fake driver. GPU restore parity, NVMe timing and
-reboot durability are not qualified by them. A qualification compares generated ids only after two cold runs of the
-same prompt agree, and its equality claim covers greedy decoding on the prompts it tested, nothing wider.
+- Writes: the lane owner binds the context and fences the engine stream, then gathers three Image ranges: 16
+  scalar bytes, compact KV through the saved position, and recurrent Mamba state. The logical payload is
+  `16 + kv_row * position + mamba`, including head KV when present. The host slot has maximum-window capacity,
+  but only the actual payload is written. A busy slot is a counted skip (`Tier.unwritten(.incomplete)`). The
+  writer reads immutable host bytes until `copied`; its outcome and reference are settled at `done`.
+- Reads: private metadata `NEMOCU02` must match the loaded KV row, recurrent size, head flag, window, grid and
+  lookahead 1 before a Copy is allocated. The name and metadata positions must agree and lie on the configured
+  grid. Old codec files refuse. The upstream Image allocator and scatter implementation restore compact state;
+  chunk boundaries split across the three logical ranges, each scatter settles before buffer reuse, and error
+  cleanup fences outstanding work before freeing it. A Copy is published only after the payload hash and zero
+  row-count/parity checks pass. Captured row count is normalized to zero before persistence.
+- Identity: config, index, every shard and the MTP file are stat'ed before load and hashed whole afterward; a
+  changed file refuses the tier. The executable and captured AOT set, driver, compute capability, kernels,
+  segments, resolved checkpoint math (`modelopt/checkpoint`, `modelopt/full` or `mlx/full`) and layout are hashed.
+- Cache policy: enabling the tier selects grid-aligned states. With the tier off, upstream Nemotron's any-row
+  snapshot policy remains available. A capture must be complete, at the named position and canonical parity.
+- Close: after the lane thread joins, one flush pass offers kept states not on disk, most recently used first.
+  Each write waits for the slot. No new write is submitted after `TENSORFOLD_SPILL_FLUSH_S`, a lost write or a
+  refusal. Every submitted job settles to `done` before the tier, device copies and context are released. The
+  deadline limits new submissions, not settlement of work already queued.
+- Status: the engine thread publishes spill counts and executed prefill rows by value. `/health` (`spill`,
+  `prefill`) and `/metrics` (`spill_*`, `prefill_rows_*`) read that copy with its age.
+- `TENSORFOLD_QUAL_IDS_DIR` is an opt-in private 0700 directory outside the model. It records completed,
+  non-streamed generated IDs for cold/RAM/disk comparisons.
+
+CPU tests use a fake device and upstream Image callbacks to cover compact round trips, metadata/hash corruption,
+quota, page-rounded admission, busy-slot ownership and close outcomes. They do not establish GPU restore parity,
+NVMe timing or reboot durability. GPU qualification must compare IDs only after two cold runs of the same prompt
+agree; equality covers greedy decoding on the tested prompts.
