@@ -122,7 +122,6 @@ pub const Sampler = struct {
         args.add(s.bits.ptr);
         args.add(@as(u32, @intCast((s.vocab + 31) / 32)));
         try cuda.launch.launch(s.mask_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &args);
-        if (r) |rule_| return s.choose(stream, rows, first, rule_, out);
         for (0..rows) |row| {
             var a: cuda.Args = .{};
             a.add(s.full.ptr + row * s.vocab * 2);
@@ -136,6 +135,8 @@ pub const Sampler = struct {
             if (!std.math.isFinite(@as(f32, @bitCast(pair[0])))) return error.NoAllowedToken;
             out[row] = pair[1];
         }
+        // The keyed kernel assumes a finite candidate exists; validate before it can index an empty set.
+        if (r) |rule_| try s.choose(stream, rows, first, rule_, out);
     }
 
     /// The whole rows a draw read (bf16 [rows][vocab]), for checks against the host rule.

@@ -239,5 +239,12 @@ pub fn grammar(gpu: check.Gpu) !void {
         try sampler.masked(stream, .local, &.{.{ .lo = 0, .hi = vocab }}, &.{.{ .rank = 0, .logits = input }}, count, 17, rule, modules.glue.top1, got[0..count]);
         try check.sameBytes("masked GLM draw excludes larger forbidden logits", std.mem.sliceAsBytes(got[0..count]), std.mem.sliceAsBytes(wanted[0..count]));
     };
+    const invalid: [vocab]u16 = @splat(0xff80);
+    const no_finite = try r.dev(std.mem.sliceAsBytes(&invalid));
+    for ([_]bool{ false, true }) |sampled| {
+        var got: [1]u32 = undefined;
+        const rule: ?glm.sampler.Rule = if (sampled) glm.sampler.rule(.{ .seed = 73, .temperature = 0.8 }) else null;
+        try std.testing.expectError(error.NoAllowedToken, sampler.masked(stream, .local, &.{.{ .lo = 0, .hi = vocab }}, &.{.{ .rank = 0, .logits = no_finite }}, 1, 17, rule, modules.glue.top1, &got));
+    }
     check.pass("glm-grammar: first and multirow masks govern greedy and sampled draws", .{});
 }
