@@ -12,7 +12,7 @@ test {
     _ = @import("cuda_spill_order_test.zig");
 }
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve, spill_write, spill_read, spill_forget, vision, redraw_masked, verify_masked };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve, spill_write, spill_read, spill_forget, vision, redraw_masked, verify_masked, draft_batch };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -36,6 +36,33 @@ pub const Header = extern struct {
 /// tf_glm_put_words' argument: a step's header (16 words) and up to `put_ids` ids.
 pub const Words = extern struct { w: [96]u32 };
 pub const put_ids = 96 - 16;
+
+fn encodeDraftBatch(parts: []const engine.DraftPart, out: *[engine.max_shared * 5]u32) ![]const u32 {
+    if (parts.len == 0 or parts.len > engine.max_shared) return error.BadDraftBatch;
+    for (parts, 0..) |p, i| {
+        const at = i * 5;
+        out[at] = p.slot;
+        out[at + 1] = @truncate(p.position);
+        out[at + 2] = @truncate(p.position >> 32);
+        out[at + 3] = p.pending;
+        out[at + 4] = p.depth;
+    }
+    return out[0 .. parts.len * 5];
+}
+
+fn decodeDraftBatch(words: []const u32, count: usize, out: *[engine.max_shared]engine.DraftPart) ![]const engine.DraftPart {
+    if (count == 0 or count > engine.max_shared or words.len != count * 5) return error.BadDraftBatch;
+    var seen: [engine.max_shared]bool = @splat(false);
+    for (out[0..count], 0..) |*p, i| {
+        const at = i * 5;
+        const slot = words[at];
+        if (slot >= engine.max_shared or seen[slot]) return error.BadDraftSlot;
+        seen[slot] = true;
+        p.* = .{ .slot = slot, .position = (@as(u64, words[at + 2]) << 32) | words[at + 1], .pending = words[at + 3], .depth = words[at + 4] };
+        if (p.position == 0 or p.pending >= 154880 or p.depth > engine.max_drafts) return error.BadDraftRequest;
+    }
+    return out[0..count];
+}
 
 /// The most ids one step carries (a prompt at the engine's capacity).
 pub const Link = struct {
@@ -287,6 +314,16 @@ pub const Leader = struct {
         return x.complete(x.e.draft(from_prompt, follow_ids, depth, out));
     }
 
+    pub fn draftBatch(x: Leader, parts: []const engine.DraftPart, out: []engine.DraftResult) !void {
+        if (out.len != parts.len) return error.BadDraftBatch;
+        try x.complete(x.e.validateDraftBatch(parts));
+        var words: [engine.max_shared * 5]u32 = undefined;
+        const payload = try encodeDraftBatch(parts, &words);
+        try x.flush();
+        try x.send(.{ .kind = @backingInt(Kind.draft_batch), .depth = @intCast(parts.len) }, payload);
+        try x.complete(x.e.draftBatch(parts, out));
+    }
+
     /// The other ranks leave their loops.
     pub fn end(x: Leader) !void {
         try x.send(.{ .kind = @backingInt(Kind.end) }, &.{});
@@ -381,6 +418,16 @@ pub fn follow(e: *Engine, link: *Link) !void {
             _ = try e.cur.vision.?.table().binding();
             continue;
         }
+        if (kind == .draft_batch) {
+            var parts_buf: [engine.max_shared]engine.DraftPart = undefined;
+            const parts = decodeDraftBatch(step.ids, h.depth, &parts_buf) catch |err| {
+                _ = try e.pairedReady(false);
+                return err;
+            };
+            var results: [engine.max_shared]engine.DraftResult = undefined;
+            try e.draftBatch(parts, results[0..parts.len]);
+            continue;
+        }
         if (kind != .end and kind != .drop and kind != .shared and kind != .release) try e.bind(h.slot);
         switch (kind) {
             .begin => try e.begin(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null),
@@ -411,7 +458,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 try link.grammarBits(&e.smp, step.ids.len);
                 try e.verifyMasked(step.ids, sampled[0..step.ids.len]);
             },
-            .reserve, .spill_write, .spill_read, .spill_forget, .vision => unreachable,
+            .reserve, .spill_write, .spill_read, .spill_forget, .vision, .draft_batch => unreachable,
             .shared => {
                 const k = h.depth;
                 if (k == 0 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadStep;
@@ -448,4 +495,40 @@ test "a step's header is 64 bytes and keeps its fields" {
     @memcpy(std.mem.asBytes(&back), bytes);
     try std.testing.expectEqual(h, back);
     try std.testing.expectEqual(Kind.draft, @as(Kind, @fromBackingInt(@intCast(back.kind))));
+}
+
+test "draft batch wire preserves unordered slots and positions and refuses a later duplicate" {
+    const parts = [_]engine.DraftPart{
+        .{ .slot = 5, .position = 1 << 33, .pending = 11, .depth = 3 },
+        .{ .slot = 1, .position = 91, .pending = 22, .depth = 0 },
+    };
+    var words: [engine.max_shared * 5]u32 = undefined;
+    const wire = try encodeDraftBatch(&parts, &words);
+    try std.testing.expectEqual(@as(usize, 10), wire.len);
+    var decoded: [engine.max_shared]engine.DraftPart = undefined;
+    try std.testing.expectEqualSlices(engine.DraftPart, &parts, try decodeDraftBatch(wire, 2, &decoded));
+    words[5] = 5;
+    try std.testing.expectError(error.BadDraftSlot, decodeDraftBatch(words[0..10], 2, &decoded));
+    try std.testing.expectError(error.BadDraftBatch, decodeDraftBatch(words[0..9], 2, &decoded));
+}
+
+test "leader draft state refusal fails the pair before sending a command" {
+    const Failed = struct {
+        var reason: ?anyerror = null;
+        fn fail(err: anyerror) void {
+            reason = err;
+        }
+    };
+    var e: Engine = undefined;
+    e.pool = null;
+    e.dflash = @ptrFromInt(256);
+    e.seqs = .empty;
+    e.pair_failure = Failed.fail;
+    var link: Link = undefined;
+    const leader: Leader = .{ .e = &e, .link = &link };
+    var out: [1]engine.DraftResult = .{.{ .count = 99 }};
+    Failed.reason = null;
+    try std.testing.expectError(error.BadDraftSlot, leader.draftBatch(&.{.{ .slot = 1, .position = 1, .pending = 7, .depth = 1 }}, &out));
+    try std.testing.expectEqual(@as(?anyerror, error.BadDraftSlot), Failed.reason);
+    try std.testing.expectEqual(@as(usize, 99), out[0].count);
 }

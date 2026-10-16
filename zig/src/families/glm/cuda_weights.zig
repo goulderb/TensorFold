@@ -31,7 +31,7 @@ pub const Layer = struct { index: u32, attn_hc: Hc, ffn_hc: Hc, in_norm: u64, po
 pub const Mtp = struct { enorm: u64, hnorm: u64, eh: b16.Proj, norm: u64, layer: Layer, draft: ?q4.Q4 };
 
 /// The kernels a load runs: affine4_pack's tf_pack_dense, and for the MTP head the quantizers and the 4-bit tiling.
-pub const Tools = struct { pack_dense: cuda.Function, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null, affine4: ?*const cuda.qlinear.Affine4Kernels = null, modelopt: ?*const cuda.modelopt.Packer = null, precision: @import("cuda_weight_precision.zig").Settings = .{}, exl3_routed: @import("cuda_experts_mia.zig").Mode = .generic };
+pub const Tools = struct { pack_dense: cuda.Function, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null, affine4: ?*const cuda.qlinear.Affine4Kernels = null, modelopt: ?*const cuda.modelopt.Packer = null, ck: ?*const cuda.ck.Ck = null, precision: @import("cuda_weight_precision.zig").Settings = .{}, exl3_routed: @import("cuda_experts_mia.zig").Mode = .generic };
 
 /// A loaded tensor by the Python family's attribute path, for digests against its weights.
 pub const Named = struct { name: []u8, ptr: u64, len: usize };
@@ -45,6 +45,7 @@ pub const Weights = struct {
     norm: u64 = 0,
     head: b16.Proj = .{ .b16 = 0 }, // bf16 [share.vocab][dims], or EXL3
     precision: @import("cuda_weight_precision.zig").Settings = .{},
+    native_conversions: [@import("cuda_weight_precision.zig").groups.len]u32 = @splat(0),
     exl3: bool = false, // an EXL3 checkpoint: the attention, shared expert, dense MLP and head quantized
     mtp: ?Mtp = null,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,

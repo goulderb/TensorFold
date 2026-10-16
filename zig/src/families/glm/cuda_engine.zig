@@ -67,6 +67,8 @@ pub const max_shared = 8;
 
 /// One stream's window of a shared verify: its slot, its ids, and its drawn tokens.
 pub const Part = struct { slot: u32, ids: []const u32, out: []u32 };
+pub const DraftPart = struct { slot: u32, position: u64, pending: u32, depth: u32 };
+pub const DraftResult = dflash_mod.BatchResult;
 
 /// A kept prompt state as the prompt cache holds it: the id every rank keeps its own copy under, and its position.
 pub const Kept = struct { id: u64, at: u32 };
@@ -173,6 +175,11 @@ pub const Engine = struct {
                 } else startup_problem = error.NoDraftCheckpoint;
             }
         }
+        if (settings.weight_dense.native() and startup_problem == null) {
+            if (ctx.capability()) |capability| {
+                if (capability != 121) startup_problem = error.UnsupportedNativeDenseDevice;
+            } else |err| startup_problem = err;
+        }
         const startup = try a.alloc(u32, world);
         try ranks.gather(u32, d, lib, comm, stream, rank, @intFromBool(startup_problem == null), startup);
         for (startup) |ready| if (ready == 0) return startup_problem orelse error.PeerStartupRefused;
@@ -192,6 +199,14 @@ pub const Engine = struct {
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
         var m = try fw.Modules.load(d, ctx);
         errdefer m.deinit();
+        if (settings.weight_dense.native()) {
+            var native_problem: ?anyerror = null;
+            m.enableNativeDense(d, ctx) catch |err| {
+                native_problem = err;
+            };
+            try ranks.gather(u32, d, lib, comm, stream, rank, @intFromBool(native_problem == null), startup);
+            for (startup) |ready| if (ready == 0) return native_problem orelse error.PeerNativeDenseRefused;
+        }
         if (settings.exl3_routed == .mia_mcg4) m.mia = try mia.Kernels.load(d, cuda.kernels.glm_exl3);
         m.experts.exl3.decode = o.settings.exl3_decode;
         var pieces = try fw.Pieces.init(d, o.settings.pieces);
@@ -204,12 +219,27 @@ pub const Engine = struct {
         wt.precision = .{ .dense = o.settings.weight_dense, .head = o.settings.weight_head };
         wt.exl3_routed = settings.exl3_routed;
         if (rank == 0) {
-            var policy_text: [128]u8 = undefined;
+            var policy_text: [256]u8 = undefined;
             const policy_hash = o.settings.weight_dense.digest();
             std.log.info("GLM dense conversion policy v1: {s}; head={s}; scope=bf16-source-only; digest={s}", .{ try o.settings.weight_dense.format(&policy_text), @tagName(o.settings.weight_head), std.fmt.bytesToHex(policy_hash, .lower) });
         }
-        e.w = try weights.load(gpa, io, d, stream, wt, checkpoint, c, share, layers, with_mtp);
+        var loaded: ?weights.Weights = null;
+        errdefer if (loaded) |*w| w.deinit();
+        var load_problem: ?anyerror = null;
+        loaded = weights.load(gpa, io, d, stream, wt, checkpoint, c, share, layers, with_mtp) catch |err| blk: {
+            load_problem = err;
+            break :blk null;
+        };
+        try ranks.gather(u32, d, lib, comm, stream, rank, @intFromBool(load_problem == null), startup);
+        for (startup) |ready| if (ready == 0) return load_problem orelse error.PeerWeightsRefused;
+        e.w = loaded.?;
+        loaded = null;
         errdefer e.w.deinit();
+        if (settings.weight_dense.native()) {
+            inline for (@import("cuda_weight_precision.zig").groups) |group| {
+                std.log.info("GLM native dense rank={d} family={s} mode={s} matrices={d}", .{ rank, @tagName(group), @tagName(settings.weight_dense.get(group)), e.w.native_conversions[@backingInt(group)] });
+            }
+        }
         try e.bind(0);
         errdefer {
             e.free(0);
@@ -415,6 +445,12 @@ pub const Engine = struct {
     /// The committed length: the pending token sits at this position, a window's row r draws position pos + 1 + r.
     pub fn pos(e: *const Engine) usize {
         return e.cur.st.pos;
+    }
+
+    pub fn slotPos(e: *const Engine, slot: u32) !usize {
+        if (slot >= e.seqs.items.len) return error.BadDraftSlot;
+        const seq = e.seqs.items[slot] orelse return error.BadDraftSlot;
+        return seq.st.pos;
     }
 
     /// A fresh sequence with `sampling` (null or temperature 0: greedy).
@@ -818,6 +854,34 @@ pub const Engine = struct {
     /// decode.draft: the MTP head absorbs the kept rows (committed first) with `follow`, then chains `depth` drafts.
     pub fn drafting(e: *const Engine) bool {
         return e.mtp or e.dflash != null;
+    }
+
+    fn resolveDraftBatch(e: *const Engine, parts: []const DraftPart, out: *[max_shared]dflash_mod.BatchRequest) !void {
+        const d = e.dflash orelse return error.NoDraftHead;
+        if (parts.len == 0 or parts.len > max_shared) return error.BadDraftBatch;
+        for (parts, 0..) |p, i| {
+            if (p.depth > max_drafts or p.position == 0) return error.BadDraftRequest;
+            const end = try e.slotPos(p.slot);
+            if (p.position != end + 1) return error.PositionMismatch;
+            out[i] = .{ .slot = p.slot, .end = end, .pending = p.pending, .depth = p.depth, .sampling = e.seqs.items[p.slot].?.sampling };
+        }
+        try d.validateBatch(out[0..parts.len]);
+    }
+
+    pub fn validateDraftBatch(e: *const Engine, parts: []const DraftPart) !void {
+        var resolved: [max_shared]dflash_mod.BatchRequest = undefined;
+        try e.resolveDraftBatch(parts, &resolved);
+    }
+
+    pub fn draftBatch(e: *Engine, parts: []const DraftPart, out: []DraftResult) !void {
+        if (out.len != parts.len) return error.BadDraftBatch;
+        var resolved: [max_shared]dflash_mod.BatchRequest = undefined;
+        var problem: ?anyerror = null;
+        e.resolveDraftBatch(parts, &resolved) catch |err| {
+            problem = err;
+        };
+        if (!try e.pairedReady(problem == null)) return problem orelse error.PeerDraftBatchRefused;
+        try e.dflash.?.proposeBatch(resolved[0..parts.len], out);
     }
 
     pub fn draft(e: *Engine, from_prompt: bool, follow: []const u32, depth: usize, out: []u32) !usize {

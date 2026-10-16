@@ -523,7 +523,7 @@ test "weight precision and spill enablement must agree before rank startup" {
     for (precision.groups) |group| try std.testing.expectEqual(precision.Dense.q4, settings.weight_dense.get(group));
     try std.testing.expectEqual(precision.Head.fp8, settings.weight_head);
     try std.testing.expectError(error.BadSetting, Settings.read(Values.badDense, &problem));
-    try std.testing.expectEqualStrings("TF_GLM_DENSE: bf16, q4, fp8 or nvfp4", problem);
+    try std.testing.expectEqualStrings("TF_GLM_DENSE: bf16, q4, fp8, nvfp4, fp8_native or nvfp4_native", problem);
     try std.testing.expectError(error.BadSetting, Settings.read(Values.badHead, &problem));
     try std.testing.expectEqualStrings("TF_GLM_HEAD: bf16 or fp8", problem);
     const hash: [32]u8 = @splat(0);

@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
+#include <float.h>
 
 #include "mma4.cuh"
 #include "qmm_frag.cuh"
@@ -41,10 +42,10 @@ __device__ __forceinline__ void unpack8(const uint4 u, float (&f)[8]) {
 }
 
 // x e4m3 [M, K] and w e4m3 [npad/64, K/64, 8, 32, 2, 8], both in the fragment order quant8 and the FP8 pack write.
-template <typename C, bool CLUSTER>
+template <typename C, bool CLUSTER, bool WIDE = false, bool ROW_SCALE = false>
 __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_t* __restrict__ w, float alpha,
-                                     __nv_bfloat16* __restrict__ out, float* __restrict__ part, int M, int N, int K,
-                                     int SK, int group) {
+                                     void* __restrict__ out, float* __restrict__ part, int M, int N, int K,
+                                     int SK, int group, const float* row_scales = nullptr) {
     using T = Tile<C, CLUSTER>;
     constexpr int THREADS = C::THREADS, CH = T::ROW / 16;
     extern __shared__ __align__(128) unsigned char buf[];
@@ -111,12 +112,21 @@ __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_
     wait<0>();
     __syncthreads();
     auto put = [&](int row, int col, float v0, float v1) {
-        __nv_bfloat16* dst = out + static_cast<size_t>(row) * N + col;
-        if (col + 1 < N && (N & 1) == 0) {
-            *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
+        const float factor = ROW_SCALE ? row_scales[row] * alpha : alpha;
+        v0 *= factor;
+        v1 *= factor;
+        if constexpr (WIDE) {
+            float* dst = static_cast<float*>(out) + static_cast<size_t>(row) * N + col;
+            if (col < N) dst[0] = v0;
+            if (col + 1 < N) dst[1] = v1;
         } else {
-            if (col < N) dst[0] = __float2bfloat16_rn(v0);
-            if (col + 1 < N) dst[1] = __float2bfloat16_rn(v1);
+            __nv_bfloat16* dst = static_cast<__nv_bfloat16*>(out) + static_cast<size_t>(row) * N + col;
+            if (col + 1 < N && (N & 1) == 0) {
+                *reinterpret_cast<__nv_bfloat162*>(dst) = __floats2bfloat162_rn(v0, v1);
+            } else {
+                if (col < N) dst[0] = __float2bfloat16_rn(v0);
+                if (col + 1 < N) dst[1] = __float2bfloat16_rn(v1);
+            }
         }
     };
     if constexpr (CLUSTER) {
@@ -143,7 +153,7 @@ __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_
                 v0 = v0 + theirs[2 * pr * THREADS + tid];
                 v1 = v1 + theirs[(2 * pr + 1) * THREADS + tid];
             }
-            if (row < M) put(row, col, v0 * alpha, v1 * alpha);
+            if (row < M) put(row, col, v0, v1);
         }
         cluster.sync();
 #endif
@@ -163,7 +173,7 @@ __device__ __forceinline__ void lane(const uint8_t* __restrict__ x, const uint8_
                         if (col + 1 < N) dst[1] = acc[i][j][2 * h + 1];
                         continue;
                     }
-                    put(row, col, acc[i][j][2 * h] * alpha, acc[i][j][2 * h + 1] * alpha);
+                    put(row, col, acc[i][j][2 * h], acc[i][j][2 * h + 1]);
                 }
             }
     }
@@ -187,6 +197,98 @@ TF_CK8(tf_ck8_64c, 64, false, true)
 TF_CK8(tf_ck8_64s, 64, true, false)
 TF_CK8(tf_ck8_64sc, 64, true, true)
 
+#define TF_CK8_DENSE(NAME, BM, SKIP, CLUSTER, WIDE) \
+    extern "C" __global__ void __launch_bounds__(128) \
+        NAME(const uint8_t* x, const uint8_t* w, float scale, void* out, float* part, \
+             int M, int N, int K, int SK, int group, const float* row_scales) { \
+        tf_ck::lane<tf_ck::Cfg<BM, 64, 1, 4, SKIP>, CLUSTER, WIDE, true>( \
+            x, w, scale, out, part, M, N, K, SK, group, row_scales); \
+    }
+#define TF_CK8_DENSE_SET(SUFFIX, WIDE) \
+    TF_CK8_DENSE(tf_ck8_dense16##SUFFIX, 16, false, false, WIDE) \
+    TF_CK8_DENSE(tf_ck8_dense16c##SUFFIX, 16, false, true, WIDE) \
+    TF_CK8_DENSE(tf_ck8_dense32##SUFFIX, 32, false, false, WIDE) \
+    TF_CK8_DENSE(tf_ck8_dense32c##SUFFIX, 32, false, true, WIDE) \
+    TF_CK8_DENSE(tf_ck8_dense64##SUFFIX, 64, false, false, WIDE) \
+    TF_CK8_DENSE(tf_ck8_dense64c##SUFFIX, 64, false, true, WIDE) \
+    TF_CK8_DENSE(tf_ck8_dense64s##SUFFIX, 64, true, false, WIDE) \
+    TF_CK8_DENSE(tf_ck8_dense64sc##SUFFIX, 64, true, true, WIDE)
+TF_CK8_DENSE_SET(_bf16, false)
+TF_CK8_DENSE_SET(_f32, true)
+
+extern "C" __global__ void __launch_bounds__(256)
+    tf_ck8_dense_reduce(const float* part, void* out, long long total, int N, int SK,
+                        float scale, const float* row_scales, int wide) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    float acc = part[i];
+    for (int s = 1; s < SK; ++s) acc = acc + part[s * total + i];
+    const float result = acc * (row_scales[i / N] * scale);
+    if (wide) static_cast<float*>(out)[i] = result;
+    else static_cast<__nv_bfloat16*>(out)[i] = __float2bfloat16_rn(result);
+}
+
+extern "C" __global__ void __launch_bounds__(256)
+    tf_ck_row_scales_or_nan(const __nv_bfloat16* x, int ldx, int K, float range, float* scales) {
+    const int row = blockIdx.x, tid = threadIdx.x;
+    __shared__ float maxima[256];
+    __shared__ int invalid[256];
+    float amax = 0.0f;
+    int bad = 0;
+    for (int k = tid; k < K; k += 256) {
+        const float v = __bfloat162float(x[static_cast<size_t>(row) * ldx + k]);
+        bad |= !isfinite(v);
+        amax = fmaxf(amax, fabsf(v));
+    }
+    maxima[tid] = amax;
+    invalid[tid] = bad;
+    __syncthreads();
+    for (int step = 128; step; step >>= 1) {
+        if (tid < step) {
+            maxima[tid] = fmaxf(maxima[tid], maxima[tid + step]);
+            invalid[tid] |= invalid[tid + step];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) scales[row] = invalid[0] ? __int_as_float(0x7fffffff) :
+        (maxima[0] == 0.0f ? 1.0f : fmaxf(maxima[0] / range, FLT_MIN));
+}
+
+// ROW selects per-row activation scales; RAW selects row-major weight bytes for the upstream packer.
+template <bool ROW, bool RAW>
+__device__ __forceinline__ void quant8(const __nv_bfloat16* x, int ldx, int M, int K,
+                                      float inv, const float* scales, uint8_t* out) {
+    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<long long>(M) * (K / 16)) return;
+    const int row = i / (K / 16), grp = i % (K / 16);
+    if constexpr (ROW) inv = __fdiv_rn(1.0f, scales[row]);
+    const uint4* src = reinterpret_cast<const uint4*>(x + static_cast<size_t>(row) * ldx + grp * 16);
+    float f[16];
+    tf_ck::unpack8(src[0], *reinterpret_cast<float(*)[8]>(f));
+    tf_ck::unpack8(src[1], *reinterpret_cast<float(*)[8]>(f + 8));
+    uint32_t w[4];
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        uint32_t packed = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int k = RAW ? 4 * q + j : 2 * q + (j % 2) + 8 * (j / 2);
+            packed |= static_cast<uint32_t>(__nv_cvt_float_to_fp8(f[k] * inv, __NV_SATFINITE, __NV_E4M3)) << (8 * j);
+        }
+        w[q] = packed;
+    }
+    *reinterpret_cast<uint4*>(out + static_cast<size_t>(row) * K + grp * 16) = make_uint4(w[0], w[1], w[2], w[3]);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+    tf_ck_quant8_rows(const __nv_bfloat16* x, int ldx, int M, int K, const float* scales, uint8_t* out) {
+    quant8<true, false>(x, ldx, M, K, 0.0f, scales, out);
+}
+extern "C" __global__ void __launch_bounds__(128)
+    tf_ck_quant8_weight(const __nv_bfloat16* x, int N, int K, float inv, uint8_t* out) {
+    quant8<false, true>(x, K, N, K, inv, nullptr, out);
+}
+
 // The slices summed in slice order, one fp32 add a slice, then the factor and one bf16 rounding.
 extern "C" __global__ void __launch_bounds__(256)
     tf_ck8_reduce(const float* __restrict__ part, __nv_bfloat16* __restrict__ out, long long total, int SK, float alpha) {
@@ -199,24 +301,6 @@ extern "C" __global__ void __launch_bounds__(256)
 
 // One thread 16 inputs: e4m3(x * inv), saturating, byte 4q + j holding input 2q + j % 2 + 8 (j / 2) (fragment order).
 extern "C" __global__ void __launch_bounds__(128)
-    tf_ck_quant8(const __nv_bfloat16* __restrict__ x, int ldx, int M, int K, float inv, uint8_t* __restrict__ out) {
-    const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;  // one thread 16 inputs
-    if (i >= static_cast<long long>(M) * (K / 16)) return;
-    const int row = static_cast<int>(i / (K / 16)), grp = static_cast<int>(i % (K / 16));
-    const uint4* src = reinterpret_cast<const uint4*>(x + static_cast<size_t>(row) * ldx + grp * 16);
-    float f[16];
-    tf_ck::unpack8(src[0], *reinterpret_cast<float(*)[8]>(f));
-    tf_ck::unpack8(src[1], *reinterpret_cast<float(*)[8]>(f + 8));
-    uint32_t w[4];
-#pragma unroll
-    for (int q = 0; q < 4; ++q) {
-        uint32_t packed = 0;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const int k = 2 * q + (j % 2) + 8 * (j / 2);
-            packed |= static_cast<uint32_t>(__nv_cvt_float_to_fp8(f[k] * inv, __NV_SATFINITE, __NV_E4M3)) << (8 * j);
-        }
-        w[q] = packed;
-    }
-    *reinterpret_cast<uint4*>(out + static_cast<size_t>(row) * K + grp * 16) = make_uint4(w[0], w[1], w[2], w[3]);
+    tf_ck_quant8(const __nv_bfloat16* x, int ldx, int M, int K, float inv, uint8_t* out) {
+    quant8<false, false>(x, ldx, M, K, inv, nullptr, out);
 }

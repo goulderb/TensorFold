@@ -39,12 +39,16 @@ pub const Weight = union(enum) {
     fp8: qmmf.Weight, // e4m3 with one fp32 scale (ModelOpt FP8)
     bf16: qmmf.Weight, // unquantized: the checkpoint's bf16 values
     exl3: exl3.Matrix, // trellis tiles as stored, with suh and svh
+    ck8: ck.Fp8Matrix,
+    ck4: ck.Fp4Matrix,
 
     pub fn outputs(w: Weight) usize {
         return switch (w) {
             .affine4 => |q| q.n,
             .fp8g, .nvfp4, .fp8, .bf16 => |q| q.n,
             .exl3 => |q| q.n,
+            .ck8 => |q| q.n,
+            .ck4 => |q| q.n,
         };
     }
 
@@ -53,12 +57,22 @@ pub const Weight = union(enum) {
             .affine4 => |q| q.k,
             .fp8g, .nvfp4, .fp8, .bf16 => |q| q.k,
             .exl3 => |q| q.k,
+            .ck8 => |q| q.k,
+            .ck4 => |q| q.k,
+        };
+    }
+
+    pub fn nativeWorkspaceBytes(w: Weight, rows: usize) !usize {
+        return switch (w) {
+            .ck8 => |q| ck.workspaceBytes(.fp8, rows, q.n, q.k),
+            .ck4 => |q| ck.workspaceBytes(.nvfp4, rows, q.n, q.k),
+            else => 0,
         };
     }
 };
 
 /// Rows in: bf16 `x` rows `ldx` apart (0: packed), their 64-group sums, and the lane's slice partials (partBytes).
-pub const Rows = struct { x: u64, ldx: usize = 0, sums: u64 = 0, part: u64 = 0 };
+pub const Rows = struct { x: u64, ldx: usize = 0, sums: u64 = 0, part: u64 = 0, native: ck.Workspace = .{} };
 
 /// The kernels of every format a family loaded; a weight whose format is not loaded is refused.
 pub const Linear = struct {
@@ -90,6 +104,7 @@ pub const Linear = struct {
             .fp8 => |q| return if (q.act != 0 and l.ck != null) l.checkpoint(s, l.ck.?, q, in, out, rows) else l.onLane(s, q, .fp8, in, out, rows),
             .bf16 => |q| return l.onLane(s, q, .bf16, in, out, rows),
             .exl3 => |q| return l.onExl3(s, q, in, out, rows),
+            .ck8, .ck4 => return l.onNative(s, w, in, out, rows, .bf16),
         }
     }
 
@@ -105,11 +120,13 @@ pub const Linear = struct {
             .fp8 => |q| return if (q.act != 0 and l.ck != null) l.checkpoint(s, l.ck.?, q, in, out, rows) else l.onPrompt(s, q, .fp8, in, out, rows),
             .bf16 => |q| return l.onLane(s, q, .bf16, in, out, rows),
             .exl3 => |q| return (l.exl3 orelse return error.FormatNotLoaded).prompt(s, in.x, if (in.ldx == 0) q.k else in.ldx, q, out, rows, false),
+            .ck8, .ck4 => return l.onNative(s, w, in, out, rows, .bf16),
         }
     }
 
     /// Decode rows as decode(), out (rows, n) fp32 unrounded: a tensor-parallel rank's partial rows (nvfp4, exl3).
     pub fn decodeF32(l: Linear, s: Stream, w: Weight, in: Rows, out: u64, rows: usize) !void {
+        if (w == .ck8 or w == .ck4) return l.onNative(s, w, in, out, rows, .f32);
         if (w == .affine4) return (l.affine4 orelse return error.FormatNotLoaded).clusterAs(s, in.x, in.ldx, in.sums, w.affine4, out, rows, splitK(w.affine4.n, w.affine4.k), true);
         if (w == .fp8g) return l.onLaneAs(s, w.fp8g, .fp8g, in, out, .f32, rows);
         const q = switch (w) {
@@ -122,6 +139,7 @@ pub const Linear = struct {
 
     /// Prompt rows as prompt(), out (rows, n) fp32 unrounded (nvfp4, exl3).
     pub fn promptF32(l: Linear, s: Stream, w: Weight, in: Rows, out: u64, rows: usize) !void {
+        if (w == .ck8 or w == .ck4) return l.onNative(s, w, in, out, rows, .f32);
         if (w == .affine4) return (l.affine4 orelse return error.FormatNotLoaded).promptAs(s, in.x, in.ldx, w.affine4, out, rows, true);
         if (w == .fp8g) return l.onLaneAs(s, w.fp8g, .fp8g, in, out, .f32, rows);
         const q = switch (w) {
@@ -130,6 +148,16 @@ pub const Linear = struct {
             else => return error.EpilogueNotBuilt,
         };
         return l.onPromptAs(s, q, .fp4, in, out, .f32, rows);
+    }
+
+    fn onNative(l: Linear, s: Stream, w: Weight, in: Rows, out: u64, rows: usize, kind: qmmf.Out) !void {
+        const c = l.ck orelse return error.FormatNotLoaded;
+        const stride = if (in.ldx == 0) w.inputs() else in.ldx;
+        return switch (w) {
+            .ck8 => |q| c.matmul8(s, q, in.x, stride, rows, in.native, out, kind),
+            .ck4 => |q| c.matmul4(s, q, in.x, stride, rows, in.native, out, kind),
+            else => unreachable,
+        };
     }
 
     fn onExl3(l: Linear, s: Stream, q: exl3.Matrix, in: Rows, out: u64, rows: usize) !void {
@@ -422,6 +450,9 @@ test "a format that is not loaded is refused before any launch" {
     const e: Weight = .{ .exl3 = .{ .trellis = 0, .suh = 0, .svh = 0, .k = 128, .n = 128, .bits = 4, .codebook = .mul1 } };
     try std.testing.expectError(error.FormatNotLoaded, l.decode(s, e, .{ .x = 0 }, 0, 1));
     try std.testing.expectError(error.FormatNotLoaded, l.prompt(s, e, .{ .x = 0 }, 0, 1));
+    const native: Weight = .{ .ck8 = .{ .codes = 0, .scale = 1, .n = 160, .k = 128, .npad = 256 } };
+    try std.testing.expectError(error.FormatNotLoaded, l.decode(s, native, .{ .x = 0 }, 0, 1));
+    try std.testing.expectError(error.FormatNotLoaded, l.promptF32(s, native, .{ .x = 0 }, 0, 1));
 }
 
 test "the affine-4 tiles' sizes follow qmm_fast.tile" {

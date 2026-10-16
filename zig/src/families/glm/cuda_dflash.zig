@@ -9,8 +9,11 @@ const Ops = @import("cuda_dflash_ops.zig").Ops;
 const Entries = @import("cuda_dflash_entries.zig").Entries;
 const policy = @import("cuda_draft_policy.zig");
 const state = @import("cuda_dflash_state.zig");
+const batch = @import("cuda_dflash_batch.zig");
 const pinned_aot = @import("cuda_dflash_aot.zig");
 const Sampling = @import("cuda_sampler.zig").Sampling;
+pub const BatchRequest = batch.Request;
+pub const BatchResult = batch.Result;
 
 pub const Dependencies = struct {
     driver: *const cuda.Driver,
@@ -37,6 +40,7 @@ pub const DFlash = struct {
     capacity: usize,
     lanes: [8]state.Lane = @splat(.{}),
     pending: [8]cuda.DeviceBuffer,
+    max_packed_width: usize = 0,
 
     pub fn open(gpa: std.mem.Allocator, io: std.Io, target_dir: []const u8, draft_dir: []const u8, streams: usize, capacity: usize, deps: Dependencies) !*DFlash {
         if (streams != 8 or capacity == 0 or capacity > std.math.maxInt(i64) - 8) return error.BadDraftCapacity;
@@ -54,6 +58,7 @@ pub const DFlash = struct {
         p.gpa = gpa;
         p.capacity = capacity;
         p.lanes = @splat(.{});
+        p.max_packed_width = 0;
         p.loader = .{ .gpa = gpa, .driver = deps.driver, .target = &target, .draft = &draft, .rank = rank };
         errdefer p.loader.deinit();
         const w = try p.loader.load(rank);
@@ -187,44 +192,56 @@ pub const DFlash = struct {
         }
         l.end = start + rows;
     }
-    pub fn propose(d: *DFlash, slot: usize, pending: u32, sampling: ?Sampling, out: []u32) !usize {
-        const l = try d.lane(slot);
-        if (!l.healthy) return error.DraftFailed;
-        if (l.pending != null or pending >= 154880) return error.BadDraftRequest;
-        if (l.end == 0 or l.end >= d.capacity or out.len == 0) return 0;
-        const count = @min(@min(out.len, 3), d.capacity - l.end - 1);
-        if (count == 0) return 0;
-        errdefer l.healthy = false;
-        var ids: [8]u32 = @splat(d.forward.cfg.mask);
-        ids[0] = pending;
-        var pos: [8]i64 = undefined;
-        const slots: [8]i64 = @splat(@intCast(slot));
-        const begin: [1]i64 = .{@intCast(l.end)};
-        const slot_ids: [1]i64 = .{@intCast(slot)};
-        for (&pos, 0..) |*p, i| p.* = @intCast(l.end + i);
-        try d.forward.stage(d.forward.ids, std.mem.sliceAsBytes(&ids));
-        try d.forward.stage(d.forward.rowpos, std.mem.sliceAsBytes(&pos));
-        try d.forward.stage(d.forward.rowslots, std.mem.sliceAsBytes(&slots));
-        try d.forward.stage(d.forward.bpos, std.mem.sliceAsBytes(&begin));
-        try d.forward.stage(d.forward.bslots, std.mem.sliceAsBytes(&slot_ids));
-        try d.forward.block(1);
-        var candidates: [4 * 7 * 32]f32 = undefined;
-        var projection: [7 * 256]f32 = undefined;
-        const candidate_slice = candidates[0 .. d.forward.rank.world * 7 * 32];
+    pub fn validateBatch(d: *const DFlash, requests: []const BatchRequest) !void {
+        _ = try batch.Plan.build(&d.lanes, d.capacity, requests);
+    }
+    pub fn proposeBatch(d: *DFlash, requests: []const BatchRequest, out: []BatchResult) !void {
+        if (out.len != requests.len) return error.BadDraftBatch;
+        const plan = try batch.Plan.build(&d.lanes, d.capacity, requests);
+        var results: [batch.max_lanes]BatchResult = @splat(.{});
+        if (plan.count == 0) {
+            @memcpy(out, results[0..requests.len]);
+            return;
+        }
+        errdefer {
+            for (plan.requests[0..plan.count]) |r| d.lanes[r.slot].healthy = false;
+        }
+        const meta = plan.metadata(d.forward.cfg.mask);
+        try d.forward.stage(d.forward.ids, std.mem.sliceAsBytes(meta.ids[0 .. plan.count * 8]));
+        try d.forward.stage(d.forward.rowpos, std.mem.sliceAsBytes(meta.positions[0 .. plan.count * 8]));
+        try d.forward.stage(d.forward.rowslots, std.mem.sliceAsBytes(meta.row_slots[0 .. plan.count * 8]));
+        try d.forward.stage(d.forward.bpos, std.mem.sliceAsBytes(meta.begins[0..plan.count]));
+        try d.forward.stage(d.forward.bslots, std.mem.sliceAsBytes(meta.block_slots[0..plan.count]));
+        try d.forward.block(plan.count);
+        if (plan.count > d.max_packed_width) {
+            d.max_packed_width = plan.count;
+            if (d.forward.rank.rank == 0) std.log.info("DFlash packed proposal width: active_count={d} requested_count={d}", .{ plan.count, requests.len });
+        }
+        var candidates: [4 * batch.max_lanes * 7 * 32]f32 = undefined;
+        var projection: [batch.max_lanes * 7 * 256]f32 = undefined;
+        const candidate_slice = candidates[0 .. d.forward.rank.world * plan.count * 7 * 32];
+        const projection_slice = projection[0 .. plan.count * 7 * 256];
         if (d.forward.asyncOk()) {
-            try d.forward.queueProposal(1);
+            try d.forward.queueProposal(plan.count);
             try d.forward.stream.synchronize();
             try d.forward.settle(true);
-            @memcpy(candidate_slice, d.forward.candidatesHost(1));
-            @memcpy(&projection, d.forward.projectionHost(1));
+            @memcpy(candidate_slice, d.forward.candidatesHost(plan.count));
+            @memcpy(projection_slice, d.forward.projectionHost(plan.count));
         } else {
             try d.forward.check();
             try d.forward.read(d.forward.candidates, std.mem.sliceAsBytes(candidate_slice));
-            try d.forward.read(d.forward.projection, std.mem.sliceAsBytes(&projection));
+            try d.forward.read(d.forward.projection, std.mem.sliceAsBytes(projection_slice));
         }
-        var merged: [7 * 16]policy.Candidate = undefined;
-        try policy.merge(candidate_slice, d.forward.rank.world, 7, 16, 154880, &merged);
-        return policy.chain(&merged, &projection, .{ .pred = d.pred, .succ = d.succ }, pending, l.end + 1, sampling, .{}, out[0..count], null);
+        try batch.select(plan, candidate_slice, projection_slice, d.forward.rank.world, .{ .pred = d.pred, .succ = d.succ }, results[0..requests.len]);
+        @memcpy(out, results[0..requests.len]);
+    }
+    pub fn propose(d: *DFlash, slot: usize, pending: u32, sampling: ?Sampling, out: []u32) !usize {
+        if (out.len > batch.max_depth) return error.BadDraftRequest;
+        const l = try d.lane(slot);
+        var result: [1]BatchResult = undefined;
+        try d.proposeBatch(&.{.{ .slot = slot, .end = l.end, .pending = pending, .depth = out.len, .sampling = sampling }}, &result);
+        @memcpy(out[0..result[0].count], result[0].tokens[0..result[0].count]);
+        return result[0].count;
     }
     pub fn snapshotBytes(d: *const DFlash) usize {
         return 5 * 2 * d.forward.rank.kv * config.Config.ring * 256;
@@ -266,6 +283,7 @@ pub const DFlash = struct {
 
 test {
     _ = state;
+    _ = batch;
     _ = pinned_aot;
     _ = config;
     _ = weights;
@@ -281,11 +299,78 @@ fn testPackage(driver: *const cuda.Driver) DFlash {
     const stream: cuda.Stream = .{ .d = driver, .handle = null };
     d.capacity = 8192;
     d.lanes = @splat(.{});
+    d.max_packed_width = 0;
     d.forward.d = driver;
     d.forward.stream = stream;
     d.forward.th = .{ .ops = undefined, .s = stream, .base = .{ .f = undefined, .s = stream } };
     d.forward.rank = config.Rank.init(2, 0) catch unreachable;
     return d;
+}
+
+test "two and eight packed lanes launch one graph and read one invalid flag" {
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    var driver = Memory.driver();
+    const Mock = struct {
+        var launches: usize = 0;
+        var reads: usize = 0;
+        var invalid: u64 = 0;
+        var download: @TypeOf(driver.api.cuMemcpyDtoH_v2) = undefined;
+        fn graph(_: cuda.abi.GraphExec, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            launches += 1;
+            @memset(Memory.slice(invalid, 4), 1);
+            return 0;
+        }
+        fn read(dst: ?*anyopaque, src: u64, n: usize) callconv(.c) cuda.abi.Result {
+            reads += 1;
+            return download(dst, src, n);
+        }
+        fn upload(dst: u64, src: ?*const anyopaque, n: usize) callconv(.c) cuda.abi.Result {
+            @memcpy(Memory.slice(dst, n), @as([*]const u8, @ptrCast(src.?))[0..n]);
+            return 0;
+        }
+    };
+    Mock.download = driver.api.cuMemcpyDtoH_v2;
+    driver.api.cuGraphLaunch = Mock.graph;
+    driver.api.cuMemcpyDtoH_v2 = Mock.read;
+    driver.api.cuMemcpyHtoD_v2 = Mock.upload;
+    for ([_]usize{ 2, 8 }) |count| {
+        var d = testPackage(&driver);
+        d.forward.cfg = .{};
+        d.forward.streams = 8;
+        d.forward.stager = .{};
+        d.forward.pin = null;
+        d.forward.blocks = @splat(null);
+        d.forward.blocks[count - 1] = .{ .d = &driver, .handle = @ptrFromInt(count) };
+        var scratch = try cuda.DeviceBuffer.alloc(&driver, 4096);
+        defer scratch.free();
+        d.forward.ids = scratch.ptr;
+        d.forward.rowpos = scratch.ptr + 256;
+        d.forward.rowslots = scratch.ptr + 768;
+        d.forward.bpos = scratch.ptr + 1280;
+        d.forward.bslots = scratch.ptr + 1408;
+        d.forward.invalid = scratch.ptr + 1536;
+        Mock.invalid = d.forward.invalid;
+        Mock.launches = 0;
+        Mock.reads = 0;
+        var requests: [8]BatchRequest = undefined;
+        for (requests[0..count], 0..) |*r, i| {
+            const slot = (i * 3) % 8;
+            d.lanes[slot].end = i + 10;
+            r.* = .{ .slot = slot, .end = i + 10, .pending = @intCast(i + 1), .depth = 2, .sampling = null };
+        }
+        var results: [8]BatchResult = undefined;
+        try std.testing.expectError(error.BadDraftIndex, d.proposeBatch(requests[0..count], results[0..count]));
+        try std.testing.expectEqual(@as(usize, 1), Mock.launches);
+        try std.testing.expectEqual(@as(usize, 1), Mock.reads);
+        for (requests[0..count]) |r| try std.testing.expect(!d.lanes[r.slot].healthy);
+        Mock.launches = 0;
+        Mock.reads = 0;
+        for (requests[0..count]) |r| d.lanes[r.slot].healthy = true;
+        requests[count - 1].slot = requests[0].slot;
+        try std.testing.expectError(error.BadDraftSlot, d.proposeBatch(requests[0..count], results[0..count]));
+        try std.testing.expectEqual(@as(usize, 0), Mock.launches);
+        try std.testing.expectEqual(@as(usize, 0), Mock.reads);
+    }
 }
 
 test "staging copies strided planes into independent owned lane windows" {
