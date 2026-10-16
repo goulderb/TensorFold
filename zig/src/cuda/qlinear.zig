@@ -313,6 +313,7 @@ pub const Affine4Kernels = struct {
     }
 
     pub fn clusterAs(a: *const Affine4Kernels, s: Stream, x: u64, ldx: usize, xs: u64, q: Affine4, out: u64, rows: usize, sk: usize, wide: bool) !void {
+        const stride = try affineStride(x, ldx, q.k, rows);
         const tiles = (q.n + 63) / 64;
         var parts: Parts = std.mem.zeroes(Parts);
         parts.count = 1;
@@ -323,7 +324,7 @@ pub const Affine4Kernels = struct {
         g.add(x);
         g.add(xs);
         g.add(parts);
-        for ([_]usize{ rows, q.k, if (ldx == 0) q.k else ldx, rows_t, sk }) |v| g.add(int(v));
+        for ([_]usize{ rows, q.k, stride, rows_t, sk }) |v| g.add(int(v));
         const cfg: launch_.Config = .{
             .grid = .{ .x = u(clusters * sk) },
             .block = .{ .x = 128 },
@@ -341,17 +342,32 @@ pub const Affine4Kernels = struct {
     }
 
     pub fn promptAs(a: *const Affine4Kernels, s: Stream, x: u64, ldx: usize, q: Affine4, out: u64, rows: usize, wide: bool) !void {
+        const stride = try affineStride(x, ldx, q.k, rows);
         const rows_t = (rows + 127) / 128;
         const band = (12 << 20) / (128 * q.k * 2);
         const group = @max(1, @min(rows_t, band));
         var g: launch_.Args = .{};
         for ([_]u64{ x, q.w, q.s, q.b, out }) |v| g.add(v);
-        for ([_]usize{ rows, q.n, q.k, q.npad, if (ldx == 0) q.k else ldx, group }) |v| g.add(int(v));
+        for ([_]usize{ rows, q.n, q.k, q.npad, stride, group }) |v| g.add(int(v));
         const grid = rows_t * ((q.n + 127) / 128);
         const f = if (wide) a.prefill_f32 orelse return error.EpilogueNotBuilt else a.prefill_fn;
         try launch_.launch(f, .{ .grid = .{ .x = u(grid), .y = 1, .z = 1 }, .block = .{ .x = 256 }, .shared = prefill_smem }, s, &g);
     }
 };
+
+fn affineStride(x: u64, ldx: usize, k: usize, rows: usize) !usize {
+    const stride = if (ldx == 0) k else ldx;
+    if (stride < k or x % 16 != 0 or (rows > 1 and stride % 8 != 0)) return error.UnsupportedAffineStride;
+    return stride;
+}
+
+test "affine tiled rows reject overlapping or unaligned strides before CUDA" {
+    try std.testing.expectEqual(@as(usize, 128), try affineStride(256, 0, 128, 3));
+    try std.testing.expectEqual(@as(usize, 136), try affineStride(256, 136, 128, 3));
+    try std.testing.expectError(error.UnsupportedAffineStride, affineStride(256, 127, 128, 3));
+    try std.testing.expectError(error.UnsupportedAffineStride, affineStride(256, 129, 128, 3));
+    try std.testing.expectError(error.UnsupportedAffineStride, affineStride(258, 128, 128, 3));
+}
 
 test "split_k follows the Python shapes" {
     try std.testing.expectEqual(@as(usize, 2), splitK(10304, 2688));
