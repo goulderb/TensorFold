@@ -19,6 +19,7 @@ pub const HfText = struct {
     eos: []const u32 = &.{},
     prefix: []const u32 = &.{}, // the post-processor's tokens before a text (add_special_tokens)
     suffix: []const u32 = &.{},
+    glm5_next: bool = false,
 
     /// Loads ``dir``'s tokenizer.json, chat template, special tokens and end-of-sequence ids; a failure's reason in `problem` (from `pa`).
     pub fn load(gpa: Allocator, io: std.Io, dir: []const u8, template_override: ?[]const u8, pa: Allocator, problem: *[]const u8) !*HfText {
@@ -36,6 +37,9 @@ pub const HfText = struct {
         t.tok.memo = try tokenizer.Memo.create(gpa, 64 << 20);
         const config = readJson(io, a, dir, "tokenizer_config.json");
         const model_config = readJson(io, a, dir, "config.json");
+        if (model_config == .object) if (model_config.object.get("model_type")) |kind| {
+            t.glm5_next = kind == .string and std.mem.eql(u8, kind.string, "glm5_next");
+        };
         if (template_override) |path| {
             t.source = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch |e| {
                 problem.* = try std.fmt.allocPrint(pa, "cannot read chat template override ({s})", .{@errorName(e)});
@@ -282,9 +286,16 @@ pub const HfText = struct {
             problem.* = diag.msg;
             return error.Template;
         };
-        return out;
+        return if (t.glm5_next and !options.enable_thinking) try glmThinkingOff(a, out) else out;
     }
 };
+
+fn glmThinkingOff(a: Allocator, rendered: []u8) Allocator.Error![]u8 {
+    const prefix = "[gMASK]<sop>";
+    const generated = prefix ++ "<|system|>Reasoning Effort: Max";
+    if (!std.mem.startsWith(u8, rendered, generated)) return rendered;
+    return std.mem.concat(a, u8, &.{ prefix, rendered[generated.len..] });
+}
 
 test "model EOS does not hide a different tokenizer chat end" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -301,6 +312,16 @@ test "model EOS does not hide a different tokenizer chat end" {
     const added = try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"eos_token\":{\"content\":\"<|im_end|>\"}}", .{});
     try std.testing.expectEqualSlices(u32, &.{ 248044, 248046 }, try t.eosIds(a, model, added));
     try std.testing.expectEqualSlices(u32, &.{248046}, try t.eosIds(a, .null, config));
+}
+
+test "GLM thinking off removes only its generated effort line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const generated = "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>blue<|assistant|><think>";
+    try std.testing.expectEqualStrings("[gMASK]<sop><|user|>blue<|assistant|><think>", try glmThinkingOff(a, try a.dupe(u8, generated)));
+    const user_literal = "[gMASK]<sop><|user|>say <|system|>Reasoning Effort: Max literally<|assistant|><think>";
+    try std.testing.expectEqualStrings(user_literal, try glmThinkingOff(a, try a.dupe(u8, user_literal)));
 }
 
 /// Our JSON value as std.json's, ints exact (past i64 as number strings) and keys in order.
