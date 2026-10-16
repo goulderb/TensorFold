@@ -111,7 +111,12 @@ pub const Loaded = struct {
 fn openTp(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     const pair = (try splitPair(ctx.d)) orelse return error.TpNeedsTwoDevices;
     if (pair[0] != ctx.device_ordinal) return error.TpRankZeroNotFirst;
-    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{ .context = o.context, .mtp = false, .graphs = false, .sampling = null, .segments = 1, .precision = o.precision, .tp = 0, .range = .{ .embed = true, .head = true, .norm_f = true } });
+    // TENSORFOLD_KV_POOL_TOKENS: every sequence's KV rows from one page pool a rank, created whole now
+    const pool_bytes = try kvPoolBytes(gpa, io, dir);
+    var pools: [2]?*cuda.KvPool = .{ null, null };
+    errdefer for (pools) |x| if (x) |q| q.deinit();
+    if (pool_bytes > 0) pools[0] = try cuda.KvPool.init(gpa, ctx.d, ctx.device, pool_bytes);
+    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{ .context = o.context, .mtp = false, .graphs = false, .sampling = null, .segments = 1, .precision = o.precision, .tp = 0, .range = .{ .embed = true, .head = true, .norm_f = true }, .kv_pool = pools[0] });
     errdefer e.deinit();
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
@@ -123,19 +128,22 @@ fn openTp(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
     p.ctx = try cuda.Context.init(ctx.d, pair[1]);
     errdefer p.ctx.deinit();
     try p.ctx.makeCurrent();
-    p.e = try engine.Engine.init(gpa, io, &p.ctx, dir, kernels, .{ .context = o.context, .mtp = false, .graphs = false, .sampling = null, .segments = 1, .precision = o.precision, .tp = 1, .range = .{ .embed = true, .head = false, .norm_f = false } });
+    if (pool_bytes > 0) pools[1] = try cuda.KvPool.init(gpa, ctx.d, p.ctx.device, pool_bytes);
+    p.e = try engine.Engine.init(gpa, io, &p.ctx, dir, kernels, .{ .context = o.context, .mtp = false, .graphs = false, .sampling = null, .segments = 1, .precision = o.precision, .tp = 1, .range = .{ .embed = true, .head = false, .norm_f = false }, .kv_pool = pools[1] });
     errdefer {
         p.ctx.makeCurrent() catch {};
         p.e.deinit();
     }
     p.stage[0] = try cuda.HostBuffer.alloc(ctx.d, 64); // unused by TP; Peer.deinit frees it
     errdefer p.stage[0].free();
-    const link = try tp2.Link.init(gpa, io, .{ ctx, &p.ctx }, state.pass_rows, e.c.hidden);
+    const link = try tp2.Link.init(gpa, io, .{ ctx, &p.ctx }, e.pass, e.c.hidden);
     errdefer link.deinit();
     e.peer = p.e;
     e.tp_link = link;
     own.peer = p;
     own.link = link;
+    own.pools = pools;
+    if (pool_bytes > 0) std.log.info("tp KV pool: {d} MiB a rank, {d}-token context a request", .{ pool_bytes >> 20, o.context });
     const floor: usize = 1536 << 20;
     const peer_free = (try p.ctx.memInfo()).free;
     if (peer_free < floor or (try ctx.memInfo()).free < floor) return error.TpMemoryFloor;
@@ -161,6 +169,16 @@ fn openTp(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
     };
 }
 
+/// A TP rank's KV pool bytes for TENSORFOLD_KV_POOL_TOKENS tokens (its KV head of every attention layer, keys and
+/// values); 0 when unset.
+fn kvPoolBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !usize {
+    const raw = std.c.getenv("TENSORFOLD_KV_POOL_TOKENS") orelse return 0;
+    const tokens = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch return error.BadKvPoolTokens;
+    if (tokens == 0) return 0;
+    const c = try (try @import("config.zig").Config.read(gpa, io, dir)).forTp(0, tp2.world);
+    return tokens * c.count(.attention) * state.kvRowBytes(c) * 2;
+}
+
 /// The first shard, index or config.json in `dir` that a write in place would reach through a link, or null.
 pub fn linked(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !?[]const u8 {
     return core.shard_edit.linked(arena, io, dir);
@@ -171,7 +189,7 @@ pub fn plainShared(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !?[]co
     return core.shard_edit.plainShared(arena, io, dir);
 }
 
-const Owned = struct { gpa: std.mem.Allocator, e: *engine.Engine, head: ?*Head, lanes: Lanes, target: reuse.Target, carve: ?*cuda.Carveout, living: ?@import("cuda_sites.zig").Sites = null, taps: [1]u32 = undefined, peer: ?*Peer = null, link: ?*tp2.Link = null };
+const Owned = struct { gpa: std.mem.Allocator, e: *engine.Engine, head: ?*Head, lanes: Lanes, target: reuse.Target, carve: ?*cuda.Carveout, living: ?@import("cuda_sites.zig").Sites = null, taps: [1]u32 = undefined, peer: ?*Peer = null, link: ?*tp2.Link = null, pools: [2]?*cuda.KvPool = .{ null, null } };
 const tp2 = @import("cuda_tp2.zig");
 
 /// The second rank of a layer split: its own device, context, engine and seam staging. The lane backend drives rank
@@ -358,6 +376,7 @@ fn release(p: *anyopaque) void {
         own.e.ctx.makeCurrent() catch {};
     }
     own.e.deinit();
+    for (own.pools) |x| if (x) |q| q.deinit(); // after every sequence that reserved from them
     if (own.carve) |c| closeCarveout(own.gpa, c);
     own.gpa.destroy(own);
 }

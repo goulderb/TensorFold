@@ -292,6 +292,7 @@ fn restoreOne(t: *Target, copy: *Copy) anyerror!void {
     const e = t.e;
     if (copy.head != (t.head != null)) return error.NoHead; // checked before any copy: nothing half restored
     if (!copy.whole) return error.Incomplete; // its chunk failed before `finish`
+    if (e.bound.paged) |x| try x.ensure(e.c, e.max_len, e.range, copy.pos); // this rank's pages; the peer restores its own
     _ = try move(t, copy.pos, copy, false, true);
     e.pos = copy.pos;
     e.parity = copy.parity;

@@ -86,7 +86,7 @@ pub fn serialChunks(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, 
             return error.Cancelled;
         }
         try e.beforeChunk(cancel);
-        const step: usize = if (wide and background) state.yield_rows else if (wide and inside(keep, s, s + state.pass_rows) < marks.max) state.pass_rows else state.prefill_rows; // 2,048 rows where a wide pass would crowd the scan's marks
+        const step: usize = if (wide and background) state.yield_rows else if (wide and inside(keep, s, s + e.pass) < marks.max) e.pass else state.prefill_rows; // 2,048 rows where a wide pass would crowd the scan's marks
         var end = cuts.end(s, prompt.len, step, if (keep) |k| (if (k.cut) k.at else &.{}) else &.{});
         // the decision row ends its chunk: the rows after it read the lessons it latched
         if (e.decide != lesson_route.none and e.decide >= s and e.decide + 1 < end) end = @intCast(e.decide + 1);
@@ -100,6 +100,7 @@ pub fn serialChunks(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, 
         f.captures = e.armed.marks();
         f.route = .{};
         f.route.add(0, chunk.len, e.pos, e.decide, e.slot);
+        try e.ensureKv(e.pos + chunk.len);
         try e.copied.synchronize();
         const host = e.promptHost(chunk.len);
         @memcpy(host, chunk);

@@ -39,7 +39,23 @@ pub const DeviceAttribute = enum(c_int) {
     compute_capability_minor = 76,
     max_shared_memory_per_multiprocessor = 81,
     max_shared_memory_per_block_optin = 97,
+    virtual_memory_management_supported = 102,
 };
+
+/// Virtual memory management (cuda/kvpool.zig): a physical allocation's handle and where it lives.
+pub const MemHandle = u64;
+pub const MemLocation = extern struct { type: c_int = 0, id: c_int = 0 };
+pub const MemAllocationProp = extern struct {
+    type: c_int = 0, // 1: pinned
+    requested_handle_types: c_int = 0,
+    location: MemLocation = .{}, // type 1: a device
+    win32_handle_meta_data: ?*anyopaque = null,
+    compression_type: u8 = 0,
+    gpu_direct_rdma_capable: u8 = 0,
+    usage: u16 = 0,
+    reserved: [4]u8 = @splat(0),
+};
+pub const MemAccessDesc = extern struct { location: MemLocation = .{}, flags: c_int = 0 }; // flags 3: read-write
 
 pub const FunctionAttribute = enum(c_int) {
     max_threads_per_block = 0,
@@ -230,12 +246,22 @@ pub const Api = struct {
     cuGraphExecDestroy: *const fn (GraphExec) callconv(.c) R,
     cuGraphExecUpdate_v2: *const fn (GraphExec, Graph, *ExecUpdateResultInfo) callconv(.c) R,
     cuGraphExecKernelNodeSetParams_v2: *const fn (GraphExec, GraphNode, *const KernelNodeParams) callconv(.c) R,
+    cuMemGetAllocationGranularity: *const fn (*usize, *const MemAllocationProp, c_int) callconv(.c) R,
+    cuMemCreate: *const fn (*MemHandle, usize, *const MemAllocationProp, u64) callconv(.c) R,
+    cuMemRelease: *const fn (MemHandle) callconv(.c) R,
+    cuMemAddressReserve: *const fn (*DevicePtr, usize, usize, DevicePtr, u64) callconv(.c) R,
+    cuMemAddressFree: *const fn (DevicePtr, usize) callconv(.c) R,
+    cuMemMap: *const fn (DevicePtr, usize, usize, MemHandle, u64) callconv(.c) R,
+    cuMemUnmap: *const fn (DevicePtr, usize) callconv(.c) R,
+    cuMemSetAccess: *const fn (DevicePtr, usize, [*]const MemAccessDesc, usize) callconv(.c) R,
     cuGetErrorName: *const fn (R, *?[*:0]const u8) callconv(.c) R,
     cuGetErrorString: *const fn (R, *?[*:0]const u8) callconv(.c) R,
 };
 
 comptime {
     const std = @import("std");
+    std.debug.assert(@sizeOf(MemAllocationProp) == 32 and @offsetOf(MemAllocationProp, "win32_handle_meta_data") == 16);
+    std.debug.assert(@sizeOf(MemAccessDesc) == 12);
     std.debug.assert(@sizeOf(LaunchAttribute) == 72 and @offsetOf(LaunchAttribute, "value") == 8);
     std.debug.assert(@sizeOf(LaunchConfig) == 56 and @offsetOf(LaunchConfig, "stream") == 32);
     std.debug.assert(@sizeOf(KernelNodeParams) == 72 and @offsetOf(KernelNodeParams, "params") == 40);

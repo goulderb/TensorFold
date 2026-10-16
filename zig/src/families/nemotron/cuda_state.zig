@@ -64,6 +64,41 @@ pub const Carved = struct {
     }
 };
 
+/// A sequence's KV planes in a shared page pool (TENSORFOLD_KV_POOL_TOKENS): address space for its whole context,
+/// pages only for the rows it has written (cuda/kvpool.zig). The kernels address the planes as before.
+pub const Paged = struct {
+    kv: [2]*cuda.kvpool.Range,
+
+    /// Both planes of `n` bytes each reserved in `pool`, or null when there is no pool.
+    fn take(pool: ?*cuda.KvPool, n: usize) !?Paged {
+        const p = pool orelse return null;
+        const k = try p.reserve(n);
+        errdefer k.free();
+        const v = try p.reserve(n);
+        return .{ .kv = .{ k, v } };
+    }
+
+    fn give(x: Paged) void {
+        x.kv[1].free();
+        x.kv[0].free();
+    }
+
+    /// Pages under the first `rows` rows of every attention layer this rank owns, in both planes.
+    pub fn ensure(x: Paged, c: Config, max_len: usize, range: Range, rows: usize) !void {
+        const row = kvRowBytes(c);
+        var j: usize = 0;
+        for (c.kinds[range.first..@min(range.last, c.layers)]) |k| if (k == .attention) {
+            for (x.kv) |r| try r.ensure(j * max_len * row, rows * row);
+            j += 1;
+        };
+    }
+
+    /// Every page back to the pool; the GPU's work on the planes must have finished.
+    pub fn trim(x: Paged) void {
+        for (x.kv) |r| r.trim();
+    }
+};
+
 /// A sequence's own Buffers fields: cache and state planes (the first seven), window io and its sampled rule.
 pub const seq_fields = [_][]const u8{ "k_cache", "v_cache", "ssm", "conv_base", "raw", "xc", "dt", "meta", "ids", "hidden", "sampled", "rule" };
 
@@ -104,8 +139,8 @@ fn seqSizesRange(c: Config, max_len: usize, range: Range) [seq_fields.len]usize 
 const scratch_count = 43;
 
 /// Scratch windows and chunks share on one stream: window logits, chunk io, activations, the expert plan.
-fn scratchSizes(c: Config, nch: usize) [scratch_count]usize {
-    const R: usize = pass_rows;
+fn scratchSizes(c: Config, nch: usize, pass: usize) [scratch_count]usize {
+    const R: usize = pass;
     const W: usize = max_rows;
     const D: usize = c.hidden;
     const ns: usize = c.slots();
@@ -161,6 +196,7 @@ pub const Seq = struct {
     decide: i64 = lesson_route.none, // the prompt row where its lessons decide whether they act on the reply
     untaught: bool = false, // reads the model as shipped: no learned neuron acts on its rows (a lesson writer's reads)
     peer: ?*Seq = null, // two-GPU TP: this sequence's share on the other rank (null: the own one's, or no TP)
+    paged: ?Paged = null, // its KV planes in the shared page pool (null: in its arena or the carveout)
 
     /// The device bytes one sequence takes: its buffers for `max_len` cache rows and a head's `head` buffers.
     pub fn bytes(c: Config, max_len: usize, head: []const usize) usize {
@@ -177,21 +213,23 @@ pub const Seq = struct {
 
     /// Cache and head buffers are zeroed on their owning stream; the KV pair goes to `carve` while it holds both.
     pub fn init(d: *const cuda.Driver, c: Config, max_len: usize, head: []const usize, stream: cuda.Stream, carve: ?*cuda.Carveout) !Seq {
-        return initRange(d, c, max_len, head, stream, carve, .all);
+        return initRange(d, c, max_len, head, stream, carve, .all, null);
     }
 
     /// `init` for one rank of a layer split: the sequence planes cover only `range`'s layers.
-    pub fn initRange(d: *const cuda.Driver, c: Config, max_len: usize, head: []const usize, stream: cuda.Stream, carve: ?*cuda.Carveout, range: Range) !Seq {
+    pub fn initRange(d: *const cuda.Driver, c: Config, max_len: usize, head: []const usize, stream: cuda.Stream, carve: ?*cuda.Carveout, range: Range, pool: ?*cuda.KvPool) !Seq {
         const sizes = seqSizesRange(c, max_len, range);
-        const carved = try Carved.take(carve, sizes[0]);
+        const paged = try Paged.take(pool, sizes[0]);
+        errdefer if (paged) |x| x.give();
+        const carved = if (paged == null) try Carved.take(carve, sizes[0]) else null;
         errdefer if (carved) |x| x.give();
-        var total = Carved.arenaBytes(carved, &sizes);
+        var total = if (paged != null) kvlessBytes(&sizes) else Carved.arenaBytes(carved, &sizes);
         for (head) |n| total += n + 256;
         var a: Arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, total) };
         errdefer a.buf.free();
         try a.buf.fill8(0, stream.handle);
-        var s: Seq = .{ .arena = null, .ptr = undefined, .carved = carved };
-        for (&s.ptr, sizes, 0..) |*p, n, i| p.* = if (carved != null and i < 2) carved.?.kv[i].ptr else a.take(n);
+        var s: Seq = .{ .arena = null, .ptr = undefined, .carved = carved, .paged = paged };
+        for (&s.ptr, sizes, 0..) |*p, n, i| p.* = if (paged != null and i < 2) paged.?.kv[i].va else if (carved != null and i < 2) carved.?.kv[i].ptr else a.take(n);
         for (s.head[0..head.len], head) |*p, n| p.* = a.take(n);
         s.arena = a;
         return s;
@@ -199,7 +237,7 @@ pub const Seq = struct {
 
     /// The engine's own buffers as a sequence.
     pub fn view(b: *const Buffers) Seq {
-        var s: Seq = .{ .arena = null, .ptr = undefined };
+        var s: Seq = .{ .arena = null, .ptr = undefined, .paged = b.paged };
         inline for (seq_fields, &s.ptr) |name, *p| p.* = @field(b, name);
         return s;
     }
@@ -207,13 +245,22 @@ pub const Seq = struct {
     pub fn deinit(s: *Seq) void {
         if (s.arena) |*a| a.buf.free();
         if (s.carved) |x| x.give();
+        if (s.arena != null) if (s.paged) |x| x.give(); // a view's planes are its Buffers' to give back
         s.* = undefined;
     }
 };
 
+/// Arena bytes for a sequence's `sizes` with both KV planes left out (they are in the page pool).
+fn kvlessBytes(sizes: []const usize) usize {
+    var total: usize = 0;
+    for (sizes[2..]) |n| total += n + 256;
+    return total;
+}
+
 pub const Buffers = struct {
     arena: Arena,
     carved: ?Carved, // the own sequence's KV planes, when the display carveout holds them
+    paged: ?Paged = null, // the own sequence's KV planes, when the page pool holds them
     // sequence state (Engine.STATE in the Python engine)
     k_cache: u64,
     v_cache: u64,
@@ -272,16 +319,19 @@ pub const Buffers = struct {
 
     /// Sizes every buffer for `max_len` cache rows and `nch` attention chunk partials a row; the own sequence's first.
     pub fn init(d: *const cuda.Driver, c: Config, max_len: usize, nch: usize, carve: ?*cuda.Carveout) !Buffers {
-        return initRange(d, c, max_len, nch, carve, .all);
+        return initRange(d, c, max_len, nch, carve, .all, null, pass_rows);
     }
 
     /// `init` for one rank of a layer split: the sequence planes cover only `range`'s layers.
-    pub fn initRange(d: *const cuda.Driver, c: Config, max_len: usize, nch: usize, carve: ?*cuda.Carveout, range: Range) !Buffers {
+    /// `pass`: the widest prompt pass the scratch holds (pass_rows; a two-GPU TP rank's is prefill_rows).
+    pub fn initRange(d: *const cuda.Driver, c: Config, max_len: usize, nch: usize, carve: ?*cuda.Carveout, range: Range, pool: ?*cuda.KvPool, pass: usize) !Buffers {
         const own = seqSizesRange(c, max_len, range);
-        const scratch = scratchSizes(c, nch);
-        const carved = try Carved.take(carve, own[0]);
+        const scratch = scratchSizes(c, nch, pass);
+        const paged = try Paged.take(pool, own[0]);
+        errdefer if (paged) |x| x.give();
+        const carved = if (paged == null) try Carved.take(carve, own[0]) else null;
         errdefer if (carved) |x| x.give();
-        var total = Carved.arenaBytes(carved, &own);
+        var total = if (paged != null) kvlessBytes(&own) else Carved.arenaBytes(carved, &own);
         for (scratch) |n| total += n + 256;
         var a: Arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, total) };
         errdefer a.buf.free();
@@ -290,8 +340,9 @@ pub const Buffers = struct {
         try a.buf.fill8(0, null);
         var b: Buffers = undefined;
         b.carved = carved;
+        b.paged = paged;
         b.state_bytes = own[0..7].*;
-        inline for (seq_fields, own, 0..) |name, n, i| @field(b, name) = if (carved != null and i < 2) carved.?.kv[i].ptr else a.take(n);
+        inline for (seq_fields, own, 0..) |name, n, i| @field(b, name) = if (paged != null and i < 2) paged.?.kv[i].va else if (carved != null and i < 2) carved.?.kv[i].ptr else a.take(n);
         for (b.scratchPtrs(), scratch) |f, n| f.* = a.take(n);
         b.arena = a;
         return b;
@@ -299,11 +350,12 @@ pub const Buffers = struct {
 
     /// Its own scratch for another prompt segment, sharing `b`'s caches and state (follow); deinit frees the scratch.
     pub fn sibling(b: *const Buffers, d: *const cuda.Driver, c: Config, nch: usize) !Buffers {
-        const scratch = scratchSizes(c, nch);
+        const scratch = scratchSizes(c, nch, pass_rows);
         var total: usize = 0;
         for (scratch) |n| total += n + 256;
         var s: Buffers = b.*;
         s.carved = null; // the owner gives its planes back
+        s.paged = null;
         s.arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, total) };
         for (s.scratchPtrs(), scratch) |f, n| f.* = s.arena.take(n);
         return s;
@@ -355,6 +407,7 @@ pub const Buffers = struct {
     pub fn deinit(b: *Buffers) void {
         b.arena.buf.free();
         if (b.carved) |x| x.give();
+        if (b.paged) |x| x.give();
         b.* = undefined;
     }
 
@@ -392,7 +445,9 @@ pub const Buffers = struct {
 
     /// Engine.reset: every cache and state buffer zeroed, as a fresh request starts.
     pub fn reset(b: *const Buffers, ops: kern.Ops) !void {
-        for (b.planes(), b.state_bytes) |p, n| try ops.fill32(p, 0, n / 4);
+        // KV rows are written before they are read; pooled planes are not all backed, so they are not zeroed
+        const from: usize = if (b.paged != null) 2 else 0;
+        for (b.planes()[from..], b.state_bytes[from..]) |p, n| try ops.fill32(p, 0, n / 4);
     }
 
     /// Bytes of the own sequence's planes in the display carveout.

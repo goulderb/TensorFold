@@ -44,6 +44,9 @@ pub const Options = struct {
     range: weights.Range = .all,
     /// Two-GPU tensor parallel in one process: this engine's rank (cuda_tp2.zig). null: not a TP rank.
     tp: ?usize = null,
+    /// Every sequence's KV planes from this shared page pool (sized by TENSORFOLD_KV_POOL_TOKENS); null: each
+    /// sequence's planes cover its whole context.
+    kv_pool: ?*cuda.KvPool = null,
 };
 
 /// Asked before each prompt chunk (or segmented call): true stops the prompt with error.Cancelled.
@@ -150,6 +153,10 @@ pub const Engine = struct {
     peer: ?*Engine = null,
     /// Two-GPU TP (rank 0's engine): the pair's exchange. null: a layer split or a single device.
     tp_link: ?*tp2.Link = null,
+    kv_pool: ?*cuda.KvPool = null,
+    /// The widest prompt pass, in rows: state.pass_rows, or a two-GPU TP rank's state.prefill_rows (its scratch,
+    /// summed over every expert pair, is the largest buffer a rank holds beside the weights and the KV pool).
+    pass: usize = state.pass_rows,
     /// The seam's host staging: one pinned buffer, sized for the widest prompt pass's h, y and xs.
     stage: [1]cuda.HostBuffer = undefined,
 
@@ -214,7 +221,9 @@ pub const Engine = struct {
             };
         }
         errdefer if (e.vision) |v| v.deinit();
-        e.b = try state.Buffers.initRange(ctx.d, e.c, e.max_len, e.nch, e.carve, opts.range);
+        e.kv_pool = opts.kv_pool;
+        e.pass = if (opts.tp != null) state.prefill_rows else state.pass_rows;
+        e.b = try state.Buffers.initRange(ctx.d, e.c, e.max_len, e.nch, e.carve, opts.range, opts.kv_pool, e.pass);
         errdefer e.b.deinit();
         try e.b.initShared(e.ops(), e.c);
         if (e.segments > 1) e.seg = try segs.Segments.init(e, e.segments);
@@ -408,7 +417,7 @@ pub const Engine = struct {
         errdefer e.gpa.destroy(s);
         var head: [head_fields.len]usize = undefined;
         if (e.head) |h| head = h.seqSizes();
-        s.* = try state.Seq.initRange(e.ctx.d, e.c, e.max_len, if (e.head != null) &head else &.{}, e.stream, e.carve, e.range);
+        s.* = try state.Seq.initRange(e.ctx.d, e.c, e.max_len, if (e.head != null) &head else &.{}, e.stream, e.carve, e.range, e.kv_pool);
         const free = @ctz(~e.slots);
         if (free >= lesson_route.max_slots) return error.TooManySequences;
         if (e.tp_link != null) {
@@ -429,11 +438,33 @@ pub const Engine = struct {
     pub fn seqBytes(e: *const Engine) usize {
         var head: [head_fields.len]usize = undefined;
         if (e.head) |h| head = h.seqSizes();
-        return state.Seq.bytesRange(e.c, e.max_len, if (e.head != null) &head else &.{}, e.range);
+        const all = state.Seq.bytesRange(e.c, e.max_len, if (e.head != null) &head else &.{}, e.range);
+        // pooled KV planes come from the pool, which the load already holds: a stream adds only its other planes
+        return if (e.kv_pool != null) all - 2 * e.b.state_bytes[0] else all;
+    }
+
+    /// The bound sequence's KV pages under its first `rows` rows (the peer's too, under TP). A no-op without a pool.
+    pub fn ensureKv(e: *Engine, rows: usize) !void {
+        if (e.bound.paged) |x| try x.ensure(e.c, e.max_len, e.range, rows);
+        if (e.tp_link == null) return;
+        const p = e.peer.?;
+        if (p.bound.paged) |x| {
+            try p.ctx.makeCurrent();
+            defer e.ctx.makeCurrent() catch {};
+            try x.ensure(p.c, p.max_len, p.range, rows);
+        }
+    }
+
+    /// The bound sequence's KV pages back to the pool, once its stream has finished with them (a reset).
+    fn trimKv(e: *Engine) !void {
+        const x = e.bound.paged orelse return;
+        try e.stream.synchronize();
+        x.trim();
     }
 
     pub fn freeSeq(e: *Engine, s: *state.Seq) void {
         if (e.bound == s) e.bind(&e.own);
+        if (s.paged != null) e.stream.synchronize() catch {}; // its pages go back to the pool: no kernel may still read them
         if (s.peer) |ps| if (e.peer) |p| {
             p.ctx.makeCurrent() catch {};
             p.freeSeq(ps);
@@ -448,7 +479,14 @@ pub const Engine = struct {
     /// Act on sequence `s` from here on: its buffers replace the bound one's, which keeps where it stands.
     pub fn bind(e: *Engine, s: *state.Seq) void {
         const old = e.bound;
-        old.* = .{ .arena = old.arena, .carved = old.carved, .ptr = old.ptr, .head = old.head, .graphs = old.graphs, .epoch = old.epoch, .pos = e.pos, .parity = e.parity, .prev_keep = e.prev_keep, .rows = e.rows, .head_pos = if (e.head) |h| h.pos else 0, .sampling = e.sampling, .slot = old.slot, .decide = e.decide, .untaught = old.untaught, .peer = old.peer };
+        // where the old sequence stands, field by field: everything else it holds (buffers, graphs, twin, pages) stays
+        old.pos = e.pos;
+        old.parity = e.parity;
+        old.prev_keep = e.prev_keep;
+        old.rows = e.rows;
+        old.head_pos = if (e.head) |h| h.pos else 0;
+        old.sampling = e.sampling;
+        old.decide = e.decide;
         inline for (state.seq_fields, s.ptr) |name, p| @field(e.b, name) = p;
         e.pos = s.pos;
         e.parity = s.parity;
@@ -501,6 +539,7 @@ pub const Engine = struct {
             try e.ctx.makeCurrent();
         }
         try e.b.reset(e.ops());
+        try e.trimKv();
         e.pos = 0;
         e.parity = 0;
         e.prev_keep = 0;
@@ -560,6 +599,7 @@ pub const Engine = struct {
     pub fn verifyMasked(e: *Engine, ids: []const u32, rows: usize, dump: ?*Dump, mask: Mask) !void {
         if (rows < 1 or rows > state.max_rows or ids.len > rows) return error.BadWindow;
         if (e.pos + rows > e.max_len) return error.ContextFull;
+        try e.ensureKv(e.pos + rows);
         try e.copied.synchronize();
         const host = e.pinned.slice(u32);
         host[pin_meta..][0..4].* = e.metaRow();
@@ -609,6 +649,7 @@ pub const Engine = struct {
         for (parts, 0..) |p, k| {
             e.bind(p.seq);
             if (e.pos + p.rows > e.max_len) return error.ContextFull;
+            try e.ensureKv(e.pos + p.rows);
             const slot = host[k * 64 ..][0..64];
             slot[0..4].* = e.metaRow();
             @memcpy(slot[4..][0..p.ids.len], p.ids);

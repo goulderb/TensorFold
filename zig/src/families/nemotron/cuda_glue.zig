@@ -309,29 +309,39 @@ pub const Glue = struct {
         }
         const grp = at.heads / at.kv_heads;
         if (at.dim != 128 or grp > 16) return error.AttentionShape;
+        // the kernels number a launch's rows from 0: a group past the first (more streams than max_segs) is rebased
+        // to its first row, its buffers offset to that row
+        const base: u64 = segs[0].row0;
+        const qd: u64 = at.heads * at.dim;
         var t = std.mem.zeroes(AttnSegs);
         for (segs, 0..) |s, k| {
             t.kc[k] = s.kc;
             t.vc[k] = s.vc;
             t.meta[k] = s.meta;
-            t.row0[k] = int(s.row0);
+            t.row0[k] = int(s.row0 - base);
         }
         t.n = int(segs.len);
+        const q0 = qkv + base * at.nqkv * 2;
+        const po0 = po + base * at.nch * qd * 4;
+        const pm0 = pm + base * at.nch * at.heads * 4;
+        const pl0 = pl + base * at.nch * at.heads * 4;
+        const out0 = out + base * qd * 2;
+        const xs0 = xs + base * (qd / 64) * 4;
         var w: cuda.Args = .{};
         w.add(t);
-        w.add(qkv);
+        w.add(q0);
         ints(&w, &.{ at.nqkv, at.heads * at.dim, at.kv_heads * at.dim });
         try g.go(g.f.kv_write_segs, .{ rows, 1, 1 }, 256, 0, &w);
         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(at.dim), -0.5));
         var a: cuda.Args = .{};
         a.add(t);
-        ptrs(&a, &.{ qkv, po, pm, pl });
+        ptrs(&a, &.{ q0, po0, pm0, pl0 });
         ints(&a, &.{ at.nqkv, at.heads, at.kv_heads, grp, chunk_keys, at.nch });
         a.add(scale);
         try g.go(g.f.attn_chunk_segs, .{ rows, at.kv_heads, @min(at.nch, chunk_blocks) }, 256, 0, &a);
         var b: cuda.Args = .{};
         b.add(t);
-        ptrs(&b, &.{ po, pm, pl, out, xs });
+        ptrs(&b, &.{ po0, pm0, pl0, out0, xs0 });
         ints(&b, &.{ at.heads, at.kv_heads, grp, chunk_keys, at.nch });
         try g.go(g.f.attn_merge_segs, .{ rows, at.kv_heads, 1 }, 256, 0, &b);
     }
