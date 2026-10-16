@@ -322,15 +322,19 @@ pub fn follow(e: *Engine, link: *Link) !void {
             continue;
         }
         if (kind == .vision) {
-            try e.bind(h.slot);
             var failure: ?anyerror = null;
+            e.bind(h.slot) catch |err| {
+                failure = err;
+            };
             const rows: usize = h.depth;
             var ids: []u32 = undefined;
             var ids_owned = false;
-            if (e.gpa.dupe(u32, step.ids)) |copy| {
-                ids = copy;
-                ids_owned = true;
-            } else |err| failure = err;
+            if (failure == null) {
+                if (e.gpa.dupe(u32, step.ids)) |copy| {
+                    ids = copy;
+                    ids_owned = true;
+                } else |err| failure = err;
+            }
             var positions: []u32 = undefined;
             var positions_owned = false;
             var features: cuda.DeviceBuffer = undefined;
@@ -366,7 +370,8 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 if (failure == null) features.free();
                 if (positions_owned) e.gpa.free(positions);
                 if (ids_owned) e.gpa.free(ids);
-                return failure orelse error.PeerVisionUnavailable;
+                if (failure) |err| std.log.warn("vision request refused on follower: {s}", .{@errorName(err)});
+                continue;
             }
             var context: cuda.abi.Context = null;
             try e.d.check(e.d.api.cuCtxGetCurrent(&context), "cuCtxGetCurrent");
