@@ -215,7 +215,6 @@ pub const Leader = struct {
         try x.send(.{ .kind = @backingInt(Kind.vision), .depth = @intCast(table.rows), .a = replica, .seed = image_token }, ids);
         if (!try x.e.pairedReady(true)) return error.PeerVisionUnavailable;
         try x.link.features(table.features);
-        try vision_binding.traceFeatureTable(table);
     }
 
     /// `cancel` (rank 0's), asked before each chunk, decides for every rank; `from` every rank holds; `marks` rank 0's.
@@ -361,10 +360,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 if (at != rows) failure = error.BadVisionPositions;
             }
             if (failure == null) {
-                if (std.c.getenv("TF_GLM_VISION_FAIL_FOLLOWER_ALLOC")) |raw| {
-                    if (std.mem.eql(u8, std.mem.span(raw), "1")) failure = error.VisionFollowerAllocFault;
-                }
-                if (failure == null) features = cuda.DeviceBuffer.alloc(e.d, rows * vision_binding.width * 2) catch |err| blk: {
+                features = cuda.DeviceBuffer.alloc(e.d, rows * vision_binding.width * 2) catch |err| blk: {
                     failure = err;
                     break :blk undefined;
                 };
@@ -383,7 +379,6 @@ pub fn follow(e: *Engine, link: *Link) !void {
             try link.features(features);
             e.cur.vision.?.table().ready = true;
             _ = try e.cur.vision.?.table().binding();
-            try vision_binding.traceFeatureTable(e.cur.vision.?.table());
             continue;
         }
         if (kind != .end and kind != .drop and kind != .shared and kind != .release) try e.bind(h.slot);
