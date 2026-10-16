@@ -361,7 +361,10 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 if (at != rows) failure = error.BadVisionPositions;
             }
             if (failure == null) {
-                features = cuda.DeviceBuffer.alloc(e.d, rows * vision_binding.width * 2) catch |err| blk: {
+                if (std.c.getenv("TF_GLM_VISION_FAIL_FOLLOWER_ALLOC")) |raw| {
+                    if (std.mem.eql(u8, std.mem.span(raw), "1")) failure = error.VisionFollowerAllocFault;
+                }
+                if (failure == null) features = cuda.DeviceBuffer.alloc(e.d, rows * vision_binding.width * 2) catch |err| blk: {
                     failure = err;
                     break :blk undefined;
                 };
