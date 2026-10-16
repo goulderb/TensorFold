@@ -296,16 +296,24 @@ pub const Engine = struct {
 
     /// A two-GPU TP window: rank 0's rows and the peer's matching own sequence (one stream a rank for now).
     fn windowTp(e: *Engine, l: *tp2.Link, parts: []const @import("cuda_forward.zig").Seg, dump: ?*Dump) !void {
-        if (parts.len != 1 or parts[0].row0 != 0 or parts[0].b != &e.b) return error.TpSingleStream;
+        if (parts.len != 1 or parts[0].row0 != 0 or parts[0].b != &e.b) return error.TpOneBoundSequence;
+        const p = e.peer.?;
+        const peer_segs = [_]@import("cuda_forward.zig").Seg{.{ .b = &p.b, .row0 = 0, .rows = parts[0].rows, .sampled = false, .slot = parts[0].slot, .untaught = parts[0].untaught }};
+        return e.windowTpParts(l, parts, &peer_segs, dump);
+    }
+
+    /// A two-GPU TP window over `parts` on rank 0 and their twins `peer_parts` on the peer (the same rows in order).
+    fn windowTpParts(e: *Engine, l: *tp2.Link, parts: []const @import("cuda_forward.zig").Seg, peer_parts: []const @import("cuda_forward.zig").Seg, dump: ?*Dump) !void {
         const p = e.peer.?;
         var f0 = e.forward(dump);
         f0.segs = parts;
-        f0.untaught = parts[0].untaught;
+        f0.untaught = for (parts) |s| {
+            if (s.untaught) break true;
+        } else false;
         var f1 = p.forward(null);
-        const peer_segs = [_]@import("cuda_forward.zig").Seg{.{ .b = &p.b, .row0 = 0, .rows = parts[0].rows, .sampled = false, .slot = parts[0].slot, .untaught = parts[0].untaught }};
-        f1.segs = &peer_segs;
-        f1.untaught = parts[0].untaught;
-        return tp2.window(l, .{ &f0, &f1 }, .{ parts, &peer_segs });
+        f1.segs = peer_parts;
+        f1.untaught = f0.untaught;
+        return tp2.window(l, .{ &f0, &f1 }, .{ parts, peer_parts });
     }
 
     /// The window's inputs on the TP peer: the same ids and meta row rank 0 uploaded, from the same pinned host words.
@@ -386,7 +394,7 @@ pub const Engine = struct {
 
     /// A zeroed sequence for another stream (its own caches, state, head caches and settings).
     pub fn newSeq(e: *Engine) !*state.Seq {
-        if (e.peer != null) return error.SplitSingleStream;
+        if (e.peer != null and e.tp_link == null) return error.SplitSingleStream;
         const s = try e.gpa.create(state.Seq);
         errdefer e.gpa.destroy(s);
         var head: [head_fields.len]usize = undefined;
@@ -394,6 +402,15 @@ pub const Engine = struct {
         s.* = try state.Seq.initRange(e.ctx.d, e.c, e.max_len, if (e.head != null) &head else &.{}, e.stream, e.carve, e.range);
         const free = @ctz(~e.slots);
         if (free >= lesson_route.max_slots) return error.TooManySequences;
+        if (e.tp_link != null) {
+            const p = e.peer.?;
+            try p.ctx.makeCurrent();
+            defer e.ctx.makeCurrent() catch {};
+            s.peer = p.newSeq() catch |err| {
+                s.deinit();
+                return err;
+            };
+        }
         e.slots |= @as(u64, 1) << @intCast(free);
         s.slot = @intCast(free);
         return s;
@@ -408,6 +425,11 @@ pub const Engine = struct {
 
     pub fn freeSeq(e: *Engine, s: *state.Seq) void {
         if (e.bound == s) e.bind(&e.own);
+        if (s.peer) |ps| if (e.peer) |p| {
+            p.ctx.makeCurrent() catch {};
+            p.freeSeq(ps);
+            e.ctx.makeCurrent() catch {};
+        };
         seq_graphs.free(e.gpa, &s.graphs);
         e.slots &= ~(@as(u64, 1) << @intCast(s.slot));
         s.deinit();
@@ -417,7 +439,7 @@ pub const Engine = struct {
     /// Act on sequence `s` from here on: its buffers replace the bound one's, which keeps where it stands.
     pub fn bind(e: *Engine, s: *state.Seq) void {
         const old = e.bound;
-        old.* = .{ .arena = old.arena, .carved = old.carved, .ptr = old.ptr, .head = old.head, .graphs = old.graphs, .epoch = old.epoch, .pos = e.pos, .parity = e.parity, .prev_keep = e.prev_keep, .rows = e.rows, .head_pos = if (e.head) |h| h.pos else 0, .sampling = e.sampling, .slot = old.slot, .decide = e.decide, .untaught = old.untaught };
+        old.* = .{ .arena = old.arena, .carved = old.carved, .ptr = old.ptr, .head = old.head, .graphs = old.graphs, .epoch = old.epoch, .pos = e.pos, .parity = e.parity, .prev_keep = e.prev_keep, .rows = e.rows, .head_pos = if (e.head) |h| h.pos else 0, .sampling = e.sampling, .slot = old.slot, .decide = e.decide, .untaught = old.untaught, .peer = old.peer };
         inline for (state.seq_fields, s.ptr) |name, p| @field(e.b, name) = p;
         e.pos = s.pos;
         e.parity = s.parity;
@@ -428,6 +450,22 @@ pub const Engine = struct {
         e.decide = s.decide;
         if (e.head) |h| h.bindSeq(s);
         e.bound = s;
+        if (e.tp_link != null) {
+            const p = e.peer.?;
+            p.bind(if (s == &e.own) &p.own else s.peer.?);
+            e.syncPeer();
+        }
+    }
+
+    /// Two-GPU TP: the peer's host view of the bound sequence is rank 0's (its position, parity, keep and rows).
+    pub fn syncPeer(e: *Engine) void {
+        const p = e.peer orelse return;
+        if (e.tp_link == null) return;
+        p.pos = e.pos;
+        p.parity = e.parity;
+        p.prev_keep = e.prev_keep;
+        p.rows = e.rows;
+        p.armed.open = e.armed.open;
     }
 
     pub fn ops(e: *const Engine) kern.Ops {
@@ -457,6 +495,7 @@ pub const Engine = struct {
         e.pos = 0;
         e.parity = 0;
         e.prev_keep = 0;
+        e.syncPeer();
     }
 
     // the prompt pass, in cuda_prompt.zig
@@ -543,7 +582,7 @@ pub const Engine = struct {
 
     /// Several streams' windows in one forward (eager): each stream's rows read its own caches, state and rule.
     pub fn verifyShared(e: *Engine, parts: []const Shared) !void {
-        if (e.peer != null) return error.SplitSingleStream;
+        if (e.peer != null and e.tp_link == null) return error.SplitSingleStream;
         if (parts.len < 1 or parts.len > max_streams) return error.BadWindow;
         var total: usize = 0;
         for (parts) |p| {
@@ -555,6 +594,8 @@ pub const Engine = struct {
         const host = e.pinned.slice(u32)[pin_shared..][0 .. max_streams * 64];
         var views: [max_streams]state.Buffers = undefined;
         var parts_f: [max_streams]Seg = undefined;
+        var pviews: [max_streams]state.Buffers = undefined; // two-GPU TP: each part's buffers on the peer
+        var pparts: [max_streams]Seg = undefined;
         var row0: usize = 0;
         for (parts, 0..) |p, k| {
             e.bind(p.seq);
@@ -566,10 +607,18 @@ pub const Engine = struct {
             try e.ops().upload(e.b.meta, std.mem.sliceAsBytes(slot[0..4]));
             views[k] = e.b; // the bound sequence's own fields beside the shared scratch
             parts_f[k] = .{ .b = &views[k], .row0 = row0, .rows = p.rows, .sampled = e.sampling != null, .mask = p.mask, .slot = p.seq.slot, .untaught = p.seq.untaught };
+            if (e.tp_link != null) {
+                const peer = e.peer.?;
+                try e.mirrorWindow(std.mem.sliceAsBytes(slot[4..][0..p.ids.len]), std.mem.sliceAsBytes(slot[0..4]));
+                pviews[k] = peer.b;
+                pparts[k] = .{ .b = &pviews[k], .row0 = row0, .rows = p.rows, .sampled = false, .slot = p.seq.slot, .untaught = p.seq.untaught };
+            }
             row0 += p.rows;
         }
         try e.copied.record(e.stream);
-        try e.runWindow(parts_f[0..parts.len]);
+        if (e.tp_link) |l| {
+            try e.windowTpParts(l, parts_f[0..parts.len], pparts[0..parts.len], null);
+        } else try e.runWindow(parts_f[0..parts.len]);
         for (parts, 0..) |p, k| try e.ops().download(std.mem.sliceAsBytes(host[k * 64 + 32 ..][0..p.rows]), views[k].sampled);
         try e.sampled_ready.record(e.stream);
         for (parts) |p| {

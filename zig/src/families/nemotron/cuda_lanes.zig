@@ -136,8 +136,11 @@ pub const Cuda = struct {
     /// The facts the round loop reads at setup: windows up to 16 rows, one stream a forward, this GPU's costs.
     pub fn facts(self: *const Cuda) lanes.Model {
         const drafting = self.head != null;
+        // two-GPU TP serves without the MTP head, but its windows are exact at any width and several streams'
+        // share a forward (Engine.verifyShared): the 52 exchanges a round cost the same at 1 or 16 rows
+        const shared = drafting or self.e.tp_link != null;
         return .{
-            .exact_width = if (drafting) state.max_rows else 1,
+            .exact_width = if (shared) state.max_rows else 1,
             .gpu_tokens = false,
             .mtp = drafting,
             .speculate = drafting,
@@ -147,9 +150,9 @@ pub const Cuda = struct {
             .draft_streams = drafting, // a shared round's heads draft in one batch (Head.chains)
             .window_costs = self.costs[0..self.cost_count],
             .mtp_step_ms = self.mtp_ms,
-            .hidden_rows = drafting, // several streams' windows share a forward (Engine.verifyShared)
+            .hidden_rows = shared, // several streams' windows share a forward (Engine.verifyShared)
             .batch_rows = state.max_rows,
-            .max_streams = if (drafting) engine.max_streams else 1,
+            .max_streams = if (shared) engine.max_streams else 1,
         };
     }
 

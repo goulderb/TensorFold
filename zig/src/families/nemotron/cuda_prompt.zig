@@ -31,7 +31,7 @@ pub fn prefillWith(e: *Engine, prompt: []const u32, dump: ?*Dump, head: ?*Head, 
 
 /// prefill from `from` (0 resets; else a state restored at that row), in passes of up to 4,096 rows from there.
 pub fn prefillFrom(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, head: ?*Head, cancel: ?Cancel, keep: ?Keep) !u32 {
-    if (e.peer != null and (from != 0 or keep != null or head != null)) return error.SplitUnsupportedReuse;
+    if (e.peer != null and e.tp_link == null and (from != 0 or keep != null or head != null)) return error.SplitUnsupportedReuse;
     if (prompt.len == 0) return error.EmptyPrompt;
     if (from >= prompt.len) return error.BadReuse;
     if (prompt.len + state.max_rows > e.max_len) return error.ContextFull;
@@ -93,7 +93,10 @@ pub fn serialChunks(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, 
         const chunk = prompt[s..end];
         e.last_chunk = s;
         if (keep) |k| arm(e, k, s, end);
-        defer e.armed.n = 0;
+        defer {
+            e.armed.n = 0;
+            if (e.tp_link != null) e.peer.?.armed.n = 0; // after reuse.finish, which makes both ranks' copies whole
+        }
         f.captures = e.armed.marks();
         f.route = .{};
         f.route.add(0, chunk.len, e.pos, e.decide, e.slot);
@@ -107,7 +110,8 @@ pub fn serialChunks(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, 
             const p = e.peer.?;
             try p.ctx.makeCurrent();
             try p.ops().upload(p.b.p_ids, std.mem.sliceAsBytes(host));
-            const f1 = p.forward(null);
+            var f1 = p.forward(null);
+            f1.captures = p.armed.marks(); // the peer's own copies of the marks rank 0 armed
             try @import("cuda_tp2.zig").chunk(l, .{ &f, &f1 }, chunk.len, e.pos);
             try e.ctx.makeCurrent();
         } else if (e.peer) |p| {
@@ -136,7 +140,11 @@ fn inside(keep: ?Keep, s: usize, end: usize) usize {
 /// The keeps of rows strictly inside the chunk [s, end), made before it runs: the chunk writes their Mamba states.
 fn arm(e: *Engine, k: Keep, s: usize, end: usize) void {
     e.armed.open = .{ s, end };
-    defer e.armed.open = null;
+    defer {
+        e.armed.open = null;
+        e.syncPeer();
+    }
+    e.syncPeer();
     for (k.at) |m| if (m > s and m < end) k.call(k.ctx, m);
 }
 

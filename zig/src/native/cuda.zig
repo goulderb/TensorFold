@@ -427,8 +427,13 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     var probe: Probe = .{ .a = a, .io = io, .ctx = &g.ctx, .held = held0, .problem = problem };
     const split = pairRequested();
-    if (split and (o.drafts or o.slide or o.learn != null or segments != 1 or disk_config != null or (o.prompt_cache_gib orelse 0) != 0 or (o.lanes_fixed and o.lanes != 1))) {
+    const tp = tpRequested();
+    if (split and !tp and (o.drafts or o.slide or o.learn != null or segments != 1 or disk_config != null or (o.prompt_cache_gib orelse 0) != 0 or (o.lanes_fixed and o.lanes != 1))) {
         problem.* = "TENSORFOLD_SPLIT is a single-stream layer-split trial, not TP: use --no-drafts --parallel 1 --prompt-cache-gib 0 without learning, spill or segments";
+        return null;
+    }
+    if (tp and (o.drafts or o.slide or o.learn != null or segments != 1 or disk_config != null)) {
+        problem.* = "TENSORFOLD_TP=2 serves without drafts, Sliding Weights, learned states, segments or the spill tier: use --no-drafts";
         return null;
     }
     var opts: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments, .slide = o.slide };
@@ -515,7 +520,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         problem.* = try std.fmt.allocPrint(a, "this CUDA cache supports at most {d} lanes; lower --parallel {d}", .{ lane_limit, o.lanes });
         return null;
     };
-    const streams: u32 = if (split) 1 else budget.admit(room, loaded.stream_bytes, free, asked, o.lanes_fixed) catch |e| {
+    const streams: u32 = if (split and !tp) 1 else budget.admit(room, loaded.stream_bytes, free, asked, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
             error.NoStream => try std.fmt.allocPrint(a, no_stream, .{
                 window,
@@ -536,7 +541,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         };
         return null;
     };
-    const cache = if (split) 0 else budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free));
+    const cache = if (split and !tp) 0 else budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free));
     const store_cache = if (@hasDecl(F, "snap_save")) try snaps.cacheBudget(F, loaded.target, cache) else 0;
     // Mamba spares are prepaid; the tier reservation is charged once inside the remaining Store budget.
     const disk: ?*nspill.Disk = if (F != nemotron.native) null else if (disk_config) |*c| (try openDisk(F, a, gpa, io, g, loaded, c, &model_files.?, &exe_files.?, kernels, segments, store_cache, problem)) orelse return null else null;

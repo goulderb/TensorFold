@@ -160,6 +160,7 @@ pub const Seq = struct {
     slot: u32 = 0, // its lesson latch slot (lesson_route)
     decide: i64 = lesson_route.none, // the prompt row where its lessons decide whether they act on the reply
     untaught: bool = false, // reads the model as shipped: no learned neuron acts on its rows (a lesson writer's reads)
+    peer: ?*Seq = null, // two-GPU TP: this sequence's share on the other rank (null: the own one's, or no TP)
 
     /// The device bytes one sequence takes: its buffers for `max_len` cache rows and a head's `head` buffers.
     pub fn bytes(c: Config, max_len: usize, head: []const usize) usize {

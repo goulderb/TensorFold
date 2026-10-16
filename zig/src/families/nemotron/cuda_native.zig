@@ -101,6 +101,9 @@ pub const Loaded = struct {
     vision: ?*vision.Vision = null, // --vision: the tower the server's image requests reach
     taps: []const u32 = &.{}, // the rows a recorder may ask `backend` for (empty: none)
     living: bool = false, // Living Weights loaded from the model folder: decoding is not the checkpoint's alone
+    /// Two-GPU TP: the peer's room (free memory less the 1536 MiB floor) after its load; the host admits streams and
+    /// kept states by the smaller of the two, since every one takes the same bytes on both.
+    peer_room: ?struct { rank: usize, bytes: u64 } = null,
 };
 
 /// Two-GPU tensor parallel (TENSORFOLD_TP=2): rank 0 on this device and rank 1 on the other internal one, each with
@@ -134,7 +137,8 @@ fn openTp(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
     own.peer = p;
     own.link = link;
     const floor: usize = 1536 << 20;
-    if ((try p.ctx.memInfo()).free < floor or (try ctx.memInfo()).free < floor) return error.TpMemoryFloor;
+    const peer_free = (try p.ctx.memInfo()).free;
+    if (peer_free < floor or (try ctx.memInfo()).free < floor) return error.TpMemoryFloor;
     try ctx.makeCurrent();
     try own.lanes.measure(io, dir);
     own.taps = .{@import("cuda_lanes.zig").finalTap(e.c)};
@@ -142,7 +146,7 @@ fn openTp(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
-        .rows = 1,
+        .rows = state.max_rows, // exact windows up to 16 rows, several streams' sharing one forward
         .stream_bytes = e.seqBytes(),
         .ctx = own,
         .deinit = release,
@@ -153,6 +157,7 @@ fn openTp(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []c
         .vision = null,
         .taps = &own.taps,
         .living = false,
+        .peer_room = .{ .rank = 1, .bytes = peer_free - floor },
     };
 }
 
