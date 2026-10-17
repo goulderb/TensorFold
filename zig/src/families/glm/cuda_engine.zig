@@ -151,10 +151,11 @@ pub const Engine = struct {
         const cfg_path = try std.fs.path.join(a, &.{ checkpoint, "config.json" });
         const text = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, a, .limited(1 << 24));
         var why: modelopt.Why = .{};
-        _ = @import("cuda_checkpoint.zig").admit(gpa, text, &why) catch |err| {
+        var admission = @import("cuda_checkpoint.zig").Admission.read(gpa, text, &why) catch |err| {
             std.log.err("{s}: {s}", .{ cfg_path, why.text() });
             return err;
         };
+        defer admission.deinit();
         const c = try config.parse(gpa, text);
         var stream = try cuda.Stream.init(d, false);
         errdefer stream.deinit();
@@ -218,6 +219,7 @@ pub const Engine = struct {
         var wt = e.m.tools();
         wt.precision = .{ .dense = o.settings.weight_dense, .head = o.settings.weight_head };
         wt.exl3_routed = settings.exl3_routed;
+        wt.recipes = if (admission.recipes) |*t| t else null;
         if (rank == 0) {
             var policy_text: [256]u8 = undefined;
             const policy_hash = o.settings.weight_dense.digest();

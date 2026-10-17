@@ -295,7 +295,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
             "GLM-5.3-Flash on CUDA runs on at most {d} ranks: set TF_GLM_WORLD to {d} or fewer",
             .{ ranks.max_world, ranks.max_world },
         ),
-        error.NotModelOpt, error.UnsupportedQuant => "GLM-5.3-Flash on CUDA reads ModelOpt NVFP4 checkpoints (the log names what config.json has)",
+        error.WeightRecipeMismatch, error.BadFp8Source => "GLM checkpoint tensors disagree with the ModelOpt module recipe",
+        error.NotModelOpt, error.UnsupportedQuant => "GLM-5.3-Flash on CUDA reads ModelOpt NVFP4, mixed FP4/FP8 and EXL3 checkpoints (the log names what config.json has)",
         else => null,
     };
 }

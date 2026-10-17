@@ -16,6 +16,7 @@ const b16 = @import("cuda_b16.zig");
 const x3 = @import("cuda_weights_exl3.zig");
 pub const projections = @import("cuda_weights_projs.zig");
 
+const source = @import("cuda_weight_source.zig");
 const Tensor = core.checkpoint.Tensor;
 pub const prefix = "model.language_model.";
 
@@ -31,7 +32,7 @@ pub const Layer = struct { index: u32, attn_hc: Hc, ffn_hc: Hc, in_norm: u64, po
 pub const Mtp = struct { enorm: u64, hnorm: u64, eh: b16.Proj, norm: u64, layer: Layer, draft: ?q4.Q4 };
 
 /// The kernels a load runs: affine4_pack's tf_pack_dense, and for the MTP head the quantizers and the 4-bit tiling.
-pub const Tools = struct { pack_dense: cuda.Function, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null, affine4: ?*const cuda.qlinear.Affine4Kernels = null, modelopt: ?*const cuda.modelopt.Packer = null, ck: ?*const cuda.ck.Ck = null, precision: @import("cuda_weight_precision.zig").Settings = .{}, exl3_routed: @import("cuda_experts_mia.zig").Mode = .generic };
+pub const Tools = struct { recipes: ?*const core.modelopt.Table = null, pack_dense: cuda.Function, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null, affine4: ?*const cuda.qlinear.Affine4Kernels = null, modelopt: ?*const cuda.modelopt.Packer = null, ck: ?*const cuda.ck.Ck = null, precision: @import("cuda_weight_precision.zig").Settings = .{}, exl3_routed: @import("cuda_experts_mia.zig").Mode = .generic };
 
 /// A loaded tensor by the Python family's attribute path, for digests against its weights.
 pub const Named = struct { name: []u8, ptr: u64, len: usize };
@@ -72,12 +73,7 @@ pub const Weights = struct {
     }
 };
 
-/// Host bf16 from fp32: round to nearest even (torch's float -> bfloat16), NaN kept quiet.
-fn toBf16(v: f32) u16 {
-    const b: u32 = @bitCast(v);
-    if (std.math.isNan(v)) return @intCast((b >> 16) | 0x40);
-    return @intCast((b + 0x7fff + ((b >> 16) & 1)) >> 16);
-}
+const toBf16 = core.quant.convert.bf16;
 
 pub const Loader = struct {
     gpa: std.mem.Allocator,
@@ -90,9 +86,9 @@ pub const Loader = struct {
     host: std.ArrayList(u8) = .empty,
     name_buf: [192]u8 = undefined,
 
-    pub fn get(L: *Loader, comptime fmt: []const u8, args: anytype) !Tensor {
+    pub fn get(L: *Loader, comptime fmt: []const u8, args: anytype) !source.Source {
         const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, args);
-        return L.ck.get(name);
+        return source.Source.read(L.ck, L.tools.recipes, name);
     }
 
     /// The host bytes gathered so far uploaded as one tensor named `fmt`.
@@ -104,43 +100,31 @@ pub const Loader = struct {
         return b.ptr;
     }
 
-    /// Elements [lo, hi) of `t` flat as `to` (bf16 or fp32 from a bf16 or fp32 tensor; other dtypes only as stored).
-    fn add(L: *Loader, t: Tensor, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
-        if (t.dtype == to) {
-            const size = t.bytes.len / t.numel();
-            return L.host.appendSlice(L.gpa, t.bytes[lo * size .. hi * size]);
-        }
-        for (lo..hi) |i| {
-            const v: f32 = switch (t.dtype) {
-                .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16),
-                .f32 => std.mem.bytesToValue(f32, t.bytes[4 * i ..][0..4]),
-                .f16 => @floatCast(std.mem.bytesToValue(f16, t.bytes[2 * i ..][0..2])),
-                else => return error.UnexpectedTensor,
-            };
-            switch (to) {
-                .f32 => try L.host.appendSlice(L.gpa, std.mem.asBytes(&v)),
-                .bf16 => try L.host.appendSlice(L.gpa, std.mem.asBytes(&toBf16(v))),
-                else => return error.UnexpectedTensor,
-            }
-        }
+    fn view(t: anytype) source.Source {
+        return if (@TypeOf(t) == Tensor) .{ .weight = t } else t;
     }
 
-    /// Rows [lo, hi) of `t`'s outermost axis (`total` long; a vector's elements): split.py's "row" cut.
-    pub fn rows(L: *Loader, t: Tensor, lo: usize, hi: usize, total: usize, to: core.checkpoint.DType) !void {
-        const per = t.numel() / total;
-        if (per * total != t.numel()) return error.UnexpectedTensor;
+    fn add(L: *Loader, t: anytype, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
+        try view(t).append(L.gpa, &L.host, lo, hi, to);
+    }
+
+    pub fn rows(L: *Loader, t: anytype, lo: usize, hi: usize, total: usize, to: core.checkpoint.DType) !void {
+        if (total == 0 or lo > hi or hi > total) return error.UnexpectedTensor;
+        const count = view(t).weight.numel();
+        const per = count / total;
+        if (per * total != count) return error.UnexpectedTensor;
         try L.add(t, lo * per, hi * per, to);
     }
 
-    pub fn whole(L: *Loader, t: Tensor, to: core.checkpoint.DType) !void {
-        try L.add(t, 0, t.numel(), to);
+    pub fn whole(L: *Loader, t: anytype, to: core.checkpoint.DType) !void {
+        try L.add(t, 0, view(t).weight.numel(), to);
     }
 
-    /// Columns [lo, hi) of every row of a matrix: split.py's "col" cut.
-    pub fn cols(L: *Loader, t: Tensor, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
-        if (t.rank != 2) return error.UnexpectedTensor;
-        const k = t.dim(1);
-        for (0..t.dim(0)) |r| try L.add(t, r * k + lo, r * k + hi, to);
+    pub fn cols(L: *Loader, t: anytype, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
+        const w = view(t).weight;
+        if (w.rank != 2 or lo > hi or hi > w.dim(1)) return error.UnexpectedTensor;
+        const k = w.dim(1);
+        for (0..w.dim(0)) |r| try L.add(t, r * k + lo, r * k + hi, to);
     }
 
     fn hc(L: *Loader, i: u32, comptime site: []const u8) !Hc {
@@ -255,7 +239,9 @@ pub const Loader = struct {
     /// An NVFP4 linear's rows [lo, hi), inputs [klo, khi) as Fp4Linear.from_checkpoint (tf_pack_dense, packScales).
     fn fp4(L: *Loader, comptime fmt: []const u8, i: u32, lo: usize, hi: usize, klo: usize, khi: usize) !cuda.qmmf.Weight {
         const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, .{i});
-        const l = try core.nvfp4.Linear.read(L.ck, name);
+        var stored = try source.Fp4.read(L.gpa, L.ck, L.tools.recipes, name);
+        defer stored.deinit(L.gpa);
+        const l = stored.linear;
         const n = hi - lo;
         const k = khi - klo;
         for (0..n) |r| try L.host.appendSlice(L.gpa, l.codes[(lo + r) * l.k / 2 + klo / 2 ..][0 .. k / 2]);
@@ -293,7 +279,9 @@ pub const Loader = struct {
         const weight_name = try std.fmt.bufPrint(&dense_name, prefix ++ "layers.{d}.mlp.gate_proj.weight", .{i});
         if (L.ck.has(weight_name)) {
             const gate = try L.ck.get(weight_name);
-            if (gate.dtype == .bf16 or gate.dtype == .f32) return .{
+            const rec = source.recipe(L.tools.recipes, weight_name[0 .. weight_name.len - 7]);
+            const bf16 = if (L.tools.recipes != null) (rec == null or rec.?.algo == .mxfp8 or rec.?.algo == .fp8_pb_wo) else (gate.dtype == .bf16 or gate.dtype == .f32);
+            if (bf16) return .{
                 .gate = try L.denseB16(i, "gate_proj", s.lo, s.hi, 0, d),
                 .up = try L.denseB16(i, "up_proj", s.lo, s.hi, 0, d),
                 .down = try L.denseB16(i, "down_proj", 0, d, s.lo, s.hi),
@@ -322,8 +310,8 @@ pub const Loader = struct {
 
     fn denseB16(L: *Loader, i: u32, comptime proj: []const u8, lo: usize, hi: usize, klo: usize, khi: usize) !b16.Proj {
         const t = try L.get("layers.{d}.mlp." ++ proj ++ ".weight", .{i});
-        if (t.rank != 2 or (t.dtype != .bf16 and t.dtype != .f32) or hi > t.dim(0) or khi > t.dim(1)) return error.UnexpectedTensor;
-        for (lo..hi) |row| try L.add(t, row * t.dim(1) + klo, row * t.dim(1) + khi, .bf16);
+        if (t.weight.rank != 2 or hi > t.weight.dim(0) or khi > t.weight.dim(1)) return error.UnexpectedTensor;
+        for (lo..hi) |row| try L.add(t, row * t.weight.dim(1) + klo, row * t.weight.dim(1) + khi, .bf16);
         return projections.finish(L, .mlp, "layers.{d}.mlp." ++ proj, .{i}, hi - lo, khi - klo);
     }
 
@@ -420,25 +408,11 @@ pub const Loader = struct {
         defer L.gpa.free(codes);
         const scales = try L.gpa.alloc(u8, d * ni / 16);
         defer L.gpa.free(scales);
-        if (i == c.layers) try L.quantizedExperts(i, up, down, up_scale, down_scale) else for (0..count) |e| {
-            var ls: [3]core.nvfp4.Linear = undefined;
-            inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, m| {
-                const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.mlp.experts.{d}." ++ proj, .{ i, e });
-                ls[m] = try core.nvfp4.Linear.read(L.ck, name);
-            }
-            // gate and up: the rank's rows; down: every row, the rank's columns
-            const gate = .{ ls[0].codes[cut.lo * d / 2 ..][0 .. ni * d / 2], ls[0].scales[cut.lo * d / 16 ..][0 .. ni * d / 16] };
-            const upm = .{ ls[1].codes[cut.lo * d / 2 ..][0 .. ni * d / 2], ls[1].scales[cut.lo * d / 16 ..][0 .. ni * d / 16] };
-            X.packGateUp(up[e * up_len ..][0..up_len], gate, upm, ni, d);
-            const l = ls[2];
-            for (0..d) |r| {
-                @memcpy(codes[r * ni / 2 ..][0 .. ni / 2], l.codes[r * l.k / 2 + cut.lo / 2 ..][0 .. ni / 2]);
-                @memcpy(scales[r * ni / 16 ..][0 .. ni / 16], l.scales[r * l.k / 16 + cut.lo / 16 ..][0 .. ni / 16]);
-            }
-            X.packOne(down[e * down_len ..][0..down_len], codes, scales, d, ni);
-            up_scale[e * 2] = ls[0].global;
-            up_scale[e * 2 + 1] = ls[1].global;
-            down_scale[e] = l.global;
+        if (i == c.layers and L.tools.recipes == null) try L.quantizedExperts(i, up, down, up_scale, down_scale) else for (0..count) |e| {
+            const globals = try source.packExpert(L.gpa, L.ck, L.tools.recipes, i, e, .{ .lo = cut.lo, .hi = cut.hi }, d, up[e * up_len ..][0..up_len], down[e * down_len ..][0..down_len], codes, scales);
+            up_scale[e * 2] = globals[0];
+            up_scale[e * 2 + 1] = globals[1];
+            down_scale[e] = globals[2];
         }
         var ptrs: [4]u64 = undefined;
         for (&ptrs, [_][]const u8{ std.mem.sliceAsBytes(up), std.mem.sliceAsBytes(down), std.mem.sliceAsBytes(up_scale), std.mem.sliceAsBytes(down_scale) }, [_][]const u8{ "up", "down", "up_scale", "down_scale" }) |*p, bytes, what| {
@@ -479,7 +453,7 @@ pub const Loader = struct {
         if (L.w.exl3) {
             var o3: [3]u64 = undefined;
             for (&o3, [_][]const u8{ "enorm.weight", "hnorm.weight", "shared_head.norm.weight" }, [_][]const u8{ "enorm", "hnorm", "norm" }) |*p, name, what| {
-                try L.whole(try L.ck.get(try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.{s}", .{ i, name })), .bf16);
+                try L.whole(try source.Source.read(L.ck, L.tools.recipes, try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.{s}", .{ i, name })), .bf16);
                 p.* = try L.put("mtp.{s}", .{what});
             }
             return .{ .enorm = o3[0], .hnorm = o3[1], .eh = .{ .q = try x3.whole(L, "layers.{d}.eh_proj", i) }, .norm = o3[2], .layer = layer_w, .draft = null };
@@ -487,7 +461,7 @@ pub const Loader = struct {
         var eh: b16.Proj = undefined;
         var out: [4]u64 = undefined;
         for (&out, [_][]const u8{ "enorm.weight", "hnorm.weight", "eh_proj.weight", "shared_head.norm.weight" }, [_][]const u8{ "enorm", "hnorm", "eh", "norm" }) |*p, name, what| {
-            try L.whole(try L.ck.get(try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.{s}", .{ i, name })), .bf16);
+            try L.whole(try source.Source.read(L.ck, L.tools.recipes, try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.{s}", .{ i, name })), .bf16);
             if (std.mem.eql(u8, what, "eh")) {
                 eh = try projections.finish(L, .mtp_eh, "mtp.eh", .{}, c.hidden, 2 * c.hidden);
                 p.* = 0;
@@ -566,11 +540,23 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
         // EXL3 keeps the MTP layer in mtp.safetensors or, in some quants, in the shards
         if (with_mtp and c.mtp > 0) ck.add(dir, "mtp.safetensors") catch |e| if (e != error.FileNotFound) return e;
     } else {
-        try L.rows(try head_ck.get("lm_head.weight"), share.vocab.lo, share.vocab.hi, c.vocab, .bf16);
+        try L.rows(try source.Source.read(&head_ck, tools.recipes, "lm_head.weight"), share.vocab.lo, share.vocab.hi, c.vocab, .bf16);
         w.head = .{ .b16 = try L.put("head", .{}) };
     }
     if (with_mtp and c.mtp > 0) w.mtp = try L.mtp();
     try projections.head(&L);
+    if (tools.recipes != null) {
+        for (0..c.layers) |i| {
+            var selected = false;
+            for (layers) |index| if (index == i) {
+                selected = true;
+                break;
+            };
+            if (!selected) try ck.skip(try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.", .{i}));
+        }
+        if (!with_mtp or c.mtp == 0) try ck.skip(try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.", .{c.layers}));
+        if (ck.unused() != 0 or head_ck.unused() != 0) return error.UnusedTensors;
+    }
     return w;
 }
 

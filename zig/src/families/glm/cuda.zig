@@ -37,6 +37,7 @@ pub const vision_runtime = @import("cuda_vision_runtime.zig");
 
 test {
     _ = @import("cuda_checkpoint.zig");
+    _ = @import("cuda_weight_source_test.zig");
     _ = experts;
     _ = glue;
     _ = kda;

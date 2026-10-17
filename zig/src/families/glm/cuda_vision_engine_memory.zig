@@ -87,12 +87,12 @@ pub const WeightLayout = struct {
         self.* = undefined;
     }
     fn check(self: *const WeightLayout, w: *const host.Weights) !void {
-        if (!std.meta.eql(self.c, w.c) or self.regions.len != w.tensors.len) return error.InvalidVisionWeightTable;
-        for (self.regions, w.tensors) |r, t| {
+        if (!std.meta.eql(self.c, w.c) or self.regions.len != w.tensors.len or (w.quantized.len != 0 and w.quantized.len != w.tensors.len)) return error.InvalidVisionWeightTable;
+        for (self.regions, w.tensors, 0..) |r, t, i| {
             if (t.rank != r.rank or !std.mem.eql(usize, t.shape[0..t.rank], r.shape[0..r.rank])) return error.InvalidVisionWeightShape;
             if (t.dtype != .bf16 and t.dtype != .f16 and t.dtype != .f32) return error.UnsupportedVisionDType;
             const bytes = std.math.mul(usize, r.len / 2, t.dtype.size()) catch return error.InvalidVisionWeightShape;
-            if (t.bytes.len != bytes) return error.InvalidVisionWeightShape;
+            if ((w.quantized.len == 0 or w.quantized[i] == null) and t.bytes.len != bytes) return error.InvalidVisionWeightShape;
         }
     }
 };
@@ -109,14 +109,14 @@ pub const DeviceWeights = struct {
         var layout = try WeightLayout.init(a, w.c, max_bytes);
         errdefer layout.deinit();
         try layout.check(w);
-        for (w.tensors) |t| {
-            const converted = try host.toBf16(a, t);
+        for (w.tensors, 0..) |_, i| {
+            const converted = try w.converted(a, i);
             a.free(converted);
         }
         var pool = try allocate(d, layout.bytes);
         errdefer pool.free();
-        for (w.tensors, layout.regions) |t, r| {
-            const converted = try host.toBf16(a, t);
+        for (layout.regions, 0..) |r, i| {
+            const converted = try w.converted(a, i);
             defer a.free(converted);
             try pool.upload(r.offset, std.mem.sliceAsBytes(converted));
         }
