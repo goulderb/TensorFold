@@ -4,6 +4,7 @@ pub const experts = @import("cuda_experts.zig");
 pub const glue = @import("cuda_glue.zig");
 pub const kda = @import("cuda_kda.zig");
 pub const b16 = @import("cuda_b16.zig");
+pub const source_dense = @import("cuda_weight_source_dense.zig");
 pub const kv_owner = @import("cuda_kv_owner.zig");
 pub const kv_pool = @import("cuda_kv_pool.zig");
 pub const layout = @import("cuda_layout.zig");

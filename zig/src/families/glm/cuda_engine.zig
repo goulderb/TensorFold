@@ -200,6 +200,14 @@ pub const Engine = struct {
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
         var m = try fw.Modules.load(d, ctx);
         errdefer m.deinit();
+        if (settings.weight_dense.source()) {
+            var source_problem: ?anyerror = null;
+            m.enableSourceDense(d) catch |err| {
+                source_problem = err;
+            };
+            try ranks.gather(u32, d, lib, comm, stream, rank, @intFromBool(source_problem == null), startup);
+            for (startup) |ready| if (ready == 0) return source_problem orelse error.PeerSourceDenseRefused;
+        }
         if (settings.weight_dense.native()) {
             var native_problem: ?anyerror = null;
             m.enableNativeDense(d, ctx) catch |err| {

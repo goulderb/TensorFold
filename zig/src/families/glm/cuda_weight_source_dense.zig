@@ -42,9 +42,20 @@ pub const Packed = struct {
         return p.codes.len + p.scales.len;
     }
 
+    /// The CUDA kernels read complete 128-input chunks and aligned four-code words.
+    pub fn checkCuda(p: Packed) !void {
+        if (p.ins == 0 or p.ins % 128 != 0 or p.outs == 0 or p.in0 % 4 != 0 or p.in_total % 4 != 0) return error.SourceDenseGeometry;
+        if (@as(u64, p.in0) + p.ins > p.in_total or @as(u64, p.out0) + p.outs > p.out_total) return error.SourceDenseGeometry;
+        _ = try p.matrix();
+        // exlr8_dense.cu constructs E8M0 scales as normal FP32 exponents.
+        if (p.format == @backingInt(Format.mxfp8)) for (p.scales) |s| {
+            if (s == 0 or s == 255) return error.SourceDenseScale;
+        };
+    }
+
     pub fn extend(p: *Packed, a: Allocator, q: Packed) !void {
         if (p.format != q.format or p.ins != q.ins or p.out0 != 0 or p.in0 != 0 or q.out0 != 0 or q.in0 != 0 or p.in_total != p.ins or q.in_total != q.ins) return error.SourceDenseGeometry;
-        const row_block: u32 = if (p.format == @intFromEnum(Format.mxfp8)) 1 else 128;
+        const row_block: u32 = if (p.format == @backingInt(Format.mxfp8)) 1 else 128;
         if (p.outs % row_block != 0) return error.SourceDenseGeometry;
         const codes = try a.alloc(u8, p.codes.len + q.codes.len);
         errdefer a.free(codes);
@@ -174,7 +185,7 @@ fn packMx(a: Allocator, w: Tensor, sc: Tensor, rows: []const Span, cols: Span, n
         at += 1;
     };
     return .{
-        .format = @intFromEnum(Format.mxfp8),
+        .format = @backingInt(Format.mxfp8),
         .out0 = 0,
         .outs = try fit(outs),
         .in0 = 0,
@@ -188,7 +199,9 @@ fn packMx(a: Allocator, w: Tensor, sc: Tensor, rows: []const Span, cols: Span, n
 
 fn pbAligned(rows: []const Span, cols: Span) bool {
     if (cols.lo % 128 != 0) return false;
-    for (rows) |sp| if (sp.lo % 128 != 0) return false;
+    for (rows, 0..) |sp, i| {
+        if (sp.lo % 128 != 0 or (i + 1 < rows.len and (sp.hi - sp.lo) % 128 != 0)) return false;
+    }
     return true;
 }
 
@@ -217,7 +230,7 @@ fn packPbTight(a: Allocator, w: Tensor, sc: Tensor, rows: []const Span, cols: Sp
         at += 1;
     };
     return .{
-        .format = @intFromEnum(Format.fp8_block),
+        .format = @backingInt(Format.fp8_block),
         .out0 = 0,
         .outs = try fit(outs),
         .in0 = 0,
@@ -249,7 +262,7 @@ fn packPbRect(a: Allocator, w: Tensor, sc: Tensor, rows: Span, cols: Span, n: us
         writeF32(scales, sr * skb + sc_i, pbScale(sc, n, k, row0 + sr * 128, col0 + sc_i * 128));
     };
     return .{
-        .format = @intFromEnum(Format.fp8_block),
+        .format = @backingInt(Format.fp8_block),
         .out0 = try fit(rows.lo - row0),
         .outs = try fit(outs),
         .in0 = try fit(cols.lo - col0),

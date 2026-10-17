@@ -50,12 +50,18 @@ pub const Modules = struct {
     affine4: cuda.qlinear.Affine4Kernels,
     mia: ?mia.Kernels = null,
     ck: ?cuda.ck.Ck = null,
+    source_mods: ?[2]cuda.Module = null,
+    source_dense: ?cuda.exlr8.Dense = null,
+    source_upcast: ?cuda.Function = null,
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
         var m: Modules = undefined;
         m.mia = null;
         m.ck = null;
+        m.source_mods = null;
+        m.source_dense = null;
+        m.source_upcast = null;
         var n: usize = 0;
         errdefer for (m.mods[0..n]) |*x| x.unload();
         for (&m.mods, [_][]const u8{ k.glm_kda, k.glm_ops, k.experts, k.affine4_pack, k.glm_quant, k.qmm_group, k.glm_glue, k.qmm_prefill, k.lane_gemv }) |*x, image| {
@@ -96,11 +102,25 @@ pub const Modules = struct {
         m.ck = try cuda.ck.Ck.load(d, 12, @intCast(try ctx.attribute(.multiprocessor_count)));
     }
 
+    pub fn enableSourceDense(m: *Modules, d: *const cuda.Driver) !void {
+        if (m.source_mods != null) return;
+        var dm = try cuda.Module.load(d, cuda.kernels.exlr8_dense);
+        errdefer dm.unload();
+        var pm = try cuda.Module.load(d, cuda.kernels.torch_pointwise);
+        errdefer pm.unload();
+        const dense = try cuda.exlr8.Dense.resolve(dm);
+        const cast = try pm.function("tf_bf16_to_f32_kernel");
+        m.source_mods = .{ dm, pm };
+        m.source_dense = dense;
+        m.source_upcast = cast;
+    }
+
     pub fn ops(m: *const Modules) cuda.Module {
         return m.mods[1];
     }
 
     pub fn deinit(m: *Modules) void {
+        if (m.source_mods) |*mods| for (mods) |*x| x.unload();
         if (m.ck) |*c| c.unload();
         if (m.mia) |*k| k.unload();
         for (&m.mods) |*x| x.unload();
@@ -195,7 +215,7 @@ pub const Forward = struct {
     vision: ?@import("cuda_vision_binding.zig").Binding = null,
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue, .linear = f.linear(), .copy_rows = f.m.copy_rows };
+        return .{ .glue = &f.m.glue, .linear = f.linear(), .copy_rows = f.m.copy_rows, .exlr8_dense = if (f.m.source_dense) |*d| d else null, .source_upcast = f.m.source_upcast };
     }
 
     /// qlinear over every format a GLM checkpoint brings: NVFP4 (lane and prompt GEMM) and EXL3.

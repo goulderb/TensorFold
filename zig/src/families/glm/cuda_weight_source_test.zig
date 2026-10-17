@@ -424,6 +424,7 @@ test "source dense packs FP8_PB_WO whole, unaligned, and head-interleaved kv_b_p
     try expectPacked(whole, mla, &.{core.fp8_source.all(130)}, core.fp8_source.all(130));
     try std.testing.expectEqual(@as(u32, 4), whole.format);
     try std.testing.expectEqual(@as(u32, 130), whole.ins);
+    try std.testing.expectError(error.SourceDenseGeometry, whole.checkCuda());
     var mid = try dense.pack(a, mla, &.{.{ .lo = 120, .hi = 130 }}, .{ .lo = 120, .hi = 130 });
     defer mid.deinit(a);
     try expectPacked(mid, mla, &.{.{ .lo = 120, .hi = 130 }}, .{ .lo = 120, .hi = 130 });
@@ -437,6 +438,8 @@ test "source dense packs FP8_PB_WO whole, unaligned, and head-interleaved kv_b_p
     try expectPacked(heads, kv_s, &spans, core.fp8_source.all(256));
     try std.testing.expectEqual(@as(u32, 0), heads.out0);
     try std.testing.expectEqual(@as(u32, 256), heads.outs);
+    try heads.checkCuda();
+    try std.testing.expectError(error.SourceDenseGeometry, dense.pack(a, kv_s, &.{ .{ .lo = 0, .hi = 64 }, .{ .lo = 128, .hi = 256 } }, core.fp8_source.all(256)));
     try std.testing.expectError(error.SourceDenseGeometry, dense.pack(a, mla, &.{ .{ .lo = 120, .hi = 130 }, .{ .lo = 0, .hi = 10 } }, core.fp8_source.all(130)));
 }
 
@@ -461,4 +464,52 @@ test "mixed loader native entry points compile" {
     _ = &@import("cuda_weights.zig").load;
     _ = &@import("cuda_engine.zig").Engine.init;
     _ = &@import("cuda_vision_runtime.zig").Service.open;
+}
+
+test "source dense CUDA refusal and upload account only checkpoint bytes and job metadata" {
+    const W = @import("cuda_weights.zig");
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    var driver = Memory.driver();
+    const Upload = struct {
+        fn copy(dst: u64, src: ?*const anyopaque, n: usize) callconv(.c) cuda.abi.Result {
+            const from: [*]const u8 = @ptrCast(src.?);
+            @memcpy(Memory.slice(dst, n), from[0..n]);
+            return 0;
+        }
+    };
+    driver.api.cuMemcpyHtoD_v2 = Upload.copy;
+    var codes: [33 * 128]u8 = @splat(0x38);
+    var scales: [33 * 4]u8 = @splat(127);
+    var p: dense.Packed = .{ .format = 3, .out0 = 0, .outs = 33, .in0 = 0, .ins = 128, .out_total = 33, .in_total = 128, .codes = &codes, .scales = &scales };
+    try p.checkCuda();
+    var model: W.Weights = .{ .gpa = a, .config = undefined, .share = undefined };
+    defer model.deinit();
+    var L: W.Loader = .{ .gpa = a, .d = &driver, .stream = undefined, .pack_dense = undefined, .tools = .{ .pack_dense = undefined, .precision = .{ .dense = .uniform(.source) } }, .w = &model, .ck = undefined };
+    defer L.host.deinit(a);
+    p.ins = 32;
+    try std.testing.expectError(error.SourceDenseGeometry, W.projections.sourceFinish(&L, .kda, "bad", .{}, p));
+    p.ins = 128;
+    p.in0 = 1;
+    try std.testing.expectError(error.SourceDenseGeometry, p.checkCuda());
+    p.in0 = 0;
+    p.in_total = 130;
+    try std.testing.expectError(error.SourceDenseGeometry, p.checkCuda());
+    p.in_total = 128;
+    for ([_]u8{ 0, 255 }) |bad| {
+        scales[0] = bad;
+        try std.testing.expectError(error.SourceDenseScale, W.projections.sourceFinish(&L, .kda, "bad", .{}, p));
+    }
+    scales[0] = 127;
+    try std.testing.expectEqual(@as(usize, 0), model.buffers.items.len);
+    const proj = try W.projections.sourceFinish(&L, .kda, "source", .{}, p);
+    try std.testing.expect(proj == .source);
+    try std.testing.expectEqual(@as(usize, 3), model.buffers.items.len);
+    const expected = p.resident() + @sizeOf(core.exlr8.job.DenseJob) + 2 * @sizeOf([2]u32);
+    var total: usize = 0;
+    for (model.buffers.items) |b| total += b.len;
+    try std.testing.expectEqual(expected, total);
+    try std.testing.expectEqual(p.resident(), model.find("source").?.len);
+    try std.testing.expectEqualSlices(u8, &codes, Memory.slice(proj.source.weights, codes.len));
+    try std.testing.expectEqualSlices(u8, &scales, Memory.slice(proj.source.weights + codes.len, scales.len));
+    try std.testing.expect(total < 33 * 128 * 2);
 }

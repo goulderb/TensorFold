@@ -97,6 +97,7 @@ fn nativeProjection(L: *W.Loader, name: []const u8, n: usize, k: usize, mode: cu
 
 pub fn sourceFinish(L: *W.Loader, group: precision.Group, comptime fmt: []const u8, args: anytype, p: dense.Packed) !b16.Proj {
     if (L.tools.precision.dense.get(group) != .source) return error.SourceDenseNeedsPack;
+    try p.checkCuda();
     const j = p.job();
     try L.host.appendSlice(L.gpa, p.codes);
     try L.host.appendSlice(L.gpa, p.scales);

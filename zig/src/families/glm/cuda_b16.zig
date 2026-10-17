@@ -112,18 +112,102 @@ pub fn proj(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, p: Proj
     }
 }
 
-fn sourceMatmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, s: Source, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
+pub fn sourcePartBytes(rows: usize, k: usize) usize {
+    return @min(rows, 16) * k * 4;
+}
+
+fn upcast(f: cuda.Function, stream: cuda.Stream, x: u64, out: u64, count: usize) !void {
+    var a: cuda.Args = .{};
+    a.add(x);
+    a.add(out);
+    a.add(@as(u64, count));
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(@min(cdiv(count, 256), 65535)) }, .block = .{ .x = 256 } }, stream, &a);
+}
+
+/// Reuse the frame's matmul scratch for one compact FP32 tile, in stream order with its projection.
+pub fn sourceMatmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, s: Source, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
     if (s.n != n or s.k != k) return error.ShapeMismatch;
-    const dense = set.exlr8_dense orelse return error.NoSourceDenseKernels;
-    _ = part;
+    if (k == 0 or k % 128 != 0 or n == 0 or x_stride < k) return error.SourceDenseGeometry;
     if (m == 0) return;
+    const dense = set.exlr8_dense orelse return error.SourceDenseNotLoaded;
+    const cast = set.source_upcast orelse return error.SourceDenseNotLoaded;
     var at: usize = 0;
     while (at < m) {
         const take: u32 = @intCast(@min(m - at, 16));
-        const rows = .{ .rows = take, .x_stride = @as(u32, @intCast(x_stride)), .y_stride = @as(u32, @intCast(n)), .y_f32 = @as(u32, @intFromBool(wide)) };
-        try dense.project(stream, x + at * x_stride * 4, s.weights, s.jobs, s.groups, s.groups_n, rows, out + at * n * @as(usize, if (wide) 4 else 2));
+        if (x_stride == k) {
+            try upcast(cast, stream, x + at * x_stride * 2, part, take * k);
+        } else for (0..take) |r| try upcast(cast, stream, x + (at + r) * x_stride * 2, part + r * k * 4, k);
+        const rows = @import("core").exlr8.job.Rows{ .rows = take, .x_stride = @intCast(k), .y_stride = @intCast(n), .y_f32 = @intFromBool(wide) };
+        try dense.project(stream, part, s.weights, s.jobs, s.groups, s.groups_n, rows, out + at * n * @as(usize, if (wide) 4 else 2));
         at += take;
     }
+}
+
+test "source dense dispatch refuses shapes and makes zero rows a no-op before driver access" {
+    const set: glue.Set = .{ .glue = undefined };
+    const stream: cuda.Stream = undefined;
+    const p: Proj = .{ .source = .{ .weights = 0, .jobs = 0, .groups = 0, .groups_n = 1, .n = 33, .k = 128 } };
+    try proj(set, stream, 0, 128, p, 0, 0, 0, 33, 128, false);
+    try std.testing.expectError(error.ShapeMismatch, proj(set, stream, 0, 128, p, 0, 0, 1, 32, 128, false));
+    try std.testing.expectError(error.SourceDenseGeometry, proj(set, stream, 0, 127, p, 0, 0, 1, 33, 128, false));
+    for ([_]usize{ 1, 7, 16, 17, 64, 2048 }) |m| for ([_]bool{ false, true }) |wide| {
+        try std.testing.expectError(error.SourceDenseNotLoaded, proj(set, stream, 0, 128, p, 0, 0, m, 33, 128, wide));
+        try std.testing.expectEqual(@as(usize, @min(m, 16)) * 128 * 4, sourcePartBytes(m, 128));
+    };
+}
+
+test "source dense dispatch upcasts BF16 tiles before FP32 or BF16 projection on the frame stream" {
+    const Rows = @import("core").exlr8.job.Rows;
+    const Capture = struct {
+        const Call = struct { f: usize, x: u64, out: u64, count: u64 = 0, rows: Rows = undefined };
+        var calls: [2304]Call = undefined;
+        var len: usize = 0;
+        fn value(comptime T: type, args: [*]?*anyopaque, i: usize) T {
+            return @as(*align(1) const T, @ptrCast(args[i].?)).*;
+        }
+        fn launch(f: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, stream: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            std.debug.assert(stream == @as(cuda.abi.Stream, @ptrFromInt(17)));
+            const id = @intFromPtr(f.?);
+            const a = args.?;
+            calls[len] = .{ .f = id, .x = value(u64, a, 0), .out = value(u64, a, if (id == 99) 1 else 5) };
+            if (id == 99) calls[len].count = value(u64, a, 2) else calls[len].rows = value(Rows, a, 4);
+            len += 1;
+            return 0;
+        }
+    };
+    var driver: cuda.Driver = .{ .lib = undefined, .api = undefined };
+    driver.api.cuLaunchKernel = Capture.launch;
+    var dense: cuda.exlr8.Dense = .{ .decode_fn = undefined, .project_fns = undefined };
+    for (&dense.project_fns, [_]usize{ 1, 2, 4, 8, 16 }) |*f, cap| f.* = .{ .d = &driver, .handle = @ptrFromInt(cap) };
+    const set: glue.Set = .{ .glue = undefined, .exlr8_dense = &dense, .source_upcast = .{ .d = &driver, .handle = @ptrFromInt(99) } };
+    const stream: cuda.Stream = .{ .d = &driver, .handle = @ptrFromInt(17) };
+    const p: Proj = .{ .source = .{ .weights = 100, .jobs = 200, .groups = 300, .groups_n = 2, .n = 33, .k = 128 } };
+    for ([_]usize{ 1, 7, 16, 17, 64, 2048 }) |m| for ([_]usize{ 128, 141 }) |stride| for ([_]bool{ false, true }) |wide| {
+        Capture.len = 0;
+        try proj(set, stream, 1000, stride, p, 2000, 3000, m, 33, 128, wide);
+        var ci: usize = 0;
+        var at: usize = 0;
+        while (at < m) {
+            const take: usize = @min(m - at, 16);
+            const casts = if (stride == 128) 1 else take;
+            for (0..casts) |r| {
+                const call = Capture.calls[ci];
+                ci += 1;
+                try std.testing.expectEqual(@as(usize, 99), call.f);
+                try std.testing.expectEqual(1000 + (at + r) * stride * 2, call.x);
+                try std.testing.expectEqual(3000 + r * 128 * 4, call.out);
+                try std.testing.expectEqual((if (casts == 1) take else 1) * 128, call.count);
+            }
+            const call = Capture.calls[ci];
+            ci += 1;
+            try std.testing.expectEqual(try std.math.ceilPowerOfTwo(usize, take), call.f);
+            try std.testing.expectEqual(@as(u64, 3000), call.x);
+            try std.testing.expectEqual(2000 + at * 33 * @as(usize, if (wide) 4 else 2), call.out);
+            try std.testing.expectEqual(Rows{ .rows = @intCast(take), .x_stride = 128, .y_stride = 33, .y_f32 = @intFromBool(wide) }, call.rows);
+            at += take;
+        }
+        try std.testing.expectEqual(ci, Capture.len);
+    };
 }
 
 /// `rows` rows of `bytes` from `src` into `dst`, each side's rows its stride apart in bytes (tf_glm_copy_rows).
