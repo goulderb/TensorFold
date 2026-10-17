@@ -23,7 +23,9 @@ pub const act_ref = @import("act_ref.zig");
 /// The kernel contract every GPU kernel's test registers with (zig/tests/contract, tf-cuda-test kernel-contract).
 pub const contract = @import("contract.zig");
 pub const nvfp4 = @import("nvfp4.zig");
+pub const csf = @import("csf.zig");
 pub const modelopt = @import("modelopt.zig");
+pub const fp8_source = @import("fp8_source.zig");
 /// Pictures as 0.6.6 loaded them: PNG, JPEG through the pinned libjpeg-turbo, orientation, the shared bicubic resizes.
 pub const picture = @import("picture/picture.zig");
 /// Qwen-VL image input every Qwen3.5-VL checkpoint shares: settings, geometry, M-RoPE positions, the tower's tables.
@@ -53,6 +55,8 @@ test {
     _ = ids_json;
     _ = nvfp4;
     _ = modelopt;
+    _ = fp8_source;
+    _ = csf;
     _ = picture;
     _ = qwen_vl;
     _ = @import("nvfp4_fixture_test.zig");
