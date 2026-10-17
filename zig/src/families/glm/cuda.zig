@@ -54,6 +54,7 @@ test {
     _ = moe;
     _ = kda_block;
     _ = dsa_block;
+    _ = @import("cuda_prefill_plan.zig");
     _ = mlp;
     _ = shard;
     _ = weights;
