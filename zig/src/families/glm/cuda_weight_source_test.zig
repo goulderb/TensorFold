@@ -2,6 +2,7 @@ const std = @import("std");
 const core = @import("core");
 const cuda = @import("cuda");
 const source = @import("cuda_weight_source.zig");
+const dense = @import("cuda_weight_source_dense.zig");
 const admission = @import("cuda_checkpoint.zig");
 const a = std.testing.allocator;
 const io = std.testing.io;
@@ -313,6 +314,147 @@ test "mixed loader vision converts attention and W4A16 matrices without owning B
     for (qkv) |value| try std.testing.expectEqual(@as(u16, 0x4000), value);
     try std.testing.expectEqual(@as(usize, 0), w.root(.gate).bytes.len);
     try std.testing.expectEqual(@as(usize, 0), ck.unused());
+}
+
+fn eq64(got: f64, want: f64) !void {
+    if (std.math.isNan(want) or std.math.isNan(got)) {
+        try std.testing.expect(std.math.isNan(got) and std.math.isNan(want));
+        return;
+    }
+    try std.testing.expectEqual(want, got);
+}
+
+fn expectPacked(p: dense.Packed, s: source.Source, rows: []const source.Span, cols: source.Span) !void {
+    const m = try p.matrix();
+    const stored = try a.alloc(f64, p.out_total * p.in_total);
+    defer a.free(stored);
+    try m.rowsF64(0, p.out_total, stored);
+    var want_n: usize = 0;
+    for (rows) |sp| want_n += sp.hi - sp.lo;
+    const cn = cols.hi - cols.lo;
+    try std.testing.expectEqual(want_n, p.outs);
+    try std.testing.expectEqual(cn, p.ins);
+    const want = try a.alloc(f64, want_n * cn);
+    defer a.free(want);
+    var at: usize = 0;
+    for (rows) |sp| {
+        const rn = sp.hi - sp.lo;
+        switch (s.format.?) {
+            .mxfp8 => try core.fp8_source.mxfp8(s.weight, s.scale.?, sp, cols, want[at * cn ..][0 .. rn * cn]),
+            .fp8_pb_wo => try core.fp8_source.pbWo(s.weight, s.scale.?, sp, cols, want[at * cn ..][0 .. rn * cn]),
+            else => unreachable,
+        }
+        at += rn;
+    }
+    const j = p.job();
+    try std.testing.expectEqual(p.format, j.format);
+    try std.testing.expectEqual(p.out0, j.out0);
+    try std.testing.expectEqual(p.outs, j.outs);
+    try std.testing.expectEqual(p.in0, j.in0);
+    try std.testing.expectEqual(p.ins, j.ins);
+    try std.testing.expectEqual(p.out_total, j.out_total);
+    try std.testing.expectEqual(p.in_total, j.in_total);
+    try std.testing.expectEqual(@as(u64, 0), j.w);
+    try std.testing.expectEqual(@as(u64, p.codes.len), j.s);
+    for (0..p.outs) |r| for (0..p.ins) |c| {
+        try eq64(stored[(p.out0 + r) * p.in_total + (p.in0 + c)], want[r * p.ins + c]);
+    };
+}
+
+test "source dense packs whole and sliced MXFP8 and matches fp64 decode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var codes: [4 * 64]u8 = @splat(0x38);
+    codes[31] = 0xc0;
+    codes[32] = 0x40;
+    codes[64 + 33] = 0x01;
+    const scales = [_]u8{ 127, 128, 126, 129, 127, 125, 130, 127 };
+    try write(tmp.dir, &.{
+        .{ .name = "kda.weight", .dtype = "F8_E4M3", .shape = &.{ 4, 64 }, .bytes = &codes },
+        .{ .name = "kda.weight_scale", .dtype = "U8", .shape = &.{ 4, 2 }, .bytes = &scales },
+    });
+    var path: [128]u8 = undefined;
+    var ck = try core.Checkpoint.openModel(a, io, try std.fmt.bufPrint(&path, ".zig-cache/tmp/{s}", .{tmp.sub_path}));
+    defer ck.close();
+    var recipes = try table();
+    defer recipes.deinit();
+    const s = try source.Source.read(&ck, &recipes, "kda.weight");
+    var whole = try dense.pack(a, s, &.{core.fp8_source.all(4)}, core.fp8_source.all(64));
+    defer whole.deinit(a);
+    try expectPacked(whole, s, &.{core.fp8_source.all(4)}, core.fp8_source.all(64));
+    try std.testing.expectEqual(@as(u32, 3), whole.format);
+    try std.testing.expectEqual(@as(usize, 4 * 64 + 4 * 2), whole.resident());
+    var part = try dense.pack(a, s, &.{.{ .lo = 1, .hi = 3 }}, .{ .lo = 32, .hi = 64 });
+    defer part.deinit(a);
+    try expectPacked(part, s, &.{.{ .lo = 1, .hi = 3 }}, .{ .lo = 32, .hi = 64 });
+    try std.testing.expectEqual(@as(u32, 0), part.out0);
+    try std.testing.expectEqual(@as(u32, 32), part.ins);
+    try std.testing.expectError(error.SourceDenseGeometry, dense.pack(a, s, &.{core.fp8_source.all(4)}, .{ .lo = 16, .hi = 48 }));
+}
+
+test "source dense packs FP8_PB_WO whole, unaligned, and head-interleaved kv_b_proj" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pb: [130 * 130]u8 = @splat(0x38);
+    pb[128] = 0xc0;
+    pb[128 * 130 + 128] = 0x40;
+    const ps = [_]f32{ 0.5, 2, 3, 4 };
+    var kv: [512 * 256]u8 = @splat(0x38);
+    kv[0] = 0x40;
+    kv[256 * 256] = 0xc0;
+    kv[128 * 256 + 128] = 0x01;
+    const ks = [_]f32{ 0.25, 0.5, 1, 2, 3, 4, 5, 6 };
+    try write(tmp.dir, &.{
+        .{ .name = "mla.weight", .dtype = "F8_E4M3", .shape = &.{ 130, 130 }, .bytes = &pb },
+        .{ .name = "mla.weight_scale", .dtype = "F32", .shape = &.{ 2, 1, 2, 1 }, .bytes = std.mem.sliceAsBytes(&ps) },
+        .{ .name = "kv.weight", .dtype = "F8_E4M3", .shape = &.{ 512, 256 }, .bytes = &kv },
+        .{ .name = "kv.weight_scale", .dtype = "F32", .shape = &.{ 4, 2 }, .bytes = std.mem.sliceAsBytes(&ks) },
+    });
+    var path: [128]u8 = undefined;
+    var ck = try core.Checkpoint.openModel(a, io, try std.fmt.bufPrint(&path, ".zig-cache/tmp/{s}", .{tmp.sub_path}));
+    defer ck.close();
+    var why: core.modelopt.Why = .{};
+    var recipes = try core.modelopt.mixed(a,
+        \\{"quantization_config":{"quant_method":"modelopt","quant_algo":"MIXED_PRECISION","quantized_layers":{"mla":{"quant_algo":"FP8_PB_WO","weight_block_size":[128,128]},"kv":{"quant_algo":"FP8_PB_WO","weight_block_size":[128,128]}}}}
+    , &why);
+    defer recipes.deinit();
+    const mla = try source.Source.read(&ck, &recipes, "mla.weight");
+    var whole = try dense.pack(a, mla, &.{core.fp8_source.all(130)}, core.fp8_source.all(130));
+    defer whole.deinit(a);
+    try expectPacked(whole, mla, &.{core.fp8_source.all(130)}, core.fp8_source.all(130));
+    try std.testing.expectEqual(@as(u32, 4), whole.format);
+    try std.testing.expectEqual(@as(u32, 130), whole.ins);
+    var mid = try dense.pack(a, mla, &.{.{ .lo = 120, .hi = 130 }}, .{ .lo = 120, .hi = 130 });
+    defer mid.deinit(a);
+    try expectPacked(mid, mla, &.{.{ .lo = 120, .hi = 130 }}, .{ .lo = 120, .hi = 130 });
+    try std.testing.expectEqual(@as(u32, 120), mid.out0);
+    try std.testing.expectEqual(@as(u32, 120), mid.in0);
+    try std.testing.expectEqual(@as(u32, 10), mid.outs);
+    const kv_s = try source.Source.read(&ck, &recipes, "kv.weight");
+    const spans = [_]source.Span{ .{ .lo = 256, .hi = 384 }, .{ .lo = 384, .hi = 512 } };
+    var heads = try dense.pack(a, kv_s, &spans, core.fp8_source.all(256));
+    defer heads.deinit(a);
+    try expectPacked(heads, kv_s, &spans, core.fp8_source.all(256));
+    try std.testing.expectEqual(@as(u32, 0), heads.out0);
+    try std.testing.expectEqual(@as(u32, 256), heads.outs);
+    try std.testing.expectError(error.SourceDenseGeometry, dense.pack(a, mla, &.{ .{ .lo = 120, .hi = 130 }, .{ .lo = 0, .hi = 10 } }, core.fp8_source.all(130)));
+}
+
+test "source dense refuses a BF16 linear and a non-mixed gather" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bytes: [64]u8 = @splat(0);
+    try write(tmp.dir, &.{
+        .{ .name = "norm.weight", .dtype = "BF16", .shape = &.{ 1, 32 }, .bytes = &bytes },
+    });
+    var path: [128]u8 = undefined;
+    var ck = try core.Checkpoint.openModel(a, io, try std.fmt.bufPrint(&path, ".zig-cache/tmp/{s}", .{tmp.sub_path}));
+    defer ck.close();
+    var recipes = try table();
+    defer recipes.deinit();
+    const n = try source.Source.read(&ck, &recipes, "norm.weight");
+    try std.testing.expectEqual(@as(?core.modelopt.Algo, null), n.format);
+    try std.testing.expectError(error.SourceDenseRequiresFp8, dense.pack(a, n, &.{core.fp8_source.all(1)}, core.fp8_source.all(32)));
 }
 
 test "mixed loader native entry points compile" {

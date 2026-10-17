@@ -14,8 +14,7 @@ pub const Layer = struct {
     routed: cuda.experts.Layer,
     mia_routed: ?mia.Experts = null,
     count: usize,
-    shared_gu: u64,
-    shared_gu_q: ?cuda.qlinear.Weight = null,
+    shared_gu: b16.Proj,
     shared_gate: ?cuda.qlinear.Weight = null,
     shared_up: ?cuda.qlinear.Weight = null,
     shared_down: b16.Proj,
@@ -80,7 +79,7 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
             try b16.proj(k.set, stream, x + lo * x_stride * 2, x_stride, .{ .q = w }, s.sact + lo * l.shared * 2, s.mm_part, n, l.shared, d, false);
             try b16.copyRows(k.set, stream, s.sact + lo * l.shared * 2, l.shared * 2, gu + j * l.shared * 2, 2 * l.shared * 2, n, l.shared * 2);
         }
-    } else try b16.proj(k.set, stream, x + lo * x_stride * 2, x_stride, if (l.shared_gu_q) |q| .{ .q = q } else .{ .b16 = l.shared_gu }, gu, s.mm_part, n, 2 * l.shared, d, false);
+    } else try b16.proj(k.set, stream, x + lo * x_stride * 2, x_stride, l.shared_gu, gu, s.mm_part, n, 2 * l.shared, d, false);
     try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
     try b16.proj(k.set, stream, s.sact + lo * l.shared * 2, l.shared, l.shared_down, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
     var a: cuda.Args = .{};

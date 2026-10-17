@@ -4,6 +4,7 @@ const W = @import("cuda_weights.zig");
 const b16 = @import("cuda_b16.zig");
 const quant = @import("cuda_quant.zig");
 const precision = @import("cuda_weight_precision.zig");
+const dense = @import("cuda_weight_source_dense.zig");
 
 fn owned(L: *W.Loader, name: []const u8, suffix: []const u8, bytes: usize) !u64 {
     const label = try std.fmt.allocPrint(L.gpa, "{s}.{s}", .{ name, suffix });
@@ -94,8 +95,24 @@ fn nativeProjection(L: *W.Loader, name: []const u8, n: usize, k: usize, mode: cu
     return .{ .q = .{ .ck4 = .{ .words = words, .scales = tiles, .scale = scale, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad) } } };
 }
 
+pub fn sourceFinish(L: *W.Loader, group: precision.Group, comptime fmt: []const u8, args: anytype, p: dense.Packed) !b16.Proj {
+    if (L.tools.precision.dense.get(group) != .source) return error.SourceDenseNeedsPack;
+    const j = p.job();
+    try L.host.appendSlice(L.gpa, p.codes);
+    try L.host.appendSlice(L.gpa, p.scales);
+    const weights = try L.put(fmt, args);
+    try L.host.appendSlice(L.gpa, std.mem.asBytes(&j));
+    const jobs = try L.put(fmt ++ ".job", args);
+    const groups = try @import("core").exlr8.job.denseGroups(L.gpa, &.{j});
+    defer L.gpa.free(groups);
+    try L.host.appendSlice(L.gpa, std.mem.sliceAsBytes(groups));
+    const gptr = try L.put(fmt ++ ".groups", args);
+    return .{ .source = .{ .weights = weights, .jobs = jobs, .groups = gptr, .groups_n = @intCast(groups.len), .n = p.outs, .k = p.ins } };
+}
+
 pub fn finish(L: *W.Loader, group: precision.Group, comptime fmt: []const u8, args: anytype, n: usize, k: usize) !b16.Proj {
     const selected = L.tools.precision.dense.get(group);
+    if (selected == .source) return error.SourceDenseNeedsPack;
     if (selected == .bf16) return .{ .b16 = try L.put(fmt, args) };
     const elements = std.math.mul(usize, n, k) catch return error.InvalidDenseShape;
     const source_bytes = std.math.mul(usize, elements, 2) catch return error.InvalidDenseShape;
@@ -151,7 +168,7 @@ pub fn head(L: *W.Loader) !void {
     if (L.tools.precision.head == .bf16) return;
     const source = switch (L.w.head) {
         .b16 => |ptr| ptr,
-        .q => return error.HeadPrecisionRequiresBf16Source,
+        .q, .source => return error.HeadPrecisionRequiresBf16Source,
     };
     const n = L.w.share.vocab.len();
     const k = L.w.config.hidden;
@@ -188,6 +205,12 @@ test "default precision uploads BF16 bytes without a quantizer" {
     try std.testing.expectEqual(@as(usize, 1), model.buffers.items.len);
     try std.testing.expectEqual(@as(usize, 8), model.buffers.items[0].len);
     try std.testing.expectEqual(@as(usize, 0), loader.host.items.len);
+}
+
+test "source dense finish refuses a BF16 host gather" {
+    var loader: W.Loader = undefined;
+    loader.tools = .{ .pack_dense = undefined, .precision = .{ .dense = .uniform(.source) } };
+    try std.testing.expectError(error.SourceDenseNeedsPack, finish(&loader, .kda, "source", .{}, 2, 2));
 }
 
 test "Q4 rejects an unsupported shape before uploading" {

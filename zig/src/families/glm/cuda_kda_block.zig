@@ -8,13 +8,10 @@ const b16 = @import("cuda_b16.zig");
 
 /// One KDA layer: proj bf16 [3 heads 128 + 256 + heads][dims] (with EXL3's qkv only its last 256 + heads), f_b, g_b, o.
 pub const Layer = struct {
-    proj: u64,
-    proj_q: ?cuda.qlinear.Weight = null,
-    fb_q: ?cuda.qlinear.Weight = null,
-    gb_q: ?cuda.qlinear.Weight = null,
+    proj: b16.Proj,
     qkv: ?cuda.qlinear.Weight = null,
-    fb: u64,
-    gb: u64,
+    fb: b16.Proj,
+    gb: b16.Proj,
     o: b16.Proj,
     conv_w: u64,
     a_log: u64,
@@ -62,11 +59,11 @@ pub fn project(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
         const small = w - fa;
         try b16.proj(set, stream, x, x_stride, .{ .q = q }, s.tmp, s.mm_part, rows, fa, l.dims, false);
         try b16.copyRows(set, stream, s.tmp, fa * 2, s.p, w * 2, rows, fa * 2);
-        try b16.matmul(set, stream, x, x_stride, l.proj, s.tmp, s.mm_part, rows, small, l.dims, false);
+        try b16.proj(set, stream, x, x_stride, l.proj, s.tmp, s.mm_part, rows, small, l.dims, false);
         try b16.copyRows(set, stream, s.tmp, small * 2, s.p + fa * 2, w * 2, rows, small * 2);
-    } else try b16.proj(set, stream, x, x_stride, if (l.proj_q) |q| .{ .q = q } else .{ .b16 = l.proj }, s.p, s.mm_part, rows, w, l.dims, false);
-    try b16.proj(set, stream, s.p + fa * 2, w, if (l.fb_q) |q| .{ .q = q } else .{ .b16 = l.fb }, s.ka, s.mm_part, rows, n, kda.dk, false);
-    try b16.proj(set, stream, s.p + (fa + kda.dk) * 2, w, if (l.gb_q) |q| .{ .q = q } else .{ .b16 = l.gb }, s.kg, s.mm_part, rows, n, kda.dk, false);
+    } else try b16.proj(set, stream, x, x_stride, l.proj, s.p, s.mm_part, rows, w, l.dims, false);
+    try b16.proj(set, stream, s.p + fa * 2, w, l.fb, s.ka, s.mm_part, rows, n, kda.dk, false);
+    try b16.proj(set, stream, s.p + (fa + kda.dk) * 2, w, l.gb, s.kg, s.mm_part, rows, n, kda.dk, false);
 }
 
 /// The chain over `rows` projected rows (s.p, s.ka, s.kg) on one sequence's conv window and recurrent state.

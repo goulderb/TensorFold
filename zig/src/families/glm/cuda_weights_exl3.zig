@@ -121,8 +121,7 @@ fn miaMoe(L: *W.Loader, i: u32) !@import("cuda_moe.zig").Layer {
         .routed = .{ .format = .exl3, .up = 0, .down = 0, .width = cut.len(), .dims = c.hidden, .experts = c.experts, .limit = c.swiglu_limit },
         .mia_routed = weights,
         .count = c.experts,
-        .shared_gu = if (gu == .b16) gu.b16 else 0,
-        .shared_gu_q = if (gu == .q) gu.q else null,
+        .shared_gu = gu,
         .shared_down = down,
         .shared = sh.len(),
         .top_k = c.topk,
@@ -213,7 +212,7 @@ pub fn kda(L: *W.Loader, i: u32) !@import("cuda_kda_block.zig").Layer {
     try L.whole(try L.get("layers.{d}.self_attn.o_norm.weight", .{i}), .bf16);
     const norm = try L.put("layers.{d}.kda.norm", .{i});
     const o = try layerMatrix(L, "layers.{d}.self_attn.o_proj", i, lo, hi, &.{.{ .lo = 0, .hi = c.hidden }});
-    return .{ .proj = proj, .qkv = qkv, .fb = fb, .gb = gb, .o = .{ .q = o }, .conv_w = conv_w, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
+    return .{ .proj = .{ .b16 = proj }, .qkv = qkv, .fb = .{ .b16 = fb }, .gb = .{ .b16 = gb }, .o = .{ .q = o }, .conv_w = conv_w, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
 }
 
 /// Loader.moeLayer on EXL3: experts as exl3_experts stacks, gate and up by the rank's columns, down by its inputs.
@@ -263,8 +262,7 @@ pub fn moe(L: *W.Loader, i: u32) !@import("cuda_moe.zig").Layer {
             .bias = bias,
             .routed = .{ .format = .exl3, .up = ptrs[0], .down = ptrs[1], .up_scale = ptrs[2], .down_scale = ptrs[3], .width = cut.len(), .dims = d, .experts = c.experts, .limit = c.swiglu_limit, .exl3 = widths },
             .count = c.experts,
-            .shared_gu = if (gu == .b16) gu.b16 else 0,
-            .shared_gu_q = if (gu == .q) gu.q else null,
+            .shared_gu = gu,
             .shared_down = down,
             .shared = sh.len(),
             .top_k = c.topk,
@@ -277,7 +275,7 @@ pub fn moe(L: *W.Loader, i: u32) !@import("cuda_moe.zig").Layer {
         .bias = bias,
         .routed = .{ .format = .exl3, .up = ptrs[0], .down = ptrs[1], .up_scale = ptrs[2], .down_scale = ptrs[3], .width = cut.len(), .dims = d, .experts = c.experts, .limit = c.swiglu_limit, .exl3 = widths },
         .count = c.experts,
-        .shared_gu = 0,
+        .shared_gu = .{ .b16 = 0 },
         .shared_gate = try layerMatrix(L, "layers.{d}.mlp.shared_experts.gate_proj", i, 0, 0, &.{sh}),
         .shared_up = try layerMatrix(L, "layers.{d}.mlp.shared_experts.up_proj", i, 0, 0, &.{sh}),
         .shared_down = .{ .q = try layerMatrix(L, "layers.{d}.mlp.shared_experts.down_proj", i, sh.lo, sh.hi, &.{.{ .lo = 0, .hi = d }}) },

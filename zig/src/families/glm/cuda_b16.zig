@@ -90,13 +90,17 @@ pub fn matmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u6
     if (sk > 1) try glue.sliceSum(set, stream, part, out, m * n, sk, wide);
 }
 
-/// A projection: BF16 (bmm), or a quantized qlinear weight (an EXL3 checkpoint quantizes what NVFP4 keeps in BF16).
-pub const Proj = union(enum) { b16: u64, q: cuda.qlinear.Weight };
+/// EXLR8 dense MXFP8 / FP8_BLOCK resident weights (TF_GLM_DENSE=source).
+pub const Source = struct { weights: u64, jobs: u64, groups: u64, groups_n: u32, n: u32, k: u32 };
+
+/// A projection: BF16 (bmm), a quantized qlinear weight, or a source-dense EXLR8 job.
+pub const Proj = union(enum) { b16: u64, q: cuda.qlinear.Weight, source: Source };
 
 /// matmul for either kind: a quantized weight takes qlinear's decode rows under rows_from rows, its prompt rows above.
 pub fn proj(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, p: Proj, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
     switch (p) {
         .b16 => |w| return matmul(set, stream, x, x_stride, w, out, part, m, n, k, wide),
+        .source => |s| return sourceMatmul(set, stream, x, x_stride, s, out, part, m, n, k, wide),
         .q => |w| {
             if (w.outputs() != n or w.inputs() != k) return error.ShapeMismatch;
             if (w == .affine4 and m < rows_from) try groupSums(set, stream, x, x_stride, part, m, k);
@@ -105,6 +109,20 @@ pub fn proj(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, p: Proj
             if (m >= rows_from) return if (wide) l.promptF32(stream, w, in, out, m) else l.prompt(stream, w, in, out, m);
             return if (wide) l.decodeF32(stream, w, in, out, m) else l.decode(stream, w, in, out, m);
         },
+    }
+}
+
+fn sourceMatmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, s: Source, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
+    if (s.n != n or s.k != k) return error.ShapeMismatch;
+    const dense = set.exlr8_dense orelse return error.NoSourceDenseKernels;
+    _ = part;
+    if (m == 0) return;
+    var at: usize = 0;
+    while (at < m) {
+        const take: u32 = @intCast(@min(m - at, 16));
+        const rows = .{ .rows = take, .x_stride = @as(u32, @intCast(x_stride)), .y_stride = @as(u32, @intCast(n)), .y_f32 = @as(u32, @intFromBool(wide)) };
+        try dense.project(stream, x + at * x_stride * 4, s.weights, s.jobs, s.groups, s.groups_n, rows, out + at * n * @as(usize, if (wide) 4 else 2));
+        at += take;
     }
 }
 

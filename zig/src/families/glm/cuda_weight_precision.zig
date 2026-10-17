@@ -1,7 +1,7 @@
 const std = @import("std");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-pub const Dense = enum { bf16, q4, fp8, nvfp4, fp8_native, nvfp4_native };
+pub const Dense = enum { bf16, q4, fp8, nvfp4, fp8_native, nvfp4_native, source };
 pub const Head = enum { bf16, fp8 };
 pub const Group = enum { kda, dsa, mlp, shared, mtp_eh };
 pub const groups = std.meta.tags(Group);
@@ -21,9 +21,14 @@ pub const DensePolicy = struct {
         return false;
     }
 
+    pub fn source(p: DensePolicy) bool {
+        for (p.values) |value| if (value == .source) return true;
+        return false;
+    }
+
     pub fn read(getEnv: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !DensePolicy {
         const default = parseDense(getEnv("TF_GLM_DENSE")) catch {
-            problem.* = "TF_GLM_DENSE: bf16, q4, fp8, nvfp4, fp8_native or nvfp4_native";
+            problem.* = "TF_GLM_DENSE: bf16, q4, fp8, nvfp4, fp8_native, nvfp4_native or source";
             return error.BadSetting;
         };
         var result = uniform(default);
@@ -37,7 +42,7 @@ pub const DensePolicy = struct {
             };
             if (getEnv(name)) |value| {
                 result.values[@backingInt(group)] = std.meta.stringToEnum(Dense, value) orelse {
-                    problem.* = name ++ ": bf16, q4, fp8, nvfp4, fp8_native or nvfp4_native";
+                    problem.* = name ++ ": bf16, q4, fp8, nvfp4, fp8_native, nvfp4_native or source";
                     return error.BadSetting;
                 };
             }
@@ -97,7 +102,10 @@ test "precision is explicit and defaults to checkpoint BF16" {
     try std.testing.expectError(error.InvalidHeadPrecision, parseHead("q4"));
     try std.testing.expectEqual(Dense.fp8_native, try parseDense("fp8_native"));
     try std.testing.expectEqual(Dense.nvfp4_native, try parseDense("nvfp4_native"));
+    try std.testing.expectEqual(Dense.source, try parseDense("source"));
     try std.testing.expect(!DensePolicy.uniform(.fp8).native());
+    try std.testing.expect(DensePolicy.uniform(.source).source());
+    try std.testing.expect(!DensePolicy.uniform(.source).native());
     try std.testing.expect(DensePolicy.uniform(.fp8_native).native());
     try std.testing.expect(!std.mem.eql(u8, &DensePolicy.uniform(.fp8).digest(), &DensePolicy.uniform(.fp8_native).digest()));
 }
@@ -123,7 +131,7 @@ test "global and family settings resolve to one effective policy" {
     try std.testing.expectEqual(Dense.bf16, mixed.get(.dsa));
     try std.testing.expectEqual(Dense.fp8, mixed.get(.kda));
     try std.testing.expectError(error.BadSetting, DensePolicy.read(E.bad, &problem));
-    try std.testing.expectEqualStrings("TF_GLM_DENSE_DSA: bf16, q4, fp8, nvfp4, fp8_native or nvfp4_native", problem);
+    try std.testing.expectEqualStrings("TF_GLM_DENSE_DSA: bf16, q4, fp8, nvfp4, fp8_native, nvfp4_native or source", problem);
     const Redundant = struct {
         fn get(name: [:0]const u8) ?[]const u8 {
             if (std.mem.eql(u8, name, "TF_GLM_DENSE")) return "fp8";

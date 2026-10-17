@@ -6,6 +6,7 @@ const st = @import("safetensors.zig");
 const codec = @import("exlr8_codec.zig");
 const xxh = @import("xxhash64.zig");
 const job = @import("exlr8_job.zig");
+const fp8 = @import("quant/fp8.zig");
 
 pub const Format = enum(u8) { trellis = 1, int4 = 2, mxfp8 = 3, fp8_block = 4, fp8_row = 5, bf16 = 6, fp32 = 7 };
 /// Which channels a tensor-parallel shard splits: none, outputs, or inputs.
@@ -82,7 +83,7 @@ pub const Matrix = struct {
         return m;
     }
 
-    fn check(m: Matrix) !void {
+    pub fn check(m: Matrix) !void {
         const r = m.record;
         const ok = switch (r.format) {
             .trellis => m.data[0].is(.u8, &.{ std.math.divExact(usize, if (r.side == .input) r.in else r.out, 128) catch return error.BadExlr8Shape, (if (r.side == .input) r.out else r.in) * 16 * @as(usize, r.k) }) and
@@ -136,6 +137,29 @@ pub const Matrix = struct {
                 .fp32 => f32At(m.data[0], o * r.in + i),
                 .trellis => unreachable,
             };
+        };
+    }
+
+    fn e8m0(b: u8) f64 {
+        if (b == 255) return std.math.nan(f64);
+        return std.math.ldexp(@as(f64, 1.0), @as(i32, b) - 127);
+    }
+
+    /// Rows [row0, row0 + n) in fp64 for mxfp8 and fp8_block, matching fp8_source.
+    pub fn rowsF64(m: Matrix, row0: usize, n: usize, out: []f64) !void {
+        const r = m.record;
+        if (r.format != .mxfp8 and r.format != .fp8_block) return error.BadExlr8Rows;
+        if (row0 + n > r.out or out.len != n * r.in) return error.BadExlr8Rows;
+        const kb = std.math.divCeil(usize, r.in, 128) catch unreachable;
+        for (0..n) |ro| for (0..r.in) |i| {
+            const o = row0 + ro;
+            const code = m.data[0].bytes[o * r.in + i];
+            const s: f64 = switch (r.format) {
+                .mxfp8 => e8m0(m.data[1].bytes[o * (r.in / 32) + i / 32]),
+                .fp8_block => @floatCast(f32At(m.data[1], (o / 128) * kb + i / 128)),
+                else => unreachable,
+            };
+            out[ro * r.in + i] = fp8.e4m3(code) * s;
         };
     }
 

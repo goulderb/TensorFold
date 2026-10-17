@@ -12,7 +12,7 @@ const cache = @import("cuda_cache.zig");
 pub const prompt_att_rows = 512;
 
 /// The indexer's weights, replicated: [wk | weights_proj] [d + heads][dims], gate, key LayerNorm, pool bias, wq_b.
-pub const Index = struct { kw: u64, kw_q: ?cuda.qlinear.Weight = null, gate: u64, ln_w: u64, ln_b: u64, ape: u64, qb: b16.Proj, heads: usize, d: usize };
+pub const Index = struct { kw: b16.Proj, gate: u64, ln_w: u64, ln_b: u64, ape: u64, qb: b16.Proj, heads: usize, d: usize };
 
 pub const InputProjection = union(enum) {
     combined_bf16: u64,
@@ -114,7 +114,7 @@ pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
     }
     try b16.proj(set, stream, s.qr, l.q_lora, l.q_b, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
     const ix = l.index;
-    try b16.proj(set, stream, x, x_stride, if (ix.kw_q) |q| .{ .q = q } else .{ .b16 = ix.kw }, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
+    try b16.proj(set, stream, x, x_stride, ix.kw, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
     try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
     try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk, l.lw);
     if (qi) try b16.proj(set, stream, s.qr, l.q_lora, ix.qb, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
