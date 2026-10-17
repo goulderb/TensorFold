@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/Bizuayeu/TensorFold",
+  "commit": "6380c8daec97dcf6fa7f18ac95906b411134b09d",
+  "files_sha256": {
+    "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "NOTICE": "74b59811a5ebc3c28e7fc89f8f189854b6ca6d44392a98394950b24ba3c1b8e7",
+    "THIRD_PARTY_NOTICES.md": "279a4ee30c83aaaf4172452c1cf7c0981df3fc0627d2376ee4c9c76a5f5bf0d8"
+  },
+  "content": "Original donor documents, unmodified; local changes are described in LICENSES/donors/README.md."
+}

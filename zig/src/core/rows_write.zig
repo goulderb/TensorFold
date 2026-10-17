@@ -86,9 +86,27 @@ pub fn drain(r: *Rows, deadline_ns: i128) usize {
 }
 
 pub fn nowNs() i128 {
+    if (comptime @import("builtin").os.tag == .windows) return winNowNs();
     var t: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t);
     return @as(i128, t.sec) * std.time.ns_per_s + t.nsec;
+}
+
+const WinClock = if (@import("builtin").os.tag != .windows) struct {} else struct {
+    extern "kernel32" fn QueryPerformanceCounter(c: *i64) callconv(.winapi) i32;
+    extern "kernel32" fn QueryPerformanceFrequency(f: *i64) callconv(.winapi) i32;
+    var hz: i64 = 0;
+};
+
+fn winNowNs() i128 {
+    if (comptime @import("builtin").os.tag == .windows) {
+        if (WinClock.hz == 0) _ = WinClock.QueryPerformanceFrequency(&WinClock.hz);
+        var c: i64 = 0;
+        _ = WinClock.QueryPerformanceCounter(&c);
+        if (WinClock.hz <= 0) return 0;
+        return @divTrunc(@as(i128, c) * std.time.ns_per_s, WinClock.hz);
+    }
+    unreachable;
 }
 
 /// The newest queued entry made a job (its blocks serve older ones); one on disk, or past budget, cap or floor, skips.

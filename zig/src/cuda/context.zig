@@ -9,6 +9,8 @@ pub const Context = struct {
     d: *const Driver,
     device: abi.Device,
     handle: abi.Context,
+    /// The ordinal this context was opened on, so a caller can tell which device it holds.
+    device_ordinal: c_int = 0,
 
     pub fn init(d: *const Driver, ordinal: c_int) Error!Context {
         var dev: abi.Device = 0;
@@ -17,11 +19,12 @@ pub const Context = struct {
         try d.check(d.api.cuDevicePrimaryCtxRetain(&ctx, dev), "cuDevicePrimaryCtxRetain");
         errdefer _ = d.api.cuDevicePrimaryCtxRelease_v2(dev);
         try d.check(d.api.cuCtxSetCurrent(ctx), "cuCtxSetCurrent");
-        return .{ .d = d, .device = dev, .handle = ctx };
+        return .{ .d = d, .device = dev, .handle = ctx, .device_ordinal = ordinal };
     }
 
     /// Waits for all work, then drops this retain; resources made in it must be released first.
     pub fn deinit(self: *Context) void {
+        self.makeCurrent() catch return;
         _ = self.d.api.cuCtxSynchronize();
         _ = self.d.api.cuDevicePrimaryCtxRelease_v2(self.device);
         self.* = undefined;
@@ -58,6 +61,9 @@ pub const Context = struct {
     pub const MemInfo = struct { free: usize, total: usize };
 
     pub fn memInfo(self: *const Context) Error!MemInfo {
+        // cuMemGetInfo reports the current context's device, so bind this one first: a caller asking about a device
+        // other than the current one would otherwise read the wrong card's numbers.
+        try self.makeCurrent();
         var m: MemInfo = .{ .free = 0, .total = 0 };
         try self.d.check(self.d.api.cuMemGetInfo_v2(&m.free, &m.total), "cuMemGetInfo");
         return m;

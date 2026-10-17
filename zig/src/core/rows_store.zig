@@ -304,6 +304,8 @@ pub const Rows = struct {
     const Day = struct { day: u64, bytes: u64 };
 
     fn written(r: *const Rows) Day {
+        // Imprint's daily budget file is a POSIX descriptor. Windows keeps the states in RAM.
+        if (comptime @import("builtin").os.tag == .windows) return .{ .day = dayNow(), .bytes = 0 };
         const today = dayNow();
         var buf: [1100]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&buf, "{s}/written", .{r.root}, 0) catch return .{ .day = today, .bytes = std.math.maxInt(u64) };
@@ -319,6 +321,7 @@ pub const Rows = struct {
     pub fn spent(r: *Rows, bytes: u64) void {
         r.counts.written += bytes;
         r.turn += bytes;
+        if (comptime @import("builtin").os.tag == .windows) return;
         var d = r.written();
         d.bytes +|= bytes;
         var buf: [1100]u8 = undefined;
@@ -348,6 +351,7 @@ pub const Rows = struct {
 
     /// The files under the store's directory: states read back and checked by name, blocks by size; leftovers go.
     fn scan(r: *Rows) !void {
+        if (comptime @import("builtin").os.tag == .windows) return;
         const d = std.c.opendir(r.dir) orelse return error.RowsDir;
         defer _ = std.c.closedir(d);
         while (std.c.readdir(d)) |ent| {
@@ -448,9 +452,25 @@ pub fn withAt(a: Allocator, starts: []const u32, at: u32, planned: bool) ![]u32 
 }
 
 fn dayNow() u64 {
+    if (comptime @import("builtin").os.tag == .windows) return winDay();
     var t: std.c.timespec = undefined;
     if (std.c.clock_gettime(std.c.CLOCK.REALTIME, &t) != 0 or t.sec < 0) return 0;
     return @as(u64, @intCast(t.sec)) / 86400;
+}
+
+const WinDay = if (@import("builtin").os.tag != .windows) struct {} else struct {
+    extern "kernel32" fn GetSystemTimePreciseAsFileTime(t: *i64) callconv(.winapi) void;
+};
+
+fn winDay() u64 {
+    if (comptime @import("builtin").os.tag == .windows) {
+        const epoch: i64 = 116444736000000000;
+        var ft: i64 = 0;
+        WinDay.GetSystemTimePreciseAsFileTime(&ft);
+        if (ft < epoch) return 0;
+        return @intCast(@divTrunc(ft - epoch, 10_000_000 * 86400));
+    }
+    unreachable;
 }
 
 /// A file's stem: the first 16 bytes of its name in hex (32 digits), then `.blk` or `.st`.
@@ -469,6 +489,7 @@ pub fn unlinkName(dir: []const u8, n: anytype, ext: []const u8) void {
 }
 
 fn readWord(p: [:0]const u8) u64 {
+    if (comptime @import("builtin").os.tag == .windows) return 0;
     const fd = std.c.open(p, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return 0;
     defer _ = std.c.close(fd);
@@ -477,6 +498,7 @@ fn readWord(p: [:0]const u8) u64 {
 }
 
 fn writeWord(p: [:0]const u8, w: u64) void {
+    if (comptime @import("builtin").os.tag == .windows) return;
     var buf: [1200]u8 = undefined;
     const part = std.fmt.bufPrintSentinel(&buf, "{s}.part", .{p}, 0) catch return;
     const fd = std.c.open(part, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true }, @as(std.c.mode_t, 0o600));

@@ -291,3 +291,101 @@ extern "C" __global__ void tf_add_row(void* __restrict__ y, int y_f32, const flo
         *p = __float2bfloat16(__bfloat162float(*p) + x[i]);
     }
 }
+
+// ---- Two-GPU TP (TENSORFOLD_TP=2): expert parallel MoE and the pair sum ------------------------------------------
+
+// A rank's picks in its own expert table, in place: routed experts it owns (first .. first + count) become 0 .. count,
+// its shared half (slot routed + keep) becomes count, every other pair -1 (the plan skips it).
+extern "C" __global__ void __launch_bounds__(256) tf_ep_remap(int* __restrict__ picks, int pairs, int slots, int routed,
+                                                              int first, int count, int keep) {
+    const int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= pairs) return;
+    const int s = p % slots;
+    const int id = picks[p];
+    int out = -1;
+    if (s < routed) {
+        if (id >= first && id < first + count) out = id - first;
+    } else if (s - routed == keep) {
+        out = count;
+    }
+    picks[p] = out;
+}
+
+// One rank's MoE partial, unrounded fp32: per row and hidden column, its own pairs' outputs in ascending slot order,
+// an fma by the route weight for each routed slot and an add for its shared slot (its weight is never read), then
+// routed + shared. A pair the rank does not own (pick -1) is skipped; its ymoe row is not read.
+extern "C" __global__ void __launch_bounds__(256) tf_ep_partial(const void* __restrict__ ymoe, int y_f32,
+                                                                const float* __restrict__ wts, const int* __restrict__ picks,
+                                                                int rows, int slots, int routed, int d,
+                                                                float* __restrict__ out) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<int64_t>(rows) * d) return;
+    const int64_t r = i / d;
+    const int64_t c = i % d;
+    float acc = 0.0f, shared = 0.0f;
+    for (int s = 0; s < slots; ++s) {
+        const int64_t p = r * slots + s;
+        if (picks[p] < 0) continue;
+        const int64_t at = p * d + c;
+        const float v = y_f32 ? static_cast<const float*>(ymoe)[at]
+                              : __bfloat162float(static_cast<const __nv_bfloat16*>(ymoe)[at]);
+        if (s < routed) acc = __fmaf_rn(wts[p], v, acc);
+        else shared = __fadd_rn(shared, v);
+    }
+    out[i] = __fadd_rn(acc, shared);
+}
+
+// The two ranks' partials summed in fp32 and rounded to bf16 once. a + b is exact-commutative in IEEE fp32, so both
+// ranks write the same bits from (own, peer) in either order.
+extern "C" __global__ void __launch_bounds__(256) tf_tp_sum2(const void* __restrict__ a, int a_f32,
+                                                             const void* __restrict__ b, int b_f32,
+                                                             __nv_bfloat16* __restrict__ out, int64_t n) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float x = a_f32 ? static_cast<const float*>(a)[i] : __bfloat162float(static_cast<const __nv_bfloat16*>(a)[i]);
+    const float y = b_f32 ? static_cast<const float*>(b)[i] : __bfloat162float(static_cast<const __nv_bfloat16*>(b)[i]);
+    out[i] = __float2bfloat16_rn(__fadd_rn(x, y));
+}
+
+// A decode window's exchange in one kernel, with no host and no event between the two GPUs (they have no peer access):
+// this rank's partial is written as fp32 into its slot of mapped pinned host memory, fenced, and its flag raised to
+// `seq`; it then polls the peer's flag over PCIe, reads the peer's slot, and writes own + peer (fp32, rounded once)
+// as bf16. Both ranks write the same bits, since a + b is commutative. One block. A peer that never raises its flag
+// stops the poll after `limit` clock ticks and raises `failed`, so a broken pair cannot hang the GPU.
+extern "C" __global__ void __launch_bounds__(1024) tf_tp_xchg(const void* __restrict__ src, int wide, float* mine,
+                                                              const float* theirs, unsigned long long* my_flag,
+                                                              const unsigned long long* peer_flag,
+                                                              unsigned long long seq, __nv_bfloat16* __restrict__ out,
+                                                              int n, long long limit, int* failed) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = wide ? static_cast<const float*>(src)[i] : __bfloat162float(static_cast<const __nv_bfloat16*>(src)[i]);
+        mine[i] = v;
+    }
+    __syncthreads();
+    __shared__ int ok;
+    if (threadIdx.x == 0) {
+        __threadfence_system();  // the slot's writes reach host memory before the flag does
+        asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(my_flag), "l"(seq) : "memory");
+        const long long t0 = clock64();
+        unsigned long long seen = 0;
+        ok = 1;
+        while (true) {
+            asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(seen) : "l"(peer_flag) : "memory");
+            if (seen >= seq) break;
+            if (clock64() - t0 > limit) {
+                ok = 0;
+                atomicExch(failed, 1);
+                break;
+            }
+            __nanosleep(64);
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (!ok) return;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float own = wide ? static_cast<const float*>(src)[i] : __bfloat162float(static_cast<const __nv_bfloat16*>(src)[i]);
+        const float peer = *(volatile const float*)(theirs + i);
+        out[i] = __float2bfloat16_rn(__fadd_rn(own, peer));
+    }
+}

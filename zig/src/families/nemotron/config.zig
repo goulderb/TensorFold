@@ -100,6 +100,14 @@ pub const Config = struct {
     held: ?usize = null, // a split checkpoint (tensorfold_tp): the one share its expert tensors hold
     rank: usize = 0, // this process's tensor-parallel rank of `world`: set at load, never by config.json
     world: usize = 1,
+    /// One process's two-GPU TP (TENSORFOLD_TP=2): this engine's rank of `tp_world`. Mamba and attention heads are
+    /// this rank's share (`forTp`); routed experts are owned in contiguous halves (expert parallel), the router stays
+    /// whole. Apart from `rank`/`world`, which a latent MoE's ranks over hosts use.
+    tp_rank: usize = 0,
+    tp_world: usize = 1,
+    /// The KV cache in e4m3 by each attention layer's calibrated k_scale and v_scale (TENSORFOLD_KV_FP8=1, TP only):
+    /// a row is half a bf16 one's bytes.
+    kv_fp8: bool = false,
     ck: bool = false, // --precision checkpoint: e4m3 rows into the FP8 layers, NVFP4 rows into the experts
     widths: [max_layers][4]Width = @splat(@splat(.{})), // each layer's matrices (members(kind) order) at their widths
     embed_width: Width = .{},
@@ -107,6 +115,30 @@ pub const Config = struct {
 
     pub fn inner(self: Config) usize {
         return self.mamba_heads * self.mamba_head_dim;
+    }
+
+    /// This rank's view of a two-GPU TP: its Mamba heads and state groups, its query heads and KV head. The hidden
+    /// size, the vocabulary and the router's expert count stay whole: the residual is replicated on both ranks.
+    pub fn forTp(self: Config, rank: usize, world: usize) error{UnsupportedTp}!Config {
+        if (world == 1) return self;
+        if (world != 2 or rank >= world) return error.UnsupportedTp;
+        if (self.latent > 0 or self.pocket > 0 or self.format != .modelopt) return error.UnsupportedTp;
+        if (self.mamba_heads % world != 0 or self.groups % world != 0 or self.heads % world != 0 or self.kv_heads % world != 0 or self.experts % world != 0) return error.UnsupportedTp;
+        if ((self.mamba_heads / self.groups) * (self.groups / world) != self.mamba_heads / world) return error.UnsupportedTp;
+        var c = self;
+        c.mamba_heads /= world;
+        c.groups /= world;
+        c.heads /= world;
+        c.kv_heads /= world;
+        c.tp_rank = rank;
+        c.tp_world = world;
+        return c;
+    }
+
+    /// The routed experts a TP rank owns: [first, first + count).
+    pub fn ownedExperts(self: Config) struct { first: usize, count: usize } {
+        const n = self.experts / self.tp_world;
+        return .{ .first = self.tp_rank * n, .count = n };
     }
 
     pub fn convDim(self: Config) usize {

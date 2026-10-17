@@ -22,6 +22,7 @@ const prompt_rows = @import("cuda_prompt_rows.zig");
 const prompt_pass = @import("cuda_prompt.zig");
 const marks = @import("cuda_marks.zig");
 const latent = @import("cuda_latent.zig");
+const tp2 = @import("cuda_tp2.zig");
 const identity = @import("cuda_identity.zig");
 pub const PromptRows = prompt_rows.PromptRows;
 
@@ -38,6 +39,16 @@ pub const Options = struct {
     slide: bool = false, // Sliding Weights asked for: refused for a checkpoint the learner cannot read
     vision: ?@import("cuda_vision.zig").Limits = null, // --vision: the checkpoint's image tower (an omni checkpoint's)
     precision: ?@import("config.zig").Precision = null, // --precision; null: the checkpoint's math where it is built
+    /// A layer split's rank: which blocks this engine loads and runs, and which of the embedding, the seam norm and
+    /// the tail. `all` is a single device.
+    range: weights.Range = .all,
+    /// Two-GPU tensor parallel in one process: this engine's rank (cuda_tp2.zig). null: not a TP rank.
+    tp: ?usize = null,
+    /// Every sequence's KV planes from this shared page pool (sized by TENSORFOLD_KV_POOL_TOKENS); null: each
+    /// sequence's planes cover its whole context.
+    kv_pool: ?*cuda.KvPool = null,
+    /// The KV cache in e4m3 by the checkpoint's KV scales (two-GPU TP only: the MTP head's caches stay bf16).
+    kv_fp8: bool = false,
 };
 
 /// Asked before each prompt chunk (or segmented call): true stops the prompt with error.Cancelled.
@@ -72,7 +83,7 @@ pub const Taps = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque, hid
 pub const lookahead = 4;
 
 /// Streams a shared window holds at most (their rows together at most state.max_rows).
-pub const max_streams = 8;
+pub const max_streams = 16; // a shared window's streams: 16 one-row windows fill its 16 rows
 
 // pinned words: the window's meta row, its ids, its sampled ids, a prompt chunk's ids, then 64 a shared window's stream
 const pin_meta = 0;
@@ -138,6 +149,18 @@ pub const Engine = struct {
     last_chunk: usize = 0, // where the last prompt pass's last chunk started (the prompt's last row: len - 1 - this)
     tp: ?cuda.tp_group.Group = null, // a latent MoE over ranks (TF_NEMOTRON_RANK of TF_NEMOTRON_WORLD)
     vision: ?*@import("cuda_vision.zig").Vision = null, // --vision: the tower and a prompt pass's image rows
+    /// A layer split's rank: which blocks this engine runs, and which of the embedding, the seam norm and the tail.
+    range: @import("cuda_forward.zig").Range = .all,
+    /// The other rank of a layer split or a two-GPU TP, when this engine is one. null: a single device.
+    peer: ?*Engine = null,
+    /// Two-GPU TP (rank 0's engine): the pair's exchange. null: a layer split or a single device.
+    tp_link: ?*tp2.Link = null,
+    kv_pool: ?*cuda.KvPool = null,
+    /// The widest prompt pass, in rows: state.pass_rows, or a two-GPU TP rank's state.prefill_rows (its scratch,
+    /// summed over every expert pair, is the largest buffer a rank holds beside the weights and the KV pool).
+    pass: usize = state.pass_rows,
+    /// The seam's host staging: one pinned buffer, sized for the widest prompt pass's h, y and xs.
+    stage: [1]cuda.HostBuffer = undefined,
 
     /// Loads the checkpoint into the Python engine's layouts and sizes the caches; `triton_dir` null: our own glue.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, model_dir: []const u8, triton_dir: ?[]const u8, opts: Options) !*Engine {
@@ -145,8 +168,16 @@ pub const Engine = struct {
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
         e.* = .{ .gpa = gpa, .io = io, .ctx = ctx, .stream = undefined, .k = undefined, .w = undefined, .b = undefined, .c = undefined, .max_len = 0, .pinned = undefined, .history = undefined };
+        // Every allocation below lands in this context, so bind it first: a layer split's second engine would
+        // otherwise allocate on whichever device the first one left current.
+        try ctx.makeCurrent();
         e.trace = std.c.getenv("TF_SLIDE_TRACE") != null;
         e.c = try Config.read(gpa, io, model_dir);
+        if (opts.tp) |rank| e.c = try e.c.forTp(rank, tp2.world);
+        if (opts.kv_fp8) {
+            if (opts.tp == null or opts.mtp) return error.Fp8KvNeedsTp;
+            e.c.kv_fp8 = true;
+        }
         try latent.place(&e.c);
         if (e.c.rank > 0) return error.RankServesExperts; // ranks past 0 run cuda_worker.serve, not an engine
         e.c.ck = try @import("cuda_latent_ck.zig").wanted(ctx, e.c, opts.precision);
@@ -185,7 +216,8 @@ pub const Engine = struct {
             std.log.err("no captured attention kernel covers {d} chunks of 512 keys; capture one for this context", .{chunks});
             return error.ContextUnsupported;
         }) else chunks;
-        e.w = try weights.load(gpa, io, e.ops(), model_dir, e.c, opts.mtp);
+        e.w = try weights.loadRange(gpa, io, e.ops(), model_dir, e.c, opts.mtp, opts.range);
+        e.range = .{ .first = opts.range.first, .last = opts.range.last };
         errdefer e.w.deinit();
         if (opts.vision) |lim| {
             var problem: []const u8 = "";
@@ -195,7 +227,9 @@ pub const Engine = struct {
             };
         }
         errdefer if (e.vision) |v| v.deinit();
-        e.b = try state.Buffers.init(ctx.d, e.c, e.max_len, e.nch, e.carve);
+        e.kv_pool = opts.kv_pool;
+        e.pass = if (opts.tp != null) state.prefill_rows else state.pass_rows;
+        e.b = try state.Buffers.initRange(ctx.d, e.c, e.max_len, e.nch, e.carve, opts.range, opts.kv_pool, e.pass);
         errdefer e.b.deinit();
         try e.b.initShared(e.ops(), e.c);
         if (e.segments > 1) e.seg = try segs.Segments.init(e, e.segments);
@@ -266,11 +300,60 @@ pub const Engine = struct {
         return exec;
     }
 
+    /// One window over this engine, crossing to the peer when this is a layer split. Every window call goes through
+    /// here, so the seam is in one place.
+    pub fn runWindow(e: *Engine, parts: []const @import("cuda_forward.zig").Seg) !void {
+        const f = e.forward(null);
+        if (e.tp_link) |l| return e.windowTp(l, parts, null);
+        if (e.peer) |p| return f.windowSplit(&p.forward(null), parts, &e.stage);
+        return f.windowSegs(parts);
+    }
+
+    /// A two-GPU TP window: rank 0's rows and the peer's matching own sequence (one stream a rank for now).
+    fn windowTp(e: *Engine, l: *tp2.Link, parts: []const @import("cuda_forward.zig").Seg, dump: ?*Dump) !void {
+        if (parts.len != 1 or parts[0].row0 != 0 or parts[0].b != &e.b) return error.TpOneBoundSequence;
+        const p = e.peer.?;
+        const peer_segs = [_]@import("cuda_forward.zig").Seg{.{ .b = &p.b, .row0 = 0, .rows = parts[0].rows, .sampled = false, .slot = parts[0].slot, .untaught = parts[0].untaught }};
+        return e.windowTpParts(l, parts, &peer_segs, dump);
+    }
+
+    /// A two-GPU TP window over `parts` on rank 0 and their twins `peer_parts` on the peer (the same rows in order).
+    fn windowTpParts(e: *Engine, l: *tp2.Link, parts: []const @import("cuda_forward.zig").Seg, peer_parts: []const @import("cuda_forward.zig").Seg, dump: ?*Dump) !void {
+        const p = e.peer.?;
+        var f0 = e.forward(dump);
+        f0.segs = parts;
+        f0.untaught = for (parts) |s| {
+            if (s.untaught) break true;
+        } else false;
+        var f1 = p.forward(null);
+        f1.segs = peer_parts;
+        f1.untaught = f0.untaught;
+        if (!l.profile) return tp2.window(l, .{ &f0, &f1 }, .{ parts, peer_parts });
+        const t0 = std.Io.Clock.awake.now(e.io).toNanoseconds();
+        try tp2.window(l, .{ &f0, &f1 }, .{ parts, peer_parts });
+        const t1 = std.Io.Clock.awake.now(e.io).toNanoseconds();
+        try e.stream.synchronize();
+        try p.ctx.makeCurrent();
+        try p.stream.synchronize();
+        try e.ctx.makeCurrent();
+        const t2 = std.Io.Clock.awake.now(e.io).toNanoseconds();
+        l.prof.note(parts.len, @intCast(t1 - t0), @intCast(t2 - t0));
+    }
+
+    /// The window's inputs on the TP peer: the same ids and meta row rank 0 uploaded, from the same pinned host words.
+    fn mirrorWindow(e: *Engine, ids: []const u8, meta: []const u8) !void {
+        const p = e.peer orelse return;
+        if (e.tp_link == null) return;
+        try p.ctx.makeCurrent();
+        defer e.ctx.makeCurrent() catch {};
+        try p.ops().upload(p.b.ids, ids);
+        try p.ops().upload(p.b.meta, meta);
+    }
+
     fn recordBody(e: *Engine, body: Body) !void {
         switch (body) {
             .window => |w| {
-                const f = e.forward(null);
-                try f.windowSegs(&.{.{ .b = f.b, .row0 = 0, .rows = w.rows, .sampled = f.sampled, .mask = w.mask, .slot = f.slot, .untaught = f.untaught }});
+                try e.runWindow(&.{.{ .b = &e.b, .row0 = 0, .rows = w.rows, .sampled = e.sampling != null, .mask = w.mask, .slot = e.slot, .untaught = e.bound.untaught }});
                 if (w.feed) return e.ops().serialFeed(e.b.sampled, e.b.ids, e.b.meta, e.history_dev);
                 try e.ops().download(std.mem.sliceAsBytes(e.pinned.slice(u32)[pin_sampled..][0..w.rows]), e.b.sampled);
             },
@@ -300,6 +383,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        e.ctx.makeCurrent() catch {};
         if (e.tp != null) @import("cuda_worker.zig").end(e) catch {}; // the other ranks leave their job loops
         e.stream.synchronize() catch {};
         e.spares.deinit();
@@ -334,13 +418,23 @@ pub const Engine = struct {
 
     /// A zeroed sequence for another stream (its own caches, state, head caches and settings).
     pub fn newSeq(e: *Engine) !*state.Seq {
+        if (e.peer != null and e.tp_link == null) return error.SplitSingleStream;
         const s = try e.gpa.create(state.Seq);
         errdefer e.gpa.destroy(s);
         var head: [head_fields.len]usize = undefined;
         if (e.head) |h| head = h.seqSizes();
-        s.* = try state.Seq.init(e.ctx.d, e.c, e.max_len, if (e.head != null) &head else &.{}, e.stream, e.carve);
+        s.* = try state.Seq.initRange(e.ctx.d, e.c, e.max_len, if (e.head != null) &head else &.{}, e.stream, e.carve, e.range, e.kv_pool);
         const free = @ctz(~e.slots);
         if (free >= lesson_route.max_slots) return error.TooManySequences;
+        if (e.tp_link != null) {
+            const p = e.peer.?;
+            try p.ctx.makeCurrent();
+            defer e.ctx.makeCurrent() catch {};
+            s.peer = p.newSeq() catch |err| {
+                s.deinit();
+                return err;
+            };
+        }
         e.slots |= @as(u64, 1) << @intCast(free);
         s.slot = @intCast(free);
         return s;
@@ -350,11 +444,38 @@ pub const Engine = struct {
     pub fn seqBytes(e: *const Engine) usize {
         var head: [head_fields.len]usize = undefined;
         if (e.head) |h| head = h.seqSizes();
-        return state.Seq.bytes(e.c, e.max_len, if (e.head != null) &head else &.{});
+        const all = state.Seq.bytesRange(e.c, e.max_len, if (e.head != null) &head else &.{}, e.range);
+        // pooled KV planes come from the pool, which the load already holds: a stream adds only its other planes
+        return if (e.kv_pool != null) all - 2 * e.b.state_bytes[0] else all;
+    }
+
+    /// The bound sequence's KV pages under its first `rows` rows (the peer's too, under TP). A no-op without a pool.
+    pub fn ensureKv(e: *Engine, rows: usize) !void {
+        if (e.bound.paged) |x| try x.ensure(e.c, e.max_len, e.range, rows);
+        if (e.tp_link == null) return;
+        const p = e.peer.?;
+        if (p.bound.paged) |x| {
+            try p.ctx.makeCurrent();
+            defer e.ctx.makeCurrent() catch {};
+            try x.ensure(p.c, p.max_len, p.range, rows);
+        }
+    }
+
+    /// The bound sequence's KV pages back to the pool, once its stream has finished with them (a reset).
+    fn trimKv(e: *Engine) !void {
+        const x = e.bound.paged orelse return;
+        try e.stream.synchronize();
+        x.trim();
     }
 
     pub fn freeSeq(e: *Engine, s: *state.Seq) void {
         if (e.bound == s) e.bind(&e.own);
+        if (s.paged != null) e.stream.synchronize() catch {}; // its pages go back to the pool: no kernel may still read them
+        if (s.peer) |ps| if (e.peer) |p| {
+            p.ctx.makeCurrent() catch {};
+            p.freeSeq(ps);
+            e.ctx.makeCurrent() catch {};
+        };
         seq_graphs.free(e.gpa, &s.graphs);
         e.slots &= ~(@as(u64, 1) << @intCast(s.slot));
         s.deinit();
@@ -364,7 +485,14 @@ pub const Engine = struct {
     /// Act on sequence `s` from here on: its buffers replace the bound one's, which keeps where it stands.
     pub fn bind(e: *Engine, s: *state.Seq) void {
         const old = e.bound;
-        old.* = .{ .arena = old.arena, .carved = old.carved, .ptr = old.ptr, .head = old.head, .graphs = old.graphs, .epoch = old.epoch, .pos = e.pos, .parity = e.parity, .prev_keep = e.prev_keep, .rows = e.rows, .head_pos = if (e.head) |h| h.pos else 0, .sampling = e.sampling, .slot = old.slot, .decide = e.decide, .untaught = old.untaught };
+        // where the old sequence stands, field by field: everything else it holds (buffers, graphs, twin, pages) stays
+        old.pos = e.pos;
+        old.parity = e.parity;
+        old.prev_keep = e.prev_keep;
+        old.rows = e.rows;
+        old.head_pos = if (e.head) |h| h.pos else 0;
+        old.sampling = e.sampling;
+        old.decide = e.decide;
         inline for (state.seq_fields, s.ptr) |name, p| @field(e.b, name) = p;
         e.pos = s.pos;
         e.parity = s.parity;
@@ -375,6 +503,22 @@ pub const Engine = struct {
         e.decide = s.decide;
         if (e.head) |h| h.bindSeq(s);
         e.bound = s;
+        if (e.tp_link != null) {
+            const p = e.peer.?;
+            p.bind(if (s == &e.own) &p.own else s.peer.?);
+            e.syncPeer();
+        }
+    }
+
+    /// Two-GPU TP: the peer's host view of the bound sequence is rank 0's (its position, parity, keep and rows).
+    pub fn syncPeer(e: *Engine) void {
+        const p = e.peer orelse return;
+        if (e.tp_link == null) return;
+        p.pos = e.pos;
+        p.parity = e.parity;
+        p.prev_keep = e.prev_keep;
+        p.rows = e.rows;
+        p.armed.open = e.armed.open;
     }
 
     pub fn ops(e: *const Engine) kern.Ops {
@@ -382,22 +526,30 @@ pub const Engine = struct {
     }
 
     pub fn forward(e: *const Engine, dump: ?*Dump) Forward {
-        var f = Forward.init(e.c, &e.w, &e.b, e.ops(), e.max_len, e.nch, e.sampling != null);
+        var f = Forward.initWith(e.c, &e.w, &e.b, e.ops(), e.max_len, e.nch, e.sampling != null, e.ctx);
         f.dump = dump;
         f.slot = e.slot;
         f.untaught = e.bound.untaught;
         f.tp = if (e.tp) |*g| g else null;
         f.vision = e.vision;
+        f.range = e.range;
         if (dump == null and e.c.experts <= 128 and e.c.slots() <= 8) f.side = e.side; // tf_plan_routed's bounds
         return f;
     }
 
     /// Engine.reset: zeroed caches and state, position 0.
     pub fn reset(e: *Engine) !void {
+        if (e.peer) |p| {
+            try p.ctx.makeCurrent();
+            try p.reset();
+            try e.ctx.makeCurrent();
+        }
         try e.b.reset(e.ops());
+        try e.trimKv();
         e.pos = 0;
         e.parity = 0;
         e.prev_keep = 0;
+        e.syncPeer();
     }
 
     // the prompt pass, in cuda_prompt.zig
@@ -407,13 +559,15 @@ pub const Engine = struct {
     pub const redrawFirst = prompt_pass.redrawFirst;
     pub const beforeChunk = prompt_pass.beforeChunk;
     pub const serialChunks = prompt_pass.serialChunks;
+    pub const chunksFrom = prompt_pass.chunksFrom;
+    pub const prefillStep = prompt_pass.prefillStep;
     pub const setSegments = prompt_pass.setSegments;
     pub const promptHost = prompt_pass.promptHost;
     pub const segmentSet = prompt_pass.segmentSet;
 
     /// Any block's change, for the buffers every block shares (null: no lesson is attached).
     pub fn lessons(e: *const Engine) ?weights.Adapter {
-        for (e.w.blocks) |blk| switch (blk.kind) {
+        for (e.w.blocks[e.range.first..@min(e.range.last, e.c.layers)]) |blk| switch (blk.kind) {
             .mamba => if (blk.mamba.adapter) |ad| return ad,
             .attention => if (blk.attn.adapter) |ad| return ad,
             .moe => if (blk.moe.adapter) |ad| return ad,
@@ -453,12 +607,14 @@ pub const Engine = struct {
     pub fn verifyMasked(e: *Engine, ids: []const u32, rows: usize, dump: ?*Dump, mask: Mask) !void {
         if (rows < 1 or rows > state.max_rows or ids.len > rows) return error.BadWindow;
         if (e.pos + rows > e.max_len) return error.ContextFull;
+        try e.ensureKv(e.pos + rows);
         try e.copied.synchronize();
         const host = e.pinned.slice(u32);
         host[pin_meta..][0..4].* = e.metaRow();
         @memcpy(host[pin_ids..][0..ids.len], ids);
         try e.ops().upload(e.b.ids, std.mem.sliceAsBytes(host[pin_ids..][0..ids.len]));
         try e.ops().upload(e.b.meta, std.mem.sliceAsBytes(host[pin_meta..][0..4]));
+        try e.mirrorWindow(std.mem.sliceAsBytes(host[pin_ids..][0..ids.len]), std.mem.sliceAsBytes(host[pin_meta..][0..4]));
         try e.copied.record(e.stream);
         const m: usize = @intFromBool(e.sampling != null);
         if (dump == null and mask.bits == 0 and e.windows[m][rows] != null) {
@@ -467,8 +623,7 @@ pub const Engine = struct {
             try e.launchCaptured(@intCast(masked_ids + m * (state.max_rows + 1) + rows), .{ .window = .{ .rows = rows, .feed = false, .mask = mask } });
         } else {
             e.stats.eager += 1;
-            const f = e.forward(dump);
-            try f.windowSegs(&.{.{ .b = f.b, .row0 = 0, .rows = rows, .sampled = f.sampled, .mask = mask, .slot = f.slot, .untaught = f.untaught }});
+            try e.runWindow(&.{.{ .b = &e.b, .row0 = 0, .rows = rows, .sampled = e.sampling != null, .mask = mask, .slot = e.slot, .untaught = e.bound.untaught }});
             try e.ops().download(std.mem.sliceAsBytes(host[pin_sampled..][0..rows]), e.b.sampled);
         }
         try e.sampled_ready.record(e.stream);
@@ -484,6 +639,7 @@ pub const Engine = struct {
 
     /// Several streams' windows in one forward (eager): each stream's rows read its own caches, state and rule.
     pub fn verifyShared(e: *Engine, parts: []const Shared) !void {
+        if (e.peer != null and e.tp_link == null) return error.SplitSingleStream;
         if (parts.len < 1 or parts.len > max_streams) return error.BadWindow;
         var total: usize = 0;
         for (parts) |p| {
@@ -495,10 +651,13 @@ pub const Engine = struct {
         const host = e.pinned.slice(u32)[pin_shared..][0 .. max_streams * 64];
         var views: [max_streams]state.Buffers = undefined;
         var parts_f: [max_streams]Seg = undefined;
+        var pviews: [max_streams]state.Buffers = undefined; // two-GPU TP: each part's buffers on the peer
+        var pparts: [max_streams]Seg = undefined;
         var row0: usize = 0;
         for (parts, 0..) |p, k| {
             e.bind(p.seq);
             if (e.pos + p.rows > e.max_len) return error.ContextFull;
+            try e.ensureKv(e.pos + p.rows);
             const slot = host[k * 64 ..][0..64];
             slot[0..4].* = e.metaRow();
             @memcpy(slot[4..][0..p.ids.len], p.ids);
@@ -506,10 +665,18 @@ pub const Engine = struct {
             try e.ops().upload(e.b.meta, std.mem.sliceAsBytes(slot[0..4]));
             views[k] = e.b; // the bound sequence's own fields beside the shared scratch
             parts_f[k] = .{ .b = &views[k], .row0 = row0, .rows = p.rows, .sampled = e.sampling != null, .mask = p.mask, .slot = p.seq.slot, .untaught = p.seq.untaught };
+            if (e.tp_link != null) {
+                const peer = e.peer.?;
+                try e.mirrorWindow(std.mem.sliceAsBytes(slot[4..][0..p.ids.len]), std.mem.sliceAsBytes(slot[0..4]));
+                pviews[k] = peer.b;
+                pparts[k] = .{ .b = &pviews[k], .row0 = row0, .rows = p.rows, .sampled = false, .slot = p.seq.slot, .untaught = p.seq.untaught };
+            }
             row0 += p.rows;
         }
         try e.copied.record(e.stream);
-        try e.forward(null).windowSegs(parts_f[0..parts.len]);
+        if (e.tp_link) |l| {
+            try e.windowTpParts(l, parts_f[0..parts.len], pparts[0..parts.len], null);
+        } else try e.runWindow(parts_f[0..parts.len]);
         for (parts, 0..) |p, k| try e.ops().download(std.mem.sliceAsBytes(host[k * 64 + 32 ..][0..p.rows]), views[k].sampled);
         try e.sampled_ready.record(e.stream);
         for (parts) |p| {

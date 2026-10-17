@@ -18,7 +18,23 @@ pub const Copy = struct {
     parity: usize,
     rows: usize,
     whole: bool = true, // false while an armed mark's chunk has not written all its parts
+    peer: ?*Copy = null, // two-GPU TP: the same state's share on the other rank
 };
+
+/// Two-GPU TP: the peer's target (its engine, no head) once its host view is rank 0's, its context current; null
+/// when not TP. `backTo` makes rank 0's current again.
+pub fn peerOf(t: *const Target) ?Target {
+    const e = t.e;
+    if (e.tp_link == null) return null;
+    e.syncPeer();
+    const p = e.peer.?;
+    p.ctx.makeCurrent() catch return null;
+    return .{ .e = p, .head = null };
+}
+
+pub fn backTo(t: *const Target) void {
+    t.e.ctx.makeCurrent() catch {};
+}
 
 /// The engine and head a cache save copies. The native host keeps one of these for the loaded model.
 pub const Target = struct {
@@ -36,9 +52,16 @@ pub fn shape(t: *const Target, at: usize) Shape {
     return .{ .layers = t.e.c.count(.attention), .row = state.kvRowBytes(t.e.c), .head = t.head != null, .kv = kvBytes(t.e.c, at, t.head != null), .mamba = m[0] + m[1] };
 }
 
-/// A whole kept state of `at` tokens, its buffers empty for a disk read to fill (`fill`).
+/// A whole kept state of `at` tokens, its buffers empty for a disk read to fill (`fill`); under TP the peer's share
+/// too (`Copy.peer`), which a read fills through the peer's target.
 pub fn blank(t: *const Target, at: usize) !*Copy {
-    return alloc(t, at, true);
+    const copy = try alloc(t, at, true);
+    errdefer drop(@constCast(t), copy);
+    if (peerOf(t)) |pt| {
+        defer backTo(t);
+        copy.peer = try alloc(&pt, at, true);
+    }
+    return copy;
 }
 
 /// `host` to or from (`out`) bytes [off, off + host.len) of a kept state's key and value buffer or its Mamba buffer.
@@ -63,6 +86,10 @@ pub fn setWords(saved: *anyopaque, w: [2]u64) void {
     const copy: *Copy = @ptrCast(@alignCast(saved));
     copy.parity = @intCast(w[0]);
     copy.rows = @intCast(w[1]);
+    if (copy.peer) |pc| { // both ranks' shares stand where rank 0's does
+        pc.parity = copy.parity;
+        pc.rows = copy.rows;
+    }
 }
 
 /// `len` bytes at `live` in the bound sequence's planes; `mamba`: the SSM or conv state, which an armed chunk writes.
@@ -145,13 +172,39 @@ pub fn ready(t: *Target, budget: u64) !u64 {
     const len = mambaBytes(e.c);
     e.spares.want = @min(marks.spares_max, budget / 4 / len);
     e.spares.fill(e.ctx.d, len);
+    if (peerOf(t)) |pt| {
+        defer backTo(t);
+        pt.e.spares.want = e.spares.want;
+        pt.e.spares.fill(pt.e.ctx.d, len);
+    }
     return e.spares.want * len;
 }
 
 /// Copy the live state after `at` prompt tokens. The pass is standing there.
 pub fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
-    _ = owner;
     const t: *Target = @ptrCast(@alignCast(ptr));
+    const mine = saveOne(t, at) catch |err| {
+        if (t.e.tp_link != null) std.log.warn("tp prompt cache: rank 0 save at {d} failed: {s}", .{ at, @errorName(err) });
+        return err;
+    };
+    const copy: *Copy = @ptrCast(@alignCast(mine));
+    if (peerOf(t)) |pt| {
+        defer backTo(t);
+        var peer_t = pt;
+        const theirs = saveOne(&peer_t, at) catch |err| {
+            std.log.warn("tp prompt cache: rank 1 save at {d} failed: {s}", .{ at, @errorName(err) });
+            backTo(t);
+            drop(ptr, mine);
+            return err;
+        };
+        copy.peer = @ptrCast(@alignCast(theirs));
+    }
+    _ = owner;
+    return mine;
+}
+
+fn saveOne(t: *Target, at: u32) anyerror!*anyopaque {
+    const ptr: *anyopaque = t;
     const e = t.e;
     // a prompt mark: no window's rows wait to replay, so raw, xc and dt hold nothing a later pass reads
     if (e.prev_keep != 0) return error.NotAtMark;
@@ -189,6 +242,14 @@ fn arm(t: *const Target, at: usize) !*anyopaque {
 
 /// Once a chunk is queued, while the GPU runs it: the armed rows' key and value rows (the head's too), then new spares.
 pub fn finish(t: Target) !void {
+    try finishOne(t);
+    if (peerOf(&t)) |pt| {
+        defer backTo(&t);
+        try finishOne(pt);
+    }
+}
+
+fn finishOne(t: Target) !void {
     const e = t.e;
     for (e.armed.marks()) |m| {
         const copy: *Copy = @ptrCast(@alignCast(m.copy));
@@ -208,6 +269,7 @@ pub fn held(saved: *anyopaque) usize {
 /// A kept state's bytes in `out` (its key and value rows, then its Mamba states), after the engine's stream.
 pub fn download(t: *const Target, saved: *anyopaque, out: []u8) !void {
     const copy: *Copy = @ptrCast(@alignCast(saved));
+    if (copy.peer != null) return error.TpStateOnTwoDevices; // the disk tier is refused under TP
     const kv = kvBytes(t.e.c, copy.pos, copy.head);
     try t.e.ops().download(out[0..kv], copy.kv.ptr);
     try t.e.ops().download(out[kv..], copy.mamba.ptr);
@@ -219,9 +281,30 @@ pub fn restore(ptr: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!
     _ = owner;
     const t: *Target = @ptrCast(@alignCast(ptr));
     const copy: *Copy = @ptrCast(@alignCast(saved));
+    if (t.e.tp_link != null) {
+        const why: ?[]const u8 = if (copy.peer == null) "no rank 1 copy" else if (!copy.peer.?.whole) "rank 1 copy not whole" else if (!copy.whole) "rank 0 copy not whole" else null;
+        if (why) |w| {
+            std.log.warn("tp prompt cache: restore at {d} refused: {s}", .{ copy.pos, w });
+            return error.Incomplete;
+        }
+    }
+    restoreOne(t, copy) catch |err| {
+        if (t.e.tp_link != null) std.log.warn("tp prompt cache: rank 0 restore at {d} failed: {s}", .{ copy.pos, @errorName(err) });
+        return err;
+    };
+    if (copy.peer) |pc| if (peerOf(t)) |pt| {
+        defer backTo(t);
+        var peer_t = pt;
+        try restoreOne(&peer_t, pc);
+    };
+    t.e.syncPeer();
+}
+
+fn restoreOne(t: *Target, copy: *Copy) anyerror!void {
     const e = t.e;
     if (copy.head != (t.head != null)) return error.NoHead; // checked before any copy: nothing half restored
     if (!copy.whole) return error.Incomplete; // its chunk failed before `finish`
+    if (e.bound.paged) |x| try x.ensure(e.c, e.max_len, e.range, copy.pos); // this rank's pages; the peer restores its own
     _ = try move(t, copy.pos, copy, false, true);
     e.pos = copy.pos;
     e.parity = copy.parity;
@@ -234,6 +317,12 @@ pub fn restore(ptr: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!
 pub fn drop(ptr: *anyopaque, saved: *anyopaque) void {
     const t: *Target = @ptrCast(@alignCast(ptr));
     const copy: *Copy = @ptrCast(@alignCast(saved));
+    if (copy.peer) |pc| if (t.e.peer) |p| {
+        p.ctx.makeCurrent() catch {};
+        var pt: Target = .{ .e = p, .head = null };
+        drop(&pt, pc);
+        t.e.ctx.makeCurrent() catch {};
+    };
     t.e.armed.forget(saved); // a copy evicted before its chunk ran: the chunk must not write it
     if (!t.e.spares.give(copy.mamba)) copy.mamba.free();
     copy.kv.free();

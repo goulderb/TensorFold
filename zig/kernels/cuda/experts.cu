@@ -214,7 +214,7 @@ __global__ void __launch_bounds__(PLAN_THREADS)
   for (int p = tid; p < P; p += PLAN_THREADS) {
     const int e = picks[p];
     pk[p] = e;
-    atomicAdd(&cnt[e], 1);
+    if (e >= 0) atomicAdd(&cnt[e], 1);
   }
   __syncthreads();
   const int o = place_items(tid < E ? cnt[tid] : 0, E, T, items, counts);
@@ -222,6 +222,7 @@ __global__ void __launch_bounds__(PLAN_THREADS)
   __syncthreads();
   for (int p = tid; p < P; p += PLAN_THREADS) {
     const int e = pk[p];
+    if (e < 0) continue;
     int rank = 0;
     for (int q = 0; q < p; ++q) rank += pk[q] == e;
     members[off[e] + rank] = p;
@@ -235,7 +236,7 @@ __global__ void __launch_bounds__(PLAN_THREADS)
   for (int e = tid; e < E; e += PLAN_THREADS) cnt[e] = 0;
   __syncthreads();
   const int p = blockIdx.x * PLAN_THREADS + tid;
-  const bool ok = p < P;
+  const bool ok = p < P && picks[p] >= 0;
   const int e = ok ? picks[p] : -1 - lane;
   const unsigned same = __match_any_sync(0xffffffffu, e);
   const int below = __popc(same & ((1u << lane) - 1u));
@@ -270,13 +271,13 @@ __global__ void __launch_bounds__(PLAN_THREADS)
 __global__ void plan_scatter(const int* __restrict__ picks, int P, int E, const int* __restrict__ rank,
                              const int* __restrict__ hist, int* __restrict__ members) {
   const int p = blockIdx.x * blockDim.x + threadIdx.x;
-  if (p < P) members[hist[(size_t)(p / PLAN_THREADS) * E + picks[p]] + rank[p]] = p;
+  if (p < P && picks[p] >= 0) members[hist[(size_t)(p / PLAN_THREADS) * E + picks[p]] + rank[p]] = p;
 }
 
 } // namespace tf_experts
 
 // Decode form for groups of 64: up with relu^2 (epilogue 1), down to fp32 (epilogue 0).
-#define TF_EXPERT(EPI) template __global__ void tf_experts::expert_kernel<64, 1, EPI, 2, 4>(const __nv_bfloat16*, \
-    int, int, const uint4*, int, int, const int*, const int*, const int*, void*, int, float);
+#define TF_EXPERT(EPI) template __global__ void tf_experts::expert_kernel<64, 1, EPI, 2, 4>(const __nv_bfloat16* __restrict__, \
+    int, int, const uint4* __restrict__, int, int, const int* __restrict__, const int* __restrict__, const int* __restrict__, void* __restrict__, int, float);
 TF_EXPERT(1)
 TF_EXPERT(0)

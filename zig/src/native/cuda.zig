@@ -54,6 +54,23 @@ pub const deviceName = cuda_device.deviceName;
 const getenv = cuda_device.getenv;
 const setting = cuda_device.setting;
 
+/// TENSORFOLD_SPLIT=1 asks for the two-GPU layer split. Unset or 0: one device, the existing path.
+/// TENSORFOLD_TP=2: two-GPU tensor parallel in one process (cuda_tp2.zig).
+fn tpRequested() bool {
+    const v = std.c.getenv("TENSORFOLD_TP") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "2");
+}
+
+/// A layer split or two-GPU TP: either one runs one stream over two devices, with the host's per-device admission.
+fn pairRequested() bool {
+    return splitOnly() or tpRequested();
+}
+
+fn splitOnly() bool {
+    const t = std.mem.trim(u8, getenv("TENSORFOLD_SPLIT") orelse return false, " ");
+    return t.len > 0 and !std.mem.eql(u8, t, "0");
+}
+
 /// The model's window (config.json's max_position_embeddings, text_config's first), 0 when it names none.
 fn modelContext(a: Allocator, io: std.Io, dir: []const u8) i64 {
     const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return 0;
@@ -189,7 +206,7 @@ const Host = struct {
 
     pub fn bind(p: *anyopaque) *Host {
         const h: *Host = @ptrCast(@alignCast(p));
-        if (h.gpu) |g| if (bound != &g.ctx) {
+        if (h.gpu) |g| if (bound != &g.ctx or pairRequested()) {
             g.ctx.makeCurrent() catch |e| std.log.err("cuCtxSetCurrent on the lane thread: {s}", .{@errorName(e)});
             bound = &g.ctx;
         };
@@ -409,7 +426,19 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         }
     };
     var probe: Probe = .{ .a = a, .io = io, .ctx = &g.ctx, .held = held0, .problem = problem };
+    const split = pairRequested();
+    const tp = tpRequested();
+    if (split and !tp and (o.drafts or o.slide or o.learn != null or segments != 1 or disk_config != null or (o.prompt_cache_gib orelse 0) != 0 or (o.lanes_fixed and o.lanes != 1))) {
+        problem.* = "TENSORFOLD_SPLIT is a single-stream layer-split trial, not TP: use --no-drafts --parallel 1 --prompt-cache-gib 0 without learning, spill or segments";
+        return null;
+    }
+    if (tp and (o.drafts or o.slide or o.learn != null or segments != 1)) {
+        problem.* = "TENSORFOLD_TP=2 serves without drafts, Sliding Weights, learned states or segments: use --no-drafts";
+        return null;
+    }
     var opts: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments, .slide = o.slide };
+    if (@hasField(F.Options, "split")) opts.split = splitOnly();
+    if (@hasField(F.Options, "tp")) opts.tp = tpRequested();
     if (o.vision) |vo| {
         if (!@hasField(F.Options, "vision")) {
             problem.* = "--vision: this CUDA family reads no images; serve it without --vision";
@@ -432,8 +461,12 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         spill_owner = try glm_spill.Adapter.prepare(gpa, io, o.dir);
         if (spill_owner) |owner| opts.persistence = .{ .ctx = owner, .attach = glm_spill.Adapter.attach };
     }
-    if (weights > before.room(held0)) {
-        problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
+    // A layer split admits rank 0's share against this device, not the whole checkpoint: rank 1's share lands on the
+    // other card, which the peer's own open checks. The layer count is not read yet, so the share is the same
+    // fraction the split uses, over the checkpoint's bytes.
+    const share = if (split) weights * 54 / 100 else weights;
+    if (share > before.room(held0)) {
+        problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights{s} do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), if (split) " (this rank's share)" else "", toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
         return null;
     }
     const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, opts) catch |e| {
@@ -473,7 +506,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     };
     const model = cuda.usage(false).device - held0;
     const after = try pool(a, io, &g.ctx, problem) orelse return null;
-    var room = after.room(model) -| loaded.learn_bytes;
+    // a split's model bytes span both devices: this one's room is its free memory less the larger of the reserve and
+    // the 1536 MiB floor (the peer checked its own floor at open)
+    var room = if (split) after.free -| @max(after.reserve, 1536 << 20) else after.room(model) -| loaded.learn_bytes;
     var low: []const u8 = ""; // names the rank whose room bounds the streams, when it is not this one
     if (@hasField(@TypeOf(loaded), "peer_room")) if (loaded.peer_room) |pr| if (pr.bytes < room) {
         room = pr.bytes;
@@ -485,7 +520,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         problem.* = try std.fmt.allocPrint(a, "this CUDA cache supports at most {d} lanes; lower --parallel {d}", .{ lane_limit, o.lanes });
         return null;
     };
-    const streams = budget.admit(room, loaded.stream_bytes, free, asked, o.lanes_fixed) catch |e| {
+    const streams: u32 = if (split and !tp) 1 else budget.admit(room, loaded.stream_bytes, free, asked, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
             error.NoStream => try std.fmt.allocPrint(a, no_stream, .{
                 window,
@@ -506,10 +541,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         };
         return null;
     };
-    const cache = budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free));
+    const cache = if (split and !tp) 0 else budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free));
     const store_cache = if (@hasDecl(F, "snap_save")) try snaps.cacheBudget(F, loaded.target, cache) else 0;
     // Mamba spares are prepaid; the tier reservation is charged once inside the remaining Store budget.
-    const disk: ?*nspill.Disk = if (F != nemotron.native) null else if (disk_config) |*c| (try openDisk(F, a, gpa, io, g, loaded, c, &model_files.?, &exe_files.?, kernels, segments, store_cache, problem)) orelse return null else null;
+    const disk: ?*nspill.Disk = if (F != nemotron.native) null else if (disk_config) |*c| (try openDisk(F, a, gpa, io, g, loaded, c, &model_files.?, &exe_files.?, kernels, segments, store_cache, after.unified, problem)) orelse return null else null;
     defer if (!opened) if (disk) |d| d.abandon(null); // after the store's own unwind, which detaches it
     if (disk != null) disk_config.?.tier.dir = ""; // the tier owns it now
     const h = try gpa.create(Host);
@@ -583,6 +618,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .startup = h.startup,
         .prompt_cache = h.store != null,
         .warm_turns = h.store != null and @hasDecl(F, "warm_quiet"),
+        .fill_arrival = F == nemotron.native, // agent turns grow: shortest-first starved the longest ones
         .logprobs = loaded.backend.vtable.first_row != null,
         .prompt_logprobs = loaded.backend.vtable.prompt_rows,
         .structures = loaded.backend.vtable.first_masked != null,
@@ -711,16 +747,25 @@ test "a cancel during a long prompt stops it, and the next request's reply is un
 
 /// The spill tier for a loaded family, or null with `problem` set: the layout from the engine, the reservation inside
 /// the cache, the identity from the files the load read and the facts it ran with.
-fn openDisk(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, g: *Gpu, loaded: F.Loaded, c: *spill_facts.Config, model_files: *const spill_facts.Artifacts, exe_files: *const spill_facts.Artifacts, kernels: ?[]const u8, segments: u32, cache: u64, problem: *[]const u8) !?*nspill.Disk {
+fn openDisk(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, g: *Gpu, loaded: F.Loaded, c: *spill_facts.Config, model_files: *const spill_facts.Artifacts, exe_files: *const spill_facts.Artifacts, kernels: ?[]const u8, segments: u32, cache: u64, unified: bool, problem: *[]const u8) !?*nspill.Disk {
     const t = loaded.target;
-    const layout = nspill.Layout.of(F.planes(t), F.prompt_rows) catch |e| {
+    // two-GPU TP: each file holds both ranks' shares, which the kept states copy through each rank's own engine
+    const ranks: u32 = if (t.e.tp_link != null) 2 else 1;
+    const layout = (nspill.Layout.of(F.planes(t), F.prompt_rows) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "spill tier: the engine's state layout is not one the tier stores ({s})", .{@errorName(e)});
+        return null;
+    }).over(ranks) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "spill tier: the engine's state layout is not one the tier stores ({s})", .{@errorName(e)});
         return null;
     };
     const payload = try layout.payload();
-    const reservation = try nspill.Disk.reservationFor(payload, 64 << 20);
+    const slot: u64 = if (nspill.Disk.slotless(payload, c.tier)) 0 else payload;
+    const reservation = try nspill.Disk.reservationFor(slot, 64 << 20);
+    // a rank's kept state; the cache's budget is a rank's (both hold the same bytes)
     const device_bytes = F.snap_bytes(t, @intCast(layout.max_len));
-    _ = nspill.Disk.admit(payload, device_bytes, c.host_bytes, cache) catch |e| {
+    // the host reservation comes out of the cache only where host memory is the device's: a discrete GPU's cache is
+    // device memory it never takes
+    _ = nspill.Disk.admit(slot, device_bytes, c.host_bytes, if (unified) cache else cache +| reservation) catch |e| {
         problem.* = switch (e) {
             error.SpillHostCeiling => try std.fmt.allocPrint(a, "TENSORFOLD_SPILL_HOST_GIB={d:.2} is below the tier's {d:.2} GiB host reservation (one {d:.2} GiB state, two transfer buffers, its index): raise it or lower --context", .{ toGib(c.host_bytes), toGib(reservation), toGib(payload) }),
             error.SpillCacheTooSmall => try std.fmt.allocPrint(a, "the {d:.2} GiB prompt cache cannot hold the spill tier's {d:.2} GiB host reservation and one {d:.2} GiB kept state: raise --prompt-cache-gib or lower --context", .{ toGib(cache), toGib(reservation), toGib(device_bytes) }),
@@ -745,10 +790,13 @@ fn openDisk(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, g: *Gpu,
         problem.* = try std.fmt.allocPrint(a, "spill tier: no compute capability ({s})", .{@errorName(e)});
         return null;
     };
-    const facts: spill_facts.Facts = .{ .weights = weights, .executable = exe, .kernels = kernels orelse "embedded", .driver = driver, .capability = capability, .format = F.formatName(t), .planes = .{ layout.kv_row, layout.mamba, 0, 0, 0, 0, 0 }, .head = @intFromBool(layout.head), .max_len = layout.max_len, .grid = layout.grid, .lookahead = nspill.lookahead, .segments = @intCast(segments) };
+    const facts: spill_facts.Facts = .{ .weights = weights, .executable = exe, .kernels = kernels orelse "embedded", .driver = driver, .capability = capability, .format = F.formatName(t), .planes = .{ layout.kv_row, layout.mamba, 0, 0, 0, 0, 0 }, .head = @intFromBool(layout.head), .max_len = layout.max_len, .grid = layout.grid, .lookahead = nspill.lookahead, .segments = @intCast(segments), .kv = if (t.e.c.kv_fp8) "fp8-e4m3" else "bf16", .tp = ranks };
     const identity = try facts.identity();
-    return nspill.Disk.open(gpa, io, gpa, .{ .ctx = &g.ctx, .stream = t.e.stream }, layout, c.tier, identity, c.host_bytes) catch |e| {
+    const d = nspill.Disk.open(gpa, io, gpa, .{ .ctx = &g.ctx, .stream = t.e.stream }, layout, c.tier, identity, c.host_bytes) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "spill tier at {s}: {s}", .{ c.tier.dir, @errorName(e) });
         return null;
     };
+    d.charged = unified;
+    std.log.info("spill tier: {s}, {d:.1} GiB on disk, {d:.1} GiB in host memory, {d} rank{s} a state, {s}", .{ c.tier.dir, toGib(c.tier.cap), toGib(c.tier.ram_cap), ranks, if (ranks == 1) "" else "s", if (slot == 0) "captured straight into memory" else "through a host slot" });
+    return d;
 }

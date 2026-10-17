@@ -6,9 +6,16 @@
 //! MiaAI-Lab's GLM-5.3-Flash TensorFold recipe (tensorfold/cuda/spill.py, Apache-2.0): its settings, its LRU by bytes
 //! under a cap and a free-disk floor, its write-then-rename files and its one-directory-per-build layout. The file and
 //! directory conventions also follow upstream TensorFold's --learn (zig/src/core/prompt_imprint.zig).
+//! Local fork changes add model-neutral source/sink interfaces, Nemotron/TP2 adapters and Windows/RAM tiers.
+//! Original notices and transitive design credits are retained in LICENSES/donors/README.md.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const fs = @import("spill_fs.zig");
+
+/// The tier's files on POSIX and on Windows (spill_fs.zig): every file made, read and deleted in a directory checked
+/// private, no link followed, written then renamed.
+pub const supported = true;
 
 pub const version: u32 = 1;
 pub const header_bytes = 4096;
@@ -26,6 +33,11 @@ pub const Settings = struct {
     min_free: u64 = 50 << 30,
     flush_s: f64 = 60,
     keep_builds: u32 = 1,
+    /// TENSORFOLD_SPILL_RAM_GIB: states a family hands over whole (`Tier.adopt`) stay in memory up to this many
+    /// bytes and are read back from there; each is also written behind to disk, so a stop that ends the process
+    /// (a kill, a crash) keeps them. Past the cap the least recently used leave memory once their file is in place.
+    /// 0: every state goes to disk alone.
+    ram_cap: u64 = 0,
 
     /// The tier's settings from `env.get(name)`, null when TENSORFOLD_SPILL_GIB is unset or 0; `dir` is allocated.
     /// Every number is finite and in range before it is converted: NaN, infinities, negatives and sizes past
@@ -43,11 +55,15 @@ pub const Settings = struct {
             if (s.flush_s < 0 or s.flush_s > most_flush_s) return error.BadSpillSetting;
         }
         if (env.get("TENSORFOLD_SPILL_KEEP_BUILDS")) |v| s.keep_builds = std.fmt.parseInt(u32, trim(v), 10) catch return error.BadSpillSetting;
-        s.dir = if (env.get("TENSORFOLD_SPILL_DIR")) |d| try a.dupe(u8, trim(d)) else blk: {
+        if (env.get("TENSORFOLD_SPILL_RAM_GIB")) |v| s.ram_cap = @intFromFloat(try gibs(v) * (1 << 30));
+        s.dir = if (env.get("TENSORFOLD_SPILL_DIR")) |d| try a.dupe(u8, trim(d)) else if (fs.windows) blk: {
+            const local = env.get("LOCALAPPDATA") orelse return error.NoSpillDir;
+            break :blk try std.fmt.allocPrint(a, "{s}/tensorfold/spill", .{local});
+        } else blk: {
             const home = env.get("HOME") orelse return error.NoSpillDir;
             break :blk try std.fmt.allocPrint(a, "{s}/.cache/tensorfold/spill", .{home});
         };
-        if (s.dir.len == 0 or s.dir[0] != '/') {
+        if (!fs.absolute(s.dir)) {
             a.free(s.dir);
             return error.SpillDirNotAbsolute;
         }
@@ -56,7 +72,7 @@ pub const Settings = struct {
 
     /// What both ranks must share, as text for the ranks' settings comparison.
     pub fn text(s: Settings, buf: []u8) ![]const u8 {
-        return std.fmt.bufPrint(buf, "spill={d}/{d}/{d}/{d}/{d}/{d}", .{ s.cap >> 20, s.highwater, s.min_tokens, s.min_free >> 20, s.flush_s, s.keep_builds });
+        return std.fmt.bufPrint(buf, "spill={d}/{d}/{d}/{d}/{d}/{d}/{d}", .{ s.cap >> 20, s.highwater, s.min_tokens, s.min_free >> 20, s.flush_s, s.keep_builds, s.ram_cap >> 20 });
     }
 
     /// The largest GiB count a setting takes (1 PiB): its byte count fits u64 with room to spare.
@@ -155,10 +171,17 @@ pub const Stats = struct {
     write_ns: u64 = 0,
     load_ns: u64 = 0,
     copy_wait_ns: u64 = 0,
+    // the memory level (TENSORFOLD_SPILL_RAM_GIB)
+    ram_adopted: u64 = 0, // states handed over whole and held in memory
+    ram_loaded: u64 = 0, // reads served from memory (a subset of `loaded`)
+    ram_demoted: u64 = 0, // held states written on to disk (behind, or for memory room)
+    ram_released: u64 = 0, // held states whose memory went for room, their file in place
+    ram_promoted: u64 = 0, // states read back from disk and held again (a hot state's next read is memory's)
+    ram_dropped: u64 = 0, // held states that left memory with no file (no disk room, a failed write)
 };
 
 /// What /health reports of a tier.
-pub const Info = struct { stats: Stats, entries: usize, pending: usize, stored_bytes: u64, queued_bytes: u64, disk_free: u64, cap: u64 };
+pub const Info = struct { stats: Stats, entries: usize, pending: usize, stored_bytes: u64, queued_bytes: u64, disk_free: u64, cap: u64, ram_entries: usize = 0, ram_bytes: u64 = 0, ram_cap: u64 = 0 };
 
 /// The fixed fields of a file's header.
 pub const Header = struct {
@@ -245,6 +268,36 @@ pub const Header = struct {
 
 /// One state on its way to disk. `copied`: every payload byte left the source (its memory may go); `done`: on disk or
 /// given up. The tier holds one reference until done, the writer's caller one until `release`.
+/// A state's bytes held in memory: its payload and meta as a file would hold them. The entry holds one reference, a
+/// read or a write of it to disk one each; the last release frees it.
+pub const Ram = struct {
+    gpa: Allocator,
+    payload: []u8,
+    meta: []u8,
+    hash: u64,
+    saved: u64,
+    refs: std.atomic.Value(u32) = .init(1),
+
+    fn retain(r: *Ram) *Ram {
+        _ = r.refs.fetchAdd(1, .monotonic);
+        return r;
+    }
+
+    fn release(r: *Ram) void {
+        if (r.refs.fetchSub(1, .acq_rel) != 1) return;
+        r.gpa.free(r.payload);
+        r.gpa.free(r.meta);
+        r.gpa.destroy(r);
+    }
+
+    /// The payload as a write's Source (on the writer thread; the job holds a reference).
+    fn read(ptr: *anyopaque, offset: u64, out: []u8) anyerror!void {
+        const r: *Ram = @ptrCast(@alignCast(ptr));
+        if (offset > r.payload.len or out.len > r.payload.len - offset) return error.SpillSourceRange;
+        @memcpy(out, r.payload[@intCast(offset)..][0..out.len]);
+    }
+};
+
 pub const Job = struct {
     tier: *Tier,
     name: Name,
@@ -252,6 +305,8 @@ pub const Job = struct {
     meta: []u8,
     payload_len: u64,
     source: Source,
+    ram: ?*Ram = null, // a held state written on to disk (its source): released with the job
+    keep_ram: bool = false, // written behind: the state stays held once its file is in place
     state: std.atomic.Value(u8) = .init(queued),
     cancel: std.atomic.Value(bool) = .init(false),
     refs: std.atomic.Value(u32) = .init(2),
@@ -293,13 +348,26 @@ pub const Job = struct {
     pub fn release(j: *Job) void {
         if (j.refs.fetchSub(1, .acq_rel) != 1) return;
         const gpa = j.tier.gpa;
+        if (j.ram) |r| r.release();
         gpa.free(j.tokens);
         gpa.free(j.meta);
         gpa.destroy(j);
     }
 };
 
-const Entry = struct { name: Name, tokens: []u32, bytes: u64, used: u64, job: ?*Job = null, source_id: usize = 0 };
+/// A state the tier holds: in memory (`ram`), on disk (`on_disk`, its file renamed in place), or on its way there
+/// (`job`, a write not renamed yet). `bytes` is its file's size, which the disk's cap and floor count.
+const Entry = struct { name: Name, tokens: []u32, bytes: u64, used: u64, job: ?*Job = null, source_id: usize = 0, ram: ?*Ram = null, on_disk: bool = false };
+
+/// Whether `e` can be read now: held in memory, or its file in place.
+fn readable(e: *const Entry) bool {
+    return e.ram != null or (e.on_disk and e.job == null);
+}
+
+/// Whether `e` takes disk room: its file in place or on its way.
+fn onDisk(e: *const Entry) bool {
+    return e.on_disk or e.job != null;
+}
 
 /// A stored state the tier can read back for a prompt.
 pub const Hit = struct { name: Name, tokens: []const u32 };
@@ -314,8 +382,8 @@ pub const Tier = struct {
     world: u32,
     top: [:0]u8, // dir/<family>-<identity>
     dir: [:0]u8, // top/rank<r>
-    /// `dir` opened once checked private: every file of the tier is made, read and deleted relative to it
-    dfd: c_int = -1,
+    /// `dir` checked private: every file of the tier is made, read and deleted in it
+    dfd: fs.Dir = undefined,
     mutex: std.Io.Mutex = .init,
     cond: std.Io.Condition = .init,
     entries: std.ArrayList(*Entry) = .empty,
@@ -328,15 +396,21 @@ pub const Tier = struct {
     closing: bool = false,
     stats: Stats = .{},
     hook: ?Hook = null,
+    /// the allocator held states' bytes come from (`ramAlloc`): the tier's own may be quota-limited to its buffers
+    ram_gpa: ?Allocator = null,
+    /// bytes the entries hold in memory (a read or a disk write may keep a released one a little longer)
+    ram_bytes: u64 = 0,
+    /// names a held state's failed disk write dropped on the writer thread: the hook hears of them on the owner's
+    gone: std.ArrayList(Name) = .empty,
     /// bytes a copy or a read moves at a time (64 MiB; small in tests)
     chunk: usize = 64 << 20,
     wbuf: []u8 = &.{},
     rbuf: []u8 = &.{},
     /// free bytes on the tier's disk (statvfs; tests replace it)
-    free_space: *const fn (dir: [:0]const u8) u64 = diskFree,
+    free_space: *const fn (dir: [:0]const u8) u64 = fs.diskFree,
     /// File writes, separate from Source.read; tests inject a real ENOSPC after a partial payload.
-    write_file: *const fn (fd: c_int, bytes: []const u8, at: u64) anyerror!void = pwriteAll,
-    advise_file: *const fn (fd: c_int, at: u64, len: u64) void = pageAdvice,
+    write_file: *const fn (fd: fs.File, bytes: []const u8, at: u64) anyerror!void = fs.pwriteAll,
+    advise_file: *const fn (fd: fs.File, at: u64, len: u64) void = pageAdvice,
 
     /// The tier under `settings.dir` for `family` at `identity` and `rank`: made when missing, its partial and foreign
     /// files deleted, other identities past `keep_builds` deleted, its states indexed oldest first.
@@ -351,18 +425,18 @@ pub const Tier = struct {
         const dir = try std.fmt.allocPrintSentinel(gpa, "{s}/rank{d}", .{ top, rank }, 0);
         errdefer gpa.free(dir);
         t.* = .{ .gpa = gpa, .io = io, .settings = settings, .family = fam, .identity = identity, .rank = rank, .world = world, .top = top, .dir = dir };
-        try makePath(gpa, dir);
+        try fs.makePath(gpa, dir);
         // the root, identity and rank directories, each opened without following a link and checked private
         const root_path = try gpa.dupeSentinel(u8, settings.dir, 0);
         defer gpa.free(root_path);
-        const root_fd = try openPrivate(std.posix.AT.FDCWD, root_path);
-        defer _ = std.c.close(root_fd);
+        const root_fd = try fs.openPrivate(null, root_path, root_path);
+        defer fs.closeDir(root_fd);
         var tn: [40]u8 = undefined;
-        const top_fd = try openPrivate(root_fd, try std.fmt.bufPrintSentinel(&tn, "{s}-{x}", .{ family, identity[0..8] }, 0));
-        defer _ = std.c.close(top_fd);
+        const top_fd = try fs.openPrivate(root_fd, try std.fmt.bufPrintSentinel(&tn, "{s}-{x}", .{ family, identity[0..8] }, 0), t.top);
+        defer fs.closeDir(top_fd);
         var rn: [24]u8 = undefined;
-        t.dfd = try openPrivate(top_fd, try std.fmt.bufPrintSentinel(&rn, "rank{d}", .{rank}, 0));
-        errdefer _ = std.c.close(t.dfd);
+        t.dfd = try fs.openPrivate(top_fd, try std.fmt.bufPrintSentinel(&rn, "rank{d}", .{rank}, 0), t.dir);
+        errdefer fs.closeDir(t.dfd);
         writeStamp(top_fd, @intCast(@max(0, std.Io.Clock.real.now(io).toSeconds())));
         t.stats.pruned += t.pruneBuilds(family);
         try t.scan();
@@ -376,9 +450,10 @@ pub const Tier = struct {
         for (t.entries.items) |e| t.freeEntry(e);
         t.entries.deinit(t.gpa);
         t.queue.deinit(t.gpa);
+        t.gone.deinit(t.gpa);
         t.gpa.free(t.wbuf);
         t.gpa.free(t.rbuf);
-        _ = std.c.close(t.dfd);
+        fs.closeDir(t.dfd);
         t.gpa.free(t.dir);
         t.gpa.free(t.top);
         t.gpa.destroy(t);
@@ -421,8 +496,17 @@ pub const Tier = struct {
     }
 
     fn freeEntry(t: *Tier, e: *Entry) void {
+        t.releaseRam(e);
         t.gpa.free(e.tokens);
         t.gpa.destroy(e);
+    }
+
+    /// The entry's memory copy released (lock held, or before the writer ran).
+    fn releaseRam(t: *Tier, e: *Entry) void {
+        const r = e.ram orelse return;
+        t.ram_bytes -|= r.payload.len;
+        e.ram = null;
+        r.release();
     }
 
     fn find(t: *const Tier, name: Name) ?usize {
@@ -466,7 +550,7 @@ pub const Tier = struct {
         defer t.mutex.unlock(t.io);
         const i = t.find(name) orelse return false;
         const e = t.entries.items[i];
-        return e.job == null and std.mem.eql(u32, e.tokens, tokens);
+        return readable(e) and std.mem.eql(u32, e.tokens, tokens);
     }
 
     /// Whether the existing copy is still being written (never waits for that writer).
@@ -474,7 +558,7 @@ pub const Tier = struct {
         t.mutex.lockUncancelable(t.io);
         defer t.mutex.unlock(t.io);
         const i = t.find(name) orelse return false;
-        return t.entries.items[i].job != null;
+        return !readable(t.entries.items[i]);
     }
 
     /// The current queued or stored copy came from this still-owned job. Scanned copies have no source id.
@@ -502,7 +586,7 @@ pub const Tier = struct {
         defer t.mutex.unlock(t.io);
         var out: ?*Entry = null;
         for (t.entries.items) |e| {
-            if (e.job != null or e.name.at <= beyond or e.name.at >= prompt.len or e.tokens.len > prompt.len) continue;
+            if (!readable(e) or e.name.at <= beyond or e.name.at >= prompt.len or e.tokens.len > prompt.len) continue;
             if (out != null and e.name.at <= out.?.name.at) continue;
             if (!std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens) or !usable(ctx, e.name.at)) continue;
             out = e;
@@ -523,14 +607,15 @@ pub const Tier = struct {
     /// Entry i out of the index (lock held): its file unlinked, or its write cut.
     fn drop(t: *Tier, i: usize) void {
         const e = t.entries.orderedRemove(i);
-        if (e.job) |j| j.cancel.store(true, .release) else t.unlink(e.name, e.bytes);
+        if (e.job) |j| j.cancel.store(true, .release);
+        if (e.on_disk) t.unlink(e.name, e.bytes);
         t.freeEntry(e);
     }
 
     fn unlink(t: *Tier, name: Name, bytes: u64) void {
         var buf: [32]u8 = undefined;
         const before = t.free_space(t.dir);
-        if (std.c.unlinkat(t.dfd, name.file(&buf), 0) == 0) {
+        if (fs.unlink(t.dfd, name.file(&buf))) {
             t.stats.unlinked_bytes += bytes;
             t.stats.reclaimed_bytes += @min(bytes, t.free_space(t.dir) -| before);
         }
@@ -541,6 +626,7 @@ pub const Tier = struct {
         var all: u64 = 0;
         var queued: u64 = 0;
         for (t.entries.items) |e| {
+            if (!onDisk(e)) continue; // held in memory alone: the memory cap counts it
             all += e.bytes;
             if (e.job != null) queued += e.bytes;
         }
@@ -573,6 +659,7 @@ pub const Tier = struct {
         errdefer t.gpa.destroy(e);
         e.* = .{ .name = name, .tokens = try t.gpa.dupe(u32, tokens), .bytes = bytes, .used = 0, .job = j, .source_id = @intFromPtr(j) };
         errdefer t.gpa.free(e.tokens);
+        t.takeGone(&gone);
         t.mutex.lockUncancelable(t.io);
         defer t.mutex.unlock(t.io);
         if (t.closing) return error.TierClosed;
@@ -580,6 +667,21 @@ pub const Tier = struct {
             t.stats.skipped += 1;
             return error.AlreadyStored;
         }
+        try t.makeRoom(bytes, &gone);
+        try t.entries.ensureUnusedCapacity(t.gpa, 1);
+        try t.queue.ensureUnusedCapacity(t.gpa, 1);
+        if (t.thread == null) t.thread = try std.Thread.spawn(.{}, run, .{t});
+        t.clock += 1;
+        e.used = t.clock;
+        t.entries.appendAssumeCapacity(e);
+        t.queue.appendAssumeCapacity(j);
+        t.cond.broadcast(t.io);
+        return j;
+    }
+
+    /// Disk room for a file of `bytes` (lock held): the least recently used stored files go until it fits the cap and
+    /// leaves the free-disk floor, their names in `gone`; refused when it would not fit with every one gone.
+    fn makeRoom(t: *Tier, bytes: u64, gone: *std.ArrayList(Name)) !void {
         if (bytes > t.settings.cap) {
             t.stats.full += 1;
             return error.LargerThanCap;
@@ -613,20 +715,210 @@ pub const Tier = struct {
             // the disk asked again: a file still open (a read of it) or not unlinked gives no bytes back
             free = t.free_space(t.dir);
         }
+    }
+
+    /// Names a held state's failed disk write dropped (writer thread) moved to `out` for the owner's hook.
+    fn takeGone(t: *Tier, out: *std.ArrayList(Name)) void {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        out.appendSlice(t.gpa, t.gone.items) catch return;
+        t.gone.clearRetainingCapacity();
+    }
+
+    /// Bytes for a state a family hands over whole (`adopt`), from the allocator held states use.
+    pub fn ramAlloc(t: *Tier, n: usize) ![]u8 {
+        return (t.ram_gpa orelse t.gpa).alloc(u8, n);
+    }
+
+    /// Whether a state of `payload_len` bytes can be held in memory (`adopt`): the memory level is on and holds it.
+    pub fn holds(t: *const Tier, payload_len: u64) bool {
+        return t.settings.ram_cap > 0 and payload_len <= t.settings.ram_cap;
+    }
+
+    /// `name` (its `tokens`, the family's `meta`) held in memory from `payload`, which the tier now owns (from
+    /// `ramAlloc`; freed on any error). The least recently used held states go on to disk until memory fits its
+    /// cap, or leave when the disk has no room; the hook hears of those, here on the owner's thread.
+    pub fn adopt(t: *Tier, name: Name, tokens: []const u32, meta: []const u8, payload: []u8) !void {
+        const ram_gpa = t.ram_gpa orelse t.gpa;
+        var owned = true;
+        defer if (owned) ram_gpa.free(payload);
+        if (meta.len > meta_most) return error.MetaTooLong;
+        if (!t.holds(payload.len)) return error.LargerThanRam;
+        var gone: std.ArrayList(Name) = .empty;
+        defer gone.deinit(t.gpa);
+        defer if (t.currentHook()) |h| for (gone.items) |n| h.forgot(h.ptr, n);
+        t.takeGone(&gone);
+        const r = try t.gpa.create(Ram);
+        errdefer t.gpa.destroy(r);
+        r.* = .{ .gpa = ram_gpa, .payload = payload, .meta = try ram_gpa.dupe(u8, meta), .hash = std.hash.XxHash3.hash(0, payload), .saved = @intCast(@max(0, std.Io.Clock.real.now(t.io).toSeconds())) };
+        errdefer ram_gpa.free(r.meta);
+        const e = try t.gpa.create(Entry);
+        errdefer t.gpa.destroy(e);
+        e.* = .{ .name = name, .tokens = try t.gpa.dupe(u32, tokens), .bytes = Header.payloadOffset(tokens.len) + payload.len, .used = 0 };
+        errdefer t.gpa.free(e.tokens);
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        if (t.closing) return error.TierClosed;
+        if (t.find(name) != null) {
+            t.stats.skipped += 1;
+            return error.AlreadyStored;
+        }
         try t.entries.ensureUnusedCapacity(t.gpa, 1);
-        try t.queue.ensureUnusedCapacity(t.gpa, 1);
-        if (t.thread == null) t.thread = try std.Thread.spawn(.{}, run, .{t});
+        owned = false;
+        e.ram = r;
+        t.ram_bytes += payload.len;
         t.clock += 1;
         e.used = t.clock;
         t.entries.appendAssumeCapacity(e);
+        t.stats.ram_adopted += 1;
+        // written behind: its file goes to disk now while it stays held (no room: it stays in memory alone)
+        _ = t.demote(t.entries.items.len - 1, &gone, true);
+        t.fitRam(e, &gone);
+    }
+
+    /// Held bytes that stay held (lock held): what the memory cap is kept to. A state on its way to disk for room
+    /// leaves memory when its file is in place, so it is not counted.
+    fn ramCommitted(t: *const Tier) u64 {
+        var n: u64 = 0;
+        for (t.entries.items) |e| if (e.ram) |r| {
+            if (e.job) |j| if (!j.keep_ram) continue;
+            n += r.payload.len;
+        };
+        return n;
+    }
+
+    /// Memory back under its cap (lock held): the least recently used held states other than `keep` leave memory
+    /// when their file is in place, else go on to disk for room, else leave altogether (their names in `gone`) when
+    /// the disk has no room. One written behind and still on its way stays until its file is in place (`trimRam`).
+    fn fitRam(t: *Tier, keep: ?*const Entry, gone: *std.ArrayList(Name)) void {
+        while (t.ramCommitted() > t.settings.ram_cap) {
+            var out: ?usize = null;
+            for (t.entries.items, 0..) |e, i| {
+                if (e.ram == null or e.job != null or e == keep) continue;
+                if (out == null or e.used < t.entries.items[out.?].used) out = i;
+            }
+            const i = out orelse return;
+            if (!t.demote(i, gone, false)) {
+                const name = t.entries.items[i].name;
+                gone.append(t.gpa, name) catch {};
+                t.drop(i);
+                t.stats.ram_dropped += 1;
+                t.stats.forgotten += 1;
+            }
+        }
+    }
+
+    /// Memory back under its cap as far as files in place allow (lock held, any thread): the least recently used
+    /// held states whose file is in place leave memory. Nothing leaves the tier, so no owner hears of it.
+    fn trimRam(t: *Tier) void {
+        while (t.ramCommitted() > t.settings.ram_cap) {
+            var out: ?usize = null;
+            for (t.entries.items, 0..) |e, i| {
+                if (e.ram == null or !e.on_disk or e.job != null) continue;
+                if (out == null or e.used < t.entries.items[out.?].used) out = i;
+            }
+            const i = out orelse return;
+            t.releaseRam(t.entries.items[i]);
+            t.stats.ram_released += 1;
+        }
+    }
+
+    /// Held entry i queued for disk from its memory (lock held), kept held once its file is in place (`behind`) or
+    /// released then: false when the disk has no room or no write starts. With its file in place already, its
+    /// memory simply goes (unless written behind, which has nothing left to do).
+    fn demote(t: *Tier, i: usize, gone: *std.ArrayList(Name), behind: bool) bool {
+        const e = t.entries.items[i];
+        const r = e.ram.?;
+        if (e.on_disk) { // its file is in place already: the memory alone goes
+            if (!behind) {
+                t.releaseRam(e);
+                t.stats.ram_released += 1;
+            }
+            return true;
+        }
+        t.makeRoom(e.bytes, gone) catch return false;
+        // makeRoom may have taken entries before i: find it again
+        const k = t.find(e.name) orelse return false;
+        std.debug.assert(t.entries.items[k] == e);
+        const j = t.gpa.create(Job) catch return false;
+        j.* = .{ .tier = t, .name = e.name, .tokens = t.gpa.dupe(u32, e.tokens) catch {
+            t.gpa.destroy(j);
+            return false;
+        }, .meta = t.gpa.dupe(u8, r.meta) catch {
+            t.gpa.free(j.tokens);
+            t.gpa.destroy(j);
+            return false;
+        }, .payload_len = r.payload.len, .source = .{ .ptr = r, .read = Ram.read }, .refs = .init(1), .ram = r.retain(), .keep_ram = behind };
+        t.queue.ensureUnusedCapacity(t.gpa, 1) catch {
+            j.release();
+            return false;
+        };
+        if (t.thread == null) t.thread = std.Thread.spawn(.{}, run, .{t}) catch {
+            j.release();
+            return false;
+        };
+        e.job = j;
+        e.source_id = @intFromPtr(j);
         t.queue.appendAssumeCapacity(j);
         t.cond.broadcast(t.io);
-        return j;
+        t.stats.ram_demoted += 1;
+        return true;
+    }
+
+    /// `payload`, read whole and checked from `r`'s file, held again by its entry when the entry is still there, its
+    /// file in place and nothing holds it yet; memory is then trimmed to its cap (files in place go first). True when
+    /// the entry took `payload`.
+    fn promote(t: *Tier, r: *const Reading, payload: []u8) bool {
+        const ram_gpa = t.ram_gpa orelse t.gpa;
+        const held = t.gpa.create(Ram) catch return false;
+        const meta = ram_gpa.dupe(u8, r.meta()) catch {
+            t.gpa.destroy(held);
+            return false;
+        };
+        held.* = .{ .gpa = ram_gpa, .payload = payload, .meta = meta, .hash = r.header.payload_hash, .saved = r.header.saved };
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        const i = t.find(r.name) orelse {
+            ram_gpa.free(meta);
+            t.gpa.destroy(held);
+            return false;
+        };
+        const e = t.entries.items[i];
+        if (e.ram != null or !e.on_disk or e.job != null) {
+            ram_gpa.free(meta);
+            t.gpa.destroy(held);
+            return false;
+        }
+        e.ram = held;
+        t.ram_bytes += payload.len;
+        t.stats.ram_promoted += 1;
+        t.clock += 1;
+        e.used = t.clock; // the most recently used: others leave memory before it
+        t.trimRam();
+        return true;
+    }
+
+    /// A clean stop: every held state not on disk queued for it, most recently used first (the writers then drain).
+    pub fn flushRam(t: *Tier) void {
+        var gone: std.ArrayList(Name) = .empty;
+        defer gone.deinit(t.gpa);
+        defer if (t.currentHook()) |h| for (gone.items) |n| h.forgot(h.ptr, n);
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        while (true) {
+            var out: ?usize = null;
+            for (t.entries.items, 0..) |e, i| {
+                if (e.ram == null or e.job != null or e.on_disk) continue;
+                if (out == null or e.used > t.entries.items[out.?].used) out = i;
+            }
+            const i = out orelse return;
+            if (!t.demote(i, &gone, false)) return; // the disk is full: the rest stay in memory until the tier closes
+        }
     }
 
     /// Whether `e` may go for room: stored (not on its way) and not one of a pinned batch.
     fn evictable(t: *const Tier, e: *const Entry) bool {
-        return e.job == null and (t.pin == null or e.used <= t.pin.?);
+        return e.on_disk and e.job == null and (t.pin == null or e.used <= t.pin.?);
     }
 
     /// The least recently used state that may go for room, lock held.
@@ -697,12 +989,11 @@ pub const Tier = struct {
         t.io.random(&nonce);
         var nb: [32]u8 = undefined;
         const partial = try std.fmt.bufPrintSentinel(name, "{s}.{x}.partial", .{ j.name.file(&nb), &nonce }, 0);
-        const fd = std.c.openat(t.dfd, partial, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
-        if (fd < 0) return error.SpillOpen;
+        const fd = fs.createExcl(t.dfd, partial) orelse return error.SpillOpen;
         var ok = false;
         defer {
-            _ = std.c.close(fd);
-            if (!ok) _ = std.c.unlinkat(t.dfd, partial, 0);
+            fs.close(fd);
+            if (!ok) _ = fs.unlink(t.dfd, partial);
         }
         const tokens = std.mem.sliceAsBytes(j.tokens);
         try t.write_file(fd, tokens, header_bytes);
@@ -738,8 +1029,8 @@ pub const Tier = struct {
         };
         h.encode(j.meta, &head);
         try t.write_file(fd, &head, 0);
-        if (std.c.ftruncate(fd, @intCast(h.fileBytes())) != 0) return error.SpillWrite;
-        if (std.c.fsync(fd) != 0) return error.SpillSync;
+        if (!fs.truncate(fd, h.fileBytes())) return error.SpillWrite;
+        if (!fs.sync(fd)) return error.SpillSync;
         t.advise_file(fd, 0, h.fileBytes());
         if (j.cancel.load(.acquire)) return error.Cancelled;
         ok = true;
@@ -763,23 +1054,40 @@ pub const Tier = struct {
         } else null;
         if (wrote and i != null and !j.cancel.load(.acquire)) {
             var nb: [32]u8 = undefined;
-            if (std.c.renameat(t.dfd, partial.?, t.dfd, j.name.file(&nb)) == 0) {
+            if (fs.rename(t.dfd, partial.?, j.name.file(&nb))) {
                 renamed = true;
-                t.entries.items[i.?].job = null;
+                const e = t.entries.items[i.?];
+                e.job = null;
+                e.on_disk = true;
+                if (j.ram != null and !j.keep_ram) t.releaseRam(e); // went on to disk for memory room: the file holds it now
                 t.stats.written += 1;
-                t.stats.written_bytes += t.entries.items[i.?].bytes;
+                t.stats.written_bytes += e.bytes;
+                if (j.ram != null) t.trimRam(); // a state written behind may now leave memory for room
             }
         }
         if (!renamed) {
-            if (partial) |p| _ = std.c.unlinkat(t.dfd, p, 0);
-            if (i) |k| t.freeEntry(t.entries.orderedRemove(k));
+            if (partial) |p| _ = fs.unlink(t.dfd, p);
+            if (i) |k| {
+                const e = t.entries.orderedRemove(k);
+                if (j.keep_ram and e.ram != null and !j.cancel.load(.acquire)) {
+                    // written behind and failed: it stays held, with no file (room for it leaves the tier instead)
+                    e.job = null;
+                    t.entries.insertAssumeCapacity(k, e);
+                } else {
+                    if (j.ram != null and !j.cancel.load(.acquire)) { // a held state's write for room failed: it leaves, the owner hears of it
+                        t.gone.append(t.gpa, e.name) catch {};
+                        t.stats.ram_dropped += 1;
+                    }
+                    t.freeEntry(e);
+                }
+            }
             if (!j.cancel.load(.acquire)) t.stats.write_failed += 1;
         }
         j.ok = renamed;
         j.state.store(Job.done_state, .release);
         t.cond.broadcast(t.io);
         t.mutex.unlock(t.io);
-        if (renamed) _ = std.c.fsync(t.dfd);
+        if (renamed) fs.syncDir(t.dfd);
         j.release();
     }
 
@@ -791,7 +1099,21 @@ pub const Tier = struct {
             t.mutex.unlock(t.io);
             return error.NotStored;
         };
-        if (t.entries.items[i].job != null) {
+        const e = t.entries.items[i];
+        if (e.ram) |held| {
+            var r: Reading = .{ .tier = t, .name = name, .t0 = t.now(), .ram = held.retain() };
+            const tokens = t.gpa.dupe(u32, e.tokens) catch |err| {
+                t.mutex.unlock(t.io);
+                r.close();
+                return err;
+            };
+            t.mutex.unlock(t.io);
+            r.tokens = tokens;
+            r.header = .{ .identity = t.identity, .family = t.family, .rank = t.rank, .world = t.world, .name = name, .tokens = @intCast(tokens.len), .payload_len = held.payload.len, .tokens_hash = 0, .payload_hash = held.hash, .saved = held.saved, .meta_len = @intCast(held.meta.len) };
+            @memcpy(r.head[136..][0..held.meta.len], held.meta);
+            return r;
+        }
+        if (!readable(e)) {
             t.mutex.unlock(t.io);
             return error.NotStored;
         }
@@ -811,8 +1133,12 @@ pub const Tier = struct {
         defer t.mutex.unlock(t.io);
         const sums = t.totals();
         var pending_count: usize = 0;
-        for (t.entries.items) |e| pending_count += @intFromBool(e.job != null);
-        return .{ .stats = t.stats, .entries = t.entries.items.len - pending_count, .pending = pending_count, .stored_bytes = sums.all - sums.queued, .queued_bytes = sums.queued, .disk_free = t.free_space(t.dir), .cap = t.settings.cap };
+        var ram_entries: usize = 0;
+        for (t.entries.items) |e| {
+            pending_count += @intFromBool(!readable(e));
+            ram_entries += @intFromBool(e.ram != null);
+        }
+        return .{ .stats = t.stats, .entries = t.entries.items.len - pending_count, .pending = pending_count, .stored_bytes = sums.all - sums.queued, .queued_bytes = sums.queued, .disk_free = t.free_space(t.dir), .cap = t.settings.cap, .ram_entries = ram_entries, .ram_bytes = t.ram_bytes, .ram_cap = t.settings.ram_cap };
     }
 
     /// Counts a state the store chose not to write.
@@ -833,21 +1159,22 @@ pub const Tier = struct {
     /// This rank's files: partial ones deleted, the rest indexed when their header and tokens check (else deleted),
     /// oldest written first.
     fn scan(t: *Tier) !void {
-        const d = std.c.opendir(t.dir) orelse return error.SpillDir;
-        defer _ = std.c.closedir(d);
+        var d = fs.Lister.open(t.dir) orelse return error.SpillDir;
+        defer d.close();
         const Found = struct { e: *Entry, saved: u64 };
         var found: std.ArrayList(Found) = .empty;
         defer found.deinit(t.gpa);
         errdefer for (found.items) |f| t.freeEntry(f.e);
-        while (std.c.readdir(d)) |ent| {
-            const file = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.name)), 0);
+        while (d.next()) |ent| {
+            var fb: [1040]u8 = undefined;
+            const file = std.fmt.bufPrintSentinel(&fb, "{s}", .{ent.name}, 0) catch continue;
             if (std.mem.endsWith(u8, file, ".partial")) {
-                _ = std.c.unlinkat(t.dfd, file, 0);
+                _ = fs.unlink(t.dfd, file);
                 continue;
             }
             const name = Name.parse(file) orelse continue;
             const got = t.index(file, name) catch {
-                _ = std.c.unlinkat(t.dfd, file, 0);
+                _ = fs.unlink(t.dfd, file);
                 t.stats.pruned += 1;
                 continue;
             };
@@ -869,21 +1196,20 @@ pub const Tier = struct {
 
     /// The entry of the directory's file `file` named `name`, when its header, size and tokens check.
     fn index(t: *Tier, file: [:0]const u8, name: Name) !struct { e: *Entry, saved: u64 } {
-        const fd = std.c.openat(t.dfd, file, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true }, @as(std.c.mode_t, 0));
-        if (fd < 0) return error.SpillOpen;
-        defer _ = std.c.close(fd);
+        const fd = fs.openRead(t.dfd, file) orelse return error.SpillOpen;
+        defer fs.close(fd);
         var head: [header_bytes]u8 = undefined;
-        if (!preadAll(fd, &head, 0)) return error.ShortFile;
+        if (!fs.preadAll(fd, &head, 0)) return error.ShortFile;
         const h = try Header.decode(&head, t.identity, t.rank, t.world);
         if (!h.name.eql(name)) return error.OtherName;
-        if (fileSize(fd) != h.fileBytes()) return error.ShortFile;
+        if (fs.size(fd) != h.fileBytes()) return error.ShortFile;
         const tokens = try t.gpa.alloc(u32, h.tokens);
         errdefer t.gpa.free(tokens);
-        if (!preadAll(fd, std.mem.sliceAsBytes(tokens), header_bytes)) return error.ShortFile;
+        if (!fs.preadAll(fd, std.mem.sliceAsBytes(tokens), header_bytes)) return error.ShortFile;
         if (std.hash.XxHash3.hash(0, std.mem.sliceAsBytes(tokens)) != h.tokens_hash) return error.TokensHash;
         if (!Name.of(tokens, h.name.at).eql(name) or h.name.at > tokens.len) return error.OtherName;
         const e = try t.gpa.create(Entry);
-        e.* = .{ .name = name, .tokens = tokens, .bytes = h.fileBytes(), .used = 0 };
+        e.* = .{ .name = name, .tokens = tokens, .bytes = h.fileBytes(), .used = 0, .on_disk = true };
         return .{ .e = e, .saved = h.saved };
     }
 
@@ -905,9 +1231,9 @@ pub const Tier = struct {
         defer builds.deinit(t.gpa);
         var rb: [1200]u8 = undefined;
         const root = std.fmt.bufPrintSentinel(&rb, "{s}", .{t.settings.dir}, 0) catch return 0;
-        const d = std.c.opendir(root) orelse return 0;
-        while (std.c.readdir(d)) |ent| {
-            const n = std.mem.sliceTo(&ent.name, 0);
+        var d = fs.Lister.open(root) orelse return 0;
+        while (d.next()) |ent| {
+            const n = ent.name;
             if (n.len != family.len + 1 + 16 or !std.mem.startsWith(u8, n, family) or n[family.len] != '-') continue;
             if (std.mem.endsWith(u8, t.top, n)) continue;
             var b: Build = .{ .name = undefined, .len = n.len, .stamp = 0 };
@@ -916,7 +1242,7 @@ pub const Tier = struct {
             b.stamp = readStamp(std.fmt.bufPrintSentinel(&sp, "{s}/{s}", .{ t.settings.dir, n }, 0) catch continue);
             builds.append(t.gpa, b) catch break;
         }
-        _ = std.c.closedir(d);
+        d.close();
         std.mem.sort(Build, builds.items, {}, struct {
             fn newer(_: void, a: Build, b: Build) bool {
                 return a.stamp > b.stamp;
@@ -930,7 +1256,7 @@ pub const Tier = struct {
             var rp: [1400]u8 = undefined;
             const mine = std.fmt.bufPrintSentinel(&rp, "{s}/rank{d}", .{ other, t.rank }, 0) catch continue;
             gone += removeFiles(mine);
-            _ = std.c.rmdir(mine);
+            fs.rmdir(mine);
             removeIfOnlyStamp(other);
         }
         return gone;
@@ -941,26 +1267,27 @@ pub const Tier = struct {
 pub const Reading = struct {
     tier: *Tier,
     name: Name,
-    fd: c_int = -1,
+    fd: ?fs.File = null,
     head: [header_bytes]u8 = undefined,
     header: Header = undefined,
     tokens: []u32 = &.{},
     t0: i96,
     timed: bool = false,
+    ram: ?*Ram = null, // read from memory (a reference held until close), not from its file
 
     fn begin(r: *Reading) !void {
         const t = r.tier;
         var nb: [32]u8 = undefined;
-        r.fd = std.c.openat(t.dfd, r.name.file(&nb), .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .CLOEXEC = true }, @as(std.c.mode_t, 0));
-        if (r.fd < 0) return error.SpillOpen;
-        if (!preadAll(r.fd, &r.head, 0)) return error.ShortFile;
-        t.advise_file(r.fd, 0, r.head.len);
+        const fd = fs.openRead(t.dfd, r.name.file(&nb)) orelse return error.SpillOpen;
+        r.fd = fd;
+        if (!fs.preadAll(fd, &r.head, 0)) return error.ShortFile;
+        t.advise_file(fd, 0, r.head.len);
         r.header = try Header.decode(&r.head, t.identity, t.rank, t.world);
         if (!r.header.name.eql(r.name)) return error.OtherName;
-        if (fileSize(r.fd) != r.header.fileBytes()) return error.ShortFile;
+        if (fs.size(fd) != r.header.fileBytes()) return error.ShortFile;
         r.tokens = try t.gpa.alloc(u32, r.header.tokens);
-        if (!preadAll(r.fd, std.mem.sliceAsBytes(r.tokens), header_bytes)) return error.ShortFile;
-        t.advise_file(r.fd, header_bytes, std.mem.sliceAsBytes(r.tokens).len);
+        if (!fs.preadAll(fd, std.mem.sliceAsBytes(r.tokens), header_bytes)) return error.ShortFile;
+        t.advise_file(fd, header_bytes, std.mem.sliceAsBytes(r.tokens).len);
         if (std.hash.XxHash3.hash(0, std.mem.sliceAsBytes(r.tokens)) != r.header.tokens_hash) return error.TokensHash;
         if (!Name.of(r.tokens, r.name.at).eql(r.name)) return error.OtherName;
     }
@@ -979,15 +1306,37 @@ pub const Reading = struct {
         const t = r.tier;
         // Resource failures follow the same conservative discard/cold-fallback policy as
         // other terminal read errors, even when the stored file itself is valid.
+        if (r.ram) |held| {
+            var off: usize = 0;
+            while (off < held.payload.len) {
+                const n = @min(t.chunk, held.payload.len - off);
+                sink.write(sink.ptr, off, held.payload[off..][0..n]) catch |err| return r.failWith(err);
+                off += n;
+            }
+            t.touch(r.name);
+            t.mutex.lockUncancelable(t.io);
+            t.stats.loaded += 1;
+            t.stats.ram_loaded += 1;
+            t.stats.loaded_bytes += held.payload.len;
+            t.stats.loaded_tokens += r.name.at;
+            r.recordTime();
+            t.mutex.unlock(t.io);
+            return;
+        }
         if (t.rbuf.len == 0) t.rbuf = t.gpa.alloc(u8, t.chunk) catch |err| return r.failWith(err);
+        // held again as it is read when the memory level holds it: the state was wanted, its next read is memory's
+        const ram_gpa = t.ram_gpa orelse t.gpa;
+        var copy: ?[]u8 = if (t.holds(r.header.payload_len)) ram_gpa.alloc(u8, @intCast(r.header.payload_len)) catch null else null;
+        defer if (copy) |c| ram_gpa.free(c);
         var hash = std.hash.XxHash3.init(0);
         const at = Header.payloadOffset(r.header.tokens);
         var off: u64 = 0;
         while (off < r.header.payload_len) {
             const n: usize = @intCast(@min(t.chunk, r.header.payload_len - off));
-            if (!preadAll(r.fd, t.rbuf[0..n], at + off)) return r.failWith(error.ShortFile);
-            t.advise_file(r.fd, at + off, n);
+            if (!fs.preadAll(r.fd.?, t.rbuf[0..n], at + off)) return r.failWith(error.ShortFile);
+            t.advise_file(r.fd.?, at + off, n);
             hash.update(t.rbuf[0..n]);
+            if (copy) |c| @memcpy(c[@intCast(off)..][0..n], t.rbuf[0..n]);
             sink.write(sink.ptr, off, t.rbuf[0..n]) catch |err| return r.failWith(err);
             off += n;
         }
@@ -997,6 +1346,9 @@ pub const Reading = struct {
             t.mutex.unlock(t.io);
             return r.failWith(error.PayloadHash);
         }
+        if (copy) |c| if (t.promote(r, c)) {
+            copy = null; // the entry owns it
+        };
         t.touch(r.name);
         t.mutex.lockUncancelable(t.io);
         t.stats.loaded += 1;
@@ -1030,8 +1382,10 @@ pub const Reading = struct {
     }
 
     pub fn close(r: *Reading) void {
-        if (r.fd >= 0) _ = std.c.close(r.fd);
-        r.fd = -1;
+        if (r.fd) |fd| fs.close(fd);
+        r.fd = null;
+        if (r.ram) |held| held.release();
+        r.ram = null;
         r.tier.gpa.free(r.tokens);
         r.tokens = &.{};
     }
@@ -1039,145 +1393,63 @@ pub const Reading = struct {
 
 // -- files ----------------------------------------------------------------------------------------------------------
 
-fn pwriteAll(fd: c_int, bytes: []const u8, at: u64) !void {
-    var done: usize = 0;
-    while (done < bytes.len) {
-        const n = std.c.pwrite(fd, bytes.ptr + done, bytes.len - done, @intCast(at + done));
-        if (n <= 0) return error.SpillWrite;
-        done += @intCast(n);
-    }
-}
-
-fn preadAll(fd: c_int, dest: []u8, at: u64) bool {
-    var done: usize = 0;
-    while (done < dest.len) {
-        const n = std.c.pread(fd, dest.ptr + done, dest.len - done, @intCast(at + done));
-        if (n <= 0) return false;
-        done += @intCast(n);
-    }
-    return true;
-}
-
-fn fileSize(fd: c_int) u64 {
-    const end = std.c.lseek(fd, 0, std.c.SEEK.END);
-    return if (end > 0) @intCast(end) else 0;
-}
-
-/// `dir` and its parents, mode 0700 (the files hold prompt token ids).
-fn makePath(gpa: Allocator, dir: [:0]const u8) !void {
-    const tmp = try gpa.dupeSentinel(u8, dir, 0);
-    defer gpa.free(tmp);
-    for (tmp[1..], 1..) |ch, i| if (ch == '/') {
-        tmp[i] = 0;
-        _ = std.c.mkdir(tmp.ptr, 0o700);
-        tmp[i] = '/';
-    };
-    const rc = std.c.mkdir(tmp.ptr, 0o700);
-    if (rc != 0 and std.c.errno(rc) != .EXIST) return error.SpillDir;
-}
-
-/// Whether an existing `dir` passes the tier's own private-directory check (no link, this user's or root's, not group
-/// or world writable), without creating, opening a tier in, or pruning anything.
+/// Whether an existing `dir` passes the tier's own private-directory check (no link; on POSIX this user's or root's,
+/// not group or world writable; on Windows changeable by no one but its owner, SYSTEM and Administrators), without
+/// creating, opening a tier in, or pruning anything.
 pub fn checkRoot(dir: [:0]const u8) !void {
-    if (dir.len == 0 or dir[0] != '/') return error.SpillDirNotAbsolute;
-    _ = std.c.close(try openPrivate(std.c.AT.FDCWD, dir));
-}
-
-/// Directory `name` in directory `at`, opened (not through a link) when only this process's user or root can change
-/// it; else another user could put a link where the tier writes. The descriptor is the caller's.
-fn openPrivate(at: c_int, name: [:0]const u8) !c_int {
-    const fd = std.c.openat(at, name, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true }, @as(std.c.mode_t, 0));
-    if (fd < 0) return error.SpillDirUnsafe;
-    errdefer _ = std.c.close(fd);
-    const st = ownerOf(fd) orelse return error.SpillDir;
-    if ((st.uid != std.c.geteuid() and st.uid != 0) or st.mode & 0o022 != 0) return error.SpillDirUnsafe;
-    return fd;
-}
-
-fn ownerOf(fd: c_int) ?struct { uid: u32, mode: u32 } {
-    if (builtin.os.tag == .linux) {
-        var sx: std.os.linux.Statx = undefined;
-        if (std.c.statx(fd, "", 0x1000, .{ .MODE = true, .UID = true }, &sx) != 0) return null; // AT_EMPTY_PATH
-        return .{ .uid = sx.uid, .mode = sx.mode };
-    }
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0) return null;
-    return .{ .uid = st.uid, .mode = @intCast(st.mode) };
+    if (!fs.absolute(dir)) return error.SpillDirNotAbsolute;
+    fs.closeDir(try fs.openPrivate(null, dir, dir));
 }
 
 /// The start stamp in the identity's directory `top`.
-fn writeStamp(top: c_int, seconds: u64) void {
-    const fd = std.c.openat(top, "opened", .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .NOFOLLOW = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o600));
-    if (fd < 0) return;
-    defer _ = std.c.close(fd);
+fn writeStamp(top: fs.Dir, seconds: u64) void {
+    const fd = fs.createTrunc(top, "opened") orelse return;
+    defer fs.close(fd);
     var w: [8]u8 = undefined;
     std.mem.writeInt(u64, &w, seconds, .little);
-    pwriteAll(fd, &w, 0) catch {};
+    fs.pwriteAll(fd, &w, 0) catch {};
 }
 
 fn readStamp(top: [:0]const u8) u64 {
     var p: [1400]u8 = undefined;
     const path = std.fmt.bufPrintSentinel(&p, "{s}/opened", .{top}, 0) catch return 0;
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return 0;
-    defer _ = std.c.close(fd);
+    const fd = fs.openPath(path) orelse return 0;
+    defer fs.close(fd);
     var w: [8]u8 = undefined;
-    return if (preadAll(fd, &w, 0)) std.mem.readInt(u64, &w, .little) else 0;
+    return if (fs.preadAll(fd, &w, 0)) std.mem.readInt(u64, &w, .little) else 0;
 }
 
 /// Regular files directly in `dir` unlinked; how many.
 fn removeFiles(dir: [:0]const u8) u64 {
-    const d = std.c.opendir(dir) orelse return 0;
-    defer _ = std.c.closedir(d);
+    var d = fs.Lister.open(dir) orelse return 0;
+    defer d.close();
     var n: u64 = 0;
-    while (std.c.readdir(d)) |ent| {
-        if (ent.type != std.c.DT.REG) continue;
+    while (d.next()) |ent| {
+        if (!ent.file) continue;
         var p: [1600]u8 = undefined;
-        const f = std.fmt.bufPrintSentinel(&p, "{s}/{s}", .{ dir, std.mem.sliceTo(&ent.name, 0) }, 0) catch continue;
-        if (std.c.unlink(f) == 0) n += 1;
+        const f = std.fmt.bufPrintSentinel(&p, "{s}/{s}", .{ dir, ent.name }, 0) catch continue;
+        if (fs.unlinkPath(f)) n += 1;
     }
     return n;
 }
 
 /// An identity directory whose ranks' directories are all gone: its stamp, then itself.
 fn removeIfOnlyStamp(top: [:0]const u8) void {
-    const d = std.c.opendir(top) orelse return;
+    var d = fs.Lister.open(top) orelse return;
     var others = false;
-    while (std.c.readdir(d)) |ent| {
-        const n = std.mem.sliceTo(&ent.name, 0);
-        if (std.mem.eql(u8, n, ".") or std.mem.eql(u8, n, "..") or std.mem.eql(u8, n, "opened")) continue;
+    while (d.next()) |ent| {
+        if (std.mem.eql(u8, ent.name, "opened")) continue;
         others = true;
     }
-    _ = std.c.closedir(d);
+    d.close();
     if (others) return;
     var p: [1500]u8 = undefined;
-    _ = std.c.unlink(std.fmt.bufPrintSentinel(&p, "{s}/opened", .{top}, 0) catch return);
-    _ = std.c.rmdir(top);
+    _ = fs.unlinkPath(std.fmt.bufPrintSentinel(&p, "{s}/opened", .{top}, 0) catch return);
+    fs.rmdir(top);
 }
-
-const Statvfs = extern struct {
-    bsize: c_ulong,
-    frsize: c_ulong,
-    blocks: u64,
-    bfree: u64,
-    bavail: u64,
-    files: u64,
-    ffree: u64,
-    favail: u64,
-    fsid: c_ulong,
-    flag: c_ulong,
-    namemax: c_ulong,
-    spare: [6]c_int,
-};
-extern "c" fn statvfs(path: [*:0]const u8, buf: *Statvfs) c_int;
 
 /// Bytes an unprivileged writer may still use on `dir`'s file system (no limit known: the most).
-fn diskFree(dir: [:0]const u8) u64 {
-    if (builtin.os.tag != .linux) return std.math.maxInt(u64);
-    var st: Statvfs = undefined;
-    if (statvfs(dir.ptr, &st) != 0) return std.math.maxInt(u64);
-    return st.bavail *| @as(u64, st.frsize);
-}
+pub const diskFree = fs.diskFree;
 
 test {
     _ = @import("spill_test.zig");
@@ -1190,7 +1462,8 @@ const MetricsFixture = struct {
 
     fn open() !MetricsFixture {
         const tmp = std.testing.tmpDir(.{});
-        const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        // a root the tier makes (and makes private): the test directory itself inherits its parent's access
+        const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/tier", .{tmp.sub_path});
         errdefer std.testing.allocator.free(path);
         const t = try Tier.open(std.testing.allocator, std.testing.io, .{ .dir = path, .cap = 1 << 20, .min_free = 0 }, "metrics", @splat(0x31), 0, 1);
         return .{ .tmp = tmp, .path = path, .tier = t };
@@ -1269,7 +1542,7 @@ test "spill metrics timing includes successful and failed attempts" {
     try r.pump(.{ .ptr = &f, .write = MetricsFixture.sink });
     // A stored entry whose file disappeared fails during begin(), not pump().
     var nb: [32]u8 = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.unlinkat(f.tier.dfd, name.file(&nb), 0));
+    try std.testing.expect(fs.unlink(f.tier.dfd, name.file(&nb)));
     try std.testing.expectError(error.SpillOpen, f.tier.read(name));
     const stats = f.tier.info().stats;
     try std.testing.expectEqual(@as(u64, 2), stats.write_count);
@@ -1309,10 +1582,10 @@ test "spill metrics unlink separates logical bytes from observed reclaim" {
     const second = try f.put(&.{ 4, 5 }, false);
     f.tier.free_space = struct {
         fn observed(dir: [:0]const u8) u64 {
-            const d = std.c.opendir(dir) orelse unreachable;
-            defer _ = std.c.closedir(d);
-            while (std.c.readdir(d)) |ent| {
-                if (std.mem.endsWith(u8, std.mem.sliceTo(&ent.name, 0), extension)) return 0;
+            var d = fs.Lister.open(dir) orelse unreachable;
+            defer d.close();
+            while (d.next()) |ent| {
+                if (std.mem.endsWith(u8, ent.name, extension)) return 0;
             }
             return 1 << 20;
         }
@@ -1367,9 +1640,9 @@ test "spill metrics payload allocation failure records one terminal load" {
     // Conservatively discard the valid copy, matching native cold fallback.
     try std.testing.expect(!t.has(name));
     var nb: [32]u8 = undefined;
-    const fd = std.c.openat(t.dfd, name.file(&nb), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
-    if (fd >= 0) _ = std.c.close(fd);
-    try std.testing.expect(fd < 0);
+    const fd = fs.openRead(t.dfd, name.file(&nb));
+    if (fd) |x| fs.close(x);
+    try std.testing.expect(fd == null);
     r.close();
     r.close();
     const closed = t.info().stats;
@@ -1379,8 +1652,8 @@ test "spill metrics payload allocation failure records one terminal load" {
 }
 
 // Advisory only: failure must never turn a valid spill operation into a cache miss.
-pub fn pageAdvice(fd: c_int, at: u64, len: u64) void {
-    if (@import("builtin").os.tag == .linux) _ = posix_fadvise(fd, @intCast(at), @intCast(len), 4);
+pub fn pageAdvice(fd: fs.File, at: u64, len: u64) void {
+    if (builtin.os.tag == .linux) _ = posix_fadvise(fd, @intCast(at), @intCast(len), 4);
 }
 
 test "spill page advice follows fsynced complete writes" {
@@ -1388,7 +1661,7 @@ test "spill page advice follows fsynced complete writes" {
         var calls: std.atomic.Value(u64) = .init(0);
         var start: std.atomic.Value(u64) = .init(0);
         var length: std.atomic.Value(u64) = .init(0);
-        fn advise(_: c_int, at: u64, len: u64) void {
+        fn advise(_: fs.File, at: u64, len: u64) void {
             start.store(at, .release);
             length.store(len, .release);
             _ = calls.fetchAdd(1, .acq_rel);
@@ -1412,7 +1685,7 @@ test "spill page advice follows header tokens and each bounded payload read" {
     const Observe = struct {
         var calls: std.atomic.Value(u64) = .init(0);
         var bytes: std.atomic.Value(u64) = .init(0);
-        fn advise(_: c_int, _: u64, len: u64) void {
+        fn advise(_: fs.File, _: u64, len: u64) void {
             _ = bytes.fetchAdd(len, .acq_rel);
             _ = calls.fetchAdd(1, .acq_rel);
         }
@@ -1431,4 +1704,6 @@ test "spill page advice follows header tokens and each bounded payload read" {
     try std.testing.expectEqual(@as(u64, header_bytes + 8 + 16), Observe.bytes.load(.acquire));
 }
 
-extern "c" fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) c_int;
+const posix_fadvise = if (builtin.os.tag == .linux) struct {
+    extern "c" fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) c_int;
+}.posix_fadvise else undefined;

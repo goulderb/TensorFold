@@ -88,6 +88,8 @@ pub fn run(a: Allocator, io: std.Io, out: *std.Io.Writer, err_out: *std.Io.Write
 
 /// Index maps, connections and scans pass the default 256 descriptors: raise this process's own limit.
 fn moreFiles() void {
+    // Windows has no NOFILE rlimit; its default handle table is already above this.
+    if (comptime @import("builtin").os.tag == .windows) return;
     var l = std.posix.getrlimit(.NOFILE) catch return;
     const want: std.posix.rlim_t = if (l.max == std.posix.RLIM.INFINITY) 4096 else @min(l.max, 4096);
     if (l.cur >= want) return;

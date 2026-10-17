@@ -6,6 +6,7 @@ pub const Precision = @import("config.zig").Precision;
 pub const weights = @import("cuda_weights.zig");
 pub const kernels = @import("cuda_kernels.zig");
 pub const state = @import("cuda_state.zig");
+pub const forward = @import("cuda_forward.zig");
 pub const Forward = @import("cuda_forward.zig").Forward;
 pub const Walk = @import("cuda_forward.zig").Walk;
 pub const Marks = @import("cuda_forward.zig").Marks;

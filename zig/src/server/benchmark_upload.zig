@@ -65,9 +65,11 @@ pub fn credential(a: Allocator, io: std.Io, o: Options, problem: *[]const u8) !?
         problem.* = "An upload token is required; run tensorfold benchmark login";
         return null;
     };
-    if (st.permissions.toMode() & 0o077 != 0) {
-        problem.* = "Upload credentials have broad file permissions; run benchmark login again";
-        return null;
+    if (comptime @import("builtin").os.tag != .windows) {
+        if (st.permissions.toMode() & 0o077 != 0) {
+            problem.* = "Upload credentials have broad file permissions; run benchmark login again";
+            return null;
+        }
     }
     problem.* = "Invalid benchmark credentials";
     if (st.size > 4096) return null;
@@ -106,12 +108,17 @@ pub fn login(a: Allocator, io: std.Io, o: Options, token: []const u8, problem: *
     io.random(&rand);
     const temp = try std.fmt.allocPrint(a, "{s}/.auth-{s}", .{ dir, std.fmt.bytesToHex(rand, .lower) });
     problem.* = "Could not store the upload credentials; check the TensorFold directory permissions";
-    _ = cwd.createDirPathStatus(io, dir, .fromMode(0o700)) catch return null;
+    if (comptime @import("builtin").os.tag == .windows) {
+        _ = cwd.createDirPathStatus(io, dir, .default_dir) catch return null;
+    } else _ = cwd.createDirPathStatus(io, dir, .fromMode(0o700)) catch return null;
     const stored = try json.newObject(a);
     try stored.put(a, "api", .{ .string = o.api });
     try stored.put(a, "token", .{ .string = token });
     const text = try json.stringify(a, .{ .object = stored }, .{});
-    var file = cwd.createFile(io, temp, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch return null;
+    var file = if (comptime @import("builtin").os.tag == .windows)
+        cwd.createFile(io, temp, .{ .exclusive = true }) catch return null
+    else
+        cwd.createFile(io, temp, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch return null;
     const written = if (file.writeStreamingAll(io, text)) true else |_| false;
     file.close(io);
     if (!written or (if (cwd.rename(temp, cwd, path, io)) false else |_| true)) {

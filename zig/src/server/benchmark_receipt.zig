@@ -173,7 +173,11 @@ pub fn save(a: Allocator, io: std.Io, v: Value, path: []const u8, now_ms: i64, p
     io.random(&name);
     const temp = try std.fmt.allocPrint(a, "{s}/.benchmark-{s}", .{ dir, std.fmt.bytesToHex(name[0..8], .lower) });
     const failed = try std.fmt.allocPrint(a, "Could not save the benchmark receipt to {s}", .{path});
-    var file = cwd.createFile(io, temp, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch {
+    var file = if (comptime @import("builtin").os.tag == .windows)
+        cwd.createFile(io, temp, .{ .exclusive = true }) catch {
+        problem.* = failed;
+        return false;
+    } else cwd.createFile(io, temp, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch {
         problem.* = failed;
         return false;
     };
@@ -203,7 +207,10 @@ pub fn writable(a: Allocator, io: std.Io, path: []const u8, problem: *[]const u8
     var name: [8]u8 = undefined;
     io.random(&name);
     const temp = try std.fmt.allocPrint(a, "{s}/.benchmark-{s}", .{ dir, std.fmt.bytesToHex(name, .lower) });
-    const file = cwd.createFile(io, temp, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch return false;
+    const file = if (comptime @import("builtin").os.tag == .windows)
+        cwd.createFile(io, temp, .{ .exclusive = true }) catch return false
+    else
+        cwd.createFile(io, temp, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch return false;
     file.close(io);
     cwd.deleteFile(io, temp) catch {};
     problem.* = "";

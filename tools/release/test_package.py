@@ -54,7 +54,8 @@ def pack(tree=None, extra=None):
         files = {m.name.removeprefix(name + "/"): tar.extractfile(m).read()
                  for m in tar.getmembers() if m.isfile()}
     for line in files["SHA256SUMS"].decode().splitlines():
-        digest, path = line.split("  ", 1)
+        assert line[64:66] in {"  ", " *"}, line
+        digest, path = line[:64], line[66:]
         assert hashlib.sha256(files[path.removeprefix("./")]).hexdigest() == digest
     return files
 
@@ -68,6 +69,9 @@ assert not any("stale.cubin" in p or "/sm120/" in p for p in second), "stale cub
 third = pack()
 assert not any(p.startswith("share/") for p in third), "capture files survived removal of the AOT input"
 assert "lib/libtfgrammar.so" not in third, "overlay files survived removal of the overlay input"
-for file in ["LICENSES/MIT.txt", "LICENSES/Apache-2.0.txt", "LICENSES/MiaAI-Lab-MIT.txt", "THIRD_PARTY_NOTICES.md"]:
-    assert third[file] == (root / file).read_bytes(), file
+for file in [root / "NOTICE", root / "THIRD_PARTY_NOTICES.md", *(root / "LICENSES").rglob("*")]:
+    if file.is_file():
+        name = file.relative_to(root).as_posix()
+        for archive in (first, second, third):
+            assert archive[name] == file.read_bytes(), name
 print(f"PASS same-version full -> smaller -> no capture, all hashes and notice files; receipt {receipt}")

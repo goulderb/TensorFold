@@ -69,7 +69,7 @@ fn openLock(io: std.Io, path: []const u8) !std.Io.File {
     const cwd = std.Io.Dir.cwd();
     const existing: std.Io.Dir.OpenFileOptions = .{ .mode = .read_write, .follow_symlinks = false, .allow_directory = false };
     return cwd.openFile(io, path, existing) catch |e| switch (e) {
-        error.FileNotFound => cwd.createFile(io, path, .{ .exclusive = true, .truncate = false, .permissions = .fromMode(0o600) }) catch |c| switch (c) {
+        error.FileNotFound => cwd.createFile(io, path, .{ .exclusive = true, .truncate = false, .permissions = if (comptime @import("builtin").os.tag == .windows) .default_file else .fromMode(0o600) }) catch |c| switch (c) {
             error.PathAlreadyExists => cwd.openFile(io, path, existing),
             else => c,
         },
@@ -81,7 +81,8 @@ fn openLock(io: std.Io, path: []const u8) !std.Io.File {
 pub fn lockRun(io: std.Io, bench_dir: []const u8, problem: *[]const u8) ?std.Io.File {
     const cwd = std.Io.Dir.cwd();
     const cannot = "Could not create the benchmark lock; check the TensorFold directory permissions";
-    _ = cwd.createDirPathStatus(io, bench_dir, .fromMode(0o700)) catch {
+    const dir_perm: std.Io.File.Permissions = if (comptime @import("builtin").os.tag == .windows) .default_dir else .fromMode(0o700);
+    _ = cwd.createDirPathStatus(io, bench_dir, dir_perm) catch {
         problem.* = cannot;
         return null;
     };
@@ -120,7 +121,8 @@ pub const Managed = struct {
         const child_argv = o.argv orelse try argv(a, plan);
         const lock = lockRun(io, o.bench_dir, problem) orelse return null;
         const cwd = std.Io.Dir.cwd();
-        const log = cwd.createFile(io, log_path, .{ .exclusive = true, .read = true, .permissions = .fromMode(0o600) }) catch {
+        const log_perm: std.Io.File.Permissions = if (comptime @import("builtin").os.tag == .windows) .default_file else .fromMode(0o600);
+        const log = cwd.createFile(io, log_path, .{ .exclusive = true, .read = true, .permissions = log_perm }) catch {
             lock.close(io);
             problem.* = "Benchmark server could not start; check local checkpoint and directory permissions";
             return null;
@@ -185,6 +187,14 @@ pub const Managed = struct {
 
     /// TERM, a grace period, KILL, another; always closes the log and the lock. Null when reaped.
     pub fn stop(m: *Managed) ?[]const u8 {
+        if (comptime builtin.os.tag == .windows) {
+            if (!m.closed) {
+                m.closed = true;
+                m.log.close(m.io);
+                m.lock.close(m.io);
+            }
+            return null;
+        }
         if (m.closed) return null;
         m.closed = true;
         defer {
@@ -210,6 +220,7 @@ pub const Managed = struct {
 
     /// The child is released from a second Ctrl-C while its exited pid is still reserved, and only then reaped.
     fn exited(m: *Managed) bool {
+        if (comptime builtin.os.tag == .windows) return true;
         if (m.reaped) return true;
         if (!ended(m.pid)) return false;
         stop_flag.releaseChild(m.pid);
@@ -232,6 +243,7 @@ const wait = struct {
 
 /// True once ``pid`` has exited, or is no child of this process, without reaping it.
 pub fn ended(pid: posix.pid_t) bool {
+    if (comptime builtin.os.tag == .windows) return false;
     var info: std.c.siginfo_t = undefined;
     @memset(std.mem.asBytes(&info), 0);
     const rc = wait.waitid(wait.p_pid, @intCast(pid), &info, wait.exited | wait.no_wait | std.c.W.NOHANG);

@@ -76,6 +76,9 @@ integration, and the CUDA launch patterns identified in the donor headers.
 Checkpoint weights retain their separate checkpoint license. No weights are
 included here. The CUDA expert file preserves the donor source and appends
 only the prompt slot FP32-to-BF16 conversion required by the current engine.
+The [local fork addendum](../LICENSES/donors/README.md) maps the original
+authors, transitive donors, exact source revisions, and local changes. The
+original donor `NOTICE`, `LICENSE`, and `CREDITS.md` are retained beside it.
 
 ## Qualification boundary
 

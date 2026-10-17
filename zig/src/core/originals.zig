@@ -1,5 +1,6 @@
 //! A model folder's original files, cloned once before --slide first teaches it, and put back by `slide rollback`.
 const std = @import("std");
+const builtin = @import("builtin");
 const disk = @import("lanes").learned_disk;
 const files = @import("originals_files.zig");
 const Allocator = std.mem.Allocator;
@@ -53,12 +54,19 @@ pub const Hold = struct {
     fd: std.c.fd_t,
 
     pub fn release(h: Hold) void {
+        if (comptime builtin.os.tag == .windows) {
+            files.winClose(h.fd);
+            return;
+        }
         _ = std.c.close(h.fd);
     }
 };
 
 /// The folder held without waiting: shared to serve it, exclusive to teach it or roll it back; Busy when held against.
 pub fn hold(a: Allocator, dir: []const u8, exclusive: bool) error{ Busy, Unlockable, OutOfMemory }!Hold {
+    // flock is absent on Windows. Serving notes that and continues; teaching and rollback refuse, as they do on a
+    // filesystem that cannot lock.
+    if (comptime builtin.os.tag == .windows) return error.Unlockable;
     const fd = files.openFolder(try a.dupeSentinel(u8, dir, 0));
     if (fd < 0) return error.Unlockable;
     const kind: c_int = if (exclusive) std.c.LOCK.EX else std.c.LOCK.SH;

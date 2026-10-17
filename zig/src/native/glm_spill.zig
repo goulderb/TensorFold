@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cuda = @import("cuda");
 const glm = @import("glm_cuda");
 const api = @import("engine_api");
@@ -220,10 +221,67 @@ pub const Adapter = struct {
 };
 
 fn metadata(path: [:0]const u8) !identity.Meta {
+    if (comptime builtin.os.tag == .windows) return metadataWindows(path);
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.SpillArtifactOpen;
     defer _ = std.c.close(fd);
     return identity.metadata(fd);
+}
+
+const WinMeta = if (builtin.os.tag != .windows) struct {} else struct {
+const ByHandleInfo = extern struct {
+    attributes: u32,
+    creation: [2]u32,
+    access: [2]u32,
+    write: [2]u32,
+    volume_serial: u32,
+    size_high: u32,
+    size_low: u32,
+    links: u32,
+    index_high: u32,
+    index_low: u32,
+};
+extern "kernel32" fn GetFileInformationByHandle(h: *anyopaque, info: *ByHandleInfo) callconv(.winapi) i32;
+
+fn fileTime(ft: [2]u32) struct { s: i64, ns: u32 } {
+    const ticks: u64 = @as(u64, ft[1]) << 32 | ft[0];
+    const epoch: u64 = 116444736000000000;
+    if (ticks < epoch) return .{ .s = 0, .ns = 0 };
+    const unix_100ns = ticks - epoch;
+    return .{ .s = @intCast(unix_100ns / 10_000_000), .ns = @intCast((unix_100ns % 10_000_000) * 100) };
+}
+
+extern "kernel32" fn CreateFileW(name: [*:0]const u16, access: u32, share: u32, security: ?*anyopaque, disposition: u32, flags: u32, template: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn CloseHandle(h: *anyopaque) callconv(.winapi) i32;
+
+fn metadataWindows(path: [:0]const u8) !identity.Meta {
+    var wide: [1024:0]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(wide[0..1023], path) catch return error.SpillArtifactOpen;
+    wide[n] = 0;
+    const h = CreateFileW(&wide, 0x80000000, 0x7, null, 3, 0, null) orelse return error.SpillArtifactOpen;
+    if (@intFromPtr(h) == std.math.maxInt(usize)) return error.SpillArtifactOpen;
+    defer _ = CloseHandle(h);
+    var info: ByHandleInfo = undefined;
+    if (GetFileInformationByHandle(h, &info) == 0) return error.SpillArtifactOpen;
+    const written = fileTime(info.write);
+    const created = fileTime(info.creation);
+    return .{
+        .size = @as(u64, info.size_high) << 32 | info.size_low,
+        .mtime_s = written.s,
+        .mtime_ns = written.ns,
+        .ctime_s = created.s,
+        .ctime_ns = created.ns,
+        .inode = @as(u64, info.index_high) << 32 | info.index_low,
+        .dev_major = info.volume_serial,
+        .dev_minor = 0,
+    };
+}
+
+};
+
+fn metadataWindows(path: [:0]const u8) !identity.Meta {
+    if (comptime builtin.os.tag == .windows) return WinMeta.metadataWindows(path);
+    unreachable;
 }
 
 test "GLM spill queue refuses a second capture and failed capture leaves no queued allocation" {

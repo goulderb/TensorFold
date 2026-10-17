@@ -7,6 +7,11 @@
 //! before any end-token stripping, their count and the SHA-256 of their canonical text (core/ids_json.zig, the text
 //! every engine's token SHA is taken over). A record that cannot be written is logged and absent, never partial.
 const std = @import("std");
+const builtin = @import("builtin");
+
+/// The recorder's files are POSIX: openat with NOFOLLOW, statx, realpath, the owner and mode check. On Windows it
+/// compiles but stays off, like the spill tier: unset means no recorder, and a set directory is refused.
+const supported = builtin.os.tag != .windows;
 
 /// A token list as Python's json.dumps writes it, "[1, 2, 3]": core/ids_json.zig's canonical text, written here
 /// because the server's module cannot share that file with the engines' (it would sit in two modules).
@@ -43,6 +48,7 @@ pub const QualIds = struct {
     }
 
     pub fn open(gpa: std.mem.Allocator, dir: []const u8, model_dir: []const u8) !*QualIds {
+        if (!supported) return error.QualIdsUnsupported;
         if (dir.len == 0 or dir[0] != '/') return error.QualIdsDirNotAbsolute;
         const z = try gpa.dupeSentinel(u8, dir, 0);
         defer gpa.free(z);
@@ -59,7 +65,7 @@ pub const QualIds = struct {
     }
 
     pub fn deinit(q: *QualIds, gpa: std.mem.Allocator) void {
-        _ = std.c.close(q.dfd);
+        if (supported) _ = std.c.close(q.dfd);
         gpa.free(q.path);
         gpa.destroy(q);
     }
@@ -85,6 +91,7 @@ pub const QualIds = struct {
 
     /// Writes the record of a completed reply; on failure nothing is left and the caller logs `error`.
     pub fn record(q: *const QualIds, gpa: std.mem.Allocator, reply_id: []const u8, finish: []const u8, ids: []const u32) !void {
+        if (!supported) return error.QualIdsUnsupported;
         const text = try idsJson(gpa, ids);
         defer gpa.free(text);
         var d: [32]u8 = undefined;

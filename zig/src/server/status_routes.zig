@@ -65,6 +65,9 @@ pub fn spillValue(a: Allocator, sp: api.SpillStatus) !Value {
     try o.put(a, "queued_bytes", try json.intValue(a, sp.tier.queued_bytes));
     try o.put(a, "cap_bytes", try json.intValue(a, sp.tier.cap));
     try o.put(a, "disk_free_bytes", try json.intValue(a, sp.tier.disk_free));
+    try o.put(a, "ram_entries", try json.intValue(a, sp.tier.ram_entries));
+    try o.put(a, "ram_bytes", try json.intValue(a, sp.tier.ram_bytes));
+    try o.put(a, "ram_cap_bytes", try json.intValue(a, sp.tier.ram_cap));
     inline for (@typeInfo(@TypeOf(sp.tier.stats)).@"struct".field_names) |name| try o.put(a, name, try json.intValue(a, @field(sp.tier.stats, name)));
     const c = try json.newObject(a);
     inline for (@typeInfo(@TypeOf(sp.cache)).@"struct".field_names) |name| try c.put(a, name, try json.intValue(a, @field(sp.cache, name)));

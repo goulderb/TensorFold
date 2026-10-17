@@ -31,6 +31,7 @@ pub fn prefillWith(e: *Engine, prompt: []const u32, dump: ?*Dump, head: ?*Head, 
 
 /// prefill from `from` (0 resets; else a state restored at that row), in passes of up to 4,096 rows from there.
 pub fn prefillFrom(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, head: ?*Head, cancel: ?Cancel, keep: ?Keep) !u32 {
+    if (e.peer != null and e.tp_link == null and (from != 0 or keep != null or head != null)) return error.SplitUnsupportedReuse;
     if (prompt.len == 0) return error.EmptyPrompt;
     if (from >= prompt.len) return error.BadReuse;
     if (prompt.len + state.max_rows > e.max_len) return error.ContextFull;
@@ -44,13 +45,36 @@ pub fn prefillFrom(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, h
         try segs.prefill(e, try e.segmentSet(), prompt, head, e.segments, cancel);
     } else try e.serialChunks(prompt, from, dump, head, cancel, keep);
     if (e.heat_gate.waited_s > waited) heat.note(e.heat_gate.waited_s - waited);
+    e.prefill_counts.completed_rows += prompt.len - from;
+    return sampled(e);
+}
+
+/// The prompt's first token, drawn by its last chunk; one more prompt call counted.
+fn sampled(e: *Engine) !u32 {
     const host = e.pinned.slice(u32)[pin_sampled..][0..1];
     try e.ops().download(std.mem.sliceAsBytes(host), e.b.p_sampled);
     try e.stream.synchronize();
-    e.prefill_counts.completed_rows += prompt.len - from;
     e.prefill_counts.passes += 1;
     if (e.trace) e.traceLessons();
     return host[0];
+}
+
+/// One chunk of the bound sequence's prompt from `at` (`first`: the call's start, which resets the sequence at 0;
+/// else the row the last chunk left it at): the first token once the prompt is whole, else null. Between two calls
+/// other sequences may run, so nothing past the sequence's own state carries over: no head, prompt rows, taps,
+/// segments or lessons (prefillFrom keeps those).
+pub fn prefillStep(e: *Engine, prompt: []const u32, at: usize, first: bool, cancel: ?Cancel, keep: ?Keep) !?u32 {
+    if (e.peer != null and e.tp_link == null) return error.SplitUnsupportedReuse;
+    if (e.prompt_rows != null or e.taps != null or e.lessons() != null or e.decide != lesson_route.none) return error.StepUnsupported;
+    if (prompt.len == 0) return error.EmptyPrompt;
+    if (at >= prompt.len) return error.BadReuse;
+    if (prompt.len + state.max_rows > e.max_len) return error.ContextFull;
+    if (first and at == 0) try e.reset() else if (e.pos != at) return error.BadReuse;
+    const waited = e.heat_gate.waited_s;
+    const end = try e.chunksFrom(prompt, at, null, null, cancel, keep, 1);
+    if (e.heat_gate.waited_s > waited) heat.note(e.heat_gate.waited_s - waited);
+    e.prefill_counts.completed_rows += end - at;
+    return if (end == prompt.len) try sampled(e) else null;
 }
 
 /// The prompt's next token at `position` drawn again under a grammar's bits (structured output's first token).
@@ -72,37 +96,57 @@ pub fn beforeChunk(e: *Engine, cancel: ?Cancel) !void {
 
 /// The prompt's chunks one after another on the engine's stream, starting at `from`.
 pub fn serialChunks(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, head: ?*Head, cancel: ?Cancel, keep: ?Keep) !void {
+    _ = try e.chunksFrom(prompt, from, dump, head, cancel, keep, std.math.maxInt(usize));
+}
+
+/// Up to `most` of the prompt's chunks from `from` on the engine's stream; the row the sequence stands at after them.
+pub fn chunksFrom(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, head: ?*Head, cancel: ?Cancel, keep: ?Keep, most: usize) !usize {
     var f = e.forward(dump);
     const shared = e.lessons();
     if (shared) |ad| try e.trainOps().latch(ad.score, ad.need, ad.latch, e.slot, false); // no lesson acts until it decides
     const wide = dump == null and shared == null and e.decide == lesson_route.none; // passes of up to pass_rows (rows equal at any cut)
     const background = Cancel.background(cancel);
     var s: usize = from;
-    while (s < prompt.len) {
+    var ran: usize = 0;
+    while (s < prompt.len and ran < most) : (ran += 1) {
         if (background) try e.stream.synchronize(); // one chunk in flight: a request that arrives waits for that one alone
         if (Cancel.now(cancel)) {
             if (background and s > from) if (keep) |k| k.call(k.ctx, @intCast(s)); // what it prefilled stays for the next turn
             return error.Cancelled;
         }
         try e.beforeChunk(cancel);
-        const step: usize = if (wide and background) state.yield_rows else if (wide and inside(keep, s, s + state.pass_rows) < marks.max) state.pass_rows else state.prefill_rows; // 2,048 rows where a wide pass would crowd the scan's marks
+        const step: usize = if (wide and background) state.yield_rows else if (wide and inside(keep, s, s + e.pass) < marks.max) e.pass else state.prefill_rows; // 2,048 rows where a wide pass would crowd the scan's marks
         var end = cuts.end(s, prompt.len, step, if (keep) |k| (if (k.cut) k.at else &.{}) else &.{});
         // the decision row ends its chunk: the rows after it read the lessons it latched
         if (e.decide != lesson_route.none and e.decide >= s and e.decide + 1 < end) end = @intCast(e.decide + 1);
         const chunk = prompt[s..end];
         e.last_chunk = s;
         if (keep) |k| arm(e, k, s, end);
-        defer e.armed.n = 0;
+        defer {
+            e.armed.n = 0;
+            if (e.tp_link != null) e.peer.?.armed.n = 0; // after reuse.finish, which makes both ranks' copies whole
+        }
         f.captures = e.armed.marks();
         f.route = .{};
         f.route.add(0, chunk.len, e.pos, e.decide, e.slot);
+        try e.ensureKv(e.pos + chunk.len);
         try e.copied.synchronize();
         const host = e.promptHost(chunk.len);
         @memcpy(host, chunk);
         try e.ops().upload(e.b.p_ids, std.mem.sliceAsBytes(host));
         try e.copied.record(e.stream);
         e.prefill_counts.submitted_rows += chunk.len;
-        try f.chunk(@intCast(chunk.len), e.pos);
+        if (e.tp_link) |l| {
+            const p = e.peer.?;
+            try p.ctx.makeCurrent();
+            try p.ops().upload(p.b.p_ids, std.mem.sliceAsBytes(host));
+            var f1 = p.forward(null);
+            f1.captures = p.armed.marks(); // the peer's own copies of the marks rank 0 armed
+            try @import("cuda_tp2.zig").chunk(l, .{ &f, &f1 }, chunk.len, e.pos);
+            try e.ctx.makeCurrent();
+        } else if (e.peer) |p| {
+            try f.chunkSplit(&p.forward(null), @intCast(chunk.len), e.pos, &e.stage);
+        } else try f.chunk(@intCast(chunk.len), e.pos);
         if (shared) |ad| if (f.route.decision(0) != null) try e.trainOps().latch(ad.score, ad.need, ad.latch, e.slot, true);
         e.pos += @intCast(chunk.len);
         const known = @min(chunk.len, prompt.len - 1 - s);
@@ -113,6 +157,7 @@ pub fn serialChunks(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, 
         s = end;
         if (keep) |k| if (s <= std.math.maxInt(u32) and std.mem.indexOfScalar(u32, k.at, @intCast(s)) != null) k.call(k.ctx, @intCast(s));
     }
+    return s;
 }
 
 /// The keep marks strictly inside rows [s, end).
@@ -126,7 +171,11 @@ fn inside(keep: ?Keep, s: usize, end: usize) usize {
 /// The keeps of rows strictly inside the chunk [s, end), made before it runs: the chunk writes their Mamba states.
 fn arm(e: *Engine, k: Keep, s: usize, end: usize) void {
     e.armed.open = .{ s, end };
-    defer e.armed.open = null;
+    defer {
+        e.armed.open = null;
+        e.syncPeer();
+    }
+    e.syncPeer();
     for (k.at) |m| if (m > s and m < end) k.call(k.ctx, m);
 }
 

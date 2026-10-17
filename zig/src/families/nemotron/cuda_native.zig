@@ -71,7 +71,7 @@ pub const default_context: i64 = engine.default_context;
 pub const max_segments: u32 = @import("cuda_segments.zig").MAX;
 pub const prompt_rows: u32 = state.pass_rows;
 
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, precision: ?@import("config.zig").Precision = null };
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, precision: ?@import("config.zig").Precision = null, split: bool = false, tp: bool = false };
 pub const vision = @import("cuda_vision.zig");
 
 /// Thinking budgets the lone driver takes (cuda_lone.zig): above it, the stream goes to the lane core before its cut.
@@ -101,7 +101,95 @@ pub const Loaded = struct {
     vision: ?*vision.Vision = null, // --vision: the tower the server's image requests reach
     taps: []const u32 = &.{}, // the rows a recorder may ask `backend` for (empty: none)
     living: bool = false, // Living Weights loaded from the model folder: decoding is not the checkpoint's alone
+    /// Two-GPU TP: the smaller rank's room (free memory less the 1536 MiB floor and its unmapped KV pool) after the
+    /// load; the host admits streams and kept states by it, since every one takes the same bytes on both.
+    peer_room: ?struct { rank: usize, bytes: u64 } = null,
+    /// A shared KV pool's admission: the lane host holds a request its pages cannot hold yet (cuda_lanes fits).
+    admit: ?struct { ctx: *anyopaque, fits: *const fn (*anyopaque, u32, u32) bool } = null,
 };
+
+/// Two-GPU tensor parallel (TENSORFOLD_TP=2): rank 0 on this device and rank 1 on the other internal one, each with
+/// its share of every block (cuda_tp2.zig). Rank 0 holds the head and samples; the lane backend sees one engine.
+fn openTp(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
+    const pair = (try splitPair(ctx.d)) orelse return error.TpNeedsTwoDevices;
+    if (pair[0] != ctx.device_ordinal) return error.TpRankZeroNotFirst;
+    // TENSORFOLD_KV_POOL_TOKENS: every sequence's KV rows from one page pool a rank, created whole now
+    const kv_fp8 = if (std.c.getenv("TENSORFOLD_KV_FP8")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+    const pool_bytes = try kvPoolBytes(gpa, io, dir, kv_fp8);
+    var pools: [2]?*cuda.KvPool = .{ null, null };
+    errdefer for (pools) |x| if (x) |q| q.deinit();
+    if (pool_bytes > 0) pools[0] = try cuda.KvPool.init(gpa, ctx.d, ctx.device, pool_bytes);
+    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{ .context = o.context, .mtp = false, .graphs = false, .sampling = null, .segments = 1, .precision = o.precision, .tp = 0, .range = .{ .embed = true, .head = true, .norm_f = true }, .kv_pool = pools[0], .kv_fp8 = kv_fp8 });
+    errdefer e.deinit();
+    const own = try gpa.create(Owned);
+    errdefer gpa.destroy(own);
+    own.* = .{ .gpa = gpa, .e = e, .head = null, .lanes = try Lanes.init(gpa, e, null), .target = .{ .e = e, .head = null }, .carve = null };
+    errdefer own.lanes.deinit();
+    const p = try gpa.create(Peer);
+    errdefer gpa.destroy(p);
+    p.gpa = gpa;
+    p.ctx = try cuda.Context.init(ctx.d, pair[1]);
+    errdefer p.ctx.deinit();
+    try p.ctx.makeCurrent();
+    if (pool_bytes > 0) pools[1] = try cuda.KvPool.init(gpa, ctx.d, p.ctx.device, pool_bytes);
+    p.e = try engine.Engine.init(gpa, io, &p.ctx, dir, kernels, .{ .context = o.context, .mtp = false, .graphs = false, .sampling = null, .segments = 1, .precision = o.precision, .tp = 1, .range = .{ .embed = true, .head = false, .norm_f = false }, .kv_pool = pools[1], .kv_fp8 = kv_fp8 });
+    errdefer {
+        p.ctx.makeCurrent() catch {};
+        p.e.deinit();
+    }
+    p.stage[0] = try cuda.HostBuffer.alloc(ctx.d, 64); // unused by TP; Peer.deinit frees it
+    errdefer p.stage[0].free();
+    const link = try tp2.Link.init(gpa, io, .{ ctx, &p.ctx }, e.pass, e.c.hidden);
+    errdefer link.deinit();
+    e.peer = p.e;
+    e.tp_link = link;
+    own.peer = p;
+    own.link = link;
+    own.pools = pools;
+    if (pool_bytes > 0) std.log.info("tp KV pool: {d} MiB a rank ({s}), {d}-token context a request", .{ pool_bytes >> 20, if (kv_fp8) "fp8 e4m3" else "bf16", o.context });
+    const floor: usize = 1536 << 20;
+    const peer_free = (try p.ctx.memInfo()).free;
+    const own_free = (try ctx.memInfo()).free;
+    if (peer_free < floor or own_free < floor) return error.TpMemoryFloor;
+    // The pool's pages map on demand, so free memory still counts them now: a rank's room for streams and kept prompt
+    // states is its free memory less the floor and the whole pool, or the cache takes what full sequences map later.
+    const rooms = [2]u64{ own_free -| floor -| pool_bytes, peer_free -| floor -| pool_bytes };
+    const low_rank: usize = if (rooms[1] < rooms[0]) 1 else 0;
+    try ctx.makeCurrent();
+    try own.lanes.measure(io, dir);
+    own.taps = .{@import("cuda_lanes.zig").finalTap(e.c)};
+    e.prefill_counts = .{};
+    return .{
+        .backend = own.lanes.backend(),
+        .facts = own.lanes.facts(),
+        .rows = state.max_rows, // exact windows up to 16 rows, several streams' sharing one forward
+        .stream_bytes = e.seqBytes(),
+        .ctx = own,
+        .deinit = release,
+        .target = &own.target,
+        .lone = null,
+        .learns = null,
+        .learn_bytes = 0,
+        .vision = null,
+        .taps = &own.taps,
+        .living = false,
+        .peer_room = .{ .rank = low_rank, .bytes = rooms[low_rank] },
+        .admit = if (pool_bytes > 0) .{ .ctx = &own.lanes, .fits = Lanes.fits } else null,
+    };
+}
+
+/// A TP rank's KV pool bytes for TENSORFOLD_KV_POOL_TOKENS tokens (its KV head of every attention layer, keys and
+/// values); 0 when unset.
+fn kvPoolBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, kv_fp8: bool) !usize {
+    const raw = std.c.getenv("TENSORFOLD_KV_POOL_TOKENS") orelse return 0;
+    const tokens = std.fmt.parseInt(usize, std.mem.span(raw), 10) catch return error.BadKvPoolTokens;
+    if (tokens == 0) return 0;
+    var c = try (try @import("config.zig").Config.read(gpa, io, dir)).forTp(0, tp2.world);
+    c.kv_fp8 = kv_fp8;
+    // a sequence holds whole pages under each layer's rows in each plane: one page a layer-plane of slack a lane
+    const slack = @as(usize, engine.max_streams) * c.count(.attention) * 2 * (2 << 20);
+    return tokens * c.count(.attention) * state.kvRowBytes(c) * 2 + slack;
+}
 
 /// The first shard, index or config.json in `dir` that a write in place would reach through a link, or null.
 pub fn linked(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !?[]const u8 {
@@ -113,7 +201,50 @@ pub fn plainShared(arena: std.mem.Allocator, io: std.Io, dir: []const u8) !?[]co
     return core.shard_edit.plainShared(arena, io, dir);
 }
 
-const Owned = struct { gpa: std.mem.Allocator, e: *engine.Engine, head: ?*Head, lanes: Lanes, target: reuse.Target, carve: ?*cuda.Carveout, living: ?@import("cuda_sites.zig").Sites = null, taps: [1]u32 = undefined };
+const Owned = struct { gpa: std.mem.Allocator, e: *engine.Engine, head: ?*Head, lanes: Lanes, target: reuse.Target, carve: ?*cuda.Carveout, living: ?@import("cuda_sites.zig").Sites = null, taps: [1]u32 = undefined, peer: ?*Peer = null, link: ?*tp2.Link = null, pools: [2]?*cuda.KvPool = .{ null, null } };
+const tp2 = @import("cuda_tp2.zig");
+
+/// The second rank of a layer split: its own device, context, engine and seam staging. The lane backend drives rank
+/// 0 only, so the peer is invisible above the seam.
+const Peer = struct {
+    gpa: std.mem.Allocator,
+    ctx: cuda.Context,
+    e: *engine.Engine,
+    stage: [1]cuda.HostBuffer,
+
+    fn deinit(p: *Peer) void {
+        p.e.deinit();
+        p.stage[0].free();
+        p.ctx.deinit();
+        p.gpa.destroy(p);
+    }
+};
+
+/// The two internal devices, by shared compute capability: the eGPU enumerates first and is a different class.
+pub fn splitPair(d: *const cuda.Driver) !?[2]c_int {
+    const count = try d.deviceCount();
+    var caps: [8]u32 = undefined;
+    var n: usize = 0;
+    var i: c_int = 0;
+    while (i < count and n < caps.len) : (i += 1) {
+        var dev: cuda.abi.Device = 0;
+        try d.check(d.api.cuDeviceGet(&dev, i), "cuDeviceGet");
+        var major: c_int = 0;
+        var minor: c_int = 0;
+        try d.check(d.api.cuDeviceGetAttribute(&major, .compute_capability_major, dev), "cuDeviceGetAttribute");
+        try d.check(d.api.cuDeviceGetAttribute(&minor, .compute_capability_minor, dev), "cuDeviceGetAttribute");
+        caps[n] = @intCast(10 * major + minor);
+        n += 1;
+    }
+    for (0..n) |a| for (a + 1..n) |b| if (caps[a] == caps[b]) return .{ @intCast(a), @intCast(b) };
+    return null;
+}
+
+/// The layer each rank owns, by the model's own layer count. Not the midpoint: rank 0 also carries the embedding,
+/// the final norm, the head and the MTP head, so the balance point sits past the middle.
+pub fn splitAt(layers: usize) usize {
+    return layers / 2 + 2;
+}
 
 /// Own-sequence graphs support both draw modes; drafting also captures the head.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
@@ -125,25 +256,75 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         };
         std.process.exit(0);
     };
+    if (o.split and o.tp) return error.SplitOrTp;
+    if ((o.split or o.tp) and (o.drafts or o.slide or o.segments != 1 or o.vision != null)) return error.SplitUnsupportedOptions;
+    if (o.tp) return openTp(gpa, io, ctx, dir, kernels, o);
     const carve = try openCarveout(gpa, ctx);
     errdefer if (carve) |c| closeCarveout(gpa, c);
-    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{ .context = o.context, .mtp = o.drafts, .graphs = true, .sampling = null, .segments = o.segments, .carveout = carve, .slide = o.slide, .vision = o.vision, .precision = o.precision });
+    // A split's range must be known before the load, or rank 0 would read the whole checkpoint. The layer count
+    // comes from the config, read here rather than inside the engine.
+    const layers = if (o.split) (try @import("config.zig").Config.read(gpa, io, dir)).layers else 0;
+    const mid = splitAt(layers);
+    const range: @import("cuda_weights.zig").Range = if (o.split) .{ .first = 0, .last = mid, .embed = true, .head = true, .norm_f = false, .seam_norm = mid } else .all;
+    const e = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{ .context = o.context, .mtp = o.drafts, .graphs = !o.split, .sampling = null, .segments = o.segments, .carveout = carve, .slide = o.slide, .vision = o.vision, .precision = o.precision, .range = range });
     errdefer e.deinit();
     const head: ?*Head = if (o.drafts) try Head.init(e) else null;
     errdefer if (head) |h| h.deinit();
-    if (head) |h| try h.capture();
-    if (!o.drafts) try e.captureWindows(); // the one-row window: Engine.init captures windows only when drafting
-    // the sampled mode's sets: a placeholder rule now, each stream's own uploaded at its prefill
-    try e.setSampling(.{ .seed = 0, .temperature = 1.0 });
-    try e.captureWindows();
-    if (head) |h| try h.capture();
-    try e.setSampling(null);
+    // A layer split runs eagerly: a graph captures one device's kernels and cannot span the seam, and the seam's
+    // synchronize is not permitted inside a capture.
+    if (!o.split) {
+        if (head) |h| try h.capture();
+        if (!o.drafts) try e.captureWindows(); // the one-row window: Engine.init captures windows only when drafting
+        // the sampled mode's sets: a placeholder rule now, each stream's own uploaded at its prefill
+        try e.setSampling(.{ .seed = 0, .temperature = 1.0 });
+        try e.captureWindows();
+        if (head) |h| try h.capture();
+        try e.setSampling(null);
+    }
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.* = .{ .gpa = gpa, .e = e, .head = head, .lanes = try Lanes.init(gpa, e, head), .target = .{ .e = e, .head = head }, .carve = carve };
     errdefer own.lanes.deinit();
-    own.living = try slide.loadLiving(gpa, io, e, dir); // before the lanes' costs are measured: they decode through it
+    own.living = if (o.split) null else try slide.loadLiving(gpa, io, e, dir); // before the lanes' costs are measured: they decode through it
     errdefer if (own.living) |*s| s.deinit();
+    // A layer split: rank 1 on the other internal device, with its own context and engine. Rank 0 keeps the
+    // embedding, the head and the sample, so the lane backend above the seam is unchanged.
+    if (o.split) {
+        const pair = (try splitPair(ctx.d)) orelse return error.SplitNeedsTwoDevices;
+        if (pair[0] != ctx.device_ordinal) return error.SplitRankZeroNotFirst;
+        const p = try gpa.create(Peer);
+        errdefer gpa.destroy(p);
+        p.gpa = gpa;
+        p.ctx = try cuda.Context.init(ctx.d, pair[1]);
+        errdefer p.ctx.deinit();
+        try p.ctx.makeCurrent();
+        p.e = try engine.Engine.init(gpa, io, &p.ctx, dir, kernels, .{
+            .context = o.context,
+            .mtp = false, // the head stays on rank 0
+            .graphs = false, // a graph captures one device's kernels and cannot span the seam
+            .sampling = null,
+            .segments = 1,
+            .precision = o.precision,
+            .range = .{ .first = mid, .last = layers, .embed = false, .head = false, .norm_f = true },
+        });
+        errdefer {
+            p.ctx.makeCurrent() catch {};
+            p.e.deinit();
+        }
+        try ctx.makeCurrent();
+        // The seam's staging: h and y are rows*hidden*2 bf16, xs is rows*(hidden/64)*4 fp32. Sized for the widest
+        // prompt pass, the widest thing that crosses: a window is at most state.max_rows rows.
+        const rows = state.pass_rows;
+        const need = 2 * rows * e.c.hidden * 2 + rows * (e.c.hidden / 64) * 4;
+        p.stage[0] = try cuda.HostBuffer.allocMapped(ctx.d, need);
+        errdefer p.stage[0].free();
+        e.peer = p.e;
+        e.stage = p.stage;
+        own.peer = p;
+        const floor: usize = 1536 << 20;
+        if ((try p.ctx.memInfo()).free < floor or (try ctx.memInfo()).free < floor) return error.SplitMemoryFloor;
+    }
+    try ctx.makeCurrent();
     try own.lanes.measure(io, dir);
     own.taps = .{@import("cuda_lanes.zig").finalTap(e.c)};
     e.prefill_counts = .{}; // requests' prompt rows only: the cost measurement's passes are not counted
@@ -190,10 +371,24 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
 
 fn release(p: *anyopaque) void {
     const own: *Owned = @ptrCast(@alignCast(p));
+    if (own.peer != null) {
+        own.e.ctx.makeCurrent() catch {};
+        own.e.stream.synchronize() catch {};
+    }
     own.lanes.deinit();
     if (own.living) |*s| s.deinit();
     if (own.head) |h| h.deinit();
+    // The peer first: rank 0's engine holds a pointer to it and its staging.
+    own.e.peer = null;
+    own.e.tp_link = null;
+    if (own.link) |l| l.deinit();
+    if (own.peer) |peer| {
+        peer.ctx.makeCurrent() catch {};
+        peer.deinit();
+        own.e.ctx.makeCurrent() catch {};
+    }
     own.e.deinit();
+    for (own.pools) |x| if (x) |q| q.deinit(); // after every sequence that reserved from them
     if (own.carve) |c| closeCarveout(own.gpa, c);
     own.gpa.destroy(own);
 }

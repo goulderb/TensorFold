@@ -25,7 +25,7 @@ pub const Adapter = struct { a: u64, b: u64, tau: u64, xa: u64, xn: u64, gates: 
 
 /// A `*_rest` is a lesson's change past its projection's 4-bit codes ([out, in] bf16), added after it; 0 when none.
 pub const Mamba = struct { in_proj: QLinear, out_proj: QLinear, conv_w: u64, conv_b: u64, a: u64, d: u64, dt_bias: u64, gnorm: u64, out_rest: u64 = 0, adapter: ?Adapter = null };
-pub const Attention = struct { qkv: QLinear, o: QLinear, o_rest: u64 = 0, adapter: ?Adapter = null };
+pub const Attention = struct { qkv: QLinear, o: QLinear, o_rest: u64 = 0, adapter: ?Adapter = null, ks: f32 = 1, vs: f32 = 1 };
 /// The pocket kernels' neurons (config's pocket): input weights and outputs, [n, D] fp32 each, from the 4-bit codes.
 pub const Pocket = kern.Pocket;
 /// The shared expert's down projection rest in two halves (experts E and E + 1); its learned change reads both.
@@ -55,6 +55,9 @@ pub const Weights = struct {
     draft_head: ?QLinear = null,
     draft_ids: u64 = 0,
     draft_count: usize = 0,
+    /// A layer split's sender holds the receiving rank's first block norm: it runs that norm so the handoff can
+    /// carry the residual h alone, and the receiver starts with its first norm already done. 0: no seam.
+    seam_norm: u64 = 0,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     named: std.ArrayList(Named) = .empty,
 
@@ -346,6 +349,7 @@ pub const Loader = struct {
     }
 
     fn mamba(L: *Loader, ck: *core.Checkpoint, name: []const u8, pre: []const u8) !Mamba {
+        if (L.w.config.tp_world > 1) return L.mambaTp(ck, name, pre);
         var a: [128]u8 = undefined;
         var b: [128]u8 = undefined;
         var m: Mamba = undefined;
@@ -376,7 +380,80 @@ pub const Loader = struct {
         return m;
     }
 
+    /// A two-GPU TP rank's Mamba block: its heads and their state groups. The in projection's z, x, B, C and dt rows of
+    /// those heads and groups (in that order, as the rank's projDim lays them out), the conv taps of its x, B and C
+    /// channels, its heads' A, D and dt bias, its gated norm's channels, and the out projection's matching columns.
+    fn mambaTp(L: *Loader, ck: *core.Checkpoint, name: []const u8, pre: []const u8) !Mamba {
+        const c = L.w.config;
+        const w = c.tp_world;
+        const r = c.tp_rank;
+        const li = c.inner(); // this rank's inner width
+        const gi = li * w; // the whole model's
+        const gl = c.groups * c.state; // this rank's B (or C) rows
+        const gg = gl * w;
+        const hl = c.mamba_heads;
+        var a: [128]u8 = undefined;
+        var b: [128]u8 = undefined;
+        var m: Mamba = undefined;
+        m.out_rest = 0;
+        m.adapter = null;
+        const in_rows = [_][2]usize{ .{ r * li, li }, .{ gi + r * li, li }, .{ 2 * gi + r * gl, gl }, .{ 2 * gi + gg + r * gl, gl }, .{ 2 * gi + 2 * gg + r * hl, hl } };
+        m.in_proj = try modelopt.denseCut(L, ck, try join(&a, name, ".in_proj"), &.{try join(&b, pre, "in_proj")}, &.{.{ .rows = &in_rows }});
+        m.out_proj = try modelopt.denseCut(L, ck, try join(&a, name, ".out_proj"), &.{try join(&b, pre, "out_proj")}, &.{.{ .cols = .{ r * li, li } }});
+        // the conv's channels are x, B and C: this rank's of each, in that order
+        const ch_ranges = [_][2]usize{ .{ r * li, li }, .{ gi + r * gl, gl }, .{ gi + gg + r * gl, gl } };
+        const conv = try ck.get(try join(&b, pre, "conv1d.weight"));
+        if (conv.rank != 3 or conv.dim(1) * conv.dim(2) != 4 or @min(conv.dim(1), conv.dim(2)) != 1 or conv.dtype != .bf16) return error.UnexpectedTensor;
+        if (conv.dim(0) != gi + 2 * gg) return error.UnexpectedTensor;
+        const ch = li + 2 * gl;
+        const whole = try L.gpa.alloc(u8, conv.bytes.len);
+        defer L.gpa.free(whole);
+        try L.src.read(whole, conv.bytes);
+        const taps = std.mem.bytesAsSlice(u32, try L.staging(ch * 4 * 4));
+        var at: usize = 0;
+        for (ch_ranges) |cr| for (cr[0]..cr[0] + cr[1]) |gc| {
+            for (0..4) |t| taps[t * ch + at] = @as(u32, std.mem.readInt(u16, whole[(gc * 4 + t) * 2 ..][0..2], .little)) << 16;
+            at += 1;
+        };
+        m.conv_w = try L.alloc(try join(&a, name, ".conv_w"), L.host.items.len);
+        try L.ops.upload(m.conv_w, L.host.items);
+        m.conv_b = try L.widen(try join(&a, name, ".conv_b"), try L.vecOf(try ck.get(try join(&b, pre, "conv1d.bias")), &ch_ranges));
+        const heads = [_][2]usize{.{ r * hl, hl }};
+        const alog = try L.widened(try L.vecOf(try ck.get(try join(&b, pre, "A_log")), &heads));
+        const src = try L.tmp(alog.len);
+        try L.ops.upload(src, alog);
+        m.a = try L.alloc(try join(&a, name, ".a"), alog.len);
+        try L.ops.torch().mambaA(src, m.a, alog.len / 4);
+        m.d = try L.widen(try join(&a, name, ".d"), try L.vecOf(try ck.get(try join(&b, pre, "D")), &heads));
+        m.dt_bias = try L.widen(try join(&a, name, ".dt_bias"), try L.vecOf(try ck.get(try join(&b, pre, "dt_bias")), &heads));
+        m.gnorm = try L.raw(try join(&a, name, ".gnorm"), try L.vecOf(try ck.get(try join(&b, pre, "norm.weight")), &.{.{ r * li, li }}));
+        return m;
+    }
+
+    /// Elements `ranges` of a 1-d tensor as a host tensor (a TP rank's channels or heads).
+    fn vecOf(L: *Loader, t: Tensor, ranges: []const [2]usize) !Tensor {
+        const per = t.bytes.len / t.dim(0);
+        var n: usize = 0;
+        for (ranges) |r| {
+            if (r[0] + r[1] > t.dim(0)) return error.BadTpCut;
+            n += r[1];
+        }
+        const whole = try L.gpa.alloc(u8, t.bytes.len);
+        defer L.gpa.free(whole);
+        try L.src.read(whole, t.bytes);
+        const out = try L.keep(u8, n * per);
+        var at: usize = 0;
+        for (ranges) |r| {
+            @memcpy(out[at..][0 .. r[1] * per], whole[r[0] * per ..][0 .. r[1] * per]);
+            at += r[1] * per;
+        }
+        var v = made(t.dtype, n, 1, out);
+        v.rank = 1;
+        return v;
+    }
+
     fn attention(L: *Loader, ck: *core.Checkpoint, name: []const u8, pre: []const u8) !Attention {
+        if (L.w.config.tp_world > 1) return L.attentionTp(ck, name, pre);
         var a: [128]u8 = undefined;
         var q: [128]u8 = undefined;
         var k: [128]u8 = undefined;
@@ -384,6 +461,32 @@ pub const Loader = struct {
         const qkv = try L.dense(ck, try join(&a, name, ".qkv"), &.{ try join(&q, pre, "q_proj"), try join(&k, pre, "k_proj"), try join(&v, pre, "v_proj") });
         var att: Attention = .{ .qkv = qkv, .o = undefined };
         att.o = try L.denseRest(ck, try join(&a, name, ".o"), &.{try join(&q, pre, "o_proj")}, &att.o_rest);
+        return att;
+    }
+
+    /// A two-GPU TP rank's attention block: its query heads, its KV head, and the out projection's matching columns.
+    fn attentionTp(L: *Loader, ck: *core.Checkpoint, name: []const u8, pre: []const u8) !Attention {
+        const c = L.w.config;
+        const r = c.tp_rank;
+        const qd = c.heads * c.head_dim;
+        const kd = c.kv_heads * c.head_dim;
+        var a: [128]u8 = undefined;
+        var q: [128]u8 = undefined;
+        var k: [128]u8 = undefined;
+        var v: [128]u8 = undefined;
+        const qr = [_][2]usize{.{ r * qd, qd }};
+        const kr = [_][2]usize{.{ r * kd, kd }};
+        const qkv = try modelopt.denseCut(L, ck, try join(&a, name, ".qkv"), &.{ try join(&q, pre, "q_proj"), try join(&k, pre, "k_proj"), try join(&v, pre, "v_proj") }, &.{ .{ .rows = &qr }, .{ .rows = &kr }, .{ .rows = &kr } });
+        var att: Attention = .{ .qkv = qkv, .o = undefined };
+        att.o_rest = 0;
+        att.adapter = null;
+        att.o = try modelopt.denseCut(L, ck, try join(&a, name, ".o"), &.{try join(&q, pre, "o_proj")}, &.{.{ .cols = .{ r * qd, qd } }});
+        // the checkpoint's calibrated KV scales (ModelOpt's FP8 KV scheme): an FP8 cache stores value / scale
+        if (c.kv_fp8) {
+            att.ks = try modelopt.scalarOf(ck, try join(&k, pre, "k_proj.k_scale"));
+            att.vs = try modelopt.scalarOf(ck, try join(&v, pre, "v_proj.v_scale"));
+            if (!(att.ks > 0) or !(att.vs > 0)) return error.BadKvScale;
+        }
         return att;
     }
 
@@ -440,9 +543,34 @@ pub fn made(dtype: core.checkpoint.DType, d0: usize, d1: usize, bytes: []const u
     return t;
 }
 
+/// Which layers a rank loads, and whether it holds the embedding and the head. A single-device load is `all`.
+pub const Range = struct {
+    first: usize = 0, // inclusive
+    last: usize = std.math.maxInt(usize), // exclusive
+    embed: bool = true,
+    head: bool = true,
+    /// The final norm. A layer split's receiving rank runs it (its last block feeds it) while the head stays on the
+    /// sending rank, so this and `head` are separate.
+    norm_f: bool = true,
+    /// The receiving rank's first block, whose norm this rank runs at the seam. null: no seam.
+    seam_norm: ?usize = null,
+
+    /// Every layer, the embedding and the head: the single-device load.
+    pub const all: Range = .{};
+};
+
 /// weights.load: the model folder's checkpoint (and its MTP head when `with_mtp`) on the GPU, leftovers refused.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, c: Config, with_mtp: bool) !Weights {
+    return loadRange(gpa, io, ops, dir, c, with_mtp, .all);
+}
+
+/// `load` for one rank of a layer split: only `range`'s layers are read, and the rest are marked used so the
+/// leftover check still means something. `w.blocks` is indexed by the global layer number, so a caller reads a
+/// block by its model index; the entries outside `range` are zero and must not be run.
+pub fn loadRange(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, c: Config, with_mtp: bool, range: Range) !Weights {
     if (c.format == .mlx) try c.fourOnly("CUDA");
+    const last = @min(range.last, c.layers);
+    if (range.first > last) return error.BadLayerRange;
     var w: Weights = .{ .gpa = gpa, .config = c };
     errdefer w.deinit();
     var src = try Source.init(gpa, ops);
@@ -463,6 +591,13 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
     const pre = c.prefix();
     w.blocks = try gpa.alloc(Block, c.layers);
     for (c.kinds[0..c.layers], 0..) |kind, i| {
+        if (i < range.first or i >= last) {
+            // not this rank's: marked used so the leftover check still catches a genuinely unread tensor
+            var pb: [128]u8 = undefined;
+            try ck.skip(try std.fmt.bufPrint(&pb, "{s}backbone.layers.{d}.", .{ pre, i }));
+            w.blocks[i] = .{ .kind = kind, .norm = 0 };
+            continue;
+        }
         var nm: [128]u8 = undefined;
         var nb: [128]u8 = undefined;
         var pb: [128]u8 = undefined;
@@ -477,7 +612,18 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
         }
         w.blocks[i] = b;
     }
-    if (c.format == .modelopt) w.embed = try modelopt.embed(&L, &ck, c) else {
+    // A sender also holds the receiving rank's first block norm, so it can run that norm at the seam. The receiver
+    // marks it used instead, since its own first block skips the norm.
+    if (range.seam_norm) |at| {
+        // The seam norm is the receiving rank's first block norm, so it sits at the sender's `last`, outside the
+        // sender's own range. Only the sender sets `seam_norm`; the receiver loads that block's norm as its own and
+        // skips running it.
+        var pb: [128]u8 = undefined;
+        w.seam_norm = try L.raw("seam.norm", try ck.expect(try std.fmt.bufPrint(&pb, "{s}backbone.layers.{d}.norm.weight", .{ pre, at }), .bf16, &.{c.hidden}));
+    }
+    if (!range.embed) {
+        try ck.skip("backbone.embeddings.");
+    } else if (c.format == .modelopt) w.embed = try modelopt.embed(&L, &ck, c) else {
         const emb = try ck.get("backbone.embeddings.weight");
         w.embed = .{
             .w = try L.raw("embed.weight", emb),
@@ -487,16 +633,28 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, ops: kern.Ops, dir: []const u8, 
             .k = emb.dim(1) * 8,
         };
     }
+    // A layer split's receiving rank runs the final norm (its last block feeds it) but not the head, which stays on
+    // the sending rank with the sample. `norm_f` and `head` are therefore separate choices.
     var tail: [96]u8 = undefined;
-    w.norm_f = try L.raw("norm_f", try ck.expect(try std.fmt.bufPrint(&tail, "{s}backbone.norm_f.weight", .{pre}), .bf16, &.{c.hidden}));
-    w.head = try L.dense(&ck, "head", &.{try std.fmt.bufPrint(&tail, "{s}lm_head", .{pre})});
+    if (!range.norm_f) {
+        try ck.skip(try std.fmt.bufPrint(&tail, "{s}backbone.norm_f.", .{pre}));
+    } else {
+        w.norm_f = try L.raw("norm_f", try ck.expect(try std.fmt.bufPrint(&tail, "{s}backbone.norm_f.weight", .{pre}), .bf16, &.{c.hidden}));
+    }
+    if (!range.head) {
+        try ck.skip(try std.fmt.bufPrint(&tail, "{s}lm_head", .{pre}));
+    } else {
+        w.head = try L.dense(&ck, "head", &.{try std.fmt.bufPrint(&tail, "{s}lm_head", .{pre})});
+    }
     // a ModelOpt checkpoint keeps its MTP head in its own shards
-    if (c.format == .modelopt) if (!with_mtp) try ck.skip(try std.fmt.bufPrint(&tail, "{s}mtp.", .{pre})) else if (c.latent > 0) try latent.mtp(&L, &ck, c) else try modelopt.mtp(&L, &ck, c);
+    if (c.format == .modelopt) if (with_mtp and range.head) {
+        if (c.latent > 0) try latent.mtp(&L, &ck, c) else try modelopt.mtp(&L, &ck, c);
+    } else try ck.skip(try std.fmt.bufPrint(&tail, "{s}mtp.", .{pre}));
     // the picture tower and its projector load with the image path (an omni checkpoint's other parts)
     if (c.omni) for ([_][]const u8{ "vision_model.", "mlp1.", "vision_projector." }) |part| try ck.skip(part);
     if (ck.unused() != 0) return error.UnusedCheckpointTensors;
     if (L.learned > 0) std.log.info("{d} output projections carry what lessons taught this model", .{L.learned});
-    if (with_mtp and c.format == .mlx) try loadMtp(gpa, io, &L, &ck, dir, c);
+    if (with_mtp and range.head and c.format == .mlx) try loadMtp(gpa, io, &L, &ck, dir, c);
     try src.flush();
     try ops.s.synchronize();
     return w;

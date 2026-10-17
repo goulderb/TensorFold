@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold",
+  "commit": "f1ee79a6bf5319775079412c727f5f6b0ebb1e19",
+  "files_sha256": {
+    "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "NOTICE": "ee701e5d31c2bc766a1af791e6a394fc5fcfc8435f0361e7e9b596292e2dc7e1",
+    "CREDITS.md": "3612e9c1c710fab911749156e66817e80d0ab8c533b87e973291a7b98a33726d"
+  },
+  "content": "Original donor documents, unmodified; native integration changes are described in LICENSES/donors/README.md."
+}

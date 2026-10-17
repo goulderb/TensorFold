@@ -21,7 +21,7 @@ pub fn pick(h: *LaneHost) ?usize {
     if (head.waits_since == null) head.waits_since = h.admissions;
     // it waits on the streams admitted before it waited: while one runs, later requests that fit go first; then none do
     for (h.admitted.items) |j| if (j.seq < head.waits_since.?) {
-        for (h.queued.items[1..], 1..) |j2, i| if (fits(a, j2) and !waiting(h, j2)) return i;
+        for (h.queued.items[1..], 1..) |j2, i| if (!waiting(h, j2) and fits(a, j2)) return i; // fits promises: last
         return null;
     };
     return null;

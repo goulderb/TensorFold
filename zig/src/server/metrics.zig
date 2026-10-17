@@ -165,6 +165,10 @@ pub const Metrics = struct {
         if (engine.spill(&sp)) {
             try gauge(w, "spill_disk_read_states_total", "counter", "Kept states read back from the spill tier into memory (raw reads; a later restore may fail).", sp.cache.read_back);
             try gauge(w, "spill_disk_read_tokens_total", "counter", "Prompt tokens of spill files read back, before any restore commits.", sp.tier.stats.loaded_tokens);
+            try gauge(w, "spill_ram_bytes", "gauge", "Bytes of kept states the spill tier holds in host memory.", sp.tier.ram_bytes);
+            try gauge(w, "spill_ram_entries", "gauge", "Kept states the spill tier holds in host memory.", sp.tier.ram_entries);
+            try gauge(w, "spill_ram_read_states_total", "counter", "Reads the spill tier served from host memory, not disk.", sp.tier.stats.ram_loaded);
+            try gauge(w, "spill_ram_demoted_total", "counter", "Held states written on to disk for host-memory room.", sp.tier.stats.ram_demoted);
             try gauge(w, "spill_restored_states_total", "counter", "Read-back states whose restore committed and a prompt pass resumed from.", sp.cache.recalled);
             try gauge(w, "spill_restored_tokens_total", "counter", "Prompt tokens committed restores from the spill tier covered.", sp.cache.recalled_tokens);
             try gauge(w, "spill_write_submitted_total", "counter", "States handed to the spill tier's writer (not proof of persistence).", sp.writes.submitted);

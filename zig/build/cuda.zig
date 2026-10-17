@@ -349,6 +349,36 @@ fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: Kerne
     return out;
 }
 
+pub const TpPartialImage = struct { image: std.Build.LazyPath, depfile: std.Build.LazyPath, flags: []const []const u8 };
+
+/// The TP2 MoE partial image alone (zig/tp_moe_gpu_oracle_build.zig): torch's flags, the glue kernels' flags and one
+/// SASS target, with the generated ABI header's directory on the include path. The caller resolves `source`, because
+/// a standalone build's root is zig/ and `fatbin` above assumes the repository's. It is not one of `kernels`, so no
+/// root target embeds, installs or checks it. `flags` is every argument but the paths, as a provenance record.
+pub fn tpPartialImage(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, source: std.Build.LazyPath, abi_dir: std.Build.LazyPath, sm: []const u8) TpPartialImage {
+    const flags = tpPartialFlags(b, sm);
+    const run = b.addSystemCommand(&.{nvcc});
+    run.addFileInput(version);
+    run.addArgs(flags);
+    run.addPrefixedDirectoryArg("-I", abi_dir);
+    run.addArgs(&.{ "-MD", "-MF" });
+    const dep = run.addDepFileOutputArg2("nemotron_tp_partial.d", .{});
+    run.addArg("-o");
+    const out = run.addOutputFileArg("nemotron_tp_partial.fatbin");
+    run.addFileArg(source);
+    return .{ .image = out, .depfile = dep, .flags = flags };
+}
+
+/// The TP partial image's nvcc arguments other than paths: what a prebuilt image's manifest must have recorded.
+pub fn tpPartialFlags(b: *std.Build, sm: []const u8) []const []const u8 {
+    var flags: std.ArrayList([]const u8) = .empty;
+    flags.append(b.allocator, "-fatbin") catch @panic("OOM");
+    flags.appendSlice(b.allocator, &torch_flags) catch @panic("OOM");
+    flags.appendSlice(b.allocator, glue) catch @panic("OOM");
+    flags.append(b.allocator, b.fmt("-gencode=arch=compute_{s},code=sm_{s}", .{ sm, sm })) catch @panic("OOM");
+    return flags.items;
+}
+
 /// Cross-build a release server, embedding the same fatbins on either host CPU.
 pub fn distServer(b: *std.Build, target: std.Build.ResolvedTarget, draft_ids: *std.Build.Module, build_options: *std.Build.Step.Options, prebuilt: ?[]const u8) *std.Build.Step.Compile {
     var images: [kernels.len]?std.Build.LazyPath = @splat(null);

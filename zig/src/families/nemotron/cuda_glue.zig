@@ -6,6 +6,13 @@ const triton = @import("cuda_triton.zig");
 
 pub const Shape = triton.Tri.Shape;
 pub const Attn = triton.Tri.Attn;
+
+/// The KV cache kernels' last three arguments: the cache's format and its layer's scales.
+fn kvTail(a: *cuda.Args, at: Attn) void {
+    a.add(@as(c_int, @intFromBool(at.fp8)));
+    a.add(at.ks);
+    a.add(at.vs);
+}
 pub const Keyed = triton.Keyed;
 
 /// Keys an attention chunk holds, at fixed absolute positions (Python's CHUNK).
@@ -34,6 +41,7 @@ pub const Fns = struct {
     attn_chunk_pf: cuda.Function,
     attn_merge: cuda.Function,
     kv_write_segs: cuda.Function,
+    kv_dequant: cuda.Function,
     attn_chunk_segs: cuda.Function,
     attn_merge_segs: cuda.Function,
     keyed: cuda.Function,
@@ -59,6 +67,7 @@ pub const Fns = struct {
             .attn_chunk_pf = try m[3].function("tf_nemo_attn_chunk_pf"),
             .attn_merge = try m[3].function("tf_nemo_attn_merge"),
             .kv_write_segs = try m[3].function("tf_nemo_kv_write_segs"),
+            .kv_dequant = try m[3].function("tf_nemo_kv_dequant"),
             .attn_chunk_segs = try m[3].function("tf_nemo_attn_chunk_segs"),
             .attn_merge_segs = try m[3].function("tf_nemo_attn_merge_segs"),
             .keyed = try m[4].function("tf_nemo_keyed_greedy"),
@@ -268,11 +277,23 @@ pub const Glue = struct {
 
     /// Each row's keys and values into the caches at meta's position.
     pub fn kvWrite(g: Glue, qkv: u64, kc: u64, vc: u64, meta: u64, rows: usize, at: Attn) !void {
+        if (at.fp8 and g.set != null) return error.Fp8KvNeedsOwnKernels;
         if (g.tri()) |t| return t.kvWrite(qkv, kc, vc, meta, rows, at);
         var a: cuda.Args = .{};
         ptrs(&a, &.{ qkv, kc, vc, meta });
         ints(&a, &.{ at.nqkv, at.heads * at.dim, at.kv_heads * at.dim });
+        kvTail(&a, at);
         try g.go(g.f.kv_write, .{ rows, 1, 1 }, 256, 0, &a);
+    }
+
+    /// Both planes' first `n` elements as bf16 (an FP8 cache's rows for a prompt chunk's attention).
+    pub fn kvDequant(g: Glue, kc: u64, vc: u64, k16: u64, v16: u64, n: usize, at: Attn) !void {
+        var a: cuda.Args = .{};
+        ptrs(&a, &.{ kc, vc, k16, v16 });
+        a.add(@as(i64, @intCast(n)));
+        a.add(at.ks);
+        a.add(at.vs);
+        try g.go(g.f.kv_dequant, .{ @min((n + 255) / 256, 4096), 1, 1 }, 256, 0, &a);
     }
 
     /// 512-key chunks at absolute positions, merged in order (a row's bits ignore its window).
@@ -285,6 +306,7 @@ pub const Glue = struct {
         ptrs(&a, &.{ qkv, kc, vc, meta, po, pm, pl });
         ints(&a, &.{ at.nqkv, at.heads, at.kv_heads, grp, chunk_keys, at.nch });
         a.add(scale);
+        kvTail(&a, at);
         // several rows: each block loads its next key tile while it computes this one (one row gains nothing)
         try g.go(if (rows > 1) g.f.attn_chunk_pf else g.f.attn_chunk, .{ rows, at.kv_heads, @min(at.nch, chunk_blocks) }, 256, 0, &a);
         var b: cuda.Args = .{};
@@ -309,29 +331,41 @@ pub const Glue = struct {
         }
         const grp = at.heads / at.kv_heads;
         if (at.dim != 128 or grp > 16) return error.AttentionShape;
+        // the kernels number a launch's rows from 0: a group past the first (more streams than max_segs) is rebased
+        // to its first row, its buffers offset to that row
+        const base: u64 = segs[0].row0;
+        const qd: u64 = at.heads * at.dim;
         var t = std.mem.zeroes(AttnSegs);
         for (segs, 0..) |s, k| {
             t.kc[k] = s.kc;
             t.vc[k] = s.vc;
             t.meta[k] = s.meta;
-            t.row0[k] = int(s.row0);
+            t.row0[k] = int(s.row0 - base);
         }
         t.n = int(segs.len);
+        const q0 = qkv + base * at.nqkv * 2;
+        const po0 = po + base * at.nch * qd * 4;
+        const pm0 = pm + base * at.nch * at.heads * 4;
+        const pl0 = pl + base * at.nch * at.heads * 4;
+        const out0 = out + base * qd * 2;
+        const xs0 = xs + base * (qd / 64) * 4;
         var w: cuda.Args = .{};
         w.add(t);
-        w.add(qkv);
+        w.add(q0);
         ints(&w, &.{ at.nqkv, at.heads * at.dim, at.kv_heads * at.dim });
+        kvTail(&w, at);
         try g.go(g.f.kv_write_segs, .{ rows, 1, 1 }, 256, 0, &w);
         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(at.dim), -0.5));
         var a: cuda.Args = .{};
         a.add(t);
-        ptrs(&a, &.{ qkv, po, pm, pl });
+        ptrs(&a, &.{ q0, po0, pm0, pl0 });
         ints(&a, &.{ at.nqkv, at.heads, at.kv_heads, grp, chunk_keys, at.nch });
         a.add(scale);
+        kvTail(&a, at);
         try g.go(g.f.attn_chunk_segs, .{ rows, at.kv_heads, @min(at.nch, chunk_blocks) }, 256, 0, &a);
         var b: cuda.Args = .{};
         b.add(t);
-        ptrs(&b, &.{ po, pm, pl, out, xs });
+        ptrs(&b, &.{ po0, pm0, pl0, out0, xs0 });
         ints(&b, &.{ at.heads, at.kv_heads, grp, chunk_keys, at.nch });
         try g.go(g.f.attn_merge_segs, .{ rows, at.kv_heads, 1 }, 256, 0, &b);
     }
