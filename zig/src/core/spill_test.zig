@@ -1027,3 +1027,34 @@ test "Windows: a root others may change is refused; the tier's own directories a
         return error.SkipZigTest; // a parent no one else may change (not a shared checkout): nothing to refuse
     } else |err| try std.testing.expectEqual(error.SpillDirUnsafe, err);
 }
+
+test "a state read back from disk is held again, so its next read is memory's" {
+    var root = try Root.make();
+    defer root.deinit();
+    var tok: [100]u32 = undefined;
+    var pay: [10_000]u8 = undefined;
+    var s = root.settings(1 << 20);
+    s.ram_cap = 1 << 20;
+    const name = blk: {
+        const t = try Tier.open(gpa, io, s, "flashnext", identity_a, 0, 1);
+        defer t.deinit();
+        const n = try hold(t, tokensOf(&tok, 5), 90, "m", payloadOf(&pay, 5));
+        try std.testing.expect(t.drain(10));
+        break :blk n;
+    };
+    const t = try Tier.open(gpa, io, s, "flashnext", identity_a, 0, 1);
+    defer t.deinit();
+    var meta: [64]u8 = undefined;
+    const first = try readBack(t, name, &meta); // from its file
+    defer gpa.free(first);
+    var info = t.info();
+    try std.testing.expectEqual(@as(u64, 0), info.stats.ram_loaded);
+    try std.testing.expectEqual(@as(u64, 1), info.stats.ram_promoted);
+    try std.testing.expectEqual(@as(usize, 1), info.ram_entries);
+    const second = try readBack(t, name, &meta); // from memory
+    defer gpa.free(second);
+    try std.testing.expectEqualSlices(u8, &pay, second);
+    try std.testing.expectEqualStrings("m", meta[0..1]);
+    info = t.info();
+    try std.testing.expectEqual(@as(u64, 1), info.stats.ram_loaded);
+}

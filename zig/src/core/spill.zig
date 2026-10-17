@@ -174,6 +174,7 @@ pub const Stats = struct {
     ram_loaded: u64 = 0, // reads served from memory (a subset of `loaded`)
     ram_demoted: u64 = 0, // held states written on to disk (behind, or for memory room)
     ram_released: u64 = 0, // held states whose memory went for room, their file in place
+    ram_promoted: u64 = 0, // states read back from disk and held again (a hot state's next read is memory's)
     ram_dropped: u64 = 0, // held states that left memory with no file (no disk room, a failed write)
 };
 
@@ -862,6 +863,39 @@ pub const Tier = struct {
         return true;
     }
 
+    /// `payload`, read whole and checked from `r`'s file, held again by its entry when the entry is still there, its
+    /// file in place and nothing holds it yet; memory is then trimmed to its cap (files in place go first). True when
+    /// the entry took `payload`.
+    fn promote(t: *Tier, r: *const Reading, payload: []u8) bool {
+        const ram_gpa = t.ram_gpa orelse t.gpa;
+        const held = t.gpa.create(Ram) catch return false;
+        const meta = ram_gpa.dupe(u8, r.meta()) catch {
+            t.gpa.destroy(held);
+            return false;
+        };
+        held.* = .{ .gpa = ram_gpa, .payload = payload, .meta = meta, .hash = r.header.payload_hash, .saved = r.header.saved };
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        const i = t.find(r.name) orelse {
+            ram_gpa.free(meta);
+            t.gpa.destroy(held);
+            return false;
+        };
+        const e = t.entries.items[i];
+        if (e.ram != null or !e.on_disk or e.job != null) {
+            ram_gpa.free(meta);
+            t.gpa.destroy(held);
+            return false;
+        }
+        e.ram = held;
+        t.ram_bytes += payload.len;
+        t.stats.ram_promoted += 1;
+        t.clock += 1;
+        e.used = t.clock; // the most recently used: others leave memory before it
+        t.trimRam();
+        return true;
+    }
+
     /// A clean stop: every held state not on disk queued for it, most recently used first (the writers then drain).
     pub fn flushRam(t: *Tier) void {
         var gone: std.ArrayList(Name) = .empty;
@@ -1288,6 +1322,10 @@ pub const Reading = struct {
             return;
         }
         if (t.rbuf.len == 0) t.rbuf = t.gpa.alloc(u8, t.chunk) catch |err| return r.failWith(err);
+        // held again as it is read when the memory level holds it: the state was wanted, its next read is memory's
+        const ram_gpa = t.ram_gpa orelse t.gpa;
+        var copy: ?[]u8 = if (t.holds(r.header.payload_len)) ram_gpa.alloc(u8, @intCast(r.header.payload_len)) catch null else null;
+        defer if (copy) |c| ram_gpa.free(c);
         var hash = std.hash.XxHash3.init(0);
         const at = Header.payloadOffset(r.header.tokens);
         var off: u64 = 0;
@@ -1296,6 +1334,7 @@ pub const Reading = struct {
             if (!fs.preadAll(r.fd.?, t.rbuf[0..n], at + off)) return r.failWith(error.ShortFile);
             t.advise_file(r.fd.?, at + off, n);
             hash.update(t.rbuf[0..n]);
+            if (copy) |c| @memcpy(c[@intCast(off)..][0..n], t.rbuf[0..n]);
             sink.write(sink.ptr, off, t.rbuf[0..n]) catch |err| return r.failWith(err);
             off += n;
         }
@@ -1305,6 +1344,9 @@ pub const Reading = struct {
             t.mutex.unlock(t.io);
             return r.failWith(error.PayloadHash);
         }
+        if (copy) |c| if (t.promote(r, c)) {
+            copy = null; // the entry owns it
+        };
         t.touch(r.name);
         t.mutex.lockUncancelable(t.io);
         t.stats.loaded += 1;
