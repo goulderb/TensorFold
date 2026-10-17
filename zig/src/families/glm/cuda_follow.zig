@@ -276,7 +276,7 @@ pub const Leader = struct {
     }
 
     pub fn verifyMasked(x: Leader, ids: []const u32, out: []u32, bits: []const u32) !void {
-        if (ids.len > engine.max_drafts + 1) return error.WindowTooWide;
+        if (ids.len > x.e.verifyPlan().drafts() + 1) return error.WindowTooWide;
         try sampler.validateMasks(bits, ids.len, x.e.c.vocab);
         try x.flush();
         try x.e.smp.bits.uploadAsync(0, std.mem.sliceAsBytes(bits), x.e.stream.handle);
@@ -520,6 +520,7 @@ test "leader draft state refusal fails the pair before sending a command" {
         }
     };
     var e: Engine = undefined;
+    e.settings = .{};
     e.pool = null;
     e.dflash = @ptrFromInt(256);
     e.seqs = .empty;

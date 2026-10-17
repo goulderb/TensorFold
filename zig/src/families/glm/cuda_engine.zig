@@ -17,6 +17,7 @@ const vision_binding = @import("cuda_vision_binding.zig");
 const vision_runtime = @import("cuda_vision_runtime.zig");
 const dflash_mod = @import("cuda_dflash.zig");
 const mia = @import("cuda_experts_mia.zig");
+const verify_plan = @import("cuda_verify_plan.zig");
 pub const persistence = @import("cuda_persistence.zig");
 pub const spill_payload = @import("cuda_spill_payload.zig");
 
@@ -56,14 +57,14 @@ test "converted KDA validates every TP rank from shared geometry" {
 pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
 
 /// The most drafts a chain holds (decode.DepthPolicy's top depth).
-pub const max_drafts = 3;
+pub const max_drafts = verify_plan.max_drafts;
 
 /// A prompt pass's chunk rows (decode.prefill's).
 pub const prompt_rows = fw.prefill_rows;
 
-/// A shared verify's max rows and streams: under hc_pre's 64-row block change, 8 streams of 4 rows.
-pub const shared_rows = 32;
-pub const max_shared = 8;
+/// Storage ceiling; verifyPlan selects the active row limit below hc_pre's 64-row change.
+pub const shared_rows = verify_plan.max_rows;
+pub const max_shared = verify_plan.max_streams;
 
 /// One stream's window of a shared verify: its slot, its ids, and its drawn tokens.
 pub const Part = struct { slot: u32, ids: []const u32, out: []u32 };
@@ -261,7 +262,9 @@ pub const Engine = struct {
         errdefer e.bd.deinit();
         e.bm = if (o.settings.kv_shard) try fw.Buffers.initOwned(d, &e.w, fw.window_rows, false, o.capacity) else try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bm.deinit();
-        if (with_mtp or settings.draft == .dflash2) e.bs = if (o.settings.kv_shard) try fw.Buffers.initSharedOwned(d, &e.w, shared_rows, o.capacity) else try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
+        const verify_rows = settings.dflash_verify.active(settings.draft == .dflash2).rows();
+        if (rank == 0 and settings.draft == .dflash2 and settings.dflash_verify == .dflash6) std.log.info("GLM DFlash verify plan: drafts=6 lane_rows=7 shared_rows=56", .{});
+        if (with_mtp or settings.draft == .dflash2) e.bs = if (o.settings.kv_shard) try fw.Buffers.initSharedOwned(d, &e.w, verify_rows, o.capacity) else try fw.Buffers.initShared(d, &e.w, verify_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
         errdefer if (e.dflash) |drafter| drafter.deinit();
         if (settings.draft == .dflash2) {
@@ -283,7 +286,7 @@ pub const Engine = struct {
         errdefer e.shared_buf.free();
         if (settings.draft == .dflash2) {
             var draft_problem: ?anyerror = null;
-            e.dflash = dflash_mod.DFlash.open(gpa, io, checkpoint, settings.draft_dir.?, max_shared, o.capacity, .{ .driver = d, .context = ctx, .stream = stream, .embed = e.w.embed, .lib = lib, .comm = comm, .rank = rank, .world = world, .kernels_dir = o.draft_kernels }) catch |err| blk: {
+            e.dflash = dflash_mod.DFlash.open(gpa, io, checkpoint, settings.draft_dir.?, max_shared, o.capacity, .{ .driver = d, .context = ctx, .stream = stream, .embed = e.w.embed, .lib = lib, .comm = comm, .rank = rank, .world = world, .kernels_dir = o.draft_kernels, .verify_plan = settings.dflash_verify }) catch |err| blk: {
                 draft_problem = err;
                 break :blk null;
             };
@@ -820,7 +823,7 @@ pub const Engine = struct {
         var ids: [shared_rows]u32 = undefined;
         var rows: usize = 0;
         for (parts, 0..) |p, i| {
-            if (p.ids.len == 0 or p.ids.len > fw.window_rows or rows + p.ids.len > shared_rows) return error.WindowTooWide;
+            if (p.ids.len == 0 or p.ids.len > 1 + e.verifyPlan().drafts() or rows + p.ids.len > b.rows) return error.WindowTooWide;
             for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
             try e.bind(p.slot);
             segs[i] = .{ .st = &e.cur.st, .row0 = rows, .rows = p.ids.len };
@@ -866,11 +869,15 @@ pub const Engine = struct {
         return e.mtp or e.dflash != null;
     }
 
+    pub fn verifyPlan(e: *const Engine) verify_plan.Plan {
+        return e.settings.dflash_verify.active(e.dflash != null);
+    }
+
     fn resolveDraftBatch(e: *const Engine, parts: []const DraftPart, out: *[max_shared]dflash_mod.BatchRequest) !void {
         const d = e.dflash orelse return error.NoDraftHead;
         if (parts.len == 0 or parts.len > max_shared) return error.BadDraftBatch;
         for (parts, 0..) |p, i| {
-            if (p.depth > max_drafts or p.position == 0) return error.BadDraftRequest;
+            if (p.depth > e.verifyPlan().drafts() or p.position == 0) return error.BadDraftRequest;
             const end = try e.slotPos(p.slot);
             if (p.position != end + 1) return error.PositionMismatch;
             out[i] = .{ .slot = p.slot, .end = end, .pending = p.pending, .depth = p.depth, .sampling = e.seqs.items[p.slot].?.sampling };
@@ -895,10 +902,10 @@ pub const Engine = struct {
     }
 
     pub fn draft(e: *Engine, from_prompt: bool, follow: []const u32, depth: usize, out: []u32) !usize {
-        if (depth > max_drafts or depth > out.len or follow.len == 0) return error.BadDraftRequest;
+        if (depth > e.verifyPlan().drafts() or depth > out.len or follow.len == 0) return error.BadDraftRequest;
         if (e.dflash) |drafter| return drafter.propose(e.slot, follow[follow.len - 1], e.cur.sampling, out[0..depth]);
         if (!e.mtp) return error.NoDraftHead;
-        if (depth > max_drafts) return error.TooDeep;
+        if (depth > verify_plan.Plan.baseline.drafts()) return error.TooDeep;
         var one: [1]fw.Rank = undefined;
         const f = e.view(&e.bm, &one);
         const D = e.c.hidden;

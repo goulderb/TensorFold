@@ -54,7 +54,7 @@ def main():
     root = 'zig/src/families/glm/'
     cache = ns.cache
     if ns.step == 'regression':
-        for file in ['cuda_checkpoint.zig', 'cuda_weight_precision.zig', 'cuda_weights_projs.zig', 'cuda_vision_weights.zig', 'cuda_vision_engine_memory.zig']:
+        for file in ['cuda_checkpoint.zig', 'cuda_weight_precision.zig', 'cuda_weights_projs.zig', 'cuda_vision_weights.zig', 'cuda_vision_engine_memory.zig', 'cuda_verify_plan_test.zig']:
             args = command(root + file, 'test', cache=cache)
             print(subprocess.list2cmdline(args), flush=True)
             subprocess.run(args, cwd=BASE, check=True)
@@ -65,6 +65,9 @@ def main():
             print(subprocess.list2cmdline(args), flush=True)
             subprocess.run(args, cwd=BASE, check=True)
         args = command(root + 'cuda_dflash_head_test.zig', 'test', cache=cache)
+        print(subprocess.list2cmdline(args), flush=True)
+        subprocess.run(args, cwd=BASE, check=True)
+        args = command(root + 'cuda_verify_plan_test.zig', 'test', cache=cache)
         print(subprocess.list2cmdline(args), flush=True)
         subprocess.run(args, cwd=BASE, check=True)
         return
@@ -78,6 +81,9 @@ def main():
             print(subprocess.list2cmdline(args), flush=True)
             subprocess.run(args, cwd=BASE, check=True)
         args = command(root + 'cuda_dflash_head_test.zig', 'test', linux=True, cache=cache)
+        print(subprocess.list2cmdline(args), flush=True)
+        subprocess.run(args, cwd=BASE, check=True)
+        args = command(root + 'cuda_verify_plan_test.zig', 'test', linux=True, cache=cache)
         print(subprocess.list2cmdline(args), flush=True)
         subprocess.run(args, cwd=BASE, check=True)
         return

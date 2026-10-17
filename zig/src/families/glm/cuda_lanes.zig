@@ -65,15 +65,16 @@ pub const Lanes = struct {
     pub fn facts(self: *const Lanes) lanes.Model {
         const drafting = self.x.e.drafting();
         const sharing = drafting and !self.alone;
+        const plan = self.x.e.verifyPlan();
         return .{
-            .exact_width = if (drafting) max_rows else 1,
+            .exact_width = if (drafting) @intCast(1 + plan.drafts()) else 1,
             .gpu_tokens = false,
             .mtp = drafting,
             .speculate = drafting,
             .speculate_early = false,
-            .drafts = engine.max_drafts,
+            .drafts = @intCast(plan.drafts()),
             .hidden_rows = sharing,
-            .batch_rows = if (sharing) engine.shared_rows else 0,
+            .batch_rows = if (sharing) @intCast(plan.rows()) else 0,
             .max_streams = if (sharing) engine.max_shared else 1,
             .draft_streams = sharing and self.x.e.dflash != null,
         };
@@ -151,7 +152,7 @@ pub const Lanes = struct {
     /// A prompt pass begins: the stream's slot bound and its sequence fresh; where the pass resumes (a kept state).
     fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
         const ids = s.prompt();
-        if (ids.len + s.max_new + max_rows >= self.x.e.capacity) return error.PromptTooLong;
+        if (ids.len + s.max_new + 1 + self.x.e.verifyPlan().drafts() >= self.x.e.capacity) return error.PromptTooLong;
         const free_slot = self.freeSlot();
         const gop = try self.lanes.getOrPut(self.x.e.gpa, s);
         if (!gop.found_existing) gop.value_ptr.* = .{ .slot = free_slot };
@@ -245,7 +246,7 @@ pub const Lanes = struct {
             if (w.parents != null) return error.TreesNotBuilt;
             const l = try self.bind(w.stream, null);
             const rows = w.rows();
-            if (rows > max_rows) return error.WindowTooWide;
+            if (rows > 1 + self.x.e.verifyPlan().drafts()) return error.WindowTooWide;
             if (w.held > l.held_n) return error.NoHeldDrafts;
             const pos = self.x.e.pos();
             for (w.positions, 0..) |p, r| if (p != pos + 1 + r) return error.PositionMismatch;
@@ -272,7 +273,7 @@ pub const Lanes = struct {
             if (w.parents != null) return error.TreesNotBuilt;
             const l = try self.bind(w.stream, null);
             const rows = w.rows();
-            if (rows > max_rows) return error.WindowTooWide;
+            if (rows > 1 + self.x.e.verifyPlan().drafts()) return error.WindowTooWide;
             if (w.held > l.held_n) return error.NoHeldDrafts;
             const pos = self.x.e.pos();
             for (w.positions, 0..) |p, r| if (p != pos + 1 + r) return error.PositionMismatch;
@@ -309,7 +310,7 @@ pub const Lanes = struct {
             const l = try self.bind(r.stream, if (r.rows) |rows| rows.len else null);
             if (r.position != self.x.e.pos() + 1) return error.PositionMismatch;
             if (r.lanes != null) return error.TreesNotBuilt;
-            const depth = @min(r.depth, engine.max_drafts);
+            const depth = @min(r.depth, self.x.e.verifyPlan().drafts());
             if (r.rows) |rows| {
                 for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
                 l.held_n = try self.x.draft(false, r.follow[0..rows.len], depth, &l.held);
@@ -324,12 +325,12 @@ pub const Lanes = struct {
 
     fn preflightDraft(self: *const Lanes, l: *const Lane, r: be.DraftRequest, base: usize) !DraftInput {
         if (r.lanes != null) return error.TreesNotBuilt;
-        if (r.depth > engine.max_drafts) return error.BadDraftRequest;
+        if (r.depth > self.x.e.verifyPlan().drafts()) return error.BadDraftRequest;
         const base_pos: u64 = @intCast(base);
         var end = r.start;
         var keep: ?usize = null;
         const pending = if (r.rows) |rows| blk: {
-            if (rows.len == 0 or rows.len > max_rows or r.follow.len < rows.len) return error.BadDraftRequest;
+            if (rows.len == 0 or rows.len > 1 + self.x.e.verifyPlan().drafts() or r.follow.len < rows.len) return error.BadDraftRequest;
             for (rows, 0..) |row, j| if (row != j) return error.TreesNotBuilt;
             end = std.math.add(u64, r.start, @as(u64, @intCast(rows.len))) catch return error.PositionMismatch;
             if (l.pending_rows) |available| {
@@ -426,6 +427,7 @@ test "DFlash publishes the actual held count through the existing lane shape cal
 
 test "DFlash facts enable batched head scheduling only while sharing" {
     var e: engine.Engine = undefined;
+    e.settings = .{};
     e.mtp = false;
     e.dflash = @ptrFromInt(256);
     var link: follow.Link = undefined;
@@ -443,6 +445,8 @@ test "DFlash facts enable batched head scheduling only while sharing" {
 
 test "DFlash draft preflight distinguishes accepted rows already committed by the core" {
     var e: engine.Engine = undefined;
+    e.settings = .{};
+    e.dflash = @ptrFromInt(256);
     e.c = .{};
     var link: follow.Link = undefined;
     const backend: Lanes = .{ .x = .{ .e = &e, .link = &link } };
@@ -461,6 +465,7 @@ test "DFlash draft preflight distinguishes accepted rows already committed by th
 
 test "a later invalid mixed draft request refuses before any bind or paired command" {
     var e: engine.Engine = undefined;
+    e.settings = .{};
     e.gpa = std.testing.allocator;
     e.c = .{};
     e.mtp = false;
@@ -492,6 +497,12 @@ test "a later invalid mixed draft request refuses before any bind or paired comm
     try std.testing.expectEqual(@as(usize, 20), second_seq.st.pos);
     try std.testing.expectEqual(@as(usize, 2), backend.lanes.getPtr(&first).?.held_n);
     try std.testing.expectEqual(@as(?usize, 2), backend.lanes.getPtr(&second).?.pending_rows);
+    e.settings.dflash_verify = .dflash6;
+    requests[1].depth = 7;
+    try std.testing.expectError(error.BadDraftRequest, b.draft(&requests));
+    try std.testing.expectEqual(@as(usize, 10), first_seq.st.pos);
+    try std.testing.expectEqual(@as(?usize, 2), backend.lanes.getPtr(&second).?.pending_rows);
+    e.settings.dflash_verify = .baseline;
     requests[1].depth = 1;
     requests[1].position = 23;
     try std.testing.expectError(error.PositionMismatch, b.draft(&requests));
