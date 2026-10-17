@@ -43,6 +43,29 @@ These donor revisions' license and notice files are retained beside this
 addendum. Source IDs identify provenance, not a promise that every original
 commit remains an ancestor after a rebase or cherry-pick.
 
+## NVIDIA GLM-5.3-Flash-FP4-Local support
+
+`zig/src/core/csf.zig` is a new implementation of the `csf_32x2_v1`
+compressed NVFP4 scale format documented by
+[Local Inference Lab](https://github.com/local-inference-lab) in
+`docs/csf-scale-blocks.md` of
+[their FlashInfer fork](https://github.com/local-inference-lab/flashinfer),
+commit `7e203806a82b588b9113f5a0866a028564847741`, Apache-2.0. No code from
+that repository is included. Its reference encoder and decoder
+(`scripts/encode_csf.py`) were used outside this tree only to verify the
+decoder against real checkpoint data. The test fixtures under
+`zig/src/core/fixtures/csf/` come from an independent encoder.
+
+`modelopt.zig`'s mixed-precision recipe table, `fp8_source.zig` and the GLM
+loader read NVIDIA's ModelOpt `MIXED_PRECISION` layout as published in
+[nvidia/GLM-5.3-Flash-FP4-Local](https://huggingface.co/nvidia/GLM-5.3-Flash-FP4-Local).
+`zig/src/core/fixtures/glm53_flash_fp4_local/config.json` and
+`zig/src/families/glm/fixtures/fp4-local-config.json` are copies of that
+checkpoint's `config.json` at revision
+`76348ddb2be2e35e39ecfc00e75dc07703f4f3d5`. The checkpoint is governed by the
+NVIDIA Open Model Agreement and its GLM-5.3-Flash base model by MIT. No
+weights are included.
+
 ## Mia's native arithmetic and captured kernels
 
 The donor is [MiaAI-Lab's GLM-5.3-Flash TensorFold recipe](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold),

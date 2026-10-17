@@ -1,4 +1,6 @@
 //! Lossless csf_32x2_v1 NVFP4 scale bytes, independent of checkpoint storage.
+//! New code implementing Local Inference Lab's documented format (flashinfer docs/csf-scale-blocks.md at 7e203806,
+//! Apache-2.0); credits in LICENSES/donors/README.md.
 
 const std = @import("std");
 
