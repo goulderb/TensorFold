@@ -18,6 +18,7 @@ pub fn effectiveDraft(mode: Drafter, enabled: bool) !Drafter {
 /// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
 pub const Settings = struct {
     kv: cache.Format = .bf16,
+    attn_fp8load: bool = false,
     weight_dense: precision.DensePolicy = .{},
     weight_head: precision.Head = .bf16,
     exl3_decode: cuda.exl3_experts.Decode = .scalar,
@@ -123,6 +124,12 @@ pub const Settings = struct {
                 return error.BadSetting;
             }
         }
+        if (get("TF_GLM_ATTN_FP8LOAD")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.attn_fp8load = true else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_ATTN_FP8LOAD: 0 or 1";
+                return error.BadSetting;
+            }
+        }
         if (get("TF_GLM_PREFILL_REDUCE")) |v| {
             if (std.mem.eql(u8, v, "split")) s.split = true else if (std.mem.eql(u8, v, "gather")) s.split = false else {
                 problem.* = "TF_GLM_PREFILL_REDUCE: split or gather";
@@ -167,7 +174,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 14,
+    layout: u32 = 15,
     world: u32,
     rank: u32,
     split: u32,
@@ -175,6 +182,7 @@ pub const Fingerprint = extern struct {
     pieces: u32,
     layers: u32, // TF_GLM_LAYERS (0: all)
     kv: u32,
+    attn_fp8load: u32 = 0,
     weight_dense: [32]u8 = @splat(0),
     weight_head: u32 = 0,
     exl3_decode: u32 = 0,
@@ -193,10 +201,11 @@ pub const Fingerprint = extern struct {
     program: [32]u8, // sha256 of this executable
     checkpoint: [64]u8, // the checkpoint folder's last name (the snapshot's revision), zero padded
 
-    pub const Field = enum { layout, rank, world, split, kda_wide, pieces, layers, kv, weight_dense, weight_head, exl3_decode, exl3_routed, draft, dflash_verify, draft_checkpoint, vision, kv_pool_tokens, kv_shard, spill, capacity, heat_high, heat_low, config, program, checkpoint };
+    pub const Field = enum { layout, rank, world, split, kda_wide, pieces, layers, kv, attn_fp8load, weight_dense, weight_head, exl3_decode, exl3_routed, draft, dflash_verify, draft_checkpoint, vision, kv_pool_tokens, kv_shard, spill, capacity, heat_high, heat_low, config, program, checkpoint };
 
     pub fn of(world: usize, rank: usize, s: Settings, capacity: usize, config: [32]u8, program: [32]u8, checkpoint_dir: []const u8) Fingerprint {
         var f: Fingerprint = .{ .world = @intCast(world), .rank = @intCast(rank), .split = @intFromBool(s.split), .kda_wide = @intFromBool(s.kda_wide), .pieces = s.pieces, .layers = s.layers, .kv = @backingInt(s.kv), .kv_pool_tokens = s.kv_pool_tokens, .kv_shard = @intFromBool(s.kv_shard), .capacity = capacity, .heat_high = if (s.heat) |b| b.high_c else 0, .heat_low = if (s.heat) |b| b.low_c else 0, .config = config, .program = program, .checkpoint = @splat(0) };
+        f.attn_fp8load = @intFromBool(s.attn_fp8load);
         f.spill = s.spill;
         f.weight_dense = s.weight_dense.digest();
         f.weight_head = @backingInt(s.weight_head);
@@ -220,7 +229,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
     for (all, 0..) |f, r| {
         if (f.layout != all[0].layout) return .{ .field = .layout, .rank = r };
         if (f.rank != r) return .{ .field = .rank, .rank = r };
-        inline for (.{ "world", "split", "kda_wide", "pieces", "layers", "kv", "weight_dense", "weight_head", "exl3_decode", "exl3_routed", "draft", "dflash_verify", "draft_checkpoint", "vision", "kv_pool_tokens", "kv_shard", "spill", "capacity", "heat_high", "heat_low", "config", "program", "checkpoint" }) |name| {
+        inline for (.{ "world", "split", "kda_wide", "pieces", "layers", "kv", "attn_fp8load", "weight_dense", "weight_head", "exl3_decode", "exl3_routed", "draft", "dflash_verify", "draft_checkpoint", "vision", "kv_pool_tokens", "kv_shard", "spill", "capacity", "heat_high", "heat_low", "config", "program", "checkpoint" }) |name| {
             if (!std.mem.eql(u8, std.mem.asBytes(&@field(f, name)), std.mem.asBytes(&@field(all[0], name))))
                 return .{ .field = @field(Fingerprint.Field, name), .rank = r };
         }
@@ -366,6 +375,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .pieces => "TF_GLM_OVERLAP_PIECES",
         .layers => "TF_GLM_LAYERS",
         .kv => "TF_GLM_KV",
+        .attn_fp8load => "TF_GLM_ATTN_FP8LOAD",
         .weight_dense => "TF_GLM_DENSE and TF_GLM_DENSE_{KDA,DSA,MLP,SHARED,MTP_EH}",
         .weight_head => "TF_GLM_HEAD",
         .exl3_decode => "TF_GLM_EXL3_DECODE",

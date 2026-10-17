@@ -37,6 +37,7 @@ pub const vision_probe = @import("cuda_vision_probe.zig");
 pub const vision_runtime = @import("cuda_vision_runtime.zig");
 
 test {
+    _ = @import("cuda_attn_fp8load_test.zig");
     _ = @import("cuda_verify_plan_test.zig");
     _ = @import("cuda_checkpoint.zig");
     _ = @import("cuda_weight_source_test.zig");
