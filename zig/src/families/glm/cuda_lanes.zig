@@ -75,6 +75,7 @@ pub const Lanes = struct {
             .hidden_rows = sharing,
             .batch_rows = if (sharing) engine.shared_rows else 0,
             .max_streams = if (sharing) engine.max_shared else 1,
+            .draft_streams = sharing and self.x.e.dflash != null,
         };
     }
 
@@ -303,6 +304,7 @@ pub const Lanes = struct {
     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const self = of(ptr);
         if (!self.x.e.drafting()) return error.NoDraftHead;
+        if (self.x.e.dflash != null) return self.draftBatch(requests);
         for (requests) |r| {
             const l = try self.bind(r.stream, if (r.rows) |rows| rows.len else null);
             if (r.position != self.x.e.pos() + 1) return error.PositionMismatch;
@@ -315,6 +317,81 @@ pub const Lanes = struct {
                 const first = self.value(r.first orelse return error.NoFirstToken);
                 l.held_n = try self.x.draft(true, &.{first}, depth, &l.held);
             }
+        }
+    }
+
+    const DraftInput = struct { pending: u32, keep: ?usize };
+
+    fn preflightDraft(self: *const Lanes, l: *const Lane, r: be.DraftRequest, base: usize) !DraftInput {
+        if (r.lanes != null) return error.TreesNotBuilt;
+        if (r.depth > engine.max_drafts) return error.BadDraftRequest;
+        const base_pos: u64 = @intCast(base);
+        var end = r.start;
+        var keep: ?usize = null;
+        const pending = if (r.rows) |rows| blk: {
+            if (rows.len == 0 or rows.len > max_rows or r.follow.len < rows.len) return error.BadDraftRequest;
+            for (rows, 0..) |row, j| if (row != j) return error.TreesNotBuilt;
+            end = std.math.add(u64, r.start, @as(u64, @intCast(rows.len))) catch return error.PositionMismatch;
+            if (l.pending_rows) |available| {
+                if (base_pos != r.start or rows.len > available) return error.NoDraftWindow;
+                keep = rows.len;
+            } else if (base_pos != end) return error.NoDraftWindow;
+            break :blk r.follow[rows.len - 1];
+        } else blk: {
+            if (l.pending_rows != null) return error.NoDraftWindow;
+            if (base_pos != r.start) return error.PositionMismatch;
+            const feed = r.first orelse return error.NoFirstToken;
+            break :blk switch (feed) {
+                .value => |token| token,
+                .handle => |h| handle: {
+                    if (h >= self.next or self.next - h > ring) return error.NoSuchToken;
+                    break :handle self.drawn[h % ring];
+                },
+            };
+        };
+        if (pending >= self.x.e.c.vocab) return error.BadDraftRequest;
+        if (r.position != (std.math.add(u64, end, 1) catch return error.PositionMismatch)) return error.PositionMismatch;
+        return .{ .pending = pending, .keep = keep };
+    }
+
+    fn draftBatch(self: *Lanes, requests: []const be.DraftRequest) !void {
+        if (requests.len == 0 or requests.len > engine.max_shared) return error.BadDraftBatch;
+        var lanes_by_request: [engine.max_shared]*Lane = undefined;
+        var pending: [engine.max_shared]u32 = undefined;
+        var keeps: [engine.max_shared]?usize = undefined;
+        var seen: [engine.max_shared]bool = @splat(false);
+        for (requests, 0..) |r, i| {
+            if (r.stream.isCancelled()) return error.Cancelled;
+            const l = self.lanes.getPtr(r.stream) orelse return error.UnknownStream;
+            if (l.slot >= engine.max_shared or seen[l.slot]) return error.BadDraftSlot;
+            seen[l.slot] = true;
+            const base = try self.x.e.slotPos(l.slot);
+            const input = try self.preflightDraft(l, r, base);
+            pending[i] = input.pending;
+            keeps[i] = input.keep;
+            lanes_by_request[i] = l;
+        }
+        for (requests, lanes_by_request[0..requests.len], keeps[0..requests.len]) |r, l, keep| {
+            _ = try self.bind(r.stream, keep);
+            if (try self.x.e.slotPos(l.slot) + 1 != r.position) return error.PositionMismatch;
+        }
+        var parts: [engine.max_shared]engine.DraftPart = undefined;
+        var original: [engine.max_shared]usize = undefined;
+        var count: usize = 0;
+        for (requests, lanes_by_request[0..requests.len], pending[0..requests.len], 0..) |r, l, token, i| {
+            if (r.depth == 0) continue;
+            parts[count] = .{ .slot = l.slot, .position = r.position, .pending = token, .depth = r.depth };
+            original[count] = i;
+            count += 1;
+        }
+        var results: [engine.max_shared]engine.DraftResult = @splat(.{});
+        if (count > 0) try self.x.draftBatch(parts[0..count], results[0..count]);
+        for (lanes_by_request[0..requests.len]) |l| l.held_n = 0;
+        for (results[0..count], original[0..count]) |result, i| {
+            if (requests[i].stream.isCancelled()) continue;
+            const l = lanes_by_request[i];
+            @memcpy(l.held[0..result.count], result.tokens[0..result.count]);
+            l.held_n = result.count;
         }
     }
 
@@ -345,4 +422,94 @@ test "DFlash publishes the actual held count through the existing lane shape cal
     try std.testing.expectEqual(@as(u32, 0), (try b.vtable.tree.?(b.ptr, &stream, e.gpa)).?.count);
     e.dflash = null;
     try std.testing.expectEqual(@as(?lanes.stream.Held, null), try b.vtable.tree.?(b.ptr, &stream, e.gpa));
+}
+
+test "DFlash facts enable batched head scheduling only while sharing" {
+    var e: engine.Engine = undefined;
+    e.mtp = false;
+    e.dflash = @ptrFromInt(256);
+    var link: follow.Link = undefined;
+    var backend: Lanes = .{ .x = .{ .e = &e, .link = &link } };
+    var cfg = try lanes.Config.init(std.testing.allocator, backend.facts(), max_rows, engine.max_drafts);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expect(cfg.family_streams and cfg.draft_streams);
+    backend.alone = true;
+    try std.testing.expect(!backend.facts().draft_streams);
+    backend.alone = false;
+    e.dflash = null;
+    e.mtp = true;
+    try std.testing.expect(!backend.facts().draft_streams);
+}
+
+test "DFlash draft preflight distinguishes accepted rows already committed by the core" {
+    var e: engine.Engine = undefined;
+    e.c = .{};
+    var link: follow.Link = undefined;
+    const backend: Lanes = .{ .x = .{ .e = &e, .link = &link } };
+    var stream: lanes.Stream = undefined;
+    const request: be.DraftRequest = .{ .stream = &stream, .follow = &.{ 11, 22 }, .rows = &.{ 0, 1 }, .start = 100, .position = 103, .depth = 1 };
+    const committed: Lane = .{ .slot = 0 };
+    const already = try backend.preflightDraft(&committed, request, 102);
+    try std.testing.expectEqual(@as(u32, 22), already.pending);
+    try std.testing.expectEqual(@as(?usize, null), already.keep);
+    const pending_window: Lane = .{ .slot = 0, .pending_rows = 3 };
+    const uncommitted = try backend.preflightDraft(&pending_window, request, 100);
+    try std.testing.expectEqual(@as(?usize, 2), uncommitted.keep);
+    try std.testing.expectError(error.NoDraftWindow, backend.preflightDraft(&committed, request, 101));
+    try std.testing.expectError(error.NoDraftWindow, backend.preflightDraft(&pending_window, request, 102));
+}
+
+test "a later invalid mixed draft request refuses before any bind or paired command" {
+    var e: engine.Engine = undefined;
+    e.gpa = std.testing.allocator;
+    e.c = .{};
+    e.mtp = false;
+    e.dflash = @ptrFromInt(256);
+    e.seqs = .empty;
+    defer e.seqs.deinit(std.testing.allocator);
+    var first_seq: @TypeOf(e.cur.*) = undefined;
+    first_seq.st.pos = 10;
+    var second_seq: @TypeOf(e.cur.*) = undefined;
+    second_seq.st.pos = 20;
+    try e.seqs.append(std.testing.allocator, &first_seq);
+    try e.seqs.append(std.testing.allocator, &second_seq);
+    var link: follow.Link = undefined;
+    var backend: Lanes = .{ .x = .{ .e = &e, .link = &link } };
+    defer backend.deinit();
+    var first: lanes.Stream = undefined;
+    first.cancel_check = null;
+    var second: lanes.Stream = undefined;
+    second.cancel_check = null;
+    try backend.lanes.put(std.testing.allocator, &first, .{ .slot = 0, .held_n = 2 });
+    try backend.lanes.put(std.testing.allocator, &second, .{ .slot = 1, .pending_rows = 2, .held_n = 1 });
+    const b = backend.backend();
+    var requests = [_]be.DraftRequest{
+        .{ .stream = &first, .follow = &.{}, .first = .{ .value = 1 }, .rows = null, .start = 10, .position = 11, .depth = 1 },
+        .{ .stream = &second, .follow = &.{2}, .rows = &.{0}, .start = 20, .position = 22, .depth = 4 },
+    };
+    try std.testing.expectError(error.BadDraftRequest, b.draft(&requests));
+    try std.testing.expectEqual(@as(usize, 10), first_seq.st.pos);
+    try std.testing.expectEqual(@as(usize, 20), second_seq.st.pos);
+    try std.testing.expectEqual(@as(usize, 2), backend.lanes.getPtr(&first).?.held_n);
+    try std.testing.expectEqual(@as(?usize, 2), backend.lanes.getPtr(&second).?.pending_rows);
+    requests[1].depth = 1;
+    requests[1].position = 23;
+    try std.testing.expectError(error.PositionMismatch, b.draft(&requests));
+    requests[1].position = 22;
+    requests[1].follow = &.{154880};
+    try std.testing.expectError(error.BadDraftRequest, b.draft(&requests));
+    requests[1].follow = &.{2};
+    backend.lanes.getPtr(&second).?.slot = 0;
+    try std.testing.expectError(error.BadDraftSlot, b.draft(&requests));
+    try std.testing.expectEqual(@as(usize, 10), first_seq.st.pos);
+    try std.testing.expectEqual(@as(usize, 20), second_seq.st.pos);
+    backend.lanes.getPtr(&second).?.slot = 1;
+    first_seq.st.pos = 12;
+    requests[0] = .{ .stream = &first, .follow = &.{ 1, 2 }, .rows = &.{ 0, 1 }, .start = 10, .position = 13, .depth = 1 };
+    requests[1].depth = 4;
+    try std.testing.expectError(error.BadDraftRequest, b.draft(&requests));
+    try std.testing.expectEqual(@as(usize, 12), first_seq.st.pos);
+    try std.testing.expectEqual(@as(usize, 20), second_seq.st.pos);
+    try std.testing.expectEqual(@as(usize, 2), backend.lanes.getPtr(&first).?.held_n);
+    try std.testing.expectEqual(@as(?usize, 2), backend.lanes.getPtr(&second).?.pending_rows);
 }

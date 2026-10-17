@@ -20,7 +20,7 @@ fn mm(k: Kernels, stream: cuda.Stream, p: b16.Proj, x: u64, ldx: usize, rows: us
         .q => |w| w,
     };
     if (q == .affine4 and !prompt) try b16.groupSums(k.set, stream, x, ldx, part, rows, dims);
-    const in: cuda.qlinear.Rows = .{ .x = x, .ldx = ldx, .sums = part, .part = part };
+    const in: cuda.qlinear.Rows = .{ .x = x, .ldx = ldx, .sums = part, .part = part, .native = .{ .ptr = part, .bytes = try q.nativeWorkspaceBytes(rows) } };
     if (prompt) {
         std.debug.assert(x % 16 == 0 and (rows == 1 or ldx % 8 == 0));
         return if (wide) k.linear.promptF32(stream, q, in, out, rows) else k.linear.prompt(stream, q, in, out, rows);

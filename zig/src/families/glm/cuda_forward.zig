@@ -49,11 +49,13 @@ pub const Modules = struct {
     q4: q4.Kernels,
     affine4: cuda.qlinear.Affine4Kernels,
     mia: ?mia.Kernels = null,
+    ck: ?cuda.ck.Ck = null,
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
         var m: Modules = undefined;
         m.mia = null;
+        m.ck = null;
         var n: usize = 0;
         errdefer for (m.mods[0..n]) |*x| x.unload();
         for (&m.mods, [_][]const u8{ k.glm_kda, k.glm_ops, k.experts, k.affine4_pack, k.glm_quant, k.qmm_group, k.glm_glue, k.qmm_prefill, k.lane_gemv }) |*x, image| {
@@ -85,7 +87,13 @@ pub const Modules = struct {
 
     /// What weights.load runs: the dense packing, and for the MTP head the quantizers and the 4-bit tiling.
     pub fn tools(m: *const Modules) weights.Tools {
-        return .{ .pack_dense = m.pack_dense, .quant = &m.quant, .q4 = &m.q4, .affine4 = &m.affine4, .modelopt = &m.modelopt };
+        return .{ .pack_dense = m.pack_dense, .quant = &m.quant, .q4 = &m.q4, .affine4 = &m.affine4, .modelopt = &m.modelopt, .ck = if (m.ck) |*c| c else null };
+    }
+
+    pub fn enableNativeDense(m: *Modules, d: *const cuda.Driver, ctx: *const cuda.Context) !void {
+        if (m.ck != null) return;
+        if (try ctx.capability() != 121) return error.UnsupportedNativeDenseDevice;
+        m.ck = try cuda.ck.Ck.load(d, 12, @intCast(try ctx.attribute(.multiprocessor_count)));
     }
 
     pub fn ops(m: *const Modules) cuda.Module {
@@ -93,6 +101,7 @@ pub const Modules = struct {
     }
 
     pub fn deinit(m: *Modules) void {
+        if (m.ck) |*c| c.unload();
         if (m.mia) |*k| k.unload();
         for (&m.mods) |*x| x.unload();
         m.affine4.deinit();
@@ -191,7 +200,7 @@ pub const Forward = struct {
 
     /// qlinear over every format a GLM checkpoint brings: NVFP4 (lane and prompt GEMM) and EXL3.
     pub fn linear(f: *const Forward) cuda.qlinear.Linear {
-        return .{ .affine4 = &f.m.affine4, .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt, .exl3 = &f.m.exl3 };
+        return .{ .affine4 = &f.m.affine4, .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt, .exl3 = &f.m.exl3, .ck = if (f.m.ck) |*c| c else null };
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.

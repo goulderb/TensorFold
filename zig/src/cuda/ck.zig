@@ -14,6 +14,57 @@ const Function = module.Function;
 const Stream = stream_.Stream;
 const Plan = grouped.Plan;
 
+pub const NativeMode = enum { fp8, nvfp4 };
+pub const numerical_identity = "ck-dense-v1:tensor-weight:row-activation:local-k:scale-floor-f32-normal:fp32-partials";
+pub const Fp8Matrix = struct { codes: u64, scale: f32, n: u32, k: u32, npad: u32 };
+pub const Fp4Matrix = struct { words: u64, scales: u64, scale: f32, n: u32, k: u32, npad: u32 };
+pub const Workspace = struct { ptr: u64 = 0, bytes: usize = 0 };
+
+pub const WorkspaceLayout = struct {
+    codes: usize = 0,
+    blocks: usize,
+    scales: usize,
+    partials: usize,
+    bytes: usize,
+};
+
+pub fn shape(n: usize, k: usize) !usize {
+    if (n == 0 or k == 0 or n > std.math.maxInt(i32) - 127 or k > std.math.maxInt(i32) or k % 64 != 0) return error.InvalidNativeShape;
+    return std.mem.alignForward(usize, n, 128);
+}
+
+pub fn workspaceLayout(mode: NativeMode, rows: usize, n: usize, k: usize) !WorkspaceLayout {
+    _ = try shape(n, k);
+    if (rows == 0 or rows > std.math.maxInt(i32)) return error.InvalidNativeShape;
+    const cells = try std.math.mul(usize, rows, k);
+    const codes = if (mode == .fp8) cells else cells / 2;
+    const blocks = std.mem.alignForward(usize, codes, 256);
+    const scales = std.mem.alignForward(usize, try std.math.add(usize, blocks, if (mode == .nvfp4) cells / 16 else 0), 256);
+    const partials = std.mem.alignForward(usize, try std.math.add(usize, scales, try std.math.mul(usize, rows, 4)), 256);
+    const sk = if (mode == .fp8) qmmf.splitK(n, k) else 1;
+    const part_bytes = if (sk > 1) try std.math.mul(usize, try std.math.mul(usize, rows, n), sk * 4) else 0;
+    return .{ .blocks = blocks, .scales = scales, .partials = partials, .bytes = try std.math.add(usize, partials, part_bytes) };
+}
+
+pub fn workspaceBytes(mode: NativeMode, rows: usize, n: usize, k: usize) !usize {
+    return (try workspaceLayout(mode, rows, n, k)).bytes;
+}
+
+pub fn tensorScale(amax: f32, mode: NativeMode) !f32 {
+    if (!std.math.isFinite(amax) or amax < 0) return error.InvalidNativeScale;
+    if (amax == 0) return 1;
+    return @max(amax / @as(f32, if (mode == .fp8) 448 else 2688), std.math.floatMin(f32));
+}
+
+fn validateDense(mode: NativeMode, rows: usize, n: usize, k: usize, npad: usize, scale: f32, x: u64, ldx: usize, out: u64, work: Workspace) !WorkspaceLayout {
+    if (npad != try shape(n, k)) return error.InvalidNativeShape;
+    if (!std.math.isFinite(scale) or scale < std.math.floatMin(f32)) return error.InvalidNativeScale;
+    if (x == 0 or out == 0 or x % 16 != 0 or ldx < k or ldx > std.math.maxInt(i32) or ldx % 8 != 0 or out % 4 != 0) return error.InvalidNativeStride;
+    const layout = try workspaceLayout(mode, rows, n, k);
+    if (work.ptr == 0 or work.ptr % 256 != 0 or work.bytes < layout.bytes) return error.NativeWorkspaceTooSmall;
+    return layout;
+}
+
 /// One fp32 factor: the checkpoint's runtimes multiply the input scale by the weight's in fp32.
 pub fn alpha(act: f32, scale: f32) f32 {
     return act * scale;
@@ -57,6 +108,13 @@ pub const Ck = struct {
     down_fn: Function,
     resident: [2]usize, // blocks the up and down kernels fill: per SM times SMs
     clusters: bool,
+    dense8: [2][8]Function,
+    dense8_reduce: Function,
+    dense4: [2]Function,
+    row_scales_fn: Function,
+    quant8_rows_fn: Function,
+    quant8_weight_fn: Function,
+    quant4_rows_fn: Function,
 
     pub fn load(d: *const Driver, capability_major: u32, sms: usize) !Ck {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -77,6 +135,18 @@ pub const Ck = struct {
         c.down_fn = try experts_mod.function("tf_ck4_down_f32");
         c.resident = .{ @max(1, try c.up_fn.occupancy(128, 0)) * sms, @max(1, try c.down_fn.occupancy(128, 0)) * sms };
         c.clusters = capability_major >= 9;
+        inline for (.{ "bf16", "f32" }, 0..) |ep, j| {
+            inline for (.{ "16", "16c", "32", "32c", "64", "64c", "64s", "64sc" }, 0..) |tile, i| {
+                c.dense8[j][i] = try lane_mod.function("tf_ck8_dense" ++ tile ++ "_" ++ ep);
+                try c.dense8[j][i].allowDynamicShared(32768);
+            }
+            c.dense4[j] = try experts_mod.function("tf_ck4_dense_" ++ ep);
+        }
+        c.dense8_reduce = try lane_mod.function("tf_ck8_dense_reduce");
+        c.row_scales_fn = try lane_mod.function("tf_ck_row_scales_or_nan");
+        c.quant8_rows_fn = try lane_mod.function("tf_ck_quant8_rows");
+        c.quant8_weight_fn = try lane_mod.function("tf_ck_quant8_weight");
+        c.quant4_rows_fn = try experts_mod.function("tf_ck_quant4_rows");
         return c;
     }
 
@@ -87,6 +157,102 @@ pub const Ck = struct {
 
     fn go(f: Function, s: Stream, grid: [3]usize, block: u32, shared: u32, a: *launch_.Args) !void {
         try launch_.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = block }, .shared = shared }, s, a);
+    }
+
+    pub fn quantizeWeight8(c: *const Ck, s: Stream, x: u64, n: usize, k: usize, scale: f32, out: u64) !void {
+        _ = try shape(n, k);
+        if (!std.math.isFinite(scale) or scale < std.math.floatMin(f32)) return error.InvalidNativeScale;
+        var a: launch_.Args = .{};
+        a.add(x);
+        a.add(@as(i32, @intCast(n)));
+        a.add(@as(i32, @intCast(k)));
+        a.add(inverse(scale));
+        a.add(out);
+        try go(c.quant8_weight_fn, s, .{ (n * (k / 16) + 127) / 128, 1, 1 }, 128, 0, &a);
+    }
+
+    pub fn quantizeWeight4(c: *const Ck, s: Stream, x: u64, n: usize, k: usize, scale: f32, codes: u64, scales: u64) !void {
+        _ = try shape(n, k);
+        if (!std.math.isFinite(scale) or scale < std.math.floatMin(f32)) return error.InvalidNativeScale;
+        var a: launch_.Args = .{};
+        a.add(x);
+        for ([_]usize{ k, n, k }) |v| a.add(@as(i32, @intCast(v)));
+        a.add(inverse(scale));
+        a.add(codes);
+        a.add(scales);
+        try go(c.quant4_fn, s, .{ (n * (k / 16) + 127) / 128, 1, 1 }, 128, 0, &a);
+    }
+
+    fn quantizeRows(c: *const Ck, s: Stream, mode: NativeMode, x: u64, ldx: usize, rows: usize, k: usize, work: Workspace, l: WorkspaceLayout) !void {
+        var a: launch_.Args = .{};
+        a.add(x);
+        a.add(@as(i32, @intCast(ldx)));
+        a.add(@as(i32, @intCast(k)));
+        a.add(@as(f32, if (mode == .fp8) 448 else 2688));
+        a.add(work.ptr + l.scales);
+        try go(c.row_scales_fn, s, .{ rows, 1, 1 }, 256, 0, &a);
+        var q: launch_.Args = .{};
+        q.add(x);
+        q.add(@as(i32, @intCast(ldx)));
+        q.add(@as(i32, @intCast(rows)));
+        q.add(@as(i32, @intCast(k)));
+        q.add(work.ptr + l.scales);
+        q.add(work.ptr);
+        if (mode == .nvfp4) q.add(work.ptr + l.blocks);
+        try go(if (mode == .fp8) c.quant8_rows_fn else c.quant4_rows_fn, s, .{ (rows * (k / 16) + 127) / 128, 1, 1 }, 128, 0, &q);
+    }
+
+    pub fn matmul8(c: *const Ck, s: Stream, w: Fp8Matrix, x: u64, ldx: usize, rows: usize, work: Workspace, out: u64, kind: qmmf.Out) !void {
+        const l = try validateDense(.fp8, rows, w.n, w.k, w.npad, w.scale, x, ldx, out, work);
+        if (w.codes == 0 or w.codes % 16 != 0) return error.InvalidNativeWeight;
+        try c.quantizeRows(s, .fp8, x, ldx, rows, w.k, work, l);
+        const sk = qmmf.splitK(w.n, w.k);
+        const cluster = sk > 1 and c.clusters;
+        const bm: usize = qmmf.bucket(rows);
+        const ti: usize = if (bm == 16) 0 else if (bm == 32) 1 else if (rows % 64 == 0) 2 else 3;
+        const f = c.dense8[@intFromBool(kind == .f32)][ti * 2 + @intFromBool(cluster)];
+        const rows_t = (rows + bm - 1) / bm;
+        const band = @max(1, @min(rows_t, (12 << 20) / (bm * w.k)));
+        var a: launch_.Args = .{};
+        a.add(work.ptr);
+        a.add(w.codes);
+        a.add(w.scale);
+        a.add(out);
+        a.add(work.ptr + l.partials);
+        for ([_]usize{ rows, w.n, w.k, sk, band }) |v| a.add(@as(i32, @intCast(v)));
+        a.add(work.ptr + l.scales);
+        try launch_.launch(f, .{
+            .grid = .{ .x = @intCast(rows_t * ((w.n + 63) / 64)), .z = sk },
+            .block = .{ .x = 128 },
+            .shared = @intCast(4 * (bm * 64 + 4096)),
+            .cluster = if (cluster) .{ .z = sk } else null,
+        }, s, &a);
+        if (sk > 1 and !cluster) {
+            const total = rows * w.n;
+            var r: launch_.Args = .{};
+            r.add(work.ptr + l.partials);
+            r.add(out);
+            r.add(@as(i64, @intCast(total)));
+            r.add(@as(i32, @intCast(w.n)));
+            r.add(@as(i32, @intCast(sk)));
+            r.add(w.scale);
+            r.add(work.ptr + l.scales);
+            r.add(@as(i32, @intFromBool(kind == .f32)));
+            try go(c.dense8_reduce, s, .{ (total + 255) / 256, 1, 1 }, 256, 0, &r);
+        }
+    }
+
+    pub fn matmul4(c: *const Ck, s: Stream, w: Fp4Matrix, x: u64, ldx: usize, rows: usize, work: Workspace, out: u64, kind: qmmf.Out) !void {
+        const l = try validateDense(.nvfp4, rows, w.n, w.k, w.npad, w.scale, x, ldx, out, work);
+        if (w.words == 0 or w.words % 16 != 0 or w.scales == 0 or w.scales % 4 != 0) return error.InvalidNativeWeight;
+        try c.quantizeRows(s, .nvfp4, x, ldx, rows, w.k, work, l);
+        var a: launch_.Args = .{};
+        for ([_]u64{ work.ptr, work.ptr + l.blocks, w.words, w.scales, work.ptr + l.scales }) |p| a.add(p);
+        a.add(w.scale);
+        for ([_]usize{ rows, w.k, w.n }) |v| a.add(@as(i32, @intCast(v)));
+        a.add(out);
+        const units = ((rows + 15) / 16) * ((w.n + 63) / 64);
+        try go(c.dense4[@intFromBool(kind == .f32)], s, .{ @max(1, @min((units + 3) / 4, c.resident[1])), 1, 1 }, 128, 0, &a);
     }
 
     /// bf16 rows [m, k] (`ldx` apart) to e4m3(x / act) at `out` [m, k], in the FP8 weights' fragment order.
@@ -208,4 +374,70 @@ test "the factors and the row bytes" {
     try std.testing.expectEqual(@as(f32, 0.5) * @as(f32, 0.25), alpha(0.5, 0.25));
     try std.testing.expectEqual(@as(usize, 4 * 512 + 4 * 64), rowsBytes(4, 1024));
     try std.testing.expectEqual([2]usize{ 2 * 64 * 1024 / 2, 2 * 64 * 64 }, Ck.packedBytes(2, 64, 1024));
+}
+
+test "native scales are finite for zero and subnormal sources and refuse nonfinite tensors" {
+    const t = std.testing;
+    try t.expectEqual(@as(f32, 1), try tensorScale(0, .fp8));
+    try t.expectEqual(@as(f32, 1), try tensorScale(0, .nvfp4));
+    try t.expectEqual(@as(f32, 0.5), try tensorScale(224, .fp8));
+    try t.expectEqual(@as(f32, 0.5), try tensorScale(1344, .nvfp4));
+    try t.expectEqual(std.math.floatMin(f32), try tensorScale(@as(f32, @bitCast(@as(u32, 1))), .fp8));
+    try t.expectError(error.InvalidNativeScale, tensorScale(std.math.inf(f32), .fp8));
+    try t.expectError(error.InvalidNativeScale, tensorScale(std.math.nan(f32), .nvfp4));
+}
+
+test "native workspaces contain separate codes scales and split partials for GLM tails" {
+    for ([_]usize{ 160, 12576 }) |n| {
+        try std.testing.expectEqual(std.mem.alignForward(usize, n, 128), try shape(n, 4096));
+        inline for (.{ NativeMode.fp8, NativeMode.nvfp4 }) |mode| {
+            const l = try workspaceLayout(mode, 33, n, 4096);
+            try std.testing.expect(l.blocks >= 33 * 4096 / (if (mode == .fp8) @as(usize, 1) else 2));
+            try std.testing.expect(l.scales >= l.blocks + (if (mode == .nvfp4) @as(usize, 33 * 4096 / 16) else 0));
+            try std.testing.expect(l.partials >= l.scales + 33 * 4);
+            try std.testing.expect(l.bytes >= l.partials);
+        }
+    }
+    try std.testing.expectError(error.InvalidNativeShape, workspaceBytes(.fp8, 0, 160, 4096));
+    try std.testing.expectError(error.InvalidNativeShape, shape(160, 127));
+}
+
+test "native dense refuses invalid buffers before launching and preserves the strided launch ABI" {
+    const abi = @import("abi.zig");
+    const Fake = struct {
+        var calls: usize = 0;
+        var seen: [3]usize = undefined;
+        var stride: i32 = 0;
+        var dims: [3]i32 = undefined;
+        fn value(comptime T: type, a: [*]?*anyopaque, i: usize) T {
+            return @as(*const T, @ptrCast(@alignCast(a[i].?))).*;
+        }
+        fn launch(f: abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) abi.Result {
+            const id = @intFromPtr(f.?);
+            seen[calls] = id;
+            calls += 1;
+            if (id == 1) stride = value(i32, args.?, 1);
+            if (id == 3) dims = .{ value(i32, args.?, 5), value(i32, args.?, 6), value(i32, args.?, 7) };
+            return 0;
+        }
+    };
+    var d: Driver = .{ .lib = undefined, .api = undefined };
+    d.api.cuLaunchKernel = Fake.launch;
+    const s: Stream = .{ .d = &d, .handle = null };
+    var c: Ck = undefined;
+    c.clusters = false;
+    c.row_scales_fn = .{ .d = &d, .handle = @ptrFromInt(1) };
+    c.quant8_rows_fn = .{ .d = &d, .handle = @ptrFromInt(2) };
+    c.dense8[1][0] = .{ .d = &d, .handle = @ptrFromInt(3) };
+    const w: Fp8Matrix = .{ .codes = 256, .scale = 0.5, .n = 160, .k = 128, .npad = 256 };
+    const bytes = try workspaceBytes(.fp8, 3, 160, 128);
+    Fake.calls = 0;
+    try std.testing.expectError(error.NativeWorkspaceTooSmall, c.matmul8(s, w, 4096, 136, 3, .{ .ptr = 12288, .bytes = bytes - 1 }, 8192, .f32));
+    try std.testing.expectError(error.InvalidNativeStride, c.matmul8(s, w, 4096, 129, 3, .{ .ptr = 12288, .bytes = bytes }, 8192, .f32));
+    try std.testing.expectError(error.InvalidNativeStride, c.matmul8(s, w, 4096, @as(usize, 1) << 31, 3, .{ .ptr = 12288, .bytes = bytes }, 8192, .f32));
+    try std.testing.expectEqual(@as(usize, 0), Fake.calls);
+    try c.matmul8(s, w, 4096, 136, 3, .{ .ptr = 12288, .bytes = bytes }, 8192, .f32);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3 }, &Fake.seen);
+    try std.testing.expectEqual(@as(i32, 136), Fake.stride);
+    try std.testing.expectEqual([3]i32{ 3, 160, 128 }, Fake.dims);
 }

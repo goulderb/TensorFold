@@ -24,9 +24,9 @@ __device__ __forceinline__ void unpack8(const uint4 u, float (&f)[8]) {
 }  // namespace tf_ck4
 
 // Row r's 16-input block b: an e4m3 scale e4m3(g * amax / 6) at scales[r][b], codes e2m1(x * g / scale) at codes[r].
-extern "C" __global__ void __launch_bounds__(128)
-    tf_ck_quant4(const __nv_bfloat16* __restrict__ x, int ldx, int M, int K, float g, uint8_t* __restrict__ codes,
-                 uint8_t* __restrict__ scales) {
+template <bool ROW>
+__device__ __forceinline__ void quant4(const __nv_bfloat16* __restrict__ x, int ldx, int M, int K, float g,
+                                     const float* row_scales, uint8_t* __restrict__ codes, uint8_t* __restrict__ scales) {
     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;  // one thread a block of 16
     if (i >= static_cast<long long>(M) * (K / 16)) return;
     const int row = static_cast<int>(i / (K / 16)), blk = static_cast<int>(i % (K / 16));
@@ -37,12 +37,18 @@ extern "C" __global__ void __launch_bounds__(128)
     float amax = 0.0f;
 #pragma unroll
     for (int i = 0; i < 16; ++i) amax = fmaxf(amax, fabsf(f[i]));
+    if constexpr (ROW) g = __fdiv_rn(1.0f, row_scales[row]);
     const nvfp4q::Scale sc = nvfp4q::block_scale(amax, g);
     uint32_t w[2] = {0u, 0u};
 #pragma unroll
     for (int i = 0; i < 16; ++i) w[i / 8] |= nvfp4q::e2m1(f[i] * sc.mul) << (4 * (i % 8));
     *reinterpret_cast<uint2*>(codes + static_cast<size_t>(row) * (K / 2) + blk * 8) = make_uint2(w[0], w[1]);
     scales[static_cast<size_t>(row) * (K / 16) + blk] = static_cast<uint8_t>(sc.sf8);
+}
+
+extern "C" __global__ void __launch_bounds__(128)
+    tf_ck_quant4(const __nv_bfloat16* x, int ldx, int M, int K, float g, uint8_t* codes, uint8_t* scales) {
+    quant4<false>(x, ldx, M, K, g, nullptr, codes, scales);
 }
 
 // Experts' bytes [E][n][ks/2] (inputs k0 ..) to words [E][n/64][k/64][8][32][2]: lane (g, t) of tile j, column 8j + g.
@@ -72,19 +78,22 @@ extern "C" __global__ void __launch_bounds__(256)
 }
 
 // A warp: a plan item's pairs (16 at most) by 64 columns; EPI 1 relu^2 of bf16(alpha_e sum) to bf16, EPI 0 fp32 sums.
-template <int EPI>
+template <int EPI, bool DENSE = false>
 __device__ __forceinline__ void grouped(const uint8_t* __restrict__ codes, const uint8_t* __restrict__ xs, int slots,
                                         const uint32_t* __restrict__ w, const uint8_t* __restrict__ ws,
                                         const float* __restrict__ alpha, int K, int N, const int* __restrict__ items,
                                         const int* __restrict__ counts, const int* __restrict__ members,
-                                        void* __restrict__ out) {
-    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, NB = N / 64, KG = K / 64;
-    const int units = __ldg(counts) * NB;
+                                        void* __restrict__ out, int M = 0, float weight_scale = 1.0f) {
+    const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3, NB = (N + (DENSE ? 63 : 0)) / 64, KG = K / 64;
+    const int units = (DENSE ? (M + 15) / 16 : __ldg(counts)) * NB;
     for (int unit = blockIdx.x * 4 + (threadIdx.x >> 5); unit < units; unit += gridDim.x * 4) {
         const int it = unit / NB, cb = unit - it * NB;
-        const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+        const int e = DENSE ? 0 : __ldg(items + 3 * it);
+        const int first = DENSE ? it * 16 : __ldg(items + 3 * it + 1);
+        const int cnt = DENSE ? min(16, M - first) : __ldg(items + 3 * it + 2);
         const bool v0 = g < cnt, v1 = g + 8 < cnt;
-        const int p0 = v0 ? __ldg(members + first + g) : 0, p1 = v1 ? __ldg(members + first + g + 8) : 0;
+        const int p0 = v0 ? (DENSE ? first + g : __ldg(members + first + g)) : 0;
+        const int p1 = v1 ? (DENSE ? first + g + 8 : __ldg(members + first + g + 8)) : 0;
         const int x0 = slots ? p0 / slots : p0, x1 = slots ? p1 / slots : p1;
         const uint8_t* c0 = codes + static_cast<size_t>(x0) * (K / 2);
         const uint8_t* c1 = codes + static_cast<size_t>(x1) * (K / 2);
@@ -111,17 +120,24 @@ __device__ __forceinline__ void grouped(const uint8_t* __restrict__ codes, const
                 mma4::mma_fp4(acc[j], a, b.x, b.y, sa, __ldg(sw + j * 8 + g));
             }
         }
-        const float al = __ldg(alpha + e);
+        const float al = DENSE ? weight_scale : __ldg(alpha + e);
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
             if (!(h ? v1 : v0)) continue;
             const size_t row = static_cast<size_t>(h ? p1 : p0) * N;
+            const float factor = DENSE ? __ldg(alpha + (h ? p1 : p0)) * al : al;
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const int col = cb * 64 + j * 8 + 2 * t;
-                const float a0 = acc[j][2 * h] * al, a1 = acc[j][2 * h + 1] * al;
+                const float a0 = acc[j][2 * h] * factor, a1 = acc[j][2 * h + 1] * factor;
                 if constexpr (EPI == 0) {
-                    *reinterpret_cast<float2*>(reinterpret_cast<float*>(out) + row + col) = make_float2(a0, a1);
+                    if constexpr (DENSE) {
+                        if (col < N) static_cast<float*>(out)[row + col] = a0;
+                        if (col + 1 < N) static_cast<float*>(out)[row + col + 1] = a1;
+                    } else *reinterpret_cast<float2*>(reinterpret_cast<float*>(out) + row + col) = make_float2(a0, a1);
+                } else if constexpr (EPI == 2) {
+                    if (col < N) static_cast<__nv_bfloat16*>(out)[row + col] = __float2bfloat16_rn(a0);
+                    if (col + 1 < N) static_cast<__nv_bfloat16*>(out)[row + col + 1] = __float2bfloat16_rn(a1);
                 } else {
                     const float u0 = fmaxf(tf_ck4::bf(a0), 0.0f), u1 = fmaxf(tf_ck4::bf(a1), 0.0f);
                     *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(out) + row + col) =
@@ -142,3 +158,18 @@ __device__ __forceinline__ void grouped(const uint8_t* __restrict__ codes, const
     }
 TF_CK4(tf_ck4_up_relu2, 1)
 TF_CK4(tf_ck4_down_f32, 0)
+
+#define TF_CK4_DENSE(NAME, EPI) \
+    extern "C" __global__ void __launch_bounds__(128) \
+        NAME(const uint8_t* codes, const uint8_t* xs, const uint32_t* w, const uint8_t* ws, \
+             const float* row_scales, float weight_scale, int M, int K, int N, void* out) { \
+        grouped<EPI, true>(codes, xs, 0, w, ws, row_scales, K, N, nullptr, nullptr, nullptr, out, M, weight_scale); \
+    }
+TF_CK4_DENSE(tf_ck4_dense_bf16, 2)
+TF_CK4_DENSE(tf_ck4_dense_f32, 0)
+
+extern "C" __global__ void __launch_bounds__(128)
+    tf_ck_quant4_rows(const __nv_bfloat16* x, int ldx, int M, int K, const float* row_scales,
+                     uint8_t* codes, uint8_t* scales) {
+    quant4<true>(x, ldx, M, K, 0.0f, row_scales, codes, scales);
+}

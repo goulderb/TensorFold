@@ -28,6 +28,14 @@ current lane interface. The returned count can be smaller. The target sampler
 and acceptance loop decide which proposals to keep. Checkpoint configuration
 and weight contents enter paired startup and spill identity.
 
+The lane backend submits active DFlash requests in one paired command. It packs
+arbitrary physical slots into the matching one-through-eight-lane captured
+graph, merges the rank-major candidate gather, and selects with each lane's own
+sampling state. Zero-depth requests commit accepted rows without proposing.
+The whole collection is checked before any lane commit, and held proposals are
+published after the entire batch succeeds. Rank 0 logs a new maximum packed
+width only when a wider graph succeeds.
+
 `mia-mcg4` requires routed 4-bit MCG EXL3, hidden size 4096 and local expert
 width 1024. Unsupported books, widths, full-EXL3 shared experts and non-EXL3
 routed weights are refused. The existing shared expert fill remains in use.
@@ -90,3 +98,32 @@ image input through `Info.vision`. The two paths share the existing request
 lifetime and server boundaries. GLM spill and Nemotron compact snapshots retain
 separate family adapters over the shared tier. Imported execution modes remain
 opt-in; the integration does not establish new GPU qualification.
+
+## Native dense arithmetic
+
+`TF_GLM_DENSE` and its five family overrides also accept `fp8_native` and
+`nvfp4_native`. These explicit modes extend the shared upstream CK operators.
+They currently require sm121. Existing `fp8` and `nvfp4` modes retain compressed
+weights with BF16 MMA operands; the new modes use FP8 or block-scaled FP4
+operands for both weights and activations. Dense defaults remain BF16, and the
+output-head policy is independent.
+
+Native FP8 converts each eligible rank-local BF16 matrix using one tensor
+scale. Native NVFP4 uses one global weight scale and the format's sixteen-value
+block scales. The shared CK packer owns its distinct word layout. Activations
+use dynamic row scales, so another lane cannot change a row's quantization.
+Zero rows use scale one, small scales have an FP32 normal floor, and nonfinite
+activation rows produce NaN outputs. Nonfinite weight sources are refused.
+
+Both modes provide BF16 outputs and unrounded FP32 tensor-parallel partials.
+Execution frames own bounded quantization scratch; native modes can increase
+its size. The mode and numerical version enter paired startup and spill
+identity. Startup reports materialized native matrices by family on each rank.
+Stored quantized checkpoint tensors retain their representation, so a requested
+native policy can convert no matrices. Verify those counts before comparing it.
+
+The model-free device check is `tf-cuda-test ck-dense`. It covers packing,
+GLM output tails, sampled numerical references, strided input, row/batch
+invariance, BF16/FP32 outputs and the existing scalar CK8 interface. The command
+must run on the GPU before the native modes are qualified. CPU compilation and
+mock launch checks do not establish output quality or performance.

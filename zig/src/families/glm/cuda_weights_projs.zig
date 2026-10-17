@@ -52,12 +52,61 @@ fn nvfp4Projection(L: *W.Loader, name: []const u8, n: usize, k: usize, source: u
     return .{ .q = .{ .nvfp4 = cuda.nvfp4.weight(words, tiles, scale, n, k) } };
 }
 
+fn nativeProjection(L: *W.Loader, name: []const u8, n: usize, k: usize, mode: cuda.ck.NativeMode) !b16.Proj {
+    const npad = try cuda.ck.shape(n, k);
+    const ck = L.tools.ck orelse return error.NoNativeDenseKernels;
+    var amax: f32 = 0;
+    for (0..n * k) |i| {
+        const bits = @as(u16, L.host.items[2 * i]) | (@as(u16, L.host.items[2 * i + 1]) << 8);
+        const value: f32 = @bitCast(@as(u32, bits) << 16);
+        if (!std.math.isFinite(value)) return error.NonfiniteDenseSource;
+        amax = @max(amax, @abs(value));
+    }
+    const scale = try cuda.ck.tensorScale(amax, mode);
+    var source = try cuda.DeviceBuffer.fromHost(L.d, L.host.items);
+    defer source.free();
+    L.host.clearRetainingCapacity();
+    var raw = try cuda.DeviceBuffer.alloc(L.d, npad * k / (if (mode == .fp8) @as(usize, 1) else 2));
+    defer raw.free();
+    var launched = false;
+    defer if (launched) L.stream.synchronize() catch {};
+    launched = true;
+    try raw.fill8(0, L.stream.handle);
+    if (mode == .fp8) {
+        const pack = L.tools.modelopt orelse return error.NoModeloptPacker;
+        const codes = try owned(L, name, "ck8.codes", npad * k);
+        try ck.quantizeWeight8(L.stream, source.ptr, n, k, scale, raw.ptr);
+        try pack.fp8Lane(L.stream, raw.ptr, codes, n, k);
+        try L.stream.synchronize();
+        launched = false;
+        return .{ .q = .{ .ck8 = .{ .codes = codes, .scale = scale, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad) } } };
+    }
+    var scales = try cuda.DeviceBuffer.alloc(L.d, npad * k / 16);
+    defer scales.free();
+    defer if (launched) L.stream.synchronize() catch {};
+    try scales.fill8(0, L.stream.handle);
+    const words = try owned(L, name, "ck4.words", npad * k / 2);
+    const tiles = try owned(L, name, "ck4.scales", npad * k / 16);
+    try ck.quantizeWeight4(L.stream, source.ptr, n, k, scale, raw.ptr, scales.ptr);
+    try ck.pack(L.stream, raw.ptr, scales.ptr, 1, npad, k, 0, k, words, tiles);
+    try L.stream.synchronize();
+    launched = false;
+    return .{ .q = .{ .ck4 = .{ .words = words, .scales = tiles, .scale = scale, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad) } } };
+}
+
 pub fn finish(L: *W.Loader, group: precision.Group, comptime fmt: []const u8, args: anytype, n: usize, k: usize) !b16.Proj {
     const selected = L.tools.precision.dense.get(group);
     if (selected == .bf16) return .{ .b16 = try L.put(fmt, args) };
     const elements = std.math.mul(usize, n, k) catch return error.InvalidDenseShape;
     const source_bytes = std.math.mul(usize, elements, 2) catch return error.InvalidDenseShape;
     if (n == 0 or k == 0 or n > std.math.maxInt(i32) or k > std.math.maxInt(i32) or k % 64 != 0 or (selected == .fp8 and k % 128 != 0) or L.host.items.len != source_bytes) return error.InvalidDenseShape;
+    if (selected == .fp8_native or selected == .nvfp4_native) {
+        const name = try std.fmt.allocPrint(L.gpa, fmt, args);
+        defer L.gpa.free(name);
+        const result = try nativeProjection(L, name, n, k, if (selected == .fp8_native) .fp8 else .nvfp4);
+        L.w.native_conversions[@backingInt(group)] += 1;
+        return result;
+    }
     if (selected == .nvfp4) {
         if (L.tools.modelopt == null) return error.NoModeloptPacker;
         for (0..elements) |i| {

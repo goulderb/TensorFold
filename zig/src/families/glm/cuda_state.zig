@@ -88,8 +88,35 @@ pub fn mixedPartBytes(w: *const weights.Weights, rows: usize) usize {
         mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), shape.n, shape.k));
         mm = @max(mm, rows * (shape.k / 64) * 4);
         mm = @max(mm, lanePartBytes(rows, shape.n, shape.k));
+        const mode = w.precision.dense.get(shape.group);
+        if (mode == .fp8_native or mode == .nvfp4_native) {
+            mm = @max(mm, cuda.ck.workspaceBytes(if (mode == .fp8_native) .fp8 else .nvfp4, rows, shape.n, shape.k) catch unreachable);
+        }
     }
     return mm;
+}
+
+test "native projection workspaces fit the physical arena for every TP2 shape and row bucket" {
+    const Config = @import("config.zig").Config;
+    const Share = @import("cuda_shard.zig").Share;
+    for (0..2) |rank| {
+        const c = Config{};
+        var w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try Share.of(&c, rank, 2) };
+        for ([_]usize{ 1, 8, 32, 2048 }) |rows| {
+            const baseline = mixedPartBytes(&w, rows);
+            inline for (.{ precision.Dense.fp8_native, precision.Dense.nvfp4_native }) |mode| {
+                w.precision.dense = .uniform(mode);
+                const allocated = mixedPartBytes(&w, rows);
+                try std.testing.expect(allocated >= baseline);
+                for (projectionShapes(&w)) |s| {
+                    const required = try cuda.ck.workspaceBytes(if (mode == .fp8_native) .fp8 else .nvfp4, rows, s.n, s.k);
+                    try std.testing.expect(required <= allocated);
+                }
+            }
+            w.precision.dense = .{};
+            try std.testing.expectEqual(baseline, mixedPartBytes(&w, rows));
+        }
+    }
 }
 
 /// Scratch for windows of up to `rows` rows (the Python family's Buffers): a prompt buffer (`prefill`) or a decode's.
