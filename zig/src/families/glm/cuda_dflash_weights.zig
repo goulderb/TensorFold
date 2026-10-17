@@ -6,7 +6,7 @@ const quant = @import("cuda_dflash_quantize.zig");
 const mm = @import("cuda_dflash_matmuls.zig");
 const dc = @import("cuda_dflash_config.zig");
 const Source = enum { model, dflash2 };
-const Slice = struct { axis: usize, start: usize, len: usize };
+pub const Slice = struct { axis: usize, start: usize, len: usize };
 fn sliceFor(name: []const u8, rank: dc.Rank) !?Slice {
     var q0: usize = 0;
     var k0: usize = 0;
@@ -57,6 +57,28 @@ fn decode(gpa: std.mem.Allocator, t: core.checkpoint.Tensor, cut: ?Slice) ![]u16
     }
     return out;
 }
+fn decodeMxfp8(gpa: std.mem.Allocator, ck: *core.Checkpoint, t: core.checkpoint.Tensor, cut: ?Slice) ![]u16 {
+    if (!ck.has("lm_head.weight_scale")) return error.UnsupportedDraftDtype;
+    const scale = try ck.get("lm_head.weight_scale");
+    if (scale.dtype != .u8 and scale.dtype != .f8_e8m0) return error.UnsupportedDraftDtype;
+    if (cut) |c| if (c.axis != 0) return error.BadDraftShape;
+    const shape = try slicedShape(t, cut);
+    const out = try gpa.alloc(u16, shape[0] * shape[1] * shape[2]);
+    errdefer gpa.free(out);
+    const rows: core.fp8_source.Span = if (cut) |c| .{ .lo = c.start, .hi = c.start + c.len } else core.fp8_source.all(t.dim(0));
+    try core.fp8_source.mxfp8Bf16(t, scale, rows, core.fp8_source.all(t.dim(1)), out);
+    return out;
+}
+fn decodeHead(gpa: std.mem.Allocator, ck: *core.Checkpoint, t: core.checkpoint.Tensor, cut: ?Slice) ![]u16 {
+    return switch (t.dtype) {
+        .bf16 => decode(gpa, t, cut),
+        .f8_e4m3 => decodeMxfp8(gpa, ck, t, cut),
+        else => error.UnsupportedDraftDtype,
+    };
+}
+pub fn decodeTargetHead(gpa: std.mem.Allocator, ck: *core.Checkpoint, cut: ?Slice) ![]u16 {
+    return decodeHead(gpa, ck, try ck.get("lm_head.weight"), cut);
+}
 pub fn readCodebook(gpa: std.mem.Allocator, ck: *core.Checkpoint, name: []const u8) ![]f32 {
     const t = try ck.get(name);
     if (t.rank != 2 or t.dim(0) != 154880 or t.dim(1) != 256 or (t.dtype != .f32 and t.dtype != .bf16)) return error.BadSelector;
@@ -92,9 +114,10 @@ pub const Loader = struct {
         l.owned.deinit(l.gpa);
     }
     fn tensor(l: *Loader, source: Source, name: []const u8, n: usize, k: usize) ![]u16 {
-        const t = try (if (source == .model) l.target else l.draft).get(name);
+        const ck = if (source == .model) l.target else l.draft;
+        const t = try ck.get(name);
         const cut = try sliceFor(name, l.rank);
-        const got = try decode(l.gpa, t, cut);
+        const got = if (source == .model and std.mem.eql(u8, name, "lm_head.weight")) try decodeHead(l.gpa, ck, t, cut) else try decode(l.gpa, t, cut);
         errdefer l.gpa.free(got);
         const shape = try slicedShape(t, cut);
         if (got.len != n * k or shape[0] != n or (t.rank >= 2 and shape[1] != k)) return error.BadDraftShape;

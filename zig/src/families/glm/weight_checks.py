@@ -64,6 +64,9 @@ def main():
             args = command(root + 'cuda_weight_source_test.zig', 'test', filter_text=filt, cache=cache)
             print(subprocess.list2cmdline(args), flush=True)
             subprocess.run(args, cwd=BASE, check=True)
+        args = command(root + 'cuda_dflash_head_test.zig', 'test', cache=cache)
+        print(subprocess.list2cmdline(args), flush=True)
+        subprocess.run(args, cwd=BASE, check=True)
         return
     if ns.step == 'family':
         args = command(root + 'cuda_weights.zig', 'test', cache=cache)
@@ -74,6 +77,9 @@ def main():
             args = command(root + 'cuda_weight_source_test.zig', 'test', linux=True, filter_text=filt, cache=cache)
             print(subprocess.list2cmdline(args), flush=True)
             subprocess.run(args, cwd=BASE, check=True)
+        args = command(root + 'cuda_dflash_head_test.zig', 'test', linux=True, cache=cache)
+        print(subprocess.list2cmdline(args), flush=True)
+        subprocess.run(args, cwd=BASE, check=True)
         return
     elif ns.step == 'linux':
         args = command(root + 'cuda.zig', 'test', linux=True, cache=cache)
