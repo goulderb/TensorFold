@@ -6,3 +6,12 @@ TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.
 Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
 MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
 THIRD_PARTY_NOTICES.md.
+
+Local development fork addendum
+This fork imports and adapts MiaAI-Lab's GLM-5.3-Flash recipe and native
+arithmetic, and ports the GLM spill tier by Robert Wojciechowski (wojo).
+Copyright 2026 MiaAI-Lab. The donor's Apache-2.0 LICENSE, NOTICE and CREDITS
+are retained unmodified in LICENSES/donors/mia-f1ee79a6/.
+Original and transitive credits, immutable source references, and local changes
+are described in LICENSES/donors/README.md. Those credits supplement, and do
+not replace, the upstream and third-party notices above.

@@ -1,5 +1,13 @@
 # Third-party notices
 
+## Local fork addendum
+
+This fork includes native GLM integrations, MiaAI-Lab's DFlash2 and expert
+arithmetic, and a shared spill tier based on wojo's GLM work. Original donor
+notices, source revisions, transitive credits, and local changes are retained
+in [LICENSES/donors/README.md](LICENSES/donors/README.md). These supplement the
+upstream credits below. No model weights are included.
+
 TensorFold uses [MLX](https://github.com/ml-explore/mlx) and
 [mlx-lm](https://github.com/ml-explore/mlx-lm), MIT License, Copyright © 2023 Apple Inc.
 The native engine installs and links neither. It reads checkpoints in their formats, and its Metal kernels under
@@ -84,9 +92,11 @@ DeltaNet kernel follows flash-linear-attention's numerics, MIT; its NCCL wrapper
 Apache-2.0, without copying either implementation.
 
 The Python engine's GLM CUDA engine implements transformers' `models/glm5_next/modular_glm5_next.py` math,
-Apache-2.0, without including that source. Its draft inputs and thinking-off rendering follow the public GLM recipe
-from Mia-AiLab without including recipe code.
-No native CUDA family serves GLM.
+Apache-2.0, without including that transformers source. The upstream Python engine's draft inputs and
+thinking-off rendering follow the public GLM recipe from Mia-AiLab. This local fork also imports native
+GLM recipe code and numerical components, as described in the local fork addendum above.
+The fork's native GLM CUDA family and its opt-in imported paths have separate qualification limits;
+see `docs/glm-cuda-mia.md`.
 
 In the Python engine, frozen at 0.6.6, GLM EXL3 (`families/glm5_next/cuda/exl3.py`, `exl3.cu`, `exl3_mm.py`), the
 shared EXL3 module (`src/tensorfold/cuda/exl3/`) and the EXL3 loaders of Qwen3.8-27B and Qwen3.8 Flash Next
@@ -100,7 +110,9 @@ checked bit for bit against ExLlamaV3's dequantization.
 
 The native `zig/src/core/exl3_format.zig` reference decoder, the `zig/src/core/exl3_projection*.zig` decoder and
 `zig/kernels/metal/core/exl3_projection.metal` separately implement the same format and codebooks
-under the Turboderp attribution above. No captured kernel binaries or model weights are bundled.
+under the Turboderp attribution above. No model weights are bundled. This local fork includes 24 captured
+DFlash2 kernel binaries under `zig/kernels/dflash2-aot/`; their `provenance.json` records the donor archive
+and file hashes. See the retained donor notices in `LICENSES/donors/`.
 
 The EXLR8 reader, decoder, pull and kernels (`zig/src/core/exlr8*.zig`, `zig/src/cli/pull_exlr8*.zig`,
 `zig/src/cuda/exlr8.zig`, `zig/kernels/metal/core/exlr8*.metal`, `zig/kernels/cuda/exlr8*.cu`) read kindlingai's exlr8

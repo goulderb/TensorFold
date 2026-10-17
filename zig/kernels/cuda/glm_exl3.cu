@@ -1,5 +1,7 @@
 // Port of TensorFold families/glm5_next/cuda/exl3.cu; authored by Ash Hart and TensorFold contributors.
 // Zig CUDA launch pattern authored by jschmied (TensorFold PR #443).
+// Local fork adaptation of MiaAI-Lab f1ee79a6: lane integration and prompt-slot FP32-to-BF16 conversion.
+// Original notices and transitive credits: LICENSES/donors/README.md and mia-f1ee79a6/NOTICE there.
 // GLM-5.3-Flash's EXL3 routed experts on CUDA: the grouped trellis GEMV and the Hadamard rotations around it.
 //
 // Format (see exl3.py, after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp): a 16x16 tile is 32 little-endian

@@ -10,6 +10,8 @@ MiaAI-Lab's GLM-5.3-Flash TensorFold recipe (Mia's patch 0088, `tensorfold/cuda/
 eviction order and multi-rank rules are wojo's. The file and directory conventions borrow from upstream TensorFold's
 `--learn` (`zig/src/core/prompt_imprint.zig`). The code here is new Zig. `zig/src/core/spill.zig` knows no model;
 the Flash Next hooks live in `zig/src/families/flashnext/cuda_lanes.zig` and `cuda_engine.zig`.
+The [local fork addendum](../LICENSES/donors/README.md) retains the earlier
+spill-design credits and describes the later local Nemotron and Windows work.
 
 ## What a kept state holds, per rank
 

@@ -6,6 +6,8 @@
 //! MiaAI-Lab's GLM-5.3-Flash TensorFold recipe (tensorfold/cuda/spill.py, Apache-2.0): its settings, its LRU by bytes
 //! under a cap and a free-disk floor, its write-then-rename files and its one-directory-per-build layout. The file and
 //! directory conventions also follow upstream TensorFold's --learn (zig/src/core/prompt_imprint.zig).
+//! Local fork changes add model-neutral source/sink interfaces, Nemotron/TP2 adapters and Windows/RAM tiers.
+//! Original notices and transitive design credits are retained in LICENSES/donors/README.md.
 const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
