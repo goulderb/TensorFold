@@ -640,3 +640,41 @@ CPU tests use a fake device and upstream Image callbacks to cover compact round 
 quota, page-rounded admission, busy-slot ownership and close outcomes. They do not establish GPU restore parity,
 NVMe timing or reboot durability. GPU qualification must compare IDs only after two cold runs of the same prompt
 agree; equality covers greedy decoding on the tested prompts.
+
+## Host-memory level, Windows and two-GPU TP (TensorFold for Windows)
+
+`TENSORFOLD_SPILL_RAM_GIB` puts a host-memory level in front of the disk. A family that can capture a state whole
+hands its payload to `Tier.adopt`; the tier owns the bytes from then on. Each held state is:
+
+- read back from memory first (`ram_loaded`), through the same `Reading` as a file, a reference held per read so a
+  state leaving memory mid-read stays whole;
+- written behind to disk at once (`ram_demoted`), staying held once its file is in place, so a stop that ends the
+  process (a kill, `Stop-ScheduledTask`, a crash) keeps every state whose write finished;
+- released from memory, least recently used first, once memory passes its cap and its file is in place
+  (`ram_released`); a state whose file could not be made (no room, a failed write) leaves the tier instead
+  (`ram_dropped`) and the owner's hook hears of it on its own thread (`Tier.gone`, drained at the next owner call).
+
+A state read back from disk is held again when memory holds it (`ram_promoted`): a hot conversation that once fell
+to disk is memory's again. Disk accounting (cap, floor, LRU eviction) counts only states with a file in place or on
+its way; the memory cap counts held bytes. A clean stop still writes any held state still without a file
+(`Tier.flushRam`, from `Store.flushSpill`).
+
+The files are the same on Windows (`spill_fs.zig`): a new file is created only when nothing is there and no reparse
+point is followed; positional reads and writes; `FlushFileBuffers` for fsync; `MoveFileExW` with write-through for
+the rename (NTFS journals it, so the directory needs no flush). A directory the tier makes gets the owner's,
+SYSTEM's and Administrators' full control only (the Windows form of 0700, inherited by its files); an existing root
+anyone else may change is refused (`SpillDirUnsafe`), as POSIX refuses a group- or world-writable one. With no
+`TENSORFOLD_SPILL_DIR`, Windows uses `%LOCALAPPDATA%/tensorfold/spill`. Nemotron's file identity on Windows is the
+handle's volume serial, file index, size and times; the executable is the module's own file.
+
+Nemotron under `TENSORFOLD_TP=2` runs both ranks in one process, so one file holds both ranks' shares: the 16 words,
+then rank 0's key and value rows and Mamba states, then rank 1's (`Layout.ranks`, meta flag `tp2`). Each rank's part
+is copied through its own context and stream. With the memory level holding a max-window state, a state is captured
+straight into tier-owned memory (no host slot, so no busy-slot skip), and on a discrete GPU the tier's host
+reservation is not charged to the GPU prompt cache. The identity carries the KV precision (`fp8-e4m3`) and the TP
+world.
+
+Measured on the workstation (RTX 5080 + RTX 5070 Ti, 12 GiB in memory, 200 GiB on a 990 PRO): cold, GPU-cache,
+memory and NVMe resumes of a 45K-token prefix decode the same 1029 characters; every state survived a hard kill;
+agentic c16 reuse rose from 3% to 60% cached prompt tokens (86% on a warm repeat) with no failed reads, writes or
+hashes.
