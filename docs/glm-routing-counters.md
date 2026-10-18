@@ -59,3 +59,28 @@ pair-sum checks, and identical generated outputs with sampling off and on.
 Source inspections and sketch artifacts are under
 `C:/Development/prep/glm53-expert-tuning/design-{a,b}`. The parent selected the
 shape; review agreement is not a substitute for runtime validation.
+
+## October 18 device result
+
+The bounded probe completed 32 shared forwards on each Spark rank, each with
+42 MoE layers. Both ranks passed every exact membership check, and all 16
+greedy code/prose outputs matched between tracing and the exhausted quota.
+These are 64 rank observations of 32 shared forwards, not 64 independent
+forwards. Across the sampled routed groups, 81.1% had at most four members,
+and logical 16-pair items per active expert averaged 1.0155. A 32-pair tile
+would save only 1.38% of logical routed items on this sample.
+
+The expert microbenchmark therefore includes 30- and 56-row sparse cases
+spread across 64 or 128 experts, as well as dense shared-group cases through
+56 rows. Weight banks rotate beyond L2. At 30 rows / 128 experts, a
+warp-distributed scale-conversion prototype matched baseline arithmetic but
+did not improve the seven-round timings: gate/up 2643.286 to 2643.177 us;
+down-FP32 1367.700 to 1377.947 us. The prototype was reverted; its source and
+negative result remain in commit `a77a3ee1c` and the fleet trial
+`glm53-expert-routing-mtu-20261018`. Default kernel selection is unchanged.
+
+Unique-weight bytes divided by time is an effective traffic rate, not a
+hardware bandwidth measurement. A separate Nsight Compute run reported
+21.77% SM throughput and a 2675.616 us gate/up launch; the requested DRAM
+metrics were absent on this device. This does not prove a DRAM ceiling or
+establish how much further kernel headroom remains.
