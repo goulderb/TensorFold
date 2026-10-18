@@ -38,7 +38,24 @@ const served = [_]c.Shape{
 };
 
 /// One tf_exlr8_dense_N's gate 1 and 4 rows; `planted` is the first of fillX's nonfinite rows (0-3) its rows hold.
-pub const Capacity = struct { rows: usize, planted: usize = 0 };
+pub const Capacity = struct {
+    rows: usize,
+    planted: usize = 0,
+
+    /// Finite rows ahead of the capacity's own launch in gate 1: dense_16's, as sourceMatmul splits 16 + N rows.
+    pub fn lead(cap: Capacity) usize {
+        return if (cap.rows < 8) 16 else 0;
+    }
+
+    /// Gate 4 runs the capacity alone; gate 1 adds the finite lead so its outputs are not all non-finite.
+    pub fn caseRows(cap: Capacity, fill: g.Fill, asked: usize) usize {
+        return switch (fill) {
+            .random => asked,
+            .stress => cap.rows,
+            .nonfinite => cap.lead() + cap.rows,
+        };
+    }
+};
 
 /// Gates 1 and 4 pick 5-8 and 1 rows, so each capacity has its own cases; one and two rows split the planted rows.
 pub const capacities = [_]Capacity{ .{ .rows = 1 }, .{ .rows = 1, .planted = 3 }, .{ .rows = 2 }, .{ .rows = 2, .planted = 2 }, .{ .rows = 4 }, .{ .rows = 8 }, .{ .rows = 16 } };
@@ -76,13 +93,15 @@ pub fn spec(kind: Kind, sliced: bool, capacity: ?usize) c.Spec {
     };
 }
 
-/// fillX for one case: nonfinite rows from `planted` on, so one- and two-row capacities hold the later planted rows.
-fn fillRows(a: std.mem.Allocator, d: Dense, cap: Capacity, fill: g.Fill, seed: u64) !void {
-    if (fill != .nonfinite or cap.planted == 0) return d.fillX(fill, seed, 2);
-    const wide = try Dense.init(a, .{ .rows = cap.planted + d.shape.rows, .n = 1, .k = d.shape.k }, 1);
+/// fillX for one case; a capacity's gate 1 rows take fillX's nonfinite rows from `planted` on, after its finite lead.
+fn fillRows(a: std.mem.Allocator, d: Dense, cap: ?Capacity, fill: g.Fill, seed: u64) !void {
+    const k = cap orelse return d.fillX(fill, seed, 2);
+    if (fill != .nonfinite or (k.lead() == 0 and k.planted == 0)) return d.fillX(fill, seed, 2);
+    d.fillX(.random, seed, 2);
+    const wide = try Dense.init(a, .{ .rows = k.planted + k.rows, .n = 1, .k = d.shape.k }, 1);
     defer wide.deinit();
-    wide.fillX(fill, seed, 2);
-    @memcpy(d.x, wide.x[cap.planted * d.shape.k ..]);
+    wide.fillX(.nonfinite, seed, 2);
+    @memcpy(d.x[k.lead() * d.shape.k ..], wide.x[k.planted * d.shape.k ..]);
 }
 
 fn tensor(dtype: core.checkpoint.DType, n: usize, k: usize, bytes: []const u8) core.checkpoint.Tensor {
@@ -122,8 +141,8 @@ pub const Source = struct {
         self.d = null;
         self.rig.reset();
         var shape = asked;
-        const cap: Capacity = if (self.capacity) |at| capacities[at] else .{ .rows = shape.rows };
-        if (fill != .random) shape.rows = cap.rows;
+        const cap: ?Capacity = if (self.capacity) |at| capacities[at] else null;
+        if (cap) |k| shape.rows = k.caseRows(fill, shape.rows);
         if (shape.rows == 0 or shape.n == 0 or shape.k == 0 or shape.k % 128 != 0) return false;
         const a = self.rig.gpu.gpa;
         const d = try Dense.init(a, shape, 1);
@@ -214,17 +233,25 @@ pub const Source = struct {
     }
 };
 
-test "each exlr8 row capacity's gate 1 cases hold NaN, +Inf and -Inf inputs" {
+test "each capacity's gate 1 cases keep finite controls and give its own rows NaN, +Inf and -Inf outputs" {
     const a = std.testing.allocator;
     for ([_]usize{ 1, 2, 4, 8, 16 }) |rows| {
         var seen: [3]bool = @splat(false);
         for (capacities) |cap| if (cap.rows == rows) {
-            const d = try Dense.init(a, .{ .rows = rows, .n = 1, .k = 4096 }, 1);
+            const n = 8;
+            const d = try Dense.init(a, .{ .rows = cap.caseRows(.nonfinite, 0), .n = n, .k = 4096 }, 1);
             defer d.deinit();
             try fillRows(a, d, cap, .nonfinite, 7);
-            for (d.x) |bits| {
-                const v = c.fromBf16(bits);
-                for ([_]bool{ std.math.isNan(v), v == std.math.inf(f32), v == -std.math.inf(f32) }, &seen) |hit, *s| s.* = s.* or hit;
+            var prng = std.Random.DefaultPrng.init(rows);
+            for (d.w) |*w| w.* = @as(f64, @floatFromInt(prng.random().intRangeAtMost(i8, -2, 2))) / 4;
+            const want = try a.alloc(f64, 2 * d.outputs());
+            defer a.free(want);
+            try d.reference(want[0..d.outputs()], want[d.outputs()..]);
+            var planted: usize = 0;
+            for (want[0..d.outputs()]) |w| planted += @intFromBool(!std.math.isFinite(w));
+            try std.testing.expect(planted > 0 and planted < d.outputs());
+            for (want[cap.lead() * n .. d.outputs()]) |w| {
+                for ([_]bool{ std.math.isNan(w), w == std.math.inf(f64), w == -std.math.inf(f64) }, &seen) |hit, *s| s.* = s.* or hit;
             }
         };
         try std.testing.expect(std.mem.allEqual(bool, &seen, true));
