@@ -18,6 +18,7 @@ const vision_runtime = @import("cuda_vision_runtime.zig");
 const dflash_mod = @import("cuda_dflash.zig");
 const mia = @import("cuda_experts_mia.zig");
 const verify_plan = @import("cuda_verify_plan.zig");
+const route_trace = @import("cuda_route_trace.zig");
 pub const persistence = @import("cuda_persistence.zig");
 pub const spill_payload = @import("cuda_spill_payload.zig");
 
@@ -123,6 +124,7 @@ pub const Engine = struct {
     bd: fw.Buffers, // verify windows
     bm: fw.Buffers, // the MTP head's rows
     bs: ?fw.Buffers = null, // shared verify windows (with the MTP head, as the lane core shares only then)
+    route_trace: ?route_trace.Trace = null,
     pairs: cuda.DeviceBuffer, // every rank's (value, id) of a greedy draw
     smp: sampler.Sampler,
     seqs: std.ArrayList(?*Seq) = .empty, // every stream's sequence by slot (the lane backend's), slot 0 made at init
@@ -266,6 +268,13 @@ pub const Engine = struct {
         if (rank == 0 and settings.draft == .dflash2 and settings.dflash_verify == .dflash6) std.log.info("GLM DFlash verify plan: drafts=6 lane_rows=7 shared_rows=56", .{});
         if (with_mtp or settings.draft == .dflash2) e.bs = if (o.settings.kv_shard) try fw.Buffers.initSharedOwned(d, &e.w, verify_rows, o.capacity) else try fw.Buffers.initShared(d, &e.w, verify_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
+        const route_samples = try route_trace.samples(ranks.environment("TF_GLM_ROUTE_SAMPLES"));
+        if (route_samples > 0) {
+            const b = e.bs orelse return error.RouteTraceNeedsSharedVerify;
+            e.route_trace = try route_trace.Trace.init(gpa, d, rank, e.w.layers.len, b.rows, c.experts, c.topk, route_samples);
+            std.log.warn("GLM routing trace rank={d} samples={d}: diagnostic copies perturb timing", .{ rank, route_samples });
+        }
+        errdefer if (e.route_trace) |*trace| trace.deinit();
         errdefer if (e.dflash) |drafter| drafter.deinit();
         if (settings.draft == .dflash2) {
             try e.bp.enableTaps(d);
@@ -318,6 +327,7 @@ pub const Engine = struct {
     pub fn deinit(e: *Engine) void {
         if (e.disk) |p| p.close(p.ctx);
         e.stream.synchronize() catch {};
+        if (e.route_trace) |*trace| trace.deinit();
         var it = e.snaps.valueIterator();
         while (it.next()) |s| e.freeSnap(s);
         e.snaps.deinit(e.gpa);
@@ -831,8 +841,11 @@ pub const Engine = struct {
             rows += p.ids.len;
         }
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load };
+        const trace = if (e.route_trace) |*t| t.begin(rows) else null;
+        errdefer if (trace) |t| t.abort(e.stream);
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .route_trace = trace };
         try f.run(@ptrCast(ids[0..rows]));
+        if (trace) |t| try t.finish(e.stream);
         for (parts, segs[0..parts.len]) |p, g| {
             try e.bind(p.slot);
             e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;

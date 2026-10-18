@@ -21,6 +21,7 @@ const shared = @import("cuda_shared.zig");
 const vision_binding = @import("cuda_vision_binding.zig");
 const taps = @import("cuda_taps.zig");
 const mia = @import("cuda_experts_mia.zig");
+const route_trace = @import("cuda_route_trace.zig");
 
 test {
     _ = taps;
@@ -214,6 +215,7 @@ pub const Forward = struct {
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
     vision: ?@import("cuda_vision_binding.zig").Binding = null,
+    route_trace: ?*route_trace.Trace = null,
 
     pub fn set(f: *const Forward) glue.Set {
         return .{ .glue = &f.m.glue, .linear = f.linear(), .copy_rows = f.m.copy_rows, .exlr8_dense = if (f.m.source_dense) |*d| d else null, .source_upcast = f.m.source_upcast, .attn_fp8load = f.attn_fp8load };
@@ -566,6 +568,10 @@ pub const Forward = struct {
                 try f.post(r, R);
                 try f.pre(r, l.ffn_hc, l.post_norm, R);
                 try f.ffn(r, l, R, slot(r, R));
+                if (f.route_trace) |trace| switch (l.ffn) {
+                    .moe => |m| try trace.capture(f.stream, j, m.count, m.top_k, r.b.moe.plan),
+                    .dense => {},
+                };
             }
             try f.gather(R);
             for (f.ranks) |r| {
