@@ -156,14 +156,18 @@ identical top-one ids on every row. They are proposed qualification limits,
 not an established accuracy guarantee. A failure requires investigation;
 do not raise a limit simply to make this candidate pass.
 
-The native server uses the same engine:
+The fleet recipe starts the native server with the same engine and pins the
+internal GPU pair. Run it from the trial worktree after the approved stop:
 
 ```powershell
-$env:TENSORFOLD_SPLIT='1'
-./zig-out/native/bin/tensorfold-native.exe serve MODEL --host 127.0.0.1 --port 11439 --name ornith-test --parallel 1 --context 4096 --no-drafts
+Set-Location C:/Development/local-ai-server/.worktrees/task/ornith35-tf-trial
+C:/Development/local-ai-server/runtime/proxy-venv/Scripts/python.exe -m fleet.launch ornith15-qwen35-tf-cuda --foreground
 ```
 
-Unset `TENSORFOLD_TP` for this layer-split path. It queues requests behind one
+The launcher sets the UUID mask and `TENSORFOLD_SPLIT` and removes inherited
+TensorFold overrides. Start the server through that launcher so direct
+manual invocation cannot bypass the physical device pins.
+It queues requests behind one
 active request, checks cancellation between tokens and resets state before
 each request. Stop the test listener when qualification ends. Restore the
 production recipe and confirm a proxy completion before ending an outage.
