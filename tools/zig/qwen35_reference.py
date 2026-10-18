@@ -25,6 +25,7 @@ from safetensors import safe_open
 REVISION = "e0eb2810ac1b2caf6d082f247d8d37162ecf67a0"
 SOURCE_SHA = "d9f88f2d048492c6a787119c7466add91cb311d7699aea5701ffb8a3ba3015a5"
 SOURCE_URL = f"https://raw.githubusercontent.com/huggingface/transformers/{REVISION}/src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py"
+ARITHMETIC_ADAPTER = "modelopt-linear-fp32-postscale-bf16-v1"
 FP4 = (0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6)
 
 
@@ -132,39 +133,45 @@ class Store:
             raise ValueError(f"invalid scale {name}")
         return value.reshape(())
 
-    def weight(
-        self, prefix: str, start: int = 0, end: int | None = None
-    ) -> torch.Tensor:
-        tensor = self.get(prefix + ".weight")[start:end]
-        if tensor.dtype == torch.bfloat16:
-            return tensor
-        if tensor.dtype == torch.float8_e4m3fn:
-            return (tensor.float() * self.scalar(prefix + ".weight_scale")).bfloat16()
-        if tensor.dtype == torch.uint8:
-            return unpack_fp4(
-                tensor,
-                self.get(prefix + ".weight_scale")[start:end],
-                self.scalar(prefix + ".weight_scale_2"),
-            )
-        raise ValueError(f"unsupported projection {prefix}: {tensor.dtype}")
-
     def linear(self, prefix: str, x: torch.Tensor) -> torch.Tensor:
         if x.device.type != "cpu" or x.dtype != torch.bfloat16:
             raise ValueError("reference requires CPU BF16 activations")
         w = self.get(prefix + ".weight")
+        if w.dtype == torch.bfloat16:
+            return torch.cat(
+                [
+                    F.linear(x, w[start : start + 4096])
+                    for start in range(0, w.shape[0], 4096)
+                ],
+                dim=-1,
+            )
+        activation = x.float()
         if w.dtype == torch.float8_e4m3fn:
             scale = self.scalar(prefix + ".input_scale")
-            x = (
-                (x.float() / scale).clamp(-448, 448).to(torch.float8_e4m3fn).float()
-                * scale
-            ).bfloat16()
-        return torch.cat(
-            [
-                F.linear(x, self.weight(prefix, start, start + 4096))
-                for start in range(0, w.shape[0], 4096)
-            ],
-            dim=-1,
-        )
+            activation = (
+                (activation * (1 / scale))
+                .clamp(-448, 448)
+                .to(torch.float8_e4m3fn)
+                .float()
+            )
+            output_scale = scale * self.scalar(prefix + ".weight_scale")
+        elif w.dtype == torch.uint8:
+            output_scale = self.scalar(prefix + ".weight_scale_2")
+        else:
+            raise ValueError(f"unsupported projection {prefix}: {w.dtype}")
+        pieces = []
+        for start in range(0, w.shape[0], 4096):
+            weight = w[start : start + 4096]
+            if w.dtype == torch.uint8:
+                weight = unpack_fp4(
+                    weight,
+                    self.get(prefix + ".weight_scale")[start : start + 4096],
+                    torch.tensor(1.0),
+                )
+            pieces.append(
+                (F.linear(activation, weight.float()) * output_scale).bfloat16()
+            )
+        return torch.cat(pieces, dim=-1)
 
 
 class LazyLinear(torch.nn.Module):
@@ -176,6 +183,25 @@ class LazyLinear(torch.nn.Module):
         return self.store.linear(self.prefix, x)
 
 
+class ExpertProjection:
+    def __init__(self, store: Store, prefixes: tuple[str, ...]):
+        self.store, self.prefixes = store, prefixes
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        if func is not F.linear:
+            return NotImplemented
+        return cls._linear(*args, **(kwargs or {}))
+
+    @staticmethod
+    def _linear(input, weight, bias=None):
+        if bias is not None:
+            raise ValueError("expert projections require bias=None")
+        return torch.cat(
+            [weight.store.linear(prefix, input) for prefix in weight.prefixes], dim=-1
+        )
+
+
 class ExpertWeights:
     def __init__(self, store: Store, prefix: str, projections: tuple[str, ...]):
         self.store, self.prefix, self.projections = store, prefix, projections
@@ -184,12 +210,12 @@ class ExpertWeights:
         expert = int(expert)
         if not 0 <= expert < 256:
             raise ValueError("invalid expert id")
-        return torch.cat(
-            [
-                self.store.weight(f"{self.prefix}.{expert}.{projection}")
+        return ExpertProjection(
+            self.store,
+            tuple(
+                f"{self.prefix}.{expert}.{projection}"
                 for projection in self.projections
-            ],
-            dim=0,
+            ),
         )
 
 
@@ -308,13 +334,15 @@ def capture(args) -> None:
             "index_sha256": sha(args.model / "model.safetensors.index.json"),
             "reference_revision": REVISION,
             "reference_source_sha256": SOURCE_SHA,
+            "reference_script_sha256": sha(Path(__file__)),
+            "arithmetic_adapter": ARITHMETIC_ADAPTER,
             "transformers": transformers.__version__,
             "torch": torch.__version__,
             "environment": environment_receipt(),
             "device": "cpu",
             "dtype": "bfloat16",
             "activation_quantization": "static FP8 only; NVFP4 W4A16",
-            "implementation": "unmodified pinned HF model forwards; lazy dequantized expert weight access",
+            "implementation": "unmodified pinned HF model forwards; lazy ModelOpt F.linear operands",
             "scope": "HF eager arithmetic reference; not an independently qualified ModelOpt serving runtime",
         },
     )

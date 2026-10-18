@@ -1,251 +1,187 @@
-# Qwen35 CUDA preparation evidence
+# Qwen35 CUDA qualification
 
-This is preparation for an Ornith 1.5 35B NVFP4 trial. No Qwen kernel or
-model has run on a GPU in this task. Numerical parity, GPU memory headroom,
-serving behavior and performance remain unqualified. Production has stayed
-running. Neither the task branch nor the inactive trial recipe is promoted.
+The Ornith 1.5 35B NVFP4 port runs through the native TensorFold server at
+the tested one-lane, 4096-token configuration. Bounded functional checks
+passed. Full-logit comparison against the corrected Hugging Face reference
+fails the unchanged diagnostic limits. This is an experimental testing path;
+numerical parity and production qualification remain open.
 
-## Source under verification
+The user approved stopping workstation Nemotron for this trial. It stopped
+at 2026-10-18 01:52:49 UTC. The trial was stopped and the existing production
+task restarted at 02:22:22 UTC. At 02:23:22 UTC the production proxy returned
+`READY` from `nemotron-3.5-lightning`, with eight lanes and paid spillover
+disabled. The production executable is still `tensorfold-native-8047d1a0917e`.
+Clef's process remained running. No deployment, component, scheduled task,
+registry, or proxy selection was changed.
 
-- Fork store `C:/Development/tensorfold.git`.
-- Worktree `C:/Development/tf/qwen35-ornith-nvfp4`.
-- Branch `task/qwen35-ornith-nvfp4`, from trunk `a92010d6e`.
-- Initial port commit `8f6a04efe`.
-- Reviewed preparation checkpoint
-  `4ba2e07314d61c7b060c46710d32363d83c1bcbd`.
-- Final code checkpoint with physical device admission
-  `343486999375947fbdd69b4cf625ab63c9452b49`.
-- Windows tools are Zig 0.17.0, CUDA 12.8 and MSVC 14.44.35207. The helper
-  changes only its child compiler environment.
+## Source and artifacts
 
-## CPU evidence
-
-The fresh, isolated host gate passed 39 tests and all eight build steps on
-the final committed code checkpoint. This includes real producer header
-fixtures, refusal behavior, scale handling, independent math contracts,
-memory budgets, mock cleanup faults and native-adapter admission.
-
-```powershell
-& 'C:/Users/developer/tools/zig-0.17.0/zig-x86_64-windows-0.17.0/zig.exe' build test-qwen35-cuda-host -j2 --cache-dir .artifacts/final-identity-host-cache --summary all
-```
-
-Evidence is `.artifacts/final-host-34348699.log`. The earlier 36-test gate
-at `4ba2e073` preceded the three device-admission tests. The three Python reference
-tests passed in `.artifacts/reference-unit-identity.log`. Ruff and whitespace
-checks passed. The fleet repository's `fleet.verify fast` passed before the
-source commits, in `.artifacts/fleet-fast-review-fixes.log` and
-`.artifacts/fleet-fast-identity-fixes.log`.
-
-The broad trunk Windows `test-cuda-host` gate was already failing before
-the port. `.artifacts/baseline-host.log` records Windows environment-library
-compile errors, POSIX spill-test issues and an inherited identity test
-failure. It is not a green aggregate gate. No merge or promotion readiness
-is claimed from the targeted pass.
-
-## Final Windows artifacts
-
-All final builds below passed at code checkpoint `34348699` with embedded
-`sm_120` CUDA kernels. Each helper invocation exits zero. The durable step
-receipt is `.artifacts/background-preparation-status.json`.
-
-| Target | Result | Evidence |
-|---|---|---|
-| `native` | 60/60 steps | `.artifacts/background-native-34348699.log` |
-| `qwen35-probe` | 56/56 steps | `.artifacts/background-qwen35-probe-34348699.log` |
-| `qwen35-kernels-probe` | 56/56 steps | `.artifacts/background-qwen35-kernels-probe-34348699.log` |
+- Fork store `C:/Development/tensorfold.git`, worktree
+  `C:/Development/tf/qwen35-ornith-nvfp4`, branch `task/qwen35-ornith-nvfp4`,
+  based on trunk `a92010d6e`.
+- Initial port `8f6a04efe`, reviewed device-admission checkpoint `343486999`.
+- Windows host fixes `b91d70d3`; kernel-oracle correction and compiled source
+  checkpoint `bc1773e2`.
+- Zig 0.17.0, CUDA 12.8, MSVC 14.44.35207 and embedded `sm_120` kernels.
+  The compiler helper changes only its child environment.
+- Current immutable runtime directory
+  `C:/Development/local-ai-server/runtime/tensorfold-qwen35-native-4d370dcedc46`.
 
 | Executable | Bytes | SHA256 |
 |---|---:|---|
-| `tensorfold-native.exe` | 22507008 | `247110a921c007cb2d1c6d4bf895e057d9d2634e630e34727c54a12e4f606247` |
-| `tf-qwen35-probe.exe` | 4670464 | `eec0a90bbe0feb81c76203042b6664270c0c19bfe94e7d0a6e0f2d32e344a66a` |
-| `tf-qwen35-kernels-probe.exe` | 4612096 | `2315123f368527bf574a021477fc967c2e7f2ab79c75421d59292804afb1d021` |
+| `tensorfold-native.exe` | 22504960 | `4d370dcedc464ccc12e3328209652f9043402c81060a0d66066ffa0f479de40a` |
+| `tf-qwen35-probe.exe` | 4670464 | `1b4c77d033fa2af308e42c5fc6ee3f24e5e3e5290d1395d3ba6a88f8645bf687` |
+| `tf-qwen35-kernels-probe.exe` | 4613632 | `b43548d3a0b32198df12581b869c86bcf9364e7ddc75b709e6b9b9d45c58fd5c` |
 
-The final model probe's `--inspect` passed on the complete local Ornith
-checkpoint, without creating a CUDA context. Evidence is
-`.artifacts/background-inspect-34348699.log`. Both executable entry points
-also passed six process checks covering usage, absent environment pins and
-ordinal-only masks. Expected errors occurred before driver initialization;
-no output directory was created. Evidence is
-`.artifacts/probe-refusals-34348699.json`.
+The final three-target build passed 14/14 steps using the retained prebuilt
+fatbins. Their source paths, sizes and SHA256 digests are recorded in
+`fatbins-sm120-manifest.json`. The source CUDA math is unchanged from the
+initial device checkpoint. Both immutable bundles retain the original root
+license, notices and byte-verified archive of all nineteen `LICENSES/` paths.
+`SOURCE_COMMIT` records the full compiled checkpoint. Every runtime file and
+all seventeen checkpoint files are pinned in the inactive fleet recipe.
 
-`.artifacts/committed-source-check.json` verifies that application/tool
-sources match the committed checkpoint and all four fixture capture-script
-digests equal the committed script's SHA256. An earlier interrupted final
-native attempt recorded no exit status and is explicitly excluded from
-the passed evidence. The retry helper runs hidden and records each exit
-status independently of the tool session.
+Unless another root is stated, run evidence below is under
+`.artifacts/qualification-20261018-0151/`. Initial preparation and three Claude
+Opus 5.5 review rounds remain in Git history at `82ae266a6` and in
+`.artifacts/review-r1.md`, `review-r2.md`, and `review-r3.md`.
 
-The immutable bundle is staged at
-`C:/Development/local-ai-server/runtime/tensorfold-qwen35-native-247110a921c0/`.
-Its eight files include the three executables, `SOURCE_COMMIT`, the original
-`LICENSE`, `NOTICE`, `THIRD_PARTY_NOTICES.md`, and `LICENSES.zip`. The archive
-retains all nineteen files under their original `LICENSES/` paths, including
-the Transformers donor license. Every archive member was compared byte for
-byte with its source. `.artifacts/staged-runtime.json` records all file pins.
-The helper completed every build, CPU inspection, reference capture and
-staging step with exit zero.
+## Checkpoint and CPU checks
 
-## Inactive fleet recipe
+The model is `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` at revision
+`94e431d9cc47fa1986a7a1a4e9a80f7f118b03aa`. All three shard hashes and byte
+counts match immutable Hugging Face LFS metadata. Both Ornith and NVIDIA
+ModelOpt header fixtures pass the text schema. The NVIDIA Qwen3.6 checkpoint
+has not been run on a GPU. Unsloth and Unsloth Fast compressed-tensors exports
+were inspected and are explicitly refused by this loader.
 
-The fleet worktree is
-`C:/Development/local-ai-server/.worktrees/task/ornith35-tf-trial`, branch
-`task/ornith35-tf-trial`. Launcher commit `b5ead91a` adds the serial layer
-split. Commit `7a1f457a` adds the prepared recipe
-`recipes/workstation/ornith15-qwen35-tf-cuda/recipe.json`, documentation,
-credits and the actual-recipe CLI test.
+The text model has forty layers, thirty GDN and ten full-attention, hidden
+width 2048, 256 experts and top-eight routing. It uses static FP8 projections
+and NVFP4 W4A16 experts, shared MLP and output head. The tested split is twenty
+layers on each internal GPU. Packed text weights total 20,850,944,512 bytes;
+that is a layout calculation, not physical VRAM usage.
 
-The recipe has experimental lifecycle and prepared status. It selects one
-lane, a 4096-token context, BF16 KV, the two internal UUIDs and loopback
-`127.0.0.1:11439`, with served id `ornith-1.5-35b-test`. There is no deployment,
-component, task, registry or proxy selection change. Its real CPU preflight
-verified all eight runtime and seventeen checkpoint files by bytes and SHA256.
-The exact source commit and all nineteen license archive paths were also
-verified. No process was created by that check.
+The original fresh Qwen host gate passed all 39 tests and eight build steps.
+The final Windows aggregate passed 43/43 steps, 1147 tests and 84 explicit
+skips. The subsequent Qwen target passed eight steps with 36 reported tests
+and one cached admission run. See [Windows host qualification](windows-host-qualification.md)
+for skip reasons, remaining Zig networking diagnostics and Linux coverage
+limits. The fleet fast gate passed before commits. The initial launcher,
+documentation and attribution suite passed 228 tests, including 67 launcher
+tests; process creation was mocked for its actual-recipe CLI case.
 
-The launcher, documentation and attribution suite passed 228 tests,
-including 67 launcher tests and the actual-recipe CLI with process creation
-mocked. The fast gate and commit hook passed. Evidence lives in the fleet
-worktree's `.artifacts/real-recipe-preflight.json`,
-`.artifacts/license-archive-verified.json` and
-`.artifacts/final-targeted-tests.txt`. These are preparation results, not a
-live server probe or the full promotion gate.
+## Kernel and session checks
 
-Model the Domain kept format-specific checkpoint structures and topology
-choices explicit. Boundary Discipline put refusal before device allocation.
-Test Behavior, Not Implementation drove observable state, routing, cleanup,
-argument and environment assertions. Prove It Works requires real device
-and live-serving evidence before the port is called qualified.
+Both kernel probes verify the physical device UUID and name before allocating
+a CUDA context. The tested devices are the RTX 5080
+`GPU-f2c0ea1e-a2be-f0b4-6c23-ffe33b537a06` and RTX 5070 Ti
+`GPU-dd2a988c-fe38-24ab-233a-9e9bb3b2645a`. The final clean probe passed all
+56 array comparisons on each, covering ten Qwen entry points and reused RMS
+normalization. See `kernels-clean-device0.stdout` and
+`kernels-clean-device1.stdout`.
 
-## Checkpoint preparation
+The first probe failed the chained GDN output at step two. CPU and GPU FP32
+recurrence outputs differed by about 2.8e-9 at a BF16 midpoint, producing
+adjacent BF16 inputs to normalization. The correction compares normalization
+on identical, already independently checked device inputs. Recurrence state
+and output checks retain their original tolerances. No tolerance or CUDA math
+was changed. The original failure and same-input diagnostic remain in
+`kernels-device0.stderr` and `kernels-same-input-device0.stderr`.
 
-All four immutable checkpoint fixtures were recaptured with the committed
-`tools/zig/qwen35_headers.py`. Their receipts now include its SHA256.
-`.artifacts/fixture-recapture.json` records the captures. Config and raw
-tensor-header hashes did not change. The compressed-tensors Unsloth and
-Unsloth Fast formats were inspected and are explicitly refused. Ornith and
-NVIDIA ModelOpt fixtures pass the text schema.
+Both complete-model cases passed exact reset and interleaved two-session
+isolation checks. The final staged probe reran both cases successfully.
+All four final logit rows are byte-identical to their earlier corresponding
+rows; see `rebuilt-logits-identical.json` and `model-final-*/result.json`.
+The committed short and chat input fixtures force the same token stream
+used by the reference. Forced tokens themselves are not an accuracy check.
 
-All three downloaded Ornith shard bodies match the immutable repository's
-LFS SHA256 values. `.artifacts/ornith-weight-hashes.json` records bytes and
-digests. The inactive fleet recipe pins these and fourteen metadata files.
+## Reference correction and remaining numerical failure
 
-The text memory plan derived from both official header fixtures is
-20,850,944,512 packed weight bytes. At cut twenty, the embedding partition
-uses 10,790,995,200 weight bytes and the final-head partition uses
-10,059,949,312. Their peak temporary packing allocations are 16,777,216 and
-286,064,640 bytes. These are calculations from the layouts, not measured
-device allocations. Admission also budgets scratch, one session's GDN/KV
-state and a 1536 MiB floor on each device before any weight uploads.
+The reference uses the pinned Transformers source at
+`e0eb2810ac1b2caf6d082f247d8d37162ecf67a0`, Transformers 5.16.1 and Torch
+2.9.0 in the existing CPU capture environment. It hides CUDA and uses the
+original PyTorch fallback functions. It is an HF arithmetic reference, not
+an independently qualified ModelOpt serving runtime.
 
-Cleanup regression tests prove device frees are attempted after a failed
-synchronization. Context-selection failures release host ownership and
-attempt to release the primary retain without freeing against a wrong
-context. Shared CUDA free/unload/destroy APIs discard driver errors.
-A fatal driver fault can still require process exit for complete reclamation.
+Layer captures exposed premature BF16 rounding in the first reference
+adapter. The corrected adapter computes quantized dot products in FP32,
+applies tensor scales after reduction, and returns BF16 projection outputs.
+Static FP8 quantization multiplies by the FP32 reciprocal before E4M3
+conversion. Lazy `F.linear` operands preserve the pinned HF expert forwards.
+Eight tests pass, including regressions that failed before the correction.
+An actual pinned-HF expert-forward CPU probe also passes. The capture receipts
+record script SHA256
+`afbe5ec943d2d7551e5b8158625d1cdaa00239ea9f022103c997098b6cb49474`
+and adapter `modelopt-linear-fp32-postscale-bf16-v1`.
 
-## Reference tooling
+Fifteen same-input first-layer projections match the corrected arithmetic
+exactly, in `projection-comparison-v3.log`. This does not establish whole-model
+parity. The native engine uses FP32 attention probabilities, routing weights
+and expert accumulation where HF eager has BF16 boundaries. A diagnostic
+reference variant covering those differences also fails the final-logit
+limits. Layer traces show tiny early differences growing across the network;
+the remaining discrepancy has not been isolated sufficiently to classify it
+as harmless rounding. Temporary engine instrumentation was removed, with its
+patch, executable and identities retained in the run directory.
 
-`tools/zig/qwen35_reference.py` runs the exact Transformers source at
-`e0eb2810ac1b2caf6d082f247d8d37162ecf67a0`, checked against SHA256
-`d9f88f2d048492c6a787119c7466add91cb311d7699aea5701ffb8a3ba3015a5`.
-It uses the installed Transformers 5.16.1 integration and Torch 2.9.0+cu128.
-CUDA devices and hub kernels are disabled in the capture process. The four
-optional kernel wrappers are unwrapped to the source's PyTorch fallbacks.
-The original model forwards are retained. Linear modules and expert weight
-indexing decode the checkpoint lazily to fit host memory. FP8 activations
-use stored static scales. NVFP4 activations remain BF16.
+| Case and row | RMSE | Maximum absolute error | Reference-to-native KL | Argmax equal |
+|---|---:|---:|---:|---|
+| Short 0 | 0.098534 | 0.546875 | 0.005401 | yes |
+| Short 1 | 0.154493 | 1.059082 | 0.001756 | yes |
+| Chat 0 | 0.498408 | 2.062500 | 0.001874 | yes |
+| Chat 1 | 0.366464 | 2.031250 | 0.000096 | yes |
 
-The committed short fixture has five prompt ids and two forced ids. The
-capture at final source `34348699` passed and produced reference top-one ids
-`11751` then `13`, corresponding to ` Paris.`. Evidence is
-`.artifacts/final-reference-34348699.log` and
-`.artifacts/reference-34348699/result.json`. A second case uses the pinned
-chat template with thinking disabled for `Say hello.`. Its fifteen-token
-prompt and two forced rows produced top-one ids `9419` then `0`, or `Hello!`.
-Its input and receipt are in `.artifacts/ornith-forced-chat.json` and
-`.artifacts/reference-chat-34348699-background/`. The complete exit-zero
-chat capture is `.artifacts/background-reference-chat-34348699.log`.
+The unchanged limits are RMSE 0.05, maximum absolute error 0.5, KL 0.001,
+and identical argmax for every row. All four rows fail. See
+`comparison-corrected-short.json` and `comparison-corrected-chat.json`.
+The initial failed comparisons remain retained separately. Matching the
+four top predictions does not turn this numerical gate green.
 
-The pinned source emits documentation diagnostics for two unused vision
-methods when loaded with the installed newer integration. Both CPU captures
-exit zero and write all expected rows. The reference is HF eager arithmetic
-with BF16 dequantized weights, not an independently qualified ModelOpt
-serving runtime. Its dequantization and static FP8 emulation also need
-comparison with a second quantized implementation before broad accuracy
-claims.
+## Bounded serving evidence
 
-Round two incorrectly inferred that the documented capture interpreter could
-not run because the imported packages reside under the ExLlama recovery
-runtime. The command did run successfully. An explicit check in
-`.artifacts/reference-environment.log` confirms `sys.executable` and
-`sys.prefix` are the documented `glimmer-capture-venv`. Its imports resolve
-to the existing recovery packages. Future receipts also record interpreter,
-prefixes and optional package versions. No package installation or change to
-the recovery runtime was made.
+The inactive recipe was launched through `python -m fleet.launch` from
+`C:/Development/local-ai-server/.worktrees/task/ornith35-tf-trial`.
+It served `ornith-1.5-35b-test` only on loopback port 11439 with one lane,
+4096-token context, BF16 KV and FP32 GDN state.
 
-The row comparator checks matching config/index hashes, token stream,
-vocabulary, row counts and finite values. Initial diagnostic limits are
-RMSE 0.05, maximum absolute error 0.5 and reference-to-candidate KL 0.001,
-with identical top-one ids for every row. They were selected before any
-device output. They are not a measured accuracy guarantee. FP32 attention,
-routing weights and expert accumulation intentionally differ from HF eager
-BF16 boundaries. Investigate a failure instead of loosening a limit to pass.
+The completed run contains all ten expected checks: raw completion, thinking
+off and on, two queued requests, streaming disconnect, subsequent reuse,
+HTTP 400 context refusal, reuse after refusal and an 1835-token prefill that
+recovered `ORCHID742`. Both BFCL smoke fixtures passed; this is two fixtures,
+not a broad model-quality benchmark. The separate engine log records the
+disconnected request ending with `reason=client-left` after one generated
+token of a requested 1024, followed by successful reuse.
 
-## Review and audit limits
+Review found that the temporary serving script could report success after
+an early exception. The script now requires normal completion and the exact
+expected check set. `serving-assessment.json` independently checks the original
+complete ten-case receipt and early-stop log line, recording their hashes.
+No GPU rerun is implied by this assessment. The rebuilt final server also
+passed a separate real greeting request through the fleet launcher.
 
-Claude Opus 5.5 reviewed the code and retained evidence. The complete raw
-conversation was not supplied, so its audit is limited to files and logs.
-Round one's result is `.artifacts/review-r1.md`. It identified missing
-device comparisons, missing teacher tooling, stale evidence links,
-inaccurate initial timestamps, fault cleanup, memory preflight, NVIDIA
-activation-metadata ambiguity, fixture script provenance and a build-entry
-credit. Source fixes and comparison tools address the preparation findings.
-Device results remain open.
+One-second `nvidia-smi` samples during serving had minima of 5358/6105 MiB
+free. The final model-probe samples had minima of 5288/6035 MiB. These observed
+workloads stayed above the 1536 MiB floor on both GPUs. CUDA context memory
+accounting is recorded separately. Under Windows WDDM, `cuMemGetInfo` alone
+does not establish physical free-memory admission under arbitrary contention;
+neither these samples nor the runtime guards prove a continuous physical
+minimum for other workloads.
 
-Round two is `.artifacts/review-r2.md`. Its P1 requires physical GPU UUID
-admission in both probes. Fleet server launches already pin the internal
-pair. The probe fix adds explicit expected UUIDs and verifies driver UUIDs
-before any context allocation, then records UUIDs and names. Query and key
-norm vectors in the
-attention test are now distinct. The device oracle receipt explicitly calls
-its math a separate host implementation, not HF-generated golden vectors.
-The HF end-to-end capture supplies the separate framework comparison.
+## Verdict and limits
 
-The model probe creates two sessions to check isolation. Initial engine
-admission budgets one; the second session checks its complete allocation
-and floor before allocating state. That can still refuse after weights have
-loaded. The text weight split leaves a calculated margin on idle 16 GiB
-cards, but actual fit remains unmeasured. Layer-level hidden-state dumps
-and a reference variant isolating the FP32 routing/accumulation drift are
-not implemented. A final-logit mismatch may require adding that diagnostic
-instrumentation during qualification.
+A fresh independent GPT-6 Astra review supports controlled experimental use
+at the tested configuration, with the numerical gate still failing. It found
+no new implementation defect in the reference adapter or GDN component
+oracle. The Windows fix review is separate. No merge, production promotion,
+public route, or performance claim follows from these results.
 
-Round three is `.artifacts/review-r3.md`. It found no new P0, P1 or P2
-defects in the probe admission changes or the fleet launcher patch. Its
-remaining conditions are final committed-source probe builds with recorded
-digests, a fully pinned inactive recipe and server launch through the fleet
-wrapper. It withdrew the reference-interpreter objection after reading the
-environment evidence. This review does not establish any device result.
+The next correctness gate is diagnosis of the remaining numerical discrepancy.
+Production admission under Windows contention, full-window occupancy,
+longer-context quality, throughput, vision, MTP, prefix caching, spill and
+tensor parallel execution are unqualified or unsupported on this path.
 
-The decision log is append-only. Its initial four timestamps were estimates,
-not captured event times. Later rows supersede those times using recorded
-filesystem observations, and correct the inspection evidence pointer and
-the implication that earlier builds covered the final source.
-
-## Remaining device gate
-
-After approval to stop workstation inference, run both internal GPUs through
-the compiled per-kernel probe. It covers all ten Qwen entry points and the
-reused RMS kernel with 56 array comparisons and sixteen exact routing ids.
-Then run the model probe on both forced cases, compare all logit rows,
-exercise reset and interleaved session isolation, and inspect failures.
-
-Launch the inactive loopback recipe through `python -m fleet.launch`.
-Check real text/reasoning/tool requests, queued requests, cancellation and
-reuse, context refusal and a longer prefill. Measure free memory under load
-on both GPUs and enforce 1536 MiB on each. These steps have not happened.
-Performance claims require the fleet benchmark workflow and its own evidence.
-
-Stop the trial, restore the production recipe under its existing wrapper,
-and confirm a proxy completion before ending the approved outage. Any merge,
-deployment selection or public model route follows qualification separately.
+Restoration evidence is `restoration-requested.json`,
+`production-restored-proxy.json`, and `production-restored-processes.json`.
+The task is running the original Nemotron runtime with eight 128K lanes;
+the Ornith listener is absent. The initial preparation bundle remains
+immutable at `tensorfold-qwen35-native-247110a921c0`.

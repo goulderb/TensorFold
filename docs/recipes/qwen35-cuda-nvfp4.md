@@ -1,8 +1,11 @@
 # Test Qwen3.5 / Qwen3.6 35B ModelOpt on native CUDA
 
 This local fork adds a serial CUDA text path for the official Ornith 1.5 35B
-and NVIDIA Qwen3.6 35B mixed ModelOpt layouts. CPU loader tests and compilation
-do not qualify model output. Run device tests only in an approved window.
+and NVIDIA Qwen3.6 35B mixed ModelOpt layouts. The Ornith private trial passed
+bounded serving checks, but full-logit comparisons fail the preset limits.
+Numerical parity remains open. NVIDIA has header validation only. See the
+[qualification record](../plans/qwen35-ornith/qualification.md). Run device
+tests only in an approved window.
 
 The first path has BF16 KV, FP32 GDN state, top-eight routed SwiGLU and a
 separate sigmoid-gated shared expert. FP8 projections use their stored static
@@ -26,8 +29,9 @@ selects the compiler environment only for its child build process.
 
 The inspection command maps the actual checkpoint, validates every text
 tensor and rejects unexplained text entries. It creates no CUDA context.
-The broader Windows host suite has inherited failures documented in the
-task's qualification record. The targeted Qwen gate remains separate.
+The broader Windows host suite passed after the delegated portability fixes.
+Its explicit skips and remaining diagnostics are documented in the task's
+qualification record. The targeted Qwen gate remains separate.
 
 ## Checkpoints inspected
 
@@ -115,7 +119,10 @@ optional FLA/causal-convolution wrappers to use the source's PyTorch fallbacks.
 It decodes only the selected experts on demand and never exposes CUDA devices.
 It is an HF eager arithmetic reference, not an independently qualified
 ModelOpt serving runtime. FP8 inputs are statically quantized; NVFP4 stays
-weight-only. Dequantized weights are BF16.
+weight-only. Quantized dot products accumulate in FP32 and apply tensor scales
+after reduction, then return BF16 projection outputs. Lazy expert operands
+intercept only `F.linear`, preserving the pinned HF forwards. Capture receipts
+record the adapter version and script hash.
 
 ```powershell
 $py='C:/Development/local-ai-server/runtime/glimmer-capture-venv/Scripts/python.exe'
