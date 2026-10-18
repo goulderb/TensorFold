@@ -37,7 +37,25 @@ at loopback port 11439. The fleet task worktree's
 `docs/plans/ornith35-shared-host-trial-20261018.md` owns the exact HTTP checks,
 physical-memory abort guard, bounded window and restoration procedure. That
 recipe and procedure require their own CPU validation before requesting the
-window. No active fleet selection, route or scheduled task changes here.
+window. That validation is now complete in fleet commit `ce244f57`: 139 targeted
+tests pass, Ruff and `fleet.verify fast` pass, and the coordinator's default
+preflight hashes every runtime and checkpoint pin without starting an outage.
+A separate five-test safety review exercises missing/below-floor readings,
+readiness failure and restoration mocks. The controller uses the existing
+`fleet.launch.start` API to own the native process handle immediately; no
+production launcher implementation changes were needed. Its approved run
+starts detached, aborts on a missing or below-floor physical GPU reading, and
+cleans up the owned candidate before restoring Nemotron. The trial budget is
+ten minutes, followed by at most ten minutes of planned recovery. Actual
+device execution and recovery remain unverified. No active fleet selection,
+route or scheduled task changes here.
+
+A current production health request at 23:40:53 UTC returned HTTP 200 and
+exact `READY` from `nemotron-3.5-lightning` through the local-only proxy, with
+paid spillover disabled. Its sampled physical free memory was 5248 and 5491
+MiB on the internal GPUs. This was a normal request to the existing production
+engine; no outage or restoration occurred. The receipt is
+`.artifacts/production-prep-20261018/current-production/production-restored-proxy.json`.
 
 The trial asks whether shared-host requests preserve the original bounded
 serial behavior. Numerical acceptance, multi-lane execution, useful batched
