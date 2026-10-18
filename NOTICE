@@ -15,3 +15,8 @@ are retained unmodified in LICENSES/donors/mia-f1ee79a6/.
 Original and transitive credits, immutable source references, and local changes
 are described in LICENSES/donors/README.md. Those credits supplement, and do
 not replace, the upstream and third-party notices above.
+
+The Qwen CUDA text operations and host mathematical references adapt work
+Copyright 2025 The Qwen Team and The HuggingFace Inc. team, under Apache-2.0.
+The original license and exact source revision are retained in
+LICENSES/donors/transformers-e0eb2810/ and LICENSES/donors/README.md.

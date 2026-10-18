@@ -167,6 +167,31 @@ The Python GLM production recipe's later wojo block-store work is a separate
 source series. Its BadAd84 and wojo credits belong to that recipe; this
 addendum does not claim that the native fork implements every later patch.
 
+## Qwen CUDA mathematical reference
+
+`zig/kernels/cuda/qwen35_ops.cu` and
+`zig/src/families/qwen3_5/cuda_kernels_test.zig` adapt the Qwen text equations
+from Hugging Face Transformers, revision
+`e0eb2810ac1b2caf6d082f247d8d37162ecf67a0`, source
+`src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py`.
+The original copyright names the Qwen Team and the HuggingFace Inc. team,
+Copyright 2025. The Apache-2.0 license is retained unmodified in
+`transformers-e0eb2810/LICENSE`, and the adapted files retain its header.
+
+Local changes implement fixed 35B CUDA entry points, serial persistent GDN
+state, online causal attention, deterministic top-eight routing and small
+independent host reference fixtures. The existing CUDA packing and matmul
+kernels retain their original TensorFold and donor credits. TensorFold
+`upstream/v0.6.6`, commit `cb2ebf0540f42604e2759b2ddef497861e928248`, was
+also inspected as a semantic reference. Its older Qwen GDN rounding was not
+copied into this implementation. These additions do not establish numerical
+parity with a particular fused implementation or approve a model deployment.
+
+The four Qwen checkpoint fixtures contain configuration and tensor metadata
+only. Each `source.json` names the producer, immutable model revision and
+header hashes. Checkpoint weights are not included and retain their producers'
+separate terms.
+
 ## Retain notices in future changes and releases
 
 Keep original copyright headers, licenses, `NOTICE`, and credit files.

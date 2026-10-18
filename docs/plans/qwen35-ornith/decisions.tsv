@@ -1,0 +1,8 @@
+ts	phase	decision	why	evidence	result
+2026-10-18T00:45:00Z	ground	Start a new task branch from trunk a92010d6e	Keep production pins and existing task branches unchanged	git task/qwen35-ornith-nvfp4	worktree created
+2026-10-18T01:00:00Z	checkpoint	Capture Ornith NVIDIA and two Unsloth immutable header fixtures	Actual tensor layouts differ despite the NVFP4 label	tools/zig/qwen35_headers.py	four captures passed
+2026-10-18T01:05:00Z	design	Choose CUDA-local Qwen ModelOpt types and a two-device layer split	Avoid changing the working HIP quantization contract while fitting the full checkpoint	docs/plans/qwen35-ornith/design.md	selected after independent cross-judge
+2026-10-18T01:05:00Z	baseline	Keep inherited Windows aggregate failures separate from new targeted tests	The unmodified trunk already fails test-cuda-host with POSIX and environment-library errors	.artifacts/baseline-host.log	baseline fails before source edits
+2026-10-18T01:03:39Z	audit	Correct approximate timestamps in the initial four rows	Those rows used approximate stamps; all four actions occurred before this correction, not at the future 01:05 stamps	docs/plans/qwen35-ornith/decisions.tsv	Supersedes timing only; decisions unchanged
+2026-10-18T01:03:39Z	verification	Validate the complete downloaded Ornith checkpoint through the native CPU probe	Exercise the actual loader without creating a CUDA context	zig-out/bin/tf-qwen35-probe.exe --inspect; .artifacts/qwen-probe-build-1.log	PASS
+2026-10-18T01:03:39Z	verification	Run the targeted host gate after combining the units	Compile the execution interfaces and exercise the checkpoint and math contracts	.artifacts/qwen-host-final.log	30/30 tests passed; no GPU execution

@@ -289,6 +289,14 @@ The multimodal rotary and image-feature integration is adapted from MiaAI-Lab's
 MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in `LICENSES/MiaAI-Lab-MIT.txt`.
 The port preserves the v0.5 CUDA execution APIs and adds an offline EXL3 vision adapter.
 
+## Qwen3.5 / Qwen3.6 CUDA text equations
+
+The serial Qwen CUDA operations and their host reference tests adapt the
+Qwen Team and HuggingFace Inc. team's Apache-2.0 mathematical implementation
+from Transformers revision `e0eb2810ac1b2caf6d082f247d8d37162ecf67a0`.
+The source headers describe the local changes. The immutable source path and
+retained license are recorded in `LICENSES/donors/README.md`.
+
 ## Pictures in the native engine
 
 `zig/src/core/picture/` reads PNG, JPEG and WebP pictures to the RGB pixels Pillow loads them as (Pillow 12.3 for

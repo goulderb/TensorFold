@@ -93,6 +93,7 @@ pub const roce_gather: []const u8 = if (available) &Blob("fatbin_roce_gather").b
 pub const route_rows: []const u8 = if (available) &Blob("fatbin_route_rows").bytes else &.{};
 pub const flashnext_hc: []const u8 = if (available) &Blob("fatbin_flashnext_hc").bytes else &.{};
 pub const flashnext_attn: []const u8 = if (available) &Blob("fatbin_flashnext_attn").bytes else &.{};
+pub const qwen35_ops: []const u8 = if (available) &Blob("fatbin_qwen35_ops").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
 pub const gdn_symbols = struct {

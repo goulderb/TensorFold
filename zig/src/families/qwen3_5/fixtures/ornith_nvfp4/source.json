@@ -1,0 +1,36 @@
+{
+  "repo": "ornith-ai/Ornith-1.5-35B-A3B-NVFP4",
+  "revision": "94e431d9cc47fa1986a7a1a4e9a80f7f118b03aa",
+  "sources": [
+    {
+      "file": "model-00001-of-00003.safetensors",
+      "header_bytes": 5884232,
+      "header_sha256": "afb06d38a2b8a4ed65f79135d513a584e7504199a0518dde4cc933b2c99ae91b",
+      "tensors": 42800
+    },
+    {
+      "file": "model-00002-of-00003.safetensors",
+      "header_bytes": 6585528,
+      "header_sha256": "9b5d70bb4533bb3e859d868df01f85fad30eadc4836f59ee5ec67483d3537943",
+      "tensors": 47852
+    },
+    {
+      "file": "model-00003-of-00003.safetensors",
+      "header_bytes": 492424,
+      "header_sha256": "09189755ac713fcdcbbb4606f5becbf8bfe6e51f1e10449261536edb5cde2047",
+      "tensors": 3741
+    }
+  ],
+  "config_sha256": "319ee1293a279a57990fcfc18fdb533101ffaf264a990a7d0bcb1c3d24fc720d",
+  "headers_sha256": "f881380292f94b7df872201755f15ce55e69f2cb7bafec059186f6800625803e",
+  "tensors": 94393,
+  "dtype_counts": {
+    "F32": 31101,
+    "BF16": 1480,
+    "F8_E4M3": 30971,
+    "U8": 30841
+  },
+  "quant_method": "modelopt",
+  "quant_algo": "MIXED_PRECISION",
+  "tensor_bytes": 23407457492
+}
