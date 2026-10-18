@@ -267,6 +267,10 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = host }) })).step);
     const cuda = runtime(b, host, .debug, &.{});
     const mods = family(b, host, .debug, cuda, draft_ids);
+    const contract_host = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "cuda", .module = cuda } } });
+    const contract_run = b.addRunArtifact(b.addTest(.{ .root_module = contract_host }));
+    step.dependOn(&contract_run.step);
+    b.step("test-kernel-contract-host", "Contract reference fixtures and offline metadata tests (CPU only)").dependOn(&contract_run.step);
     const native_modules = engines(b, host, .debug, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat);
     const native = native_modules.engines;
     // the engine seam (engine_api.zig's test block: lane_host and prompt_cache) runs too, not only the engines module that imports it

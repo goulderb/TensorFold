@@ -103,7 +103,7 @@ const usage =
     \\  glm-precision             GLM Q4 MSE and FP8 row128 layout and projection references
     \\  glm-grammar               GLM first and multirow masked greedy and sampled draws
     \\  kernel-contract           the registered kernels through the contract's gates, each planted control red (needs -Dnvcc)
-    \\  kernel-contract-limits DIR   each registered launch against sm_80/86/89/120/121 from the fatbins in DIR
+    \\  kernel-contract-limits DIR [--sm SM] [--only TEXT]   CPU-only ELF limits; scoped filters limit the claim
     \\  glm-attn-fp8load [rows]    FP8 attention byte parity and chunks-only timing (default 2048 rows, 32 heads)
     \\  glm-ref                   GLM projections (matmuls, router, attention, indexer, hc) against float64 (synthetic)
     \\  glm-source-dense          source MXFP8/FP8_PB_WO: BF16 activations, FP64, both epilogues, 1-2048 rows
@@ -120,6 +120,13 @@ pub fn main(init: std.process.Init) !u8 {
     if (args.len < 2) {
         std.debug.print("{s}", .{usage});
         return 2;
+    }
+    if (std.mem.eql(u8, args[1], "kernel-contract-limits")) {
+        @import("contract_limits.zig").run(init.gpa, init.io, args[2..]) catch |e| {
+            std.debug.print("FAIL kernel-contract-limits: {t}\n", .{e});
+            return 1;
+        };
+        return 0;
     }
     var driver = try cuda.Driver.open();
     defer driver.close();
@@ -217,7 +224,6 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
         return carveout_tests.run(gpu, if (rest.len > 1) rest[1] else cuda.carveout.default_card, mib);
     }
     if (std.mem.eql(u8, cmd, "kernel-contract")) return contract_tests.run(gpu);
-    if (std.mem.eql(u8, cmd, "kernel-contract-limits")) return contract_tests.fatbins(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "train-pack")) return train_pack.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) try std.fmt.parseInt(usize, rest[2], 10) else 24);
     if (std.mem.eql(u8, cmd, "glm-lanes-cover")) return glm_lanes_tests.coverCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
     if (std.mem.eql(u8, cmd, "glm-shared-check")) return glm_lanes_tests.sharedCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));

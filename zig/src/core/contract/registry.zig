@@ -7,7 +7,16 @@ const C = limits.CudaLaunch;
 const U = limits.Usage;
 
 /// A CUDA launch and what nvcc made of it for sm_80, sm_86, sm_89, sm_120 and sm_121 (limits.sms' order; regs 0: none).
-pub const CudaRecord = struct { launch: C, usage: [limits.sms.len]U };
+pub const CudaRecord = struct {
+    launch: C,
+    usage: [limits.sms.len]U,
+    /// Zero declares every registry target; a scoped compile is not evidence for the other targets.
+    target_sm: u32 = 0,
+
+    pub fn applies(self: CudaRecord, sm: u32) bool {
+        return self.target_sm == 0 or self.target_sm == sm;
+    }
+};
 
 const none: [limits.sms.len]U = @splat(.{ .regs = 0, .static = 0 });
 const group_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
@@ -45,7 +54,7 @@ pub const cuda = [_]CudaRecord{
     .{ .launch = .{ .name = "vit tf_vit_pointwise", .symbol = "tf_vit_pointwise", .image = "vit", .threads = 256 }, .usage = .{ .{ .regs = 14, .static = 0, .bound = 256 }, .{ .regs = 14, .static = 0, .bound = 256 }, .{ .regs = 14, .static = 0, .bound = 256 }, .{ .regs = 14, .static = 0, .bound = 256 }, .{ .regs = 14, .static = 0, .bound = 256 } } },
     .{ .launch = .{ .name = "vit tf_vit_bias", .symbol = "tf_vit_bias", .image = "vit", .threads = 256 }, .usage = .{ .{ .regs = 12, .static = 0, .bound = 256 }, .{ .regs = 12, .static = 0, .bound = 256 }, .{ .regs = 12, .static = 0, .bound = 256 }, .{ .regs = 12, .static = 0, .bound = 256 }, .{ .regs = 12, .static = 0, .bound = 256 } } },
     .{ .launch = .{ .name = "vit tf_vit_unshuffle", .symbol = "tf_vit_unshuffle", .image = "vit", .threads = 256 }, .usage = .{ .{ .regs = 29, .static = 0, .bound = 256 }, .{ .regs = 32, .static = 0, .bound = 256 }, .{ .regs = 32, .static = 0, .bound = 256 }, .{ .regs = 34, .static = 0, .bound = 256 }, .{ .regs = 34, .static = 0, .bound = 256 } } },
-};
+} ++ @import("registry_glm.zig").records(CudaRecord);
 
 /// Gate 5's planted CUDA controls: a launch past its __launch_bounds__, one needing more registers than a block has.
 pub const cuda_controls = [_]CudaRecord{
@@ -58,7 +67,12 @@ pub fn checkCuda(a: std.mem.Allocator, list: []const CudaRecord, quiet: bool) !u
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
     var n: usize = 0;
+    for (list) |r| if (r.target_sm != 0 and limits.target(r.target_sm) == null) {
+        try out.print(a, "{s}: unknown declared sm_{d}\n", .{ r.launch.name, r.target_sm });
+        n += 1;
+    };
     for (list) |r| for (limits.sms, r.usage) |t, u| {
+        if (!r.applies(t.sm)) continue;
         if (u.regs == 0) {
             try out.print(a, "{s} on sm_{d}: no compiled usage recorded\n", .{ r.launch.name, t.sm });
             n += 1;
@@ -173,4 +187,16 @@ test "the registered launches fit every Apple family and every SM, and each plan
     for (metal_controls) |l| try std.testing.expect(try checkMetal(a, &.{l}, true) > 0);
     try std.testing.expectEqual(@as(usize, 0), try checkCuda(a, &cuda, false));
     for (cuda_controls) |r| try std.testing.expect(try checkCuda(a, &.{r}, true) > 0);
+}
+
+test "scoped records still require every declared compile and an unknown target cannot skip all checks" {
+    const a = std.testing.allocator;
+    var r = CudaRecord{ .launch = .{ .name = "scoped", .symbol = "scoped", .image = "scoped", .threads = 128 }, .usage = @splat(.{ .regs = 0, .static = 0 }), .target_sm = 121 };
+    try std.testing.expectEqual(@as(usize, 1), try checkCuda(a, &.{r}, true));
+    r.usage[4] = .{ .regs = 32, .static = 0, .bound = 128 };
+    try std.testing.expectEqual(@as(usize, 0), try checkCuda(a, &.{r}, true));
+    r.target_sm = 0;
+    try std.testing.expectEqual(@as(usize, 4), try checkCuda(a, &.{r}, true));
+    r.target_sm = 75;
+    try std.testing.expectEqual(@as(usize, 1), try checkCuda(a, &.{r}, true));
 }
