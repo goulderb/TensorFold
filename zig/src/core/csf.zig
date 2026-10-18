@@ -1,8 +1,8 @@
 //! Lossless csf_32x2_v1 NVFP4 scale bytes, independent of checkpoint storage.
 
-// New code implementing Local Inference Lab's documented format (flashinfer docs/csf-scale-blocks.md at 7e203806,
+// New code for Local Inference Lab's format: flashinfer docs/csf-scale-blocks.md at 7e203806, Apache-2.0.
 
-// Apache-2.0); credits in LICENSES/donors/README.md.
+// Credits for that format are in LICENSES/donors/README.md.
 
 const std = @import("std");
 
@@ -144,9 +144,7 @@ pub fn validate(bases: []const u8, codes: []const u8, page_bases: []const u8, of
     if (end != exceptions.len) return error.UnusedExceptionRecords;
 }
 
-// Validation completes before any output write; no allocation or floating-point conversion.
-
-/// Write exact row-major [rows, columns] E4M3 bytes. Inputs and output must not overlap.
+/// Validate, then write exact row-major [rows, columns] E4M3 bytes without allocation or float math; no aliasing.
 pub fn decode(bases: []const u8, codes: []const u8, page_bases: []const u8, offsets: []const u8, exceptions: []const u8, rows: usize, columns: usize, output: []u8) Error!void {
     const g = try Geometry.init(rows, columns);
     if (output.len != g.elements) return error.InvalidOutputLength;
