@@ -119,3 +119,8 @@ tiles with fp32 out (K slices met in a cluster, fused, or by `reduce_kernel<true
 checkpoint-source MXFP8 and FP8_PB_WO projections at every `tf_exlr8_dense_N` row capacity and the bf16 upcast, the
 DFlash MXFP8 head's `glm_qmm` tiles, and the NVFP4 expert decode variants (bit-equal to the baseline) and prompt
 epilogues, each SwiGLU also with its clamp.
+
+The [2026-10-18 sm_121 receipt](receipts/glm53-contract-sm121-20261018.json) records the live CUDA run at
+`4424dbd45b1b3835cfe31f73baa396cf678ec0ca`: 88 kernels pass gates 1-4, all five planted controls are red,
+and live gate 5 has zero limit problems. The receipt includes the full log and the measured image hashes.
+This run qualifies the registered kernel contracts on sm_121, not full model serving or another GPU target.

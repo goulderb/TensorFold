@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "scope": "CUDA kernel-contract gates 1-4 and live gate 5 on sm_121; GLM FP4-Local and the shared CUDA registrations",
+  "tested_commit": "4424dbd45b1b3835cfe31f73baa396cf678ec0ca",
+  "registration_merge": "8156ea4ef9157cac618eff02dbe7452a47b9e0a8",
+  "source_archive_sha256": "1e5ffbdf241eec4072b8bf07ad7cae1338df28b9833de9a3303b079d8d3e3227",
+  "test_binary_sha256": "006eb7366420b2dffcad5e9655f37be7c4253dbbb38b7c3f5b2c7233563f6441",
+  "build_image": "sha256:15b8de8baabe68e46afc51e88f3ccad5042013bafe8f244ec082ce0bb06d47e3",
+  "platform": {
+    "observed_at": "2026-10-18T12:12:17.705441+00:00",
+    "os": "Linux 6.17.0-1032-nvidia #32-Ubuntu SMP PREEMPT_DYNAMIC Wed Aug 19 17:40:46 UTC 2026 aarch64 GNU/Linux",
+    "gpu": "NVIDIA GB10, 580.178.04",
+    "cuda": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2026 NVIDIA Corporation\nBuilt on Tue_Jun_09_02:45:27_PM_PDT_2026\nCuda compilation tools, release 13.3, V13.3.73\nBuild cuda_13.3.r13.3/compiler.38244171_0"
+  },
+  "command": "tf-cuda-test kernel-contract",
+  "completed_utc": "2026-10-18T12:40:58.014913+00:00",
+  "gpu_summary": "SUMMARY 88 kernels: 88 pass gates 1-4, 0 fail, 0 known findings; 5 controls: 5 red as planted, 0 missed; 0 limit problems; gates 1386403 ms, limits 4 ms",
+  "gpu_counts": {
+    "kernels": 88,
+    "passed": 88,
+    "failed": 0,
+    "known": 0,
+    "controls": 5,
+    "caught": 5,
+    "missed": 0,
+    "limit_problems": 0
+  },
+  "gpu_log": "glm53-contract-sm121-20261018.log",
+  "gpu_log_sha256": "b2aa4fdfda277046bcda55d4028ada87888fb0848011656041a6cbff46feaad3",
+  "original_capture_sha256": "a5ec0f22fd65f7c9be16b0cdaa63b1ee2d924e11cba783bd73e52ccb68ebd815",
+  "build_summaries": [
+    "Build Summary: 43/43 steps succeeded; 523/523 tests passed",
+    "Build Summary: 64/64 steps succeeded",
+    "Build Summary: 59/59 steps succeeded"
+  ],
+  "offline_sm121_summary": "SUMMARY limits: 62 launches, 62 compiled records, 2 controls red, 0 controls missed, 0 problems; all selected targets sm_121",
+  "prior_five_sm_source": "c0424d9761a473cc85d2cdf1974a6faf592ee1f5",
+  "prior_five_sm_summary": "SUMMARY limits: 62 launches, 174 compiled records, 10 controls red, 0 controls missed, 0 problems; all selected targets",
+  "prior_five_sm_scope": "Registry and CUDA sources are unchanged from this compile; the later change only reorders the CPU expert reference",
+  "windows_contract_host_tests": "12/12 passed, including byte equality against the original CPU reference",
+  "linux_lean": "1148 inherited findings, unchanged from the registration baseline; no findings in the changed file",
+  "registered_glm_images": [
+    {
+      "image": "dflash_qmm.fatbin",
+      "sha256": "fde20744d5ab41832660864a7a8aa7e398ccd720454f5d016dff9760799420b1"
+    },
+    {
+      "image": "exlr8_dense.fatbin",
+      "sha256": "481fff255df9a6306208f8b4ad7dfb46e9358d3fa039b1f9035e95335e720936"
+    },
+    {
+      "image": "glm_glue.fatbin",
+      "sha256": "c2b2b6d23f5aa51ffed1d21659e0c93a5e13a552bbfee9b3a0e78ffb1693f369"
+    },
+    {
+      "image": "nvfp4_experts.fatbin",
+      "sha256": "361db1a561a0cefd7b81db5e9e486d46c82a08f25205b7283ef72ebf5ed6740c"
+    },
+    {
+      "image": "torch_pointwise.fatbin",
+      "sha256": "b784ed09041e6b8e3eed592b502ae7e2373ab2a23b3e246d559056ced183a8fe"
+    }
+  ],
+  "not_qualified": [
+    "Live CUDA gates on other SMs",
+    "Metal",
+    "Full model serving, checkpoint fidelity, capacity, or persistence"
+  ]
+}
