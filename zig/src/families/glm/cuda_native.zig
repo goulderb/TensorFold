@@ -164,6 +164,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         }
         try vision_startup.paired(vision_problem, .{ .ctx = own.e, .ready = visionReady });
     }
+    // Every rank checks TF_GLM_LONE_COSTS so a bad value stops both before they part; rank 0 alone plans with it.
+    const lone_costs: ?glm_lanes.LoneCosts = if (std.c.getenv("TF_GLM_LONE_COSTS")) |raw| glm_lanes.LoneCosts.parse(std.mem.span(raw)) catch {
+        std.log.err("rank {d}: TF_GLM_LONE_COSTS: ONE,ROW (positive ms, e.g. 38,7.9), not {s}", .{ p.rank, std.mem.span(raw) });
+        return error.BadSetting;
+    } else null;
     // Rank 0 admits by the smallest room of the ranks; its sizes are the largest (the first ranks take the remainder).
     const rooms = try gpa.alloc(u64, p.world);
     defer gpa.free(rooms);
@@ -188,7 +193,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
             return if (std.c.getenv(name)) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
         }
     }.get;
-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .vision = own.vision, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED") };
+    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .vision = own.vision, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .lone_costs = lone_costs };
+    if (lone_costs != null) std.log.info("GLM lone-stream round costs: {s} ms (one row, each further row)", .{std.mem.span(std.c.getenv("TF_GLM_LONE_COSTS").?)});
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),

@@ -15,6 +15,31 @@ const ring = 1024;
 /// The widest verify window: the pending token and a full draft chain (glm-decode-check's, the AOT row variants).
 pub const max_rows = 1 + engine.max_drafts;
 
+/// TF_GLM_LONE_COSTS=ONE,ROW: a lone stream's round modeled as ONE ms plus ROW ms a row past the first. Without a
+/// table lanes/depth.zig asks a lone stream for three drafts at most; with one it prices every depth the verify plan
+/// allows, and the stream's measured rounds replace the model depth by depth. Shared rounds keep their untimed fill:
+/// a constant cost leaves allocate.zig's rate rising with every likelier node, as an empty table does.
+pub const LoneCosts = struct {
+    window: [max_rows]lanes.config.Cost,
+    flat: [engine.shared_rows]lanes.config.Cost,
+
+    pub fn parse(raw: []const u8) !LoneCosts {
+        const comma = std.mem.indexOfScalar(u8, raw, ',') orelse return error.BadLoneCosts;
+        const one = try positive(raw[0..comma]);
+        const row = try positive(raw[comma + 1 ..]);
+        var c: LoneCosts = undefined;
+        for (&c.window, 0..) |*x, i| x.* = .{ .width = @intCast(i + 1), .ms = one + row * @as(f64, @floatFromInt(i)) };
+        for (&c.flat, 0..) |*x, i| x.* = .{ .width = @intCast(i + 1), .ms = 1.0 };
+        return c;
+    }
+
+    fn positive(raw: []const u8) !f64 {
+        const v = std.fmt.parseFloat(f64, raw) catch return error.BadLoneCosts;
+        if (!std.math.isFinite(v) or v <= 0.0) return error.BadLoneCosts;
+        return v;
+    }
+};
+
 /// A stream's place in the backend: its sequence's slot, the rows its last verify left uncommitted, its held drafts.
 const Lane = struct {
     slot: u32,
@@ -29,6 +54,7 @@ pub const Lanes = struct {
     vision: ?*vision_runtime.Service = null,
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
+    lone_costs: ?LoneCosts = null, // TF_GLM_LONE_COSTS
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
     drawn: [ring]u32 = undefined,
@@ -66,7 +92,10 @@ pub const Lanes = struct {
         const drafting = self.x.e.drafting();
         const sharing = drafting and !self.alone;
         const plan = self.x.e.verifyPlan();
+        const costs: ?*const LoneCosts = if (drafting) if (self.lone_costs) |*c| c else null else null;
         return .{
+            .window_costs = if (costs) |c| c.window[0 .. 1 + plan.drafts()] else &.{},
+            .shared_costs = if (costs) |c| &c.flat else &.{},
             .exact_width = if (drafting) @intCast(1 + plan.drafts()) else 1,
             .gpu_tokens = false,
             .mtp = drafting,
@@ -441,6 +470,80 @@ test "DFlash facts enable batched head scheduling only while sharing" {
     e.dflash = null;
     e.mtp = true;
     try std.testing.expect(!backend.facts().draft_streams);
+}
+
+test "TF_GLM_LONE_COSTS takes two positive ms and models each window width" {
+    const c = try LoneCosts.parse("38,7.9");
+    try std.testing.expectEqual(@as(u32, 1), c.window[0].width);
+    try std.testing.expectApproxEqAbs(@as(f64, 38.0), c.window[0].ms, 1e-12);
+    try std.testing.expectEqual(@as(u32, max_rows), c.window[max_rows - 1].width);
+    try std.testing.expectApproxEqAbs(@as(f64, 38.0 + 7.9 * (max_rows - 1)), c.window[max_rows - 1].ms, 1e-9);
+    for ([_][]const u8{ "", "38", "38,", ",7.9", "0,7.9", "38,-1", "inf,1", "nan,1", "38,7.9,1", "a,b", " 38,7.9" }) |raw|
+        try std.testing.expectError(error.BadLoneCosts, LoneCosts.parse(raw));
+}
+
+fn loneFixture(e: *engine.Engine, link: *follow.Link, costs: ?LoneCosts) Lanes {
+    e.settings = .{ .dflash_verify = .dflash6 };
+    e.mtp = false;
+    e.dflash = @ptrFromInt(256);
+    return .{ .x = .{ .e = e, .link = link }, .lone_costs = costs };
+}
+
+fn loneDepth(cfg: *const lanes.Config, p: f64) !i64 {
+    const gpa = std.testing.allocator;
+    const prior: [engine.max_drafts]f64 = @splat(p);
+    var rule: lanes.depth.Rule = .{ .gpa = gpa, .k = cfg.k, .prior = &prior, .most_drafts = cfg.most_drafts, .family_costs = &cfg.family_costs, .shared_costs = &cfg.shared_costs, .mtp_step_ms = cfg.mtp_step_ms, .plain_guard = cfg.plain_guard, .node_probabilities = cfg.node_probabilities, .batch_rows = cfg.batch_rows, .batched_heads = cfg.draft_streams };
+    defer rule.deinit();
+    var st: ?lanes.depth.State = null;
+    defer if (st) |*s| s.deinit(gpa);
+    return rule.depth(.{ .state = &st, .draft_room = 1000, .finished = false, .forced = false });
+}
+
+test "lone costs let a lone DFlash stream price drafts past three, by acceptance" {
+    var e: engine.Engine = undefined;
+    var link: follow.Link = undefined;
+    const untimed = loneFixture(&e, &link, null);
+    var plain = try lanes.Config.init(std.testing.allocator, untimed.facts(), max_rows, engine.max_drafts);
+    defer plain.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 6), plain.most_drafts);
+    try std.testing.expectEqual(@as(i64, 3), try loneDepth(&plain, 0.95)); // depth.zig's untimed rule stops at three
+    const timed = loneFixture(&e, &link, try LoneCosts.parse("38,7.9"));
+    var cfg = try lanes.Config.init(std.testing.allocator, timed.facts(), max_rows, engine.max_drafts);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?f64, 38.0 + 7.9 * 6), cfg.family_costs.get(7));
+    try std.testing.expectEqual(@as(i64, 6), try loneDepth(&cfg, 0.9)); // code-like acceptance: the whole plan pays
+    try std.testing.expect(try loneDepth(&cfg, 0.6) <= 3); // prose-like acceptance: shallow stays cheaper a token
+}
+
+test "lone costs leave a shared round's draft allocation as the untimed fill made it" {
+    const gpa = std.testing.allocator;
+    var e: engine.Engine = undefined;
+    var link: follow.Link = undefined;
+    const timed = loneFixture(&e, &link, try LoneCosts.parse("38,7.9"));
+    var cfg = try lanes.Config.init(gpa, timed.facts(), max_rows, engine.max_drafts);
+    defer cfg.deinit(gpa);
+    const untimed = loneFixture(&e, &link, null);
+    var plain = try lanes.Config.init(gpa, untimed.facts(), max_rows, engine.max_drafts);
+    defer plain.deinit(gpa);
+    try std.testing.expect(plain.shared_costs.empty());
+    try std.testing.expectEqual(@as(?f64, 1.0), cfg.shared_costs.get(@intCast(engine.shared_rows)));
+    const sets = [_][]const []const f64{
+        &.{ &.{ 0.9, 0.81, 0.73, 0.66, 0.59, 0.53 }, &.{ 0.6, 0.36, 0.22, 0.13, 0.08, 0.05 } },
+        &.{ &.{ 0.5, 0.2, 0.05, 0.01, 0.001, 0.0001 }, &.{ 0.95, 0.9, 0.86, 0.81, 0.77, 0.74 }, &.{ 0.7, 0.49, 0.34, 0.24, 0.17, 0.12 } },
+        &.{ &.{ 0.3, 0.09, 0.03, 0.01, 0.0, 0.0 }, &.{ 0.3, 0.09, 0.03, 0.01, 0.0, 0.0 } },
+    };
+    for (sets) |probs| {
+        const fixed: [3]u32 = @splat(1);
+        for ([_]f64{ 0.0, 8.0, 120.0 }) |overhead| {
+            for ([_]u64{ 8, 32, engine.shared_rows }) |rows| {
+                const want = try lanes.allocate.allocateDrafts(gpa, fixed[0..probs.len], probs, &plain.shared_costs, overhead, rows, .{ .batched = true });
+                defer gpa.free(want);
+                const got = try lanes.allocate.allocateDrafts(gpa, fixed[0..probs.len], probs, &cfg.shared_costs, overhead, rows, .{ .batched = true });
+                defer gpa.free(got);
+                try std.testing.expectEqualSlices(u32, want, got);
+            }
+        }
+    }
 }
 
 test "DFlash draft preflight distinguishes accepted rows already committed by the core" {
