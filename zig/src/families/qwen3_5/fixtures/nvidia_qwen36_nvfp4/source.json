@@ -21,6 +21,7 @@
       "tensors": 9322
     }
   ],
+  "capture_script_sha256": "1e686ce92ce47aba08e7421f88913fd4e8c0d25848cc0d85963f05b74ccb7513",
   "config_sha256": "58aefa1c9eff7989f431d748f2ddec39446cb1fd2a69acc46e285c6a37b0cecc",
   "headers_sha256": "0466d37c5bd793e84d10972c555d4f9baa09c1dd44f5b05615b8e87e04d8c8c1",
   "tensors": 124468,

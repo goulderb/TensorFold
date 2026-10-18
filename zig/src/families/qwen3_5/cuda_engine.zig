@@ -77,6 +77,23 @@ fn checkFloor(ctx: *const cuda.Context) !void {
     if ((try ctx.memInfo()).free < floor_bytes) return error.GpuMemoryFloor;
 }
 
+pub fn requiredMemory(plan: weights.MemoryPlan, cfg: checkpoint.Config, first: usize, end: usize, context: usize) !usize {
+    var state: usize = 0;
+    for (first..end) |i| state = try std.math.add(usize, state, try stateBytes(cfg.spec.full(i), context));
+    const live = try std.math.add(usize, scratchBytes(), state);
+    const peak = try std.math.add(usize, plan.weights, @max(plan.staging, live));
+    return std.math.add(usize, peak, floor_bytes);
+}
+
+pub fn checkCapacity(available: usize, required: usize) !void {
+    if (available < required) return error.InsufficientGpuMemory;
+}
+
+fn releaseContext(ctx: *cuda.Context) void {
+    _ = ctx.d.api.cuDevicePrimaryCtxRelease_v2(ctx.device);
+    ctx.* = undefined;
+}
+
 const Partition = struct {
     context: cuda.Context,
     stream: cuda.Stream,
@@ -91,7 +108,7 @@ const Partition = struct {
         p.first = first;
         p.end = end;
         p.context = try cuda.Context.init(&e.driver, ordinal);
-        errdefer p.context.deinit();
+        errdefer releaseContext(&p.context);
         try checkFloor(&p.context);
         p.stream = try cuda.Stream.init(&e.driver, true);
         errdefer p.stream.deinit();
@@ -107,13 +124,13 @@ const Partition = struct {
     }
 
     fn deinit(p: *Partition) void {
+        defer releaseContext(&p.context);
+        defer p.weights.deinit();
         p.context.makeCurrent() catch return;
-        p.stream.synchronize() catch return;
+        p.stream.synchronize() catch {};
         p.scratch.free();
-        p.weights.deinit();
         p.ops.unload();
         p.stream.deinit();
-        p.context.deinit();
     }
 
     fn projection(p: *Partition, w: weights.Projection, x: u64, out: u64) !void {
@@ -184,6 +201,19 @@ pub const Engine = struct {
         errdefer gpa.free(e.dir);
         e.driver = try cuda.Driver.open();
         errdefer e.driver.close();
+        for (options.devices, 0..) |device, i| {
+            const first = if (i == 0) 0 else options.cut;
+            const end = if (i + 1 == options.devices.len) 40 else options.cut;
+            const plan = try weights.planPartition(gpa, io, dir, cfg, first, end);
+            const required = try requiredMemory(plan, cfg, first, end, options.context);
+            var context = try cuda.Context.init(&e.driver, device);
+            defer releaseContext(&context);
+            const memory = try context.memInfo();
+            checkCapacity(memory.free, required) catch |err| {
+                std.log.warn("Qwen CUDA device {d} needs at least {d} MiB free for layers {d}..{d}, including the {d} MiB floor; available {d} MiB", .{ device, (required + (1 << 20) - 1) >> 20, first, end, floor_bytes >> 20, memory.free >> 20 });
+                return err;
+            };
+        }
         const parts = try gpa.alloc(Partition, options.devices.len);
         errdefer gpa.free(parts);
         var initialized: usize = 0;
@@ -302,7 +332,7 @@ pub const Session = struct {
         const e = session.engine;
         for (e.partitions) |*p| {
             p.context.makeCurrent() catch continue;
-            p.stream.synchronize() catch continue;
+            p.stream.synchronize() catch {};
             for (session.layers[p.first..p.end]) |*state| state.deinit();
         }
         e.gpa.free(session.layers);
@@ -373,4 +403,29 @@ test "session cache budgets include both KV planes and complete GDN state" {
     try std.testing.expectEqual(@as(usize, 2048 * 4096), try stateBytes(true, 4096));
     try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024 + 49152), try stateBytes(false, 4096));
     try std.testing.expect(scratchBytes() > 8 << 20);
+}
+
+test "partition teardown releases its primary retain when context selection fails" {
+    const Mock = struct {
+        var releases: usize = 0;
+
+        fn select(_: cuda.abi.Context) callconv(.c) cuda.abi.Result {
+            return cuda.abi.error_not_ready;
+        }
+
+        fn release(device: cuda.abi.Device) callconv(.c) cuda.abi.Result {
+            std.debug.assert(device == 7);
+            releases += 1;
+            return cuda.abi.success;
+        }
+    };
+    var driver: cuda.Driver = .{ .lib = undefined, .api = undefined };
+    driver.api.cuCtxSetCurrent = Mock.select;
+    driver.api.cuDevicePrimaryCtxRelease_v2 = Mock.release;
+    var partition: Partition = undefined;
+    partition.context = .{ .d = &driver, .device = 7, .handle = @ptrFromInt(32) };
+    partition.weights = .{ .layers = try std.testing.allocator.alloc(weights.Layer, 1), .gpa = std.testing.allocator, .ctx = &partition.context };
+    Mock.releases = 0;
+    partition.deinit();
+    try std.testing.expectEqual(@as(usize, 1), Mock.releases);
 }

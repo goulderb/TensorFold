@@ -3,12 +3,12 @@ const core = @import("core");
 const ck = @import("cuda_checkpoint.zig");
 const Tensor = core.checkpoint.Tensor;
 
-const Header = struct {
+pub const Header = struct {
     arena: std.mem.Allocator,
     entries: std.json.ObjectMap,
     used: std.StringHashMapUnmanaged(void) = .empty,
 
-    fn parse(arena: std.mem.Allocator, bytes: []const u8) !Header {
+    pub fn parse(arena: std.mem.Allocator, bytes: []const u8) !Header {
         var input: std.Io.Reader = .fixed(bytes);
         var gz: std.compress.flate.Decompress = .init(&input, .gzip, &.{});
         var out: std.Io.Writer.Allocating = .init(arena);
@@ -83,6 +83,20 @@ test "cuda Qwen checkpoint validates every official text header and optional NVF
         h.entries.getPtr(key).?.array.items[1].array.items[1].integer = 127;
         try std.testing.expectError(error.UnexpectedTensor, ck.projectionLayout(&h, "model.language_model.layers.0.mlp.experts.0.gate_proj", 512, 2048));
     }
+}
+
+test "cuda Qwen checkpoint refuses dynamic FP4 group metadata even with W4A16 layer tags" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const doc = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("fixtures/nvidia_qwen36_nvfp4/config.json"), .{});
+    const quant = doc.object.get("quantization_config").?.object;
+    const group = quant.get("config_groups").?.object.get("group_1").?.object;
+    var activation = group.get("input_activations").?.object;
+    activation.getPtr("dynamic").?.* = .{ .bool = true };
+    var serialized: std.Io.Writer.Allocating = .init(a);
+    try std.json.Stringify.value(doc, .{}, &serialized.writer);
+    try std.testing.expectError(error.UnsupportedQwenQuantization, ck.Config.parse(a, serialized.written()));
 }
 
 test "cuda Qwen checkpoint preserves raw GDN parameters and converts only zero-centered norm roles" {

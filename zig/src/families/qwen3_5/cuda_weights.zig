@@ -45,6 +45,77 @@ pub const Layer = struct {
 
 pub const gpu_floor_bytes: usize = 1536 * 1024 * 1024;
 
+pub const MemoryPlan = struct {
+    weights: usize = 0,
+    staging: usize = 0,
+
+    fn tensor(p: *MemoryPlan, name: []const u8, t: Tensor) !void {
+        if (std.mem.endsWith(u8, name, ".input_scale")) return;
+        const expert = std.mem.indexOf(u8, name, ".mlp.experts.") != null;
+        if (std.mem.endsWith(u8, name, ".weight_scale_2")) {
+            if (expert) p.weights = try std.math.add(usize, p.weights, 4);
+            return;
+        }
+        if (std.mem.endsWith(u8, name, ".weight_scale")) return;
+        var elements: usize = 1;
+        for (t.shape[0..t.rank]) |dim| elements = try std.math.mul(usize, elements, dim);
+        const raw = std.mem.eql(u8, name, "model.language_model.embed_tokens.weight") or
+            std.mem.endsWith(u8, name, ".mlp.gate.weight") or
+            std.mem.endsWith(u8, name, ".mlp.shared_expert_gate.weight");
+        var bytes: usize = undefined;
+        if (raw) {
+            bytes = try std.math.mul(usize, elements, t.dtype.size());
+        } else if (t.rank == 2) {
+            const n = t.dim(0);
+            const k = t.dim(1);
+            if (expert) {
+                bytes = Nvfp4Experts.bytes(1, n, try std.math.mul(usize, k, 2), 1);
+            } else {
+                const padded_elements = try std.math.mul(usize, cuda.modelopt.padded(n), k);
+                bytes = try std.math.mul(usize, padded_elements, t.dtype.size());
+                if (t.dtype == .u8) bytes = try std.math.add(usize, bytes, padded_elements / 8);
+            }
+            var staging = try std.math.mul(usize, elements, t.dtype.size());
+            if (t.dtype == .u8) staging = try std.math.add(usize, staging, elements / 8);
+            p.staging = @max(p.staging, staging);
+        } else {
+            bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+        }
+        p.weights = try std.math.add(usize, p.weights, bytes);
+    }
+};
+
+pub fn memoryPlan(source: anytype, cfg: Config, first: usize, end: usize, with_embed: bool, with_head: bool) !MemoryPlan {
+    // Admit the shapes before the packed-layout allocation arithmetic uses them.
+    try checkpoint.validateText(source, cfg, first, end, with_embed, with_head);
+    const Source = @TypeOf(source);
+    const Planned = struct {
+        source: Source,
+        plan: MemoryPlan = .{},
+
+        pub fn has(s: *const @This(), name: []const u8) bool {
+            return s.source.has(name);
+        }
+
+        pub fn get(s: *@This(), name: []const u8) !Tensor {
+            const t = try s.source.get(name);
+            try s.plan.tensor(name, t);
+            return t;
+        }
+    };
+    var planned: Planned = .{ .source = source };
+    try checkpoint.validateText(&planned, cfg, first, end, with_embed, with_head);
+    return planned.plan;
+}
+
+pub fn planPartition(gpa: Allocator, io: Io, dir: []const u8, cfg: Config, first: usize, end: usize) !MemoryPlan {
+    var ck = try core.Checkpoint.openModel(gpa, io, dir);
+    defer ck.close();
+    const plan = try memoryPlan(&ck, cfg, first, end, first == 0, end == 40);
+    try checkpoint.refuseUnusedText(&ck, first, end, first == 0, end == 40);
+    return plan;
+}
+
 pub const Weights = struct {
     layers: []Layer,
     embed: ?u64 = null,
@@ -86,12 +157,14 @@ pub const Weights = struct {
     }
 
     pub fn deinit(self: *Weights) void {
+        defer {
+            self.buffers.deinit(self.gpa);
+            self.gpa.free(self.layers);
+            self.* = undefined;
+        }
         self.ctx.makeCurrent() catch return;
-        self.ctx.synchronize() catch return;
+        self.ctx.synchronize() catch {};
         for (self.buffers.items) |*buffer| buffer.free();
-        self.buffers.deinit(self.gpa);
-        self.gpa.free(self.layers);
-        self.* = undefined;
     }
 };
 

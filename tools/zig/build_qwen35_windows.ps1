@@ -1,7 +1,7 @@
 #requires -Version 7.0
 [CmdletBinding()]
 param(
-    [ValidateSet('test-qwen35-cuda-host', 'native', 'fatbins', 'qwen35-probe')]
+    [ValidateSet('test-qwen35-cuda-host', 'native', 'fatbins', 'qwen35-probe', 'qwen35-kernels-probe')]
     [string]$Target = 'test-qwen35-cuda-host',
     [string]$Zig = 'C:/Users/developer/tools/zig-0.17.0/zig-x86_64-windows-0.17.0/zig.exe',
     [string]$CudaRoot = 'C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8',

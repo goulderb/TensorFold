@@ -77,13 +77,14 @@ def capture(repo: str, revision: str, metadata: Path, output: Path, local: Path 
     quant = config.get("quantization_config", {})
     report = {
         "repo": repo, "revision": revision, "sources": sources,
+        "capture_script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
         "headers_sha256": hashlib.sha256(raw).hexdigest(),
         "tensors": len(headers), "dtype_counts": dict(Counter(t[0] for t in headers.values())),
         "quant_method": quant.get("quant_method"), "quant_algo": quant.get("quant_algo"),
         "tensor_bytes": index.get("metadata", {}).get("total_size"),
     }
-    (output / "source.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    (output / "source.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8", newline="\n")
     return report
 
 

@@ -129,6 +129,26 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const d3_tool = b.createModule(.{ .root_source_file = b.path("zig/src/families/drama3/generate.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "drama3", .module = @import("drama3_host.zig").module(b, target, optimize, cuda, mods.core) } } });
     const d3_exe = b.addExecutable(.{ .name = "drama3-generate", .root_module = d3_tool });
     b.step("drama3-generate", "Drama generation and replay controls on CUDA").dependOn(&b.addInstallArtifact(d3_exe, .{}).step);
+    const qwen_probe = b.addExecutable(.{ .name = "tf-qwen35-probe", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/qwen35_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core) }, .{ .name = "core", .module = mods.core } },
+    }) });
+    b.step("qwen35-probe", "Build the native Qwen35 checkpoint and teacher-forcing probe").dependOn(&b.addInstallArtifact(qwen_probe, .{}).step);
+    const qwen_kernels_probe = b.addExecutable(.{ .name = "tf-qwen35-kernels-probe", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/qwen35_kernels_probe.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "cuda", .module = cuda },
+            .{ .name = "qwen35_ops", .module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/cuda_kernels.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "cuda", .module = cuda }} }) },
+            .{ .name = "qwen35_ref", .module = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/cuda_kernels_test.zig"), .target = target, .optimize = .ReleaseSafe }) },
+        },
+    }) });
+    b.step("qwen35-kernels-probe", "Build only the Qwen35 device-kernel parity probe; never run it").dependOn(&b.addInstallArtifact(qwen_kernels_probe, .{}).step);
     return server_exe;
 }
 
@@ -359,6 +379,20 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     }
     const drama3 = @import("drama3_host.zig").hostTests(b, step, cuda, mods.core);
     const native_modules = engines(b, host, .debug, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.qwen35, mods.qwen_vision);
+    const qwen35 = qwen35Module(b, host, .debug, cuda, mods.core);
+    const qwen35_run = b.addRunArtifact(b.addTest(.{ .root_module = qwen35 }));
+    qwen35_run.has_side_effects = true;
+    const qwen35_step = b.step("test-qwen35-cuda-host", "Qwen35 CUDA checkpoint and execution contracts without GPU work");
+    qwen35_step.dependOn(&qwen35_run.step);
+    const qwen35_adapter = b.createModule(.{
+        .root_source_file = b.path("zig/src/native/qwen35_cuda.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "qwen35_cuda", .module = qwen35 }, .{ .name = "engine_api", .module = native_modules.api }, .{ .name = "lanes", .module = mods.lanes } },
+    });
+    qwen35_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen35_adapter })).step);
+    step.dependOn(&qwen35_run.step);
     const native = native_modules.engines;
     const windows_port = @import("windows_host.zig").steps(b, cuda, native_modules.api);
     @import("drama3_host.zig").native(b, step, drama3, mods.core, native_modules.api, cuda, "drama_cuda_native_host");

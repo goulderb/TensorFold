@@ -72,7 +72,9 @@ pub fn main(init: std.process.Init) !u8 {
     if (!std.mem.eql(u8, std.mem.sliceAsBytes(logits), std.mem.sliceAsBytes(peer_logits))) return error.ResetMismatch;
     var free_mib: [2]usize = @splat(0);
     for (model.partitions, 0..) |*part, i| free_mib[i] = (try part.context.memInfo()).free / (1 << 20);
-    const report = .{ .prompt = input.prompt, .forced = input.forced, .tokens = tokens, .vocab = 248320, .context = input.context, .devices = input.devices, .cut = input.cut, .free_mib = free_mib[0..model.partitions.len], .session_isolation = true, .reset = true, .teacher_parity = "not checked by this executable" };
+    const config_sha = try fileHash(a, init.io, args[1], "config.json");
+    const index_sha = try fileHash(a, init.io, args[1], "model.safetensors.index.json");
+    const report = .{ .prompt = input.prompt, .forced = input.forced, .tokens = tokens, .vocab = 248320, .context = input.context, .devices = input.devices, .cut = input.cut, .free_mib = free_mib[0..model.partitions.len], .config_sha256 = config_sha[0..], .index_sha256 = index_sha[0..], .session_isolation = true, .reset = true, .teacher_parity = "not checked by this executable" };
     var out: std.Io.Writer.Allocating = .init(a);
     try std.json.Stringify.value(report, .{ .whitespace = .indent_2 }, &out.writer);
     try out.writer.writeByte('\n');
@@ -80,6 +82,14 @@ pub fn main(init: std.process.Init) !u8 {
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = manifest, .data = out.written() });
     try std.Io.File.stdout().writeStreamingAll(init.io, out.written());
     return 0;
+}
+
+fn fileHash(a: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8) ![64]u8 {
+    const path = try std.fs.path.join(a, &.{ dir, name });
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64 << 20));
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn finite(logits: []const f32) !void {

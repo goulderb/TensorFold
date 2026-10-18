@@ -46,7 +46,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     else
         &.{device};
     const model = qwen.Engine.open(gpa, io, o.dir, .{ .devices = devices, .context = context }) catch |err| {
-        problem.* = try std.fmt.allocPrint(a, "Qwen CUDA load failed: {s}; the 23 GB checkpoint needs TENSORFOLD_SPLIT=1 on the internal 16 GB pair", .{@errorName(err)});
+        problem.* = try std.fmt.allocPrint(a, "Qwen CUDA load failed: {s}; use a GPU with sufficient free memory or TENSORFOLD_SPLIT=1 for the internal pair", .{@errorName(err)});
         return null;
     };
     errdefer model.deinit();

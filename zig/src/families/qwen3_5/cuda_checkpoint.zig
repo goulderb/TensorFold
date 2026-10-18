@@ -58,6 +58,13 @@ pub const Config = struct {
                     return error.UnsupportedQwenQuantization;
                 fp8 = true;
             } else if (isInt(w.get("num_bits"), 4) and isInt(w.get("group_size"), 16)) {
+                // ModelOpt's per-layer W4A16_NVFP4 tag overrides the generic group's activation metadata.
+                if (g.get("input_activations")) |activation| {
+                    const a = try object(activation);
+                    if (!isInt(a.get("num_bits"), 4) or !isString(a.get("type"), "float") or
+                        !isBool(a.get("dynamic"), false) or !isInt(a.get("group_size"), 16))
+                        return error.UnsupportedQwenQuantization;
+                }
                 nvfp4 = true;
             } else return error.UnsupportedQwenQuantization;
         }

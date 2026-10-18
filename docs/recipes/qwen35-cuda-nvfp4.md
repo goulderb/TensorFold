@@ -31,7 +31,7 @@ task's qualification record. The targeted Qwen gate remains separate.
 
 ## Checkpoints inspected
 
-The first loaded checkpoint is
+The first target checkpoint is
 `ornith-ai/Ornith-1.5-35B-A3B-NVFP4` at
 `94e431d9cc47fa1986a7a1a4e9a80f7f118b03aa`. Its three shards contain
 23,407,457,492 tensor bytes. Its attention and GDN projections are FP8 with
@@ -42,6 +42,11 @@ projections omit `input_scale`, which is valid for W4A16.
 `nvidia/Qwen3.6-35B-A3B-NVFP4` at
 `1355db6a052410cfd62085d94b58866fd0f2c3c5` uses the same text geometry and
 mixed ModelOpt layout. Its NVFP4 entries also carry optional input scales.
+Its generic NVFP4 group declares static four-bit activations, but every
+per-layer quantization tag says `W4A16_NVFP4`. The loader treats those explicit
+per-layer tags as authoritative. It validates and consumes the optional
+input-scale metadata, then runs BF16 activations for these projections.
+Actual `NVFP4` activation tags and dynamic FP4 groups are refused.
 Both complete text headers pass the same loader validation rules. NVIDIA's
 card identifies ModelOpt 0.44.0 and CNN/DailyMail plus NVIDIA's
 Nemotron-Post-Training-Dataset-v2 as calibration sources.
@@ -96,6 +101,48 @@ and generated ids to the same quantized checkpoint in a trusted runtime.
 Pay particular attention to FP8 activation quantization, Qwen's raw
 zero-centered norms, convolution BF16 boundaries, GDN normalization epsilon
 and attention softmax rounding. The baseline uses online FP32 attention.
+It also retains FP32 routing weights and routed-expert sums. HF eager casts
+the routing weights to BF16 and accumulates expert outputs in BF16.
+
+Before the outage, capture a CPU reference with the pinned HF equations.
+`qwen35_reference.py` loads that exact source by SHA256 and uses the installed
+Transformers 5.16.1 integration. It disables hub kernels and unwraps the
+optional FLA/causal-convolution wrappers to use the source's PyTorch fallbacks.
+It decodes only the selected experts on demand and never exposes CUDA devices.
+It is an HF eager arithmetic reference, not an independently qualified
+ModelOpt serving runtime. FP8 inputs are statically quantized; NVFP4 stays
+weight-only. Dequantized weights are BF16.
+
+```powershell
+$py='C:/Development/local-ai-server/runtime/glimmer-capture-venv/Scripts/python.exe'
+& $py tools/zig/qwen35_reference.py capture MODEL INPUT.json REFERENCE_DIR
+./tools/zig/build_qwen35_windows.ps1 -Target qwen35-kernels-probe
+```
+
+Reference capture requires explicit forced ids for every row. The saved
+short Ornith case uses prompt ids `[760,6511,314,9338,369]` for
+`The capital of France is` and forced ids `[11751,13]` for ` Paris.` from
+the pinned checkpoint's tokenizer. Full model parity and longer cases remain
+unqualified. No tolerance has been tuned using device output.
+
+In the approved window, run the kernel checks on each internal GPU before
+loading the model. The executable reports fixed per-array tolerances and
+requires every value to be finite. This command does initialize CUDA.
+
+```powershell
+./zig-out/bin/tf-qwen35-kernels-probe.exe --approved-device 0
+./zig-out/bin/tf-qwen35-kernels-probe.exe --approved-device 1
+./zig-out/bin/tf-qwen35-probe.exe MODEL INPUT.json ACTUAL_DIR
+& $py tools/zig/qwen35_reference.py compare ACTUAL_DIR REFERENCE_DIR comparison.json --max-rmse 0.05 --max-abs 0.5 --max-kl 0.001
+```
+
+The model comparison requires matching config/index hashes, prompt and forced
+streams, row counts and vocabulary. It reports RMSE, maximum absolute logit
+error, reference-to-candidate KL divergence, top-ten overlap and top-one ids.
+The initial diagnostic limits above allow BF16 reduction drift but require
+identical top-one ids on every row. They are proposed qualification limits,
+not an established accuracy guarantee. A failure requires investigation;
+do not raise a limit simply to make this candidate pass.
 
 The native server uses the same engine:
 
