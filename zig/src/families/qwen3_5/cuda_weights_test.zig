@@ -173,6 +173,14 @@ test "official checkpoint memory plans refuse one 16 GiB GPU and admit the idle 
         try engine.checkCapacity(32 << 30, required);
         try engine.checkCapacity(16 << 30, try engine.requiredMemory(first, cfg, 0, 20, 4096));
         try engine.checkCapacity(16 << 30, try engine.requiredMemory(last, cfg, 20, 40, 4096));
+        const two_first = try engine.memoryBudget(first, cfg, 0, 20, 65536, 2);
+        const two_last = try engine.memoryBudget(last, cfg, 20, 40, 65536, 2);
+        try std.testing.expectEqual(@as(usize, 703_283_200), two_first.stream_bytes);
+        try std.testing.expectEqual(two_first.stream_bytes, two_last.stream_bytes);
+        try engine.checkCapacity(16 << 30, two_first.required_bytes);
+        try engine.checkCapacity(16 << 30, two_last.required_bytes);
+        const four_first = try engine.memoryBudget(first, cfg, 0, 20, 131072, 4);
+        try std.testing.expectError(error.InsufficientGpuMemory, engine.checkCapacity(16 << 30, four_first.required_bytes));
         try std.testing.expectError(error.InsufficientGpuMemory, engine.checkCapacity(required - 1, required));
         try engine.checkCapacity(required, required);
         try std.testing.expectError(error.Overflow, engine.requiredMemory(.{ .weights = std.math.maxInt(usize) }, cfg, 0, 40, 4096));

@@ -18,13 +18,36 @@ calls, streaming, cancellation, bounded queues, and explicit context admission
 through the existing proxy and supervised fleet launcher.
 
 Include concurrent agent sessions, chunked prompt processing that lets active
-sessions continue decoding, and correct prompt-cache restore. Use the existing
-GPU, host-memory, and disk cache infrastructure where Qwen supplies a complete
-state adapter. Qualify every tier that the production recipe enables.
+sessions continue decoding, and correct prompt-cache restore. The first
+production candidate enables a bounded GPU prefix cache. Host-memory and NVMe
+tiers follow as separately qualified additions to the same store. Neither is
+advertised by the first candidate. Qualify every tier a recipe enables.
 
-Measure one, two, and four active lanes at 32K and 64K total tokens per request,
-then test 128K where memory permits. These are qualification candidates, not
-capacity promises. Publish the chosen maximum request window, shared token
+The initial qualification profile is two active lanes with a 65536-token total
+window each and a 131072-token shared KV budget. Reserve 16384 tokens per
+request for output in fleet admission. Bound the waiting queue at eight.
+Start with BF16 KV and FP32 GDN state. Budget a 512 MiB GPU prefix cache on
+each device. These are engineering targets; admission must refuse them if the
+complete per-device budget and physical readings cannot preserve the floor.
+
+The first API contract includes chat and raw completions, streaming, automatic,
+required, and forced tool choice, thinking on and off, cancellation, queue
+refusal, and reuse after errors. Thinking budgets, structured response output,
+logprobs, and loop guards remain disabled until their own API cases pass.
+Advertise support through `api.Info` only after the relevant tests pass.
+
+Set these initial workload gates before candidate timings: a 32768-token cold
+prompt with 256 output tokens has TTFT at most 30 seconds; a 16384-token reused
+prefix with a 1024-token suffix has TTFT at most 5 seconds; two active sessions
+each decode at least 20 tokens per second; another session's prefill causes
+no decode pause over 1 second. These are chosen acceptance targets, not prior
+measurements or user-specified service guarantees. Record paired samples and
+their spread before deciding whether a candidate meets them.
+
+Screen one, two, and four active lanes at 32K and 64K total tokens per request,
+then 128K, using the CPU checkpoint-layout budget first. Run only feasible
+cells on a device. These are qualification candidates, not capacity promises.
+Publish the chosen maximum request window, shared token
 pool, lane count, output reserve, queue limit, and measured latency together.
 Keep at least 1536 MiB physically free on each internal GPU under the intended
 load. Preserve GDN recurrent-state precision while evaluating KV precision,
@@ -38,16 +61,33 @@ extensions with their own qualification.
 
 ## Deliver verifiable engineering units
 
-1. **Establish the arithmetic baseline.** Preserve the failed comparisons and
+1. **Align source and freeze the contract.** Merge the selected current trunk
+   into this task branch, preserving the original evidence and runtime pins.
+   Run the targeted host baseline and record the kernel and interface diff.
+   Run `tf-qwen35-probe --plan MODEL` to derive weights, staging, scratch,
+   complete session state, and the floor from the actual checkpoint. This is
+   a layout budget, not physical admission. Add batched workspaces, cache
+   copies, transfer slots, allocator overhead, and external use before deciding
+   which placement and matrix cells deserve a GPU experiment.
+
+2. **Establish the arithmetic baseline.** Preserve the failed comparisons and
    their fixed limits. Extend same-input operator comparisons with identical
    attention and GDN state until the first unexplained difference is isolated.
    Establish a separately pinned serving reference for the exact checkpoint
    and quantization semantics. The custom CPU adapter is useful evidence but
    is not an independently qualified ModelOpt runtime. Check logits and model
    quality across a wider corpus. Explain any acceptance-policy change with
-   independent evidence before applying it to the candidate.
+   independent evidence before applying it to the candidate. Name and pin the
+   reference runtime, host, dependencies, exact checkpoint, compatibility probe,
+   and resource window. Metadata compatibility is a screening result, not a
+   successful model execution. If that path cannot execute the checkpoint,
+   validate a replacement before calling it a reference. Variants sharing the
+   same custom CPU adapter cannot independently calibrate each other.
+   Numerical acceptance gates performance qualification and promotion. CPU
+   integration may proceed against the preserved baseline while diagnosis
+   continues. A byte-identical migration is not numerical qualification.
 
-2. **Connect Qwen to the shared lane host.** Reconcile the existing task branch
+3. **Connect Qwen to the shared lane host.** Reconcile the existing task branch
    with current `trunk`, retaining its checkpoint loader, packed weights, and
    family operators. Implement `lanes.backend.Backend` and the family `Loaded`
    contract used by `families/nemotron/cuda_native.zig`. Route Qwen through
@@ -56,7 +96,16 @@ extensions with their own qualification.
    `native/qwen35_cuda.zig`. First prove a one-lane integration with the same
    arithmetic. This is an intermediate engineering checkpoint.
 
-3. **Add stream-owned state and useful prompt execution.** Give each stream
+4. **Extend shared host and launcher capabilities.** The existing host forces
+   layer split to one stream and zero cache, and refuses spill and multiple
+   segments. The fleet launcher separately enforces the trial limits. Extend
+   these boundaries through family-declared placement, per-device weight and
+   state budgets, and persistence capabilities. Retain existing refusals for
+   unqualified combinations. Prove two independent streams and a nonzero cache
+   budget through the shared host and real launcher. Do not use a TP flag to
+   bypass a missing Qwen implementation.
+
+5. **Add stream-owned state and useful prompt execution.** Give each stream
    its own full-attention KV, GDN matrices, convolution history, and position.
    Add admission that budgets weights, workspaces, all admitted sessions,
    cache storage, and the per-device reserve. Use shared scheduling and
@@ -64,11 +113,21 @@ extensions with their own qualification.
    decode rounds without requiring TP or MTP. Qwen's lane facts must admit
    these shared rounds for the layer-split placement. Yielding between serial
    token calls proves fairness but does not establish adequate long-prompt
-   performance. Use the existing Qwen
+   performance. Name and prove `streams_exact`, `hidden_rows`, and the admitted
+   exact-width contract. Implement `verify`, `keep`, and `draft` for enabled
+   request paths. Disable copied or forced multi-row windows until complete
+   GDN and history rollback is proven. Shared rounds still call `keep` without
+   MTP. Use the existing Qwen
    HIP lane/state design as a reference and retain existing CUDA kernels
    wherever their equations and layouts fit.
 
-4. **Implement complete cache restore.** Connect Qwen to the shared snapshot
+   Before broad integration, bound the payoff and falsify the smallest batched
+   prompt and decode operation at representative shapes. Use fixed correctness
+   checks and a ten-minute experiment budget plus recovery for a proof window.
+   Choose placement before its full persistence implementation. Reserve the
+   full model matrix for candidates that survive the cheap screen.
+
+6. **Implement complete cache restore.** Connect Qwen to the shared snapshot
    and compact-image interfaces. Capture attention KV, GDN matrices,
    convolution history, position, and any logits or execution metadata needed
    to resume. Key stored state to checkpoint, arithmetic, layout, and topology.
@@ -77,9 +136,14 @@ extensions with their own qualification.
    policies against the arithmetic and quality gates. Prove cross-session
    isolation, eviction, cancellation, corrupt-image refusal, clean restart,
    and abrupt-stop recovery for every enabled cache tier. Multi-device restore
-   must commit all partitions or fall back to a fresh prefill.
+   must commit all partitions or fall back to a fresh prefill. Include prefill
+   and decode policy in compatibility checks; an incompatible cached state
+   misses rather than silently crossing arithmetic policies. The CUDA disk
+   attachment is currently Nemotron-specific. A later host/NVMe addition needs
+   a Qwen adapter or a minimal family capability extension to the existing
+   store; Windows `rows_store` alone is not that spill implementation.
 
-5. **Qualify the production profile.** Run the exact checkpoint and immutable
+7. **Qualify the production profile.** Run the exact checkpoint and immutable
    runtime through the capability and agentic paths. Exercise every admitted
    lane at the chosen request limit and shared-pool limit, mixed long prefill
    and decode, saturation, disconnect, cancellation, refusal, and subsequent
@@ -89,14 +153,21 @@ extensions with their own qualification.
    throughput acceptance before comparing candidates. Include supervisor
    restart and a reboot drill before claiming unattended persistence.
 
-6. **Package and promote the selected checkpoint.** Pin the final source,
+8. **Package and promote the selected checkpoint.** Pin the final source,
    executable, kernels, checkpoint, tokenizer, template, and retained notices.
    Add the deployment, component, supervised-task settings, registry entry,
    admission contract, and recovery recipe together in a task worktree.
    Run `fleet.current_state` before fleet configuration changes. Run targeted
    checks and the final full promotion gate, then complete direct and proxy
    probes in an approved window. Preserve the working Nemotron recovery inputs
-   and prove the recovery procedure. Record the outcome in `fleet/trials/`.
+   and prove the recovery procedure. Use `ornith-1.5-35b` as the proposed new
+   concrete route; qualify direct and public proxy paths before exposing it.
+   Do not repoint `local-small`. Derive the supervisor's per-UUID memory
+   expectations from this candidate's measured peaks, not Nemotron's.
+   Prepare a restore deadline and explicit unsafe-condition stop criteria.
+   A numerical failure blocks promotion; planned bounded diagnostics may
+   continue while safe. Keep the existing trial recipe inactive and pinned as
+   diagnostic evidence. Record the outcome in `fleet/trials/`.
 
 ## Qualify checkpoints and formats separately
 

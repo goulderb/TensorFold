@@ -25,10 +25,20 @@ selects the compiler environment only for its child build process.
 ./tools/zig/build_qwen35_windows.ps1 -Target native
 ./tools/zig/build_qwen35_windows.ps1 -Target qwen35-probe
 ./zig-out/bin/tf-qwen35-probe.exe --inspect C:/Development/local-ai-server/models/ornith15-35b-nvfp4-94e431d9
+./zig-out/bin/tf-qwen35-probe.exe --plan C:/Development/local-ai-server/models/ornith15-35b-nvfp4-94e431d9
 ```
 
 The inspection command maps the actual checkpoint, validates every text
 tensor and rejects unexplained text entries. It creates no CUDA context.
+The plan command also stays on the CPU. It emits JSON for one, two, and four
+streams at 4K, 32K, 64K, and 128K using the current cut at layer twenty. Each
+device's budget includes its actual packed weights, peak staging, current
+scratch, complete BF16 KV and FP32 GDN state, and the 1536 MiB floor. The
+runtime's one-stream admission uses the same calculation. CUDA modules,
+allocator overhead, display and other processes, prompt-cache copies, spill
+slots, and future batch workspaces remain outside this layout calculation.
+It is an analytical screen, not physical admission or qualification of those
+stream counts. The current server still admits one stream only.
 The broader Windows host suite passed after the delegated portability fixes.
 Its explicit skips and remaining diagnostics are documented in the task's
 qualification record. The targeted Qwen gate remains separate.

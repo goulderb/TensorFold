@@ -17,6 +17,7 @@ const Input = struct {
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--plan")) return plan(init, args[2]);
     if (args.len == 3 and std.mem.eql(u8, args[1], "--inspect")) {
         const cfg = try qwen.Config.read(init.gpa, init.io, args[2]);
         var ck = try core.Checkpoint.openModel(init.gpa, init.io, args[2]);
@@ -27,7 +28,7 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
     if (args.len != 4) {
-        try std.Io.File.stderr().writeStreamingAll(init.io, "usage: tf-qwen35-probe --inspect MODEL\n       tf-qwen35-probe MODEL INPUT.json OUTPUT_DIR\n");
+        try std.Io.File.stderr().writeStreamingAll(init.io, "usage: tf-qwen35-probe --inspect MODEL\n       tf-qwen35-probe --plan MODEL\n       tf-qwen35-probe MODEL INPUT.json OUTPUT_DIR\n");
         return 2;
     }
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, args[2], a, .limited(4 << 20));
@@ -89,6 +90,43 @@ pub fn main(init: std.process.Init) !u8 {
     try out.writer.writeByte('\n');
     const manifest = try std.fs.path.join(a, &.{ args[3], "result.json" });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = manifest, .data = out.written() });
+    try std.Io.File.stdout().writeStreamingAll(init.io, out.written());
+    return 0;
+}
+
+fn plan(init: std.process.Init, dir: []const u8) !u8 {
+    const a = init.arena.allocator();
+    const cfg = try qwen.Config.read(init.gpa, init.io, dir);
+    const first = try qwen.weights.planPartition(init.gpa, init.io, dir, cfg, 0, 20);
+    const last = try qwen.weights.planPartition(init.gpa, init.io, dir, cfg, 20, 40);
+    const Row = struct { context: usize, streams: usize, devices: [2]qwen.engine.MemoryBudget };
+    var rows: std.ArrayList(Row) = .empty;
+    for ([_]usize{ 4096, 32768, 65536, 131072 }) |context| {
+        for ([_]usize{ 1, 2, 4 }) |streams| try rows.append(a, .{
+            .context = context,
+            .streams = streams,
+            .devices = .{
+                try qwen.engine.memoryBudget(first, cfg, 0, 20, context, streams),
+                try qwen.engine.memoryBudget(last, cfg, 20, 40, context, streams),
+            },
+        });
+    }
+    const config_sha = try fileHash(a, init.io, dir, "config.json");
+    const index_sha = try fileHash(a, init.io, dir, "model.safetensors.index.json");
+    const report = .{
+        .kind = "qwen35-dense-bf16-kv-layout-budget",
+        .cuda_initialized = false,
+        .cut = 20,
+        .config_sha256 = config_sha[0..],
+        .index_sha256 = index_sha[0..],
+        .floor_bytes_per_device = qwen.engine.floor_bytes,
+        .physical_admission = "not checked",
+        .excludes = &[_][]const u8{ "CUDA modules and allocator overhead", "other process and display allocations", "prompt-cache copies and spill slots", "future batched workspaces" },
+        .rows = rows.items,
+    };
+    var out: std.Io.Writer.Allocating = .init(a);
+    try std.json.Stringify.value(report, .{ .whitespace = .indent_2 }, &out.writer);
+    try out.writer.writeByte('\n');
     try std.Io.File.stdout().writeStreamingAll(init.io, out.written());
     return 0;
 }

@@ -77,12 +77,41 @@ fn checkFloor(ctx: *const cuda.Context) !void {
     if ((try ctx.memInfo()).free < floor_bytes) return error.GpuMemoryFloor;
 }
 
-pub fn requiredMemory(plan: weights.MemoryPlan, cfg: checkpoint.Config, first: usize, end: usize, context: usize) !usize {
+pub const MemoryBudget = struct {
+    weights_bytes: usize,
+    staging_bytes: usize,
+    scratch_bytes: usize,
+    streams: usize,
+    stream_bytes: usize,
+    state_bytes: usize,
+    steady_bytes: usize,
+    required_bytes: usize,
+};
+
+pub fn memoryBudget(plan: weights.MemoryPlan, cfg: checkpoint.Config, first: usize, end: usize, context: usize, streams: usize) !MemoryBudget {
+    if (streams == 0) return error.InvalidStreamCount;
+    if (context == 0 or context > cfg.context) return error.InvalidContext;
+    if (first > end or end > cfg.spec.n_layers) return error.InvalidLayerRange;
     var state: usize = 0;
     for (first..end) |i| state = try std.math.add(usize, state, try stateBytes(cfg.spec.full(i), context));
-    const live = try std.math.add(usize, scratchBytes(), state);
+    const states = try std.math.mul(usize, state, streams);
+    const live = try std.math.add(usize, scratchBytes(), states);
+    const steady = try std.math.add(usize, plan.weights, live);
     const peak = try std.math.add(usize, plan.weights, @max(plan.staging, live));
-    return std.math.add(usize, peak, floor_bytes);
+    return .{
+        .weights_bytes = plan.weights,
+        .staging_bytes = plan.staging,
+        .scratch_bytes = scratchBytes(),
+        .streams = streams,
+        .stream_bytes = state,
+        .state_bytes = states,
+        .steady_bytes = steady,
+        .required_bytes = try std.math.add(usize, peak, floor_bytes),
+    };
+}
+
+pub fn requiredMemory(plan: weights.MemoryPlan, cfg: checkpoint.Config, first: usize, end: usize, context: usize) !usize {
+    return (try memoryBudget(plan, cfg, first, end, context, 1)).required_bytes;
 }
 
 pub fn checkCapacity(available: usize, required: usize) !void {
@@ -403,6 +432,27 @@ test "session cache budgets include both KV planes and complete GDN state" {
     try std.testing.expectEqual(@as(usize, 2048 * 4096), try stateBytes(true, 4096));
     try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024 + 49152), try stateBytes(false, 4096));
     try std.testing.expect(scratchBytes() > 8 << 20);
+}
+
+test "multi-stream memory budget includes full KV and GDN state for every stream" {
+    const cfg = try checkpoint.Config.parse(std.testing.allocator, @embedFile("fixtures/ornith_nvfp4/config.json"));
+    const budget = try memoryBudget(.{ .weights = 1024 }, cfg, 0, 40, 131072, 4);
+    const state = 10 * 131072 * 2048 + 30 * (32 * 128 * 128 * 4 + 3 * 8192 * 2);
+    try std.testing.expectEqual(@as(usize, state), budget.stream_bytes);
+    try std.testing.expectEqual(@as(usize, 4 * state), budget.state_bytes);
+    try std.testing.expectEqual(@as(usize, 1024 + scratchBytes() + 4 * state), budget.steady_bytes);
+    try std.testing.expectEqual(budget.steady_bytes + floor_bytes, budget.required_bytes);
+    try std.testing.expectEqual(try requiredMemory(.{ .weights = 1024 }, cfg, 0, 40, 131072), (try memoryBudget(.{ .weights = 1024 }, cfg, 0, 40, 131072, 1)).required_bytes);
+}
+
+test "memory budget accounts for load staging and rejects invalid or overflowing requests" {
+    const cfg = try checkpoint.Config.parse(std.testing.allocator, @embedFile("fixtures/ornith_nvfp4/config.json"));
+    const budget = try memoryBudget(.{ .weights = 1024, .staging = 4 << 30 }, cfg, 0, 20, 4096, 1);
+    try std.testing.expectEqual(@as(usize, 1024 + (4 << 30) + floor_bytes), budget.required_bytes);
+    try std.testing.expectError(error.InvalidStreamCount, memoryBudget(.{}, cfg, 0, 20, 4096, 0));
+    try std.testing.expectError(error.InvalidContext, memoryBudget(.{}, cfg, 0, 20, 0, 1));
+    try std.testing.expectError(error.InvalidLayerRange, memoryBudget(.{}, cfg, 20, 41, 4096, 1));
+    try std.testing.expectError(error.Overflow, memoryBudget(.{}, cfg, 0, 40, 131072, std.math.maxInt(usize)));
 }
 
 test "partition teardown releases its primary retain when context selection fails" {
