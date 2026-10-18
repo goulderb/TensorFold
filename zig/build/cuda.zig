@@ -134,7 +134,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{ .{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core) }, .{ .name = "core", .module = mods.core } },
+        .imports = &.{ .{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core) }, .{ .name = "core", .module = mods.core }, .{ .name = "cuda", .module = cuda } },
     }) });
     b.step("qwen35-probe", "Build the native Qwen35 checkpoint and teacher-forcing probe").dependOn(&b.addInstallArtifact(qwen_probe, .{}).step);
     const qwen_kernels_probe = b.addExecutable(.{ .name = "tf-qwen35-kernels-probe", .root_module = b.createModule(.{
@@ -384,6 +384,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     qwen35_run.has_side_effects = true;
     const qwen35_step = b.step("test-qwen35-cuda-host", "Qwen35 CUDA checkpoint and execution contracts without GPU work");
     qwen35_step.dependOn(&qwen35_run.step);
+    const qwen35_probe_admission = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/qwen35_probe_device.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{.{ .name = "cuda", .module = cuda }},
+    });
+    qwen35_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen35_probe_admission })).step);
     const qwen35_adapter = b.createModule(.{
         .root_source_file = b.path("zig/src/native/qwen35_cuda.zig"),
         .target = host,

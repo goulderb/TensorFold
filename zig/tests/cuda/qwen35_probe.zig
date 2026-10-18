@@ -1,6 +1,8 @@
 const std = @import("std");
 const qwen = @import("qwen35_cuda");
 const core = @import("core");
+const cuda = @import("cuda");
+const device_admission = @import("qwen35_probe_device.zig");
 
 const Input = struct {
     prompt: []const u32,
@@ -8,6 +10,7 @@ const Input = struct {
     max_tokens: usize = 8,
     context: usize = 4096,
     devices: []const c_int = &.{ 0, 1 },
+    expected_device_uuids: []const []const u8,
     cut: usize = 20,
 };
 
@@ -32,6 +35,12 @@ pub fn main(init: std.process.Init) !u8 {
     if (input.prompt.len == 0 or input.context == 0 or input.max_tokens > input.context or
         input.forced.len > input.max_tokens or input.prompt.len > input.context - input.max_tokens)
         return error.InvalidProbeInput;
+    const admission = try device_admission.Admission.parse(init.environ_map.get("CUDA_DEVICE_ORDER"), init.environ_map.get("CUDA_VISIBLE_DEVICES"), input.devices, input.expected_device_uuids);
+    const identities = blk: {
+        var driver = try cuda.Driver.open();
+        defer driver.close();
+        break :blk try admission.verify(a, &driver);
+    };
     const model = try qwen.Engine.open(init.gpa, init.io, args[1], .{ .devices = input.devices, .context = input.context, .cut = input.cut });
     defer model.deinit();
     var main_session = try model.createSession();
@@ -74,7 +83,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (model.partitions, 0..) |*part, i| free_mib[i] = (try part.context.memInfo()).free / (1 << 20);
     const config_sha = try fileHash(a, init.io, args[1], "config.json");
     const index_sha = try fileHash(a, init.io, args[1], "model.safetensors.index.json");
-    const report = .{ .prompt = input.prompt, .forced = input.forced, .tokens = tokens, .vocab = 248320, .context = input.context, .devices = input.devices, .cut = input.cut, .free_mib = free_mib[0..model.partitions.len], .config_sha256 = config_sha[0..], .index_sha256 = index_sha[0..], .session_isolation = true, .reset = true, .teacher_parity = "not checked by this executable" };
+    const report = .{ .prompt = input.prompt, .forced = input.forced, .tokens = tokens, .vocab = 248320, .context = input.context, .devices = input.devices, .device_identities = identities, .cut = input.cut, .free_mib = free_mib[0..model.partitions.len], .config_sha256 = config_sha[0..], .index_sha256 = index_sha[0..], .session_isolation = true, .reset = true, .teacher_parity = "not checked by this executable" };
     var out: std.Io.Writer.Allocating = .init(a);
     try std.json.Stringify.value(report, .{ .whitespace = .indent_2 }, &out.writer);
     try out.writer.writeByte('\n');

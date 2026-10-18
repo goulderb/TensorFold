@@ -2,6 +2,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const ops_module = @import("qwen35_ops");
 const ref = @import("qwen35_ref");
+const device_admission = @import("qwen35_probe_device.zig");
 const Ops = ops_module.Ops;
 const Buffer = cuda.DeviceBuffer;
 const floor = 1536 << 20;
@@ -239,9 +240,14 @@ fn attention(r: *Rig) !void {
     @memset(values, 100);
     const keys_dev = try r.bfloats(keys);
     const values_dev = try r.bfloats(values);
-    var norm: [256]f32 = undefined;
-    for (&norm, 0..) |*value, d| value.* = 1 + @as(f32, @floatFromInt(d % 5)) / 16;
-    const norm_dev = try r.floats(&norm);
+    var q_norm: [256]f32 = undefined;
+    var k_norm: [256]f32 = undefined;
+    for (&q_norm, &k_norm, 0..) |*q, *k, d| {
+        q.* = 1 + @as(f32, @floatFromInt(d % 5)) / 16;
+        k.* = 0.5 + @as(f32, @floatFromInt(d % 7)) / 8;
+    }
+    const q_norm_dev = try r.floats(&q_norm);
+    const k_norm_dev = try r.floats(&k_norm);
     const out_dev = try r.alloc(u16, 4096);
     for (0..capacity) |position| {
         const qg = try pattern(r.a, 8192, position + 1, 1.0 / 32.0);
@@ -255,14 +261,14 @@ fn attention(r: *Rig) !void {
             for (key[head * 256 ..][0..256]) |x| squared += @as(f64, x) * x;
             const inv = 1 / @sqrt(squared / 256 + 1e-6);
             var normalized: [256]f32 = undefined;
-            for (&normalized, 0..) |*out, d| out.* = ref.bf16(@floatCast(@as(f64, key[head * 256 + d]) * inv * norm[d]));
+            for (&normalized, 0..) |*out, d| out.* = ref.bf16(@floatCast(@as(f64, key[head * 256 + d]) * inv * k_norm[d]));
             @memcpy(keys[position * 512 + head * 256 ..][0..256], &ref.rotary(normalized, position));
         }
         @memcpy(values[position * 512 ..][0..512], value);
         var q_gate: [16][512]f32 = undefined;
         for (&q_gate, 0..) |*head, h| @memcpy(head, qg[h * 512 ..][0..512]);
-        const want = ref.attention(q_gate, norm, keys, values, position);
-        try r.ops.attention(r.stream, qg_dev.ptr, key_dev.ptr, value_dev.ptr, norm_dev.ptr, norm_dev.ptr, keys_dev.ptr, values_dev.ptr, position, capacity, out_dev.ptr, 1e-6);
+        const want = ref.attention(q_gate, q_norm, keys, values, position);
+        try r.ops.attention(r.stream, qg_dev.ptr, key_dev.ptr, value_dev.ptr, q_norm_dev.ptr, k_norm_dev.ptr, keys_dev.ptr, values_dev.ptr, position, capacity, out_dev.ptr, 1e-6);
         try r.checkBf16(try std.fmt.allocPrint(r.a, "attention_kv_keys_pos{d}", .{position}), keys_dev, keys, bf16_tolerance);
         try r.checkBf16(try std.fmt.allocPrint(r.a, "attention_kv_values_pos{d}", .{position}), values_dev, values, .{});
         try r.checkBf16(try std.fmt.allocPrint(r.a, "attention_pos{d}", .{position}), out_dev, std.mem.bytesAsSlice(f32, std.mem.asBytes(&want)), bf16_tolerance);
@@ -312,14 +318,15 @@ fn routing(r: *Rig) !void {
 
 pub fn main(init: std.process.Init) !u8 {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 3 or !std.mem.eql(u8, args[1], "--approved-device")) {
-        try std.Io.File.stderr().writeStreamingAll(init.io, "usage: tf-qwen35-kernels-probe --approved-device ORDINAL\nRequires an approved device window. Building this executable runs no device code.\n");
+    if (args.len != 5 or !std.mem.eql(u8, args[1], "--approved-device") or !std.mem.eql(u8, args[3], "--expected-uuid")) {
+        try std.Io.File.stderr().writeStreamingAll(init.io, "usage: tf-qwen35-kernels-probe --approved-device ORDINAL --expected-uuid GPU-UUID\nRequires PCI_BUS_ID ordering, two full UUIDs in CUDA_VISIBLE_DEVICES, and an approved device window. Building this executable runs no device code.\n");
         return 2;
     }
     const ordinal = try std.fmt.parseInt(c_int, args[2], 10);
-    if (ordinal < 0) return error.InvalidDevice;
+    const admission = try device_admission.Admission.parse(init.environ_map.get("CUDA_DEVICE_ORDER"), init.environ_map.get("CUDA_VISIBLE_DEVICES"), &.{ordinal}, &.{args[4]});
     var driver = try cuda.Driver.open();
     defer driver.close();
+    const identities = try admission.verify(init.arena.allocator(), &driver);
     var context = try cuda.Context.init(&driver, ordinal);
     defer context.deinit();
     if ((try context.memInfo()).free < floor + (32 << 20)) return error.GpuMemoryFloor;
@@ -337,7 +344,9 @@ pub fn main(init: std.process.Init) !u8 {
     const report = .{
         .status = "pass",
         .device = ordinal,
-        .reference = "Transformers e0eb2810ac1b2caf6d082f247d8d37162ecf67a0, independent host oracles",
+        .device_identities = identities,
+        .reference = "independent host implementation of pinned HF equations, Transformers e0eb2810ac1b2caf6d082f247d8d37162ecf67a0",
+        .reference_vectors = "handwritten host equations; not HF-generated vectors; end-to-end HF comparison remains separate",
         .routing_weight_contract = "FP32 selected-softmax weights; HF eager casts them to BF16",
         .entries = [_][]const u8{ "embed", "add", "swiglu", "gdn_pre", "gdn_step", "gdn_out", "attention_kv", "attention", "route", "combine" },
         .checks = rig.results.items,

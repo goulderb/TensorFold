@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import importlib.util
 import inspect
 import json
@@ -38,6 +39,29 @@ def write_json(path: Path, value: dict) -> None:
         encoding="utf-8",
         newline="\n",
     )
+
+
+def environment_receipt() -> dict:
+    packages = {}
+    for name in (
+        "transformers",
+        "torch",
+        "safetensors",
+        "flash-linear-attention",
+        "fla-core",
+        "kernels",
+    ):
+        try:
+            packages[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            packages[name] = None
+    return {
+        "executable": sys.executable,
+        "prefix": sys.prefix,
+        "base_prefix": sys.base_prefix,
+        "python": sys.version,
+        "packages": packages,
+    }
 
 
 def source_module(path: Path):
@@ -286,6 +310,7 @@ def capture(args) -> None:
             "reference_source_sha256": SOURCE_SHA,
             "transformers": transformers.__version__,
             "torch": torch.__version__,
+            "environment": environment_receipt(),
             "device": "cpu",
             "dtype": "bfloat16",
             "activation_quantization": "static FP8 only; NVFP4 W4A16",

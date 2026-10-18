@@ -77,11 +77,15 @@ greedy selection.
 
 ```json
 {
-  "prompt": [825, 264, 15352],
-  "forced": [],
-  "max_tokens": 8,
+  "prompt": [760, 6511, 314, 9338, 369],
+  "forced": [11751, 13],
+  "max_tokens": 2,
   "context": 4096,
   "devices": [0, 1],
+  "expected_device_uuids": [
+    "GPU-f2c0ea1e-a2be-f0b4-6c23-ffe33b537a06",
+    "GPU-dd2a988c-fe38-24ab-233a-9e9bb3b2645a"
+  ],
   "cut": 20
 }
 ```
@@ -128,10 +132,18 @@ unqualified. No tolerance has been tuned using device output.
 In the approved window, run the kernel checks on each internal GPU before
 loading the model. The executable reports fixed per-array tolerances and
 requires every value to be finite. This command does initialize CUDA.
+Pin the two internal physical GPUs in PCI order. Ordinals zero and one then
+refer only to that pair. The decision eGPU remains outside the visible set.
+The fleet launcher already applies these same UUID pins to the server.
+Both probes refuse missing or ambiguous environment pins before initializing
+CUDA. They compare the expected UUIDs to the driver's physical identities
+before creating a context or loading the model, and report UUIDs and names.
 
 ```powershell
-./zig-out/bin/tf-qwen35-kernels-probe.exe --approved-device 0
-./zig-out/bin/tf-qwen35-kernels-probe.exe --approved-device 1
+$env:CUDA_DEVICE_ORDER='PCI_BUS_ID'
+$env:CUDA_VISIBLE_DEVICES='GPU-f2c0ea1e-a2be-f0b4-6c23-ffe33b537a06,GPU-dd2a988c-fe38-24ab-233a-9e9bb3b2645a'
+./zig-out/bin/tf-qwen35-kernels-probe.exe --approved-device 0 --expected-uuid GPU-f2c0ea1e-a2be-f0b4-6c23-ffe33b537a06
+./zig-out/bin/tf-qwen35-kernels-probe.exe --approved-device 1 --expected-uuid GPU-dd2a988c-fe38-24ab-233a-9e9bb3b2645a
 ./zig-out/bin/tf-qwen35-probe.exe MODEL INPUT.json ACTUAL_DIR
 & $py tools/zig/qwen35_reference.py compare ACTUAL_DIR REFERENCE_DIR comparison.json --max-rmse 0.05 --max-abs 0.5 --max-kl 0.001
 ```
