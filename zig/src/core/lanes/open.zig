@@ -73,6 +73,13 @@ fn openedCommitted(e: *Engine, s: *Stream, reach: Reach, hook: ?be.Committed) !v
     s.rows.clearRetainingCapacity();
     s.pending = null;
     s.cache_len = s.prompt_len;
+    if (s.max_new == 0) {
+        s.finished = true;
+        s.reason = .length;
+        try trail.finish(e, s);
+        e.release(s);
+        return;
+    }
     const position: u64 = s.prompt_len;
     const drawn = try e.drawFirst(s, position);
     var feed: Feed = .{ .handle = drawn };

@@ -65,6 +65,7 @@ pub const LaneHost = struct {
     published_prefill: ?api.PrefillCounts = null,
     published_at: i96 = 0,
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
+    request_refusal: ?*const fn (*const Request) ?[]const u8 = null,
     learner: ?api.Learner = null, // the family's Sliding Weights learner; null: learn requests are refused
     lessons: std.ArrayList(Lesson) = .empty, // learn requests waiting for an idle engine
     lesson_open: bool = false, // the learner holds a begun job (engine thread only)
@@ -378,6 +379,7 @@ pub const LaneHost = struct {
     pub fn setup(h: *LaneHost, job: *Job) ?i96 {
         const r = job.request;
         if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) return h.ended(h.cancel(job)); // other work came first
+        if (h.request_refusal) |check| if (check(r)) |message| return h.ended(h.drop(job, message));
         if (!lane_stream.open(h, job)) return null; // the job was finished instead
         return job.began;
     }
