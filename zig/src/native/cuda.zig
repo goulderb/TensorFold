@@ -875,7 +875,7 @@ test "the Qwen host profile preserves memory reporting, direct refusals and zero
     try std.testing.expectEqual(api.Reason.length, try empty.wait());
     try std.testing.expectEqual(@as(usize, 0), empty.tokens);
     var next: Fixture = .{};
-    const valid: api.Request = .{ .prompt = bad.prompt, .max_tokens = 3 };
+    const valid: api.Request = .{ .prompt = bad.prompt, .max_tokens = 3, .decide = 2 };
     try e.submit(3, &valid, .{ .ctx = &next, .event = Fixture.event });
     try std.testing.expectEqual(api.Reason.length, try next.wait());
     try std.testing.expectEqual(@as(usize, 3), next.tokens);

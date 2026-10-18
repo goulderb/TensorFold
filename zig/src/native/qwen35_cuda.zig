@@ -25,7 +25,6 @@ pub fn requestRefusal(r: *const api.Request) ?[]const u8 {
     if (r.decode_spans.len > 0) return "Qwen CUDA decoded prompt rows are not qualified";
     if (r.logprobs != null or r.prompt_logprobs != null) return "Qwen CUDA logprob responses are not qualified";
     if (r.think_budget != 0) return "Qwen CUDA thinking budgets are not qualified";
-    if (r.decide != null) return "Qwen CUDA has no routed lessons";
     return null;
 }
 
@@ -122,6 +121,11 @@ test "unsupported Qwen capabilities refuse before loading CUDA" {
     o = base;
     o.segments = 2;
     try std.testing.expect(refusal(o) != null);
+}
+
+test "Qwen accepts an ordinary chat prompt carrying a decision position" {
+    const request: api.Request = .{ .prompt = &.{ 1, 2, 3 }, .max_tokens = 4, .decide = 2 };
+    try std.testing.expect(requestRefusal(&request) == null);
 }
 
 test "Qwen refuses unsupported direct requests and inherited pool or spill settings" {
