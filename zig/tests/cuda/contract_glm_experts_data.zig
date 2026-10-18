@@ -192,30 +192,39 @@ pub const Host = struct {
     pub fn calculate(h: Host, acc: ?c.Accum, order: g.Order, want: []f64, mag: ?[]f64) !void {
         const terms_buf = try h.a.alloc(f64, h.shape.k);
         defer h.a.free(terms_buf);
-        for (0..h.shape.rows * slots) |p| for (0..h.shape.n) |j| {
-            var sums: [2]f64 = @splat(0);
-            var abs: [2]f64 = @splat(0);
-            for (0..h.parts()) |m| {
-                h.terms(p, m, j, terms_buf);
-                if (acc) |a| {
-                    sums[m] = rows.sumIn(a, order, terms_buf);
-                } else {
-                    for (terms_buf) |v| sums[m] += v;
-                }
-                for (terms_buf) |v| abs[m] += @abs(v);
-                sums[m] *= h.scale(h.expert(p), m);
-                abs[m] *= h.scale(h.expert(p), m);
-            }
-            const at = p * h.shape.n + j;
-            want[at] = h.activation(sums[0], sums[1]);
-            if (mag) |out| out[at] = switch (h.epi) {
-                .down_f32, .down_bf16 => abs[0],
-                .relu2 => 2 * @max(@abs(sums[0]), 1) * abs[0] + c.gamma(@floatFromInt(h.shape.k / 16 + 4), c.unit(.f32)) * abs[0] * abs[0],
-                .swiglu => blk: {
-                    const gv, const uv = h.clamped(bf(sums[0]), bf(sums[1]));
-                    break :blk 1.1 * @abs(uv) * abs[0] + @abs(gv) * abs[1];
-                },
+        const weights = try h.a.alloc(f64, h.parts() * h.shape.k);
+        defer h.a.free(weights);
+        for (0..experts) |e| for (0..h.shape.n) |j| {
+            for (0..h.parts()) |m| for (0..h.shape.k) |i| {
+                weights[m * h.shape.k + i] = h.weight(e, m, j, i);
             };
+            for (0..h.shape.rows * slots) |p| {
+                if (h.expert(p) != e) continue;
+                const row = if (h.up()) p / slots else p;
+                var sums: [2]f64 = @splat(0);
+                var abs: [2]f64 = @splat(0);
+                for (0..h.parts()) |m| {
+                    for (terms_buf, 0..) |*v, i| v.* = @as(f64, c.fromBf16(h.x[row * h.stride() + i])) * weights[m * h.shape.k + i];
+                    if (acc) |a| {
+                        sums[m] = rows.sumIn(a, order, terms_buf);
+                    } else {
+                        for (terms_buf) |v| sums[m] += v;
+                    }
+                    for (terms_buf) |v| abs[m] += @abs(v);
+                    sums[m] *= h.scale(h.expert(p), m);
+                    abs[m] *= h.scale(h.expert(p), m);
+                }
+                const at = p * h.shape.n + j;
+                want[at] = h.activation(sums[0], sums[1]);
+                if (mag) |out| out[at] = switch (h.epi) {
+                    .down_f32, .down_bf16 => abs[0],
+                    .relu2 => 2 * @max(@abs(sums[0]), 1) * abs[0] + c.gamma(@floatFromInt(h.shape.k / 16 + 4), c.unit(.f32)) * abs[0] * abs[0],
+                    .swiglu => blk: {
+                        const gv, const uv = h.clamped(bf(sums[0]), bf(sums[1]));
+                        break :blk 1.1 * @abs(uv) * abs[0] + @abs(gv) * abs[1];
+                    },
+                };
+            }
         };
     }
 };
@@ -231,4 +240,59 @@ test "clamped SwiGLU reference follows minNumber/maxNumber for finite values and
     try std.testing.expect(std.math.isNan(h.activation(-std.math.inf(f64), -std.math.inf(f64))));
     h.limit = 0;
     try std.testing.expect(std.math.isNan(h.activation(std.math.nan(f64), std.math.nan(f64))));
+}
+
+fn directReference(h: Host, acc: ?c.Accum, order: g.Order, want: []f64, mag: ?[]f64) !void {
+    const terms_buf = try h.a.alloc(f64, h.shape.k);
+    defer h.a.free(terms_buf);
+    for (0..h.shape.rows * slots) |p| for (0..h.shape.n) |j| {
+        var sums: [2]f64 = @splat(0);
+        var abs: [2]f64 = @splat(0);
+        for (0..h.parts()) |m| {
+            h.terms(p, m, j, terms_buf);
+            if (acc) |a| {
+                sums[m] = rows.sumIn(a, order, terms_buf);
+            } else {
+                for (terms_buf) |v| sums[m] += v;
+            }
+            for (terms_buf) |v| abs[m] += @abs(v);
+            sums[m] *= h.scale(h.expert(p), m);
+            abs[m] *= h.scale(h.expert(p), m);
+        }
+        const at = p * h.shape.n + j;
+        want[at] = h.activation(sums[0], sums[1]);
+        if (mag) |out| out[at] = switch (h.epi) {
+            .down_f32, .down_bf16 => abs[0],
+            .relu2 => 2 * @max(@abs(sums[0]), 1) * abs[0] + c.gamma(@floatFromInt(h.shape.k / 16 + 4), c.unit(.f32)) * abs[0] * abs[0],
+            .swiglu => blk: {
+                const gv, const uv = h.clamped(bf(sums[0]), bf(sums[1]));
+                break :blk 1.1 * @abs(uv) * abs[0] + @abs(gv) * abs[1];
+            },
+        };
+    };
+}
+
+test "expert reference reuses weights without changing any output or bound bytes" {
+    const a = std.testing.allocator;
+    for (std.enums.values(Epi)) |epi| for (std.enums.values(g.Fill)) |fill| {
+        var h = try Host.init(a, .{ .rows = 5, .n = 32, .k = 32 }, epi, fill, 0x5388);
+        defer h.deinit();
+        for ([_]bool{ false, true }) |clamped| {
+            if (clamped and epi != .swiglu) continue;
+            if (clamped) h.clamp(10);
+            const n = h.shape.rows * slots * h.shape.n;
+            const storage = try a.alloc(f64, n * 4);
+            defer a.free(storage);
+            const want = storage[0..n];
+            const mag = storage[n .. 2 * n];
+            const direct = storage[2 * n .. 3 * n];
+            const direct_mag = storage[3 * n ..];
+            for ([_]?c.Accum{ null, .f32, .f16, .bf16 }) |acc| for (std.enums.values(g.Order)) |order| {
+                try h.calculate(acc, order, want, mag);
+                try directReference(h, acc, order, direct, direct_mag);
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(direct), std.mem.sliceAsBytes(want));
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(direct_mag), std.mem.sliceAsBytes(mag));
+            };
+        }
+    };
 }
