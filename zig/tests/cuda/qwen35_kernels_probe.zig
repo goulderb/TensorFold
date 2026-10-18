@@ -219,7 +219,6 @@ fn gdn(r: *Rig) !void {
         try r.checkBf16(try std.fmt.allocPrint(r.a, "gdn_pre_history_step{d}", .{step}), history_dev, history, .{});
         for (0..32) |head| {
             y[head] = ref.gdn(q[head / 2], k[head / 2], conv[4096 + head * 128 ..][0..128].*, decay[head], beta[head], &states[head]);
-            normalized[head] = ref.gatedNorm(y[head], z[head * 128 ..][0..128].*, norm[0..128].*, 1e-6);
             for (0..128) |value| {
                 for (0..128) |key| state_input[(head * 128 + value) * 128 + key] = states[head][key][value];
             }
@@ -227,6 +226,9 @@ fn gdn(r: *Rig) !void {
         try r.ops.gdnStep(r.stream, q_dev.ptr, k_dev.ptr, v_dev.ptr, decay_dev.ptr, beta_dev.ptr, state_dev.ptr, y_dev.ptr);
         try r.checkF32(try std.fmt.allocPrint(r.a, "gdn_state_step{d}", .{step}), state_dev, state_input, state_tolerance);
         try r.checkF32(try std.fmt.allocPrint(r.a, "gdn_y_step{d}", .{step}), y_dev, std.mem.bytesAsSlice(f32, std.mem.asBytes(&y)), state_tolerance);
+        // Compare normalization on identical inputs: accepted FP32 recurrence drift can cross a BF16 midpoint.
+        const actual_y = try r.download(f32, y_dev, 4096);
+        for (0..32) |head| normalized[head] = ref.gatedNorm(actual_y[head * 128 ..][0..128].*, z[head * 128 ..][0..128].*, norm[0..128].*, 1e-6);
         try r.ops.gdnOut(r.stream, y_dev.ptr, z_dev.ptr, norm_dev.ptr, out_dev.ptr, 1e-6);
         try r.checkBf16(try std.fmt.allocPrint(r.a, "gdn_out_step{d}", .{step}), out_dev, std.mem.bytesAsSlice(f32, std.mem.asBytes(&normalized)), bf16_tolerance);
     }
