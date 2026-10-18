@@ -1,4 +1,4 @@
-// Adapted from nvfp4/experts.cu (lines 14-149); local pipeline, column-slice and warp-scale A/B variants.
+// Adapted from nvfp4/experts.cu (lines 14-149); local pipeline and column-slice A/B variants.
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -30,27 +30,15 @@ __device__ __forceinline__ float e4m3f(uint32_t b) {
   return __half2float(__half(__nv_cvt_fp8_to_halfraw(static_cast<__nv_fp8_storage_t>(b), __NV_E4M3)));
 }
 
-__device__ __forceinline__ float2 broadcast_scales(float2 pair, int h, int j) {
-  const int source = (threadIdx.x & 3) + 4 * (h * NTW + j);
-  return make_float2(__shfl_sync(0xffffffffu, pair.x, source), __shfl_sync(0xffffffffu, pair.y, source));
-}
-
-template <int M, bool WARP_SCALES = false>
+template <int M>
 struct Stage {
   uint4 w[M];
   uint4 s[M];
   uint2 xa[2], xb[2];
 };
 
-template <int M>
-struct Stage<M, true> {
-  uint4 w[M];
-  float2 scale_pair[M];
-  uint2 xa[2], xb[2];
-};
-
-template <int M, int NC = NTW, bool WARP_SCALES = false>
-__device__ __forceinline__ void load_stage(Stage<M, WARP_SCALES>& st, const uint4* blk, int g, int lane, int t,
+template <int M, int NC = NTW>
+__device__ __forceinline__ void load_stage(Stage<M>& st, const uint4* blk, int g, int lane, int t,
                                            const __nv_bfloat16* x0, const __nv_bfloat16* x1, bool v0, bool v1, int slice = 0) {
   const uint4* b = blk + (size_t)g * (M * BLOCK4);
 #pragma unroll
@@ -61,15 +49,7 @@ __device__ __forceinline__ void load_stage(Stage<M, WARP_SCALES>& st, const uint
       const uint2 w = __ldg(reinterpret_cast<const uint2*>(b + m * BLOCK4 + lane) + slice);
       st.w[m] = make_uint4(w.x, w.y, 0u, 0u);
     }
-    if constexpr (WARP_SCALES) {
-      static_assert(NC == NTW);
-      const int q = lane >> 2, h = q / NTW, j = q % NTW;
-      const uint32_t sw = __ldg(reinterpret_cast<const uint32_t*>(b + m * BLOCK4 + 32 + t) + 2 * h + (j >> 1));
-      const int sh = (j & 1) * 16;
-      st.scale_pair[m] = make_float2(e4m3f((sw >> sh) & 0xFFu), e4m3f((sw >> (sh + 8)) & 0xFFu));
-    } else {
-      st.s[m] = ld_nc(b + m * BLOCK4 + 32 + t);
-    }
+    st.s[m] = ld_nc(b + m * BLOCK4 + 32 + t);
   }
   const uint2 zero = make_uint2(0u, 0u);
   const int k0 = g * 32 + 4 * t;
@@ -80,8 +60,8 @@ __device__ __forceinline__ void load_stage(Stage<M, WARP_SCALES>& st, const uint
   }
 }
 
-template <int M, int NC = NTW, bool WARP_SCALES = false>
-__device__ __forceinline__ void compute_stage(float (&acc)[M][1][NTW][4], const Stage<M, WARP_SCALES>& st, bool hi, int slice = 0) {
+template <int M, int NC = NTW>
+__device__ __forceinline__ void compute_stage(float (&acc)[M][1][NTW][4], const Stage<M>& st, bool hi, int slice = 0) {
 #pragma unroll
   for (int m = 0; m < M; ++m)
 #pragma unroll
@@ -92,18 +72,10 @@ __device__ __forceinline__ void compute_stage(float (&acc)[M][1][NTW][4], const 
         const uint32_t word = comp(st.w[m], j);
         float p[4] = {0.f, 0.f, 0.f, 0.f};
         mma(p, a0, a1, a2, a3, fp4pair(word, 8 * h), fp4pair(word, 8 * h + 4));
-        float s0, s1;
-        if constexpr (WARP_SCALES) {
-          const float2 pair = broadcast_scales(st.scale_pair[m], h, j);
-          s0 = pair.x;
-          s1 = pair.y;
-        } else {
-          const int sj = slice * NC + j;
-          const uint32_t sw = comp(st.s[m], 2 * h + (sj >> 1));
-          const int sh = (sj & 1) * 16;
-          s0 = e4m3f((sw >> sh) & 0xFFu);
-          s1 = e4m3f((sw >> (sh + 8)) & 0xFFu);
-        }
+        const int sj = slice * NC + j;
+        const uint32_t sw = comp(st.s[m], 2 * h + (sj >> 1));
+        const int sh = (sj & 1) * 16;
+        const float s0 = e4m3f((sw >> sh) & 0xFFu), s1 = e4m3f((sw >> (sh + 8)) & 0xFFu);
         float(&a)[4] = acc[m][0][j];
         a[0] = fmaf(p[0], s0, a[0]);
         a[1] = fmaf(p[1], s1, a[1]);
@@ -115,26 +87,26 @@ __device__ __forceinline__ void compute_stage(float (&acc)[M][1][NTW][4], const 
     }
 }
 
-template <int M, int D = 2, int NC = NTW, bool WARP_SCALES = false>
+template <int M, int D = 2, int NC = NTW>
 __device__ __forceinline__ void k_loop(float (&acc)[M][1][NTW][4], const uint4* blk, int KG, int lane, int t,
                                        const __nv_bfloat16* x0, const __nv_bfloat16* x1, bool v0, bool v1, int slice = 0) {
-  Stage<M, WARP_SCALES> st[D];
+  Stage<M> st[D];
 #pragma unroll
   for (int d = 0; d < D; ++d)
-    if (d < KG) load_stage<M, NC, WARP_SCALES>(st[d], blk, d, lane, t, x0, x1, v0, v1, slice);
+    if (d < KG) load_stage<M, NC>(st[d], blk, d, lane, t, x0, x1, v0, v1, slice);
   for (int g0 = 0; g0 < KG; g0 += D) {
 #pragma unroll
     for (int d = 0; d < D; ++d) {
       const int g = g0 + d;
       if (g < KG) {
-        compute_stage<M, NC, WARP_SCALES>(acc, st[d], v1, slice);
-        if (g + D < KG) load_stage<M, NC, WARP_SCALES>(st[d], blk, g + D, lane, t, x0, x1, v0, v1, slice);
+        compute_stage<M, NC>(acc, st[d], v1, slice);
+        if (g + D < KG) load_stage<M, NC>(st[d], blk, g + D, lane, t, x0, x1, v0, v1, slice);
       }
     }
   }
 }
 
-template <int M, int EPI, int WARPS, int D, int NC, bool WARP_SCALES = false>
+template <int M, int EPI, int WARPS, int D, int NC>
 __device__ __forceinline__ void decode_body(const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
                         const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
                         const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out, int N,
@@ -160,7 +132,7 @@ __device__ __forceinline__ void decode_body(const __nv_bfloat16* __restrict__ X,
       for (int m = 0; m < M; ++m)
 #pragma unroll
         for (int j = 0; j < NTW; ++j) acc[m][0][j][0] = acc[m][0][j][1] = acc[m][0][j][2] = acc[m][0][j][3] = 0.f;
-      k_loop<M, D, NC, WARP_SCALES>(acc, blk, KG, lane, t, x0, x1, v0, v1, slice);
+      k_loop<M, D, NC>(acc, blk, KG, lane, t, x0, x1, v0, v1, slice);
 #pragma unroll
       for (int m = 0; m < M; ++m) {
         const float g = __ldg(scale + e * M + m);
@@ -400,39 +372,21 @@ TF_NVFP4_PROMPT(tf_nvfp4_prompt_relu2, 1, 1, 8)
 TF_NVFP4_PROMPT(tf_nvfp4_prompt_swiglu, 2, 2, 4)
 TF_NVFP4_PROMPT(tf_nvfp4_prompt_down, 1, 3, 8)
 
-#define TF_NVFP4_DECODE(NAME, M, EPI, WARPS, D, NC, WS)                                                                  \
+#define TF_NVFP4_DECODE(NAME, M, EPI, WARPS, D, NC)                                                                  \
   extern "C" __global__ void __launch_bounds__(WARPS * 32) NAME(                                                     \
       const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,                     \
       const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items, const int* __restrict__ counts, \
       const int* __restrict__ members, void* __restrict__ out, int N, float limit, int skip) {                       \
-    tf_nvfp4_experts::decode_body<M, EPI, WARPS, D, NC, WS>(                                                             \
+    tf_nvfp4_experts::decode_body<M, EPI, WARPS, D, NC>(                                                             \
         X, x_stride, slots, W, scale, KG, NB, items, counts, members, out, N, limit, skip);                           \
   }
-#define TF_NVFP4_DECODE_SET(TAG, WARPS, D, NC, WS) \
-  TF_NVFP4_DECODE(tf_nvfp4_##TAG##_swiglu, 2, 2, WARPS, D, NC, WS) \
-  TF_NVFP4_DECODE(tf_nvfp4_##TAG##_down_f32, 1, 0, WARPS, D, NC, WS) \
-  TF_NVFP4_DECODE(tf_nvfp4_##TAG##_down_bf16, 1, 3, WARPS, D, NC, WS) \
-  TF_NVFP4_DECODE(tf_nvfp4_##TAG##_relu2, 1, 1, WARPS, D, NC, WS)
-TF_NVFP4_DECODE_SET(pipe4, 4, 4, 4, false)
-TF_NVFP4_DECODE_SET(n16, 4, 2, 2, false)
-TF_NVFP4_DECODE_SET(n16_pipe4, 4, 4, 2, false)
-TF_NVFP4_DECODE_SET(warp_scales, 4, 2, 4, true)
+#define TF_NVFP4_DECODE_SET(TAG, WARPS, D, NC) \
+  TF_NVFP4_DECODE(tf_nvfp4_##TAG##_swiglu, 2, 2, WARPS, D, NC) \
+  TF_NVFP4_DECODE(tf_nvfp4_##TAG##_down_f32, 1, 0, WARPS, D, NC) \
+  TF_NVFP4_DECODE(tf_nvfp4_##TAG##_down_bf16, 1, 3, WARPS, D, NC) \
+  TF_NVFP4_DECODE(tf_nvfp4_##TAG##_relu2, 1, 1, WARPS, D, NC)
+TF_NVFP4_DECODE_SET(pipe4, 4, 4, 4)
+TF_NVFP4_DECODE_SET(n16, 4, 2, 2)
+TF_NVFP4_DECODE_SET(n16_pipe4, 4, 4, 2)
 #undef TF_NVFP4_DECODE_SET
 #undef TF_NVFP4_DECODE
-
-extern "C" __global__ void tf_nvfp4_warp_scale_check(unsigned int* errors) {
-  const int q = (threadIdx.x & 31) >> 2, t = threadIdx.x & 3;
-  const uint32_t byte = (blockIdx.x + 17 * q + t) & 255;
-  const float2 mine = make_float2(tf_nvfp4_experts::e4m3f(byte), tf_nvfp4_experts::e4m3f((byte + 128) & 255));
-#pragma unroll
-  for (int h = 0; h < 2; ++h)
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      const float2 got = tf_nvfp4_experts::broadcast_scales(mine, h, j);
-      const uint32_t want_byte = (blockIdx.x + 17 * (h * 4 + j) + t) & 255;
-      const float want0 = tf_nvfp4_experts::e4m3f(want_byte);
-      const float want1 = tf_nvfp4_experts::e4m3f((want_byte + 128) & 255);
-      if (__float_as_uint(got.x) != __float_as_uint(want0)) atomicAdd(errors, 1u);
-      if (__float_as_uint(got.y) != __float_as_uint(want1)) atomicAdd(errors, 1u);
-    }
-}
