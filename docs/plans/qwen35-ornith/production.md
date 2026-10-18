@@ -10,6 +10,14 @@ This plan defines the next work. It does not qualify a runtime, select a
 deployment, or authorize another production outage. The previous approved
 window ended with Nemotron restored and a successful proxy completion.
 
+CPU preparation on 2026-10-18 merged the selected trunk and implemented the
+checkpoint-derived memory screen. The one-lane shared-host integration is
+implemented and CPU-tested; its native Windows executable builds. See the
+[integration design and receipts](shared-host-design.md) and
+[layout budget](cpu-preparation-20261018.md). Device execution of this
+integration, numerical acceptance, multiple lanes, cache, service capacity,
+and production promotion remain open.
+
 ## Set the first production contract
 
 Target native Windows CUDA on the internal RTX 5080 and RTX 5070 Ti. Run one
@@ -33,7 +41,8 @@ complete per-device budget and physical readings cannot preserve the floor.
 The first API contract includes chat and raw completions, streaming, automatic,
 required, and forced tool choice, thinking on and off, cancellation, queue
 refusal, and reuse after errors. Thinking budgets, structured response output,
-logprobs, and loop guards remain disabled until their own API cases pass.
+and logprobs remain disabled until their own API cases pass. Loop guards use
+the existing shared core; include their API behavior in device qualification.
 Advertise support through `api.Info` only after the relevant tests pass.
 
 Set these initial workload gates before candidate timings: a 32768-token cold

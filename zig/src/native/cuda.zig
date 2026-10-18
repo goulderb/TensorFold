@@ -111,7 +111,7 @@ const Gpu = failed_load.Gpu;
 /// One loaded model behind the lane host: everything the engine thread reads lives here.
 pub const Host = struct {
     gpa: Allocator,
-    gpu: ?*Gpu, // null in host tests: no context to bind
+    gpu: ?*Gpu, // null when the family binds its own contexts, or in host tests
     family: *anyopaque,
     release: *const fn (*anyopaque) void,
     inner: lanes.backend.Backend,
@@ -136,6 +136,8 @@ pub const Host = struct {
     health: ?api.HealthSource = null,
     recording: ?*record.Recording = null, // --record: the recorder in front of the family's backend
     served: drafted.Served = undefined, // the family's backend, wrapped with --drafter's draft model when given
+    memory_source: ?api.MemorySource = null,
+    request_refusal: ?*const fn (*const api.Request) ?[]const u8 = null,
 
     fn followFamily(p: *anyopaque) anyerror!void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -232,7 +234,8 @@ pub const Host = struct {
         h.core.trim = h.trim;
         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
         h.host.proposers = h.proposers;
-        h.host.memory = if (h.gpu != null) .{ .read = family_memory.read } else null;
+        h.host.memory = h.memory_source orelse (if (h.gpu != null) api.MemorySource{ .read = family_memory.read } else null);
+        h.host.request_refusal = h.request_refusal;
         h.host.explain = explain;
         h.host.health = h.health;
         h.host.cache = h.store;
@@ -303,6 +306,36 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     }
     problem.* = try std.fmt.allocPrint(a, "the native CUDA engine has no backend for {s} checkpoints yet", .{o.model_type});
     return null;
+}
+
+fn openQwen(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+    const loaded = try qwen35.load(a, gpa, io, o, problem) orelse return null;
+    errdefer loaded.release(loaded.ctx);
+    const h = try gpa.create(Host);
+    errdefer gpa.destroy(h);
+    h.* = .{
+        .gpa = gpa,
+        .gpu = null,
+        .family = loaded.ctx,
+        .release = loaded.release,
+        .inner = loaded.backend,
+        .vtable = undefined,
+        .cfg = undefined,
+        .clock = undefined,
+        .core = undefined,
+        .host = undefined,
+        .memory_source = .{ .read = readMemory },
+        .request_refusal = qwen35.requestRefusal,
+    };
+    try h.serve(io, qwen35.facts, 1, .{
+        .name = "qwen35-cuda-lanes",
+        .lanes = 1,
+        .context_window = @intCast(loaded.context),
+        .max_queued = o.max_queued orelse 8,
+        .plain_only = true,
+        .thinking_budget = false,
+    }, null);
+    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }
 
 /// The admit's refusals: no stream fits, or --parallel asks for more than the budget holds.
@@ -766,6 +799,89 @@ test "every registered family and d1's decision engine are listed for capabiliti
     try std.testing.expectEqual(@as(usize, registry.len + 2), families.len);
     try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
     try std.testing.expectEqualStrings("lfm2_vl", families[registry.len].model_type);
+}
+
+test "the Qwen host profile preserves memory reporting, direct refusals and zero-output completion" {
+    const gpa = std.testing.allocator;
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
+    defer target.deinit();
+    const Fixture = struct {
+        fn release(_: *anyopaque) void {}
+        fn memory(_: ?*anyopaque, _: bool) ?api.Memory {
+            return .{ .active = 23 };
+        }
+        mutex: std.Io.Mutex = .init,
+        done: ?api.Reason = null,
+        terminals: usize = 0,
+        tokens: usize = 0,
+        fn event(ctx: *anyopaque, _: api.Id, ev: *const api.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.mutex.lockUncancelable(std.testing.io);
+            defer self.mutex.unlock(std.testing.io);
+            switch (ev.*) {
+                .tokens => |t| self.tokens += t.len,
+                .finished => |f| {
+                    self.done = f.reason;
+                    self.terminals += 1;
+                },
+                else => {},
+            }
+        }
+        fn wait(self: *@This()) !api.Reason {
+            for (0..5000) |_| {
+                self.mutex.lockUncancelable(std.testing.io);
+                const done = self.done;
+                self.mutex.unlock(std.testing.io);
+                if (done) |reason| return reason;
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            }
+            return error.TestTimedOut;
+        }
+    };
+    const h = try gpa.create(Host);
+    defer gpa.destroy(h);
+    h.* = .{
+        .gpa = gpa,
+        .gpu = null,
+        .family = &target,
+        .release = Fixture.release,
+        .inner = target.stepped(),
+        .vtable = undefined,
+        .cfg = undefined,
+        .clock = undefined,
+        .core = undefined,
+        .host = undefined,
+        .memory_source = .{ .read = Fixture.memory },
+        .request_refusal = qwen35.requestRefusal,
+    };
+    try h.serve(std.testing.io, qwen35.facts, 1, .{ .lanes = 1, .plain_only = true, .thinking_budget = false }, null);
+    defer {
+        h.host.stop();
+        h.core.deinit();
+        h.cfg.deinit(gpa);
+    }
+    const e = h.host.engine();
+    try std.testing.expectEqual(@as(u64, 23), e.memory(false).?.active);
+    try std.testing.expect(e.info().plain_only and e.info().loop_guard);
+    try std.testing.expectEqual(@as(u32, 0), e.info().prefill_step);
+    var refused: Fixture = .{};
+    const bad: api.Request = .{ .prompt = &.{ 2, 7, 1 }, .max_tokens = 2, .decode_spans = &.{.{ 1, 2 }} };
+    try e.submit(1, &bad, .{ .ctx = &refused, .event = Fixture.event });
+    try std.testing.expectEqual(api.Reason.failed, try refused.wait());
+    try std.testing.expectEqual(@as(usize, 0), target.prefill_count);
+    var empty: Fixture = .{};
+    const zero: api.Request = .{ .prompt = bad.prompt, .max_tokens = 0 };
+    try e.submit(2, &zero, .{ .ctx = &empty, .event = Fixture.event });
+    try std.testing.expectEqual(api.Reason.length, try empty.wait());
+    try std.testing.expectEqual(@as(usize, 0), empty.tokens);
+    var next: Fixture = .{};
+    const valid: api.Request = .{ .prompt = bad.prompt, .max_tokens = 3 };
+    try e.submit(3, &valid, .{ .ctx = &next, .event = Fixture.event });
+    try std.testing.expectEqual(api.Reason.length, try next.wait());
+    try std.testing.expectEqual(@as(usize, 3), next.tokens);
+    try std.testing.expectEqual(@as(usize, 1), refused.terminals);
+    try std.testing.expectEqual(@as(usize, 1), empty.terminals);
+    try std.testing.expectEqual(@as(usize, 1), next.terminals);
 }
 
 test "a cancel during a long prompt stops it, and the next request's reply is unchanged (#291)" {
