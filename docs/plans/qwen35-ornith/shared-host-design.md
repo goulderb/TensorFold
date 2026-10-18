@@ -15,8 +15,9 @@ Candidate artifacts and the judge's response are under
 The selected shape adapts three details from the extraction candidate:
 
 - A pure optional request-refusal hook runs before `LaneHost` converts a
-  request to a stream. It preserves refusal of `decode_spans`, which the host
-  otherwise discards when decoded-row execution is disabled.
+  request to a stream. It refuses unsupported requested features before
+  stream construction. The post-trial correction below distinguishes those
+  features from passive prompt metadata.
 - `Info.prefill_step` stays zero. The backend's `prefill_step` callback yields
   between serial prompt tokens and publishes `fill_at`; it does not define
   the HTTP prompt chunk plan or establish faster prefill.
@@ -63,6 +64,13 @@ Fake sessions prove adapter and lifecycle behavior, not CUDA arithmetic.
 Compile and host-test the migrated native/server roots before staging a
 candidate for an approved device window. The failed numerical gate and
 production qualification remain open.
+
+The first hardware trial exposed an overbroad metadata refusal. Ordinary
+chat's decision position and history reply spans do not enable learning or
+decoded-row execution. The corrected hook accepts them. This Qwen host leaves
+`decoded_rows` disabled, so the shared host drops the spans and prefills with
+the same prompt arithmetic. Direct low-level `Stream` requests for decoded
+rows remain refused. See the [trial and correction](shared-host-trial-20261018.md).
 
 ## CPU implementation evidence, 2026-10-18
 

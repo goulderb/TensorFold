@@ -864,8 +864,9 @@ test "the Qwen host profile preserves memory reporting, direct refusals and zero
     try std.testing.expectEqual(@as(u64, 23), e.memory(false).?.active);
     try std.testing.expect(e.info().plain_only and e.info().loop_guard);
     try std.testing.expectEqual(@as(u32, 0), e.info().prefill_step);
+    try std.testing.expect(!h.host.decoded_rows);
     var refused: Fixture = .{};
-    const bad: api.Request = .{ .prompt = &.{ 2, 7, 1 }, .max_tokens = 2, .decode_spans = &.{.{ 1, 2 }} };
+    const bad: api.Request = .{ .prompt = &.{ 2, 7, 1 }, .max_tokens = 2, .logprobs = 0 };
     try e.submit(1, &bad, .{ .ctx = &refused, .event = Fixture.event });
     try std.testing.expectEqual(api.Reason.failed, try refused.wait());
     try std.testing.expectEqual(@as(usize, 0), target.prefill_count);
@@ -875,7 +876,7 @@ test "the Qwen host profile preserves memory reporting, direct refusals and zero
     try std.testing.expectEqual(api.Reason.length, try empty.wait());
     try std.testing.expectEqual(@as(usize, 0), empty.tokens);
     var next: Fixture = .{};
-    const valid: api.Request = .{ .prompt = bad.prompt, .max_tokens = 3, .decide = 2 };
+    const valid: api.Request = .{ .prompt = bad.prompt, .max_tokens = 3, .decide = 2, .decode_spans = &.{.{ 0, 2 }} };
     try e.submit(3, &valid, .{ .ctx = &next, .event = Fixture.event });
     try std.testing.expectEqual(api.Reason.length, try next.wait());
     try std.testing.expectEqual(@as(usize, 3), next.tokens);

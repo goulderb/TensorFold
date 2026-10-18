@@ -58,3 +58,34 @@ refusal behavior on a device. Those require the corrected candidate's next
 approved test. The first window is complete and production is restored.
 The existing four failed full-logit rows, multi-lane work, cache and production
 qualification remain open.
+
+## Review of ordinary chat history
+
+Fable's post-trial review found the same class of error for reply-span metadata.
+The server attaches prior assistant reply spans to chat history. The default
+Qwen host has `decoded_rows=false`; the shared host deliberately drops those
+spans and uses prompt arithmetic for all rows. Refusing them before this
+normalization would reject ordinary multi-turn chat.
+
+A second focused regression fails with the history-span refusal and passes
+after removing it. The host-profile fixture now carries both the decision
+position and nonempty reply spans, asserts decoded rows are disabled, and
+completes through the shared host. Its unsupported-request case uses logprobs,
+which is still refused. The low-level backend still refuses explicit decoded
+rows in a raw `Stream`; no decoded-row execution mode is enabled by this fix.
+
+The corrected tests report 46 targeted passes, with the admission root cached;
+the aggregate passes 45/45 steps, with 98 reported passes, one skip and other
+roots cached. Receipts are `chat-history-{red,green,aggregate}.log` under the
+same trial artifact directory. The first correction's native build also
+passed 60/60 steps; the final corrected source must be built and pinned again.
+
+The next HTTP probe adds a prior assistant turn and another user message. It
+now has thirteen checks. This new case requires a successful nonempty text
+reply; it is not a claimed token-parity comparison with an uncaptured serial
+history response. The historical failed trial still planned twelve checks.
+
+The review's concern about automatic tool requests was checked in
+`server/server.zig:234`: call gates are constructed only for required or named
+tool choice. Those modes remain explicitly unsupported; ordinary automatic
+tool output does not activate that guard. No tool execution is newly qualified.

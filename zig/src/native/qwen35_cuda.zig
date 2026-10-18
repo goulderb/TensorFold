@@ -22,7 +22,6 @@ pub fn refusal(o: api.Open) ?[]const u8 {
 pub fn requestRefusal(r: *const api.Request) ?[]const u8 {
     if (r.call != null or r.structure != null) return "Qwen CUDA call gates and structured decoding are not qualified";
     if (r.images.len > 0 or r.vision != null) return "Qwen CUDA serves text only";
-    if (r.decode_spans.len > 0) return "Qwen CUDA decoded prompt rows are not qualified";
     if (r.logprobs != null or r.prompt_logprobs != null) return "Qwen CUDA logprob responses are not qualified";
     if (r.think_budget != 0) return "Qwen CUDA thinking budgets are not qualified";
     return null;
@@ -128,10 +127,15 @@ test "Qwen accepts an ordinary chat prompt carrying a decision position" {
     try std.testing.expect(requestRefusal(&request) == null);
 }
 
+test "Qwen accepts chat-history spans for the default host's prompt arithmetic" {
+    const request: api.Request = .{ .prompt = &.{ 1, 2, 3 }, .max_tokens = 4, .decide = 2, .decode_spans = &.{.{ 0, 2 }} };
+    try std.testing.expect(requestRefusal(&request) == null);
+}
+
 test "Qwen refuses unsupported direct requests and inherited pool or spill settings" {
     var r: api.Request = .{ .prompt = &.{1}, .max_tokens = 1, .loop_guard = true };
     try std.testing.expect(requestRefusal(&r) == null);
-    r.decode_spans = &.{.{ 0, 1 }};
+    r.logprobs = 0;
     try std.testing.expect(requestRefusal(&r) != null);
     const Env = struct {
         fn empty(_: [:0]const u8) ?[]const u8 {
