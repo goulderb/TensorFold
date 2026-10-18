@@ -48,14 +48,15 @@ pub const Linear = struct {
     scales: []const u8, // [n, k/16] e4m3
     global: f32, // weight_scale_2
 
-    /// `module`'s four tensors, marked as used; input_scale is the W4A4 math's static scale, unread by W4A16.
+    /// `module`'s weight tensors, marked as used; input_scale is optional (W4A4's static scale, absent on W4A16).
     pub fn read(ck: *ckpt.Checkpoint, module: []const u8) !Linear {
         var buf: [256]u8 = undefined;
         const w = try ck.get(try std.fmt.bufPrint(&buf, "{s}.weight", .{module}));
         const s = try ck.get(try std.fmt.bufPrint(&buf, "{s}.weight_scale", .{module}));
         const g = try ck.get(try std.fmt.bufPrint(&buf, "{s}.weight_scale_2", .{module}));
-        const a = try ck.get(try std.fmt.bufPrint(&buf, "{s}.input_scale", .{module}));
-        const d = dims(meta(&w), meta(&s), meta(&g), meta(&a)) catch |e| {
+        const in_name = try std.fmt.bufPrint(&buf, "{s}.input_scale", .{module});
+        const a: ?Meta = if (ck.has(in_name)) meta(&(try ck.get(in_name))) else null;
+        const d = dims(meta(&w), meta(&s), meta(&g), a) catch |e| {
             const ws = w.shape[0..w.rank];
             const ss = s.shape[0..s.rank];
             std.log.err("{s}: not ModelOpt NVFP4 ({t} {any}, {t} {any})", .{ module, w.dtype, ws, s.dtype, ss });
@@ -123,4 +124,32 @@ test "a linear read from a checkpoint folder decodes as core/quant's reference" 
     try std.testing.expectEqual(@as(f64, 0.0), out[1]);
     try std.testing.expectEqual(quant.nvfp4.e2m1(body[8] & 0xf) * 2.0 * 0.25, out[16]);
     try std.testing.expectEqual(quant.nvfp4.e2m1(body[16 + 15] >> 4) * -1.0 * 0.25, out[32 + 31]); // row 1, scale -1.0
+}
+
+test "a W4A16 linear without input_scale still reads" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const header =
+        \\{"l.weight":{"dtype":"U8","shape":[2,16],"data_offsets":[0,32]},
+        \\ "l.weight_scale":{"dtype":"F8_E4M3","shape":[2,2],"data_offsets":[32,36]},
+        \\ "l.weight_scale_2":{"dtype":"F32","shape":[],"data_offsets":[36,40]}}
+    ;
+    var data: [8 + header.len + 40]u8 = undefined;
+    std.mem.writeInt(u64, data[0..8], header.len, .little);
+    @memcpy(data[8..][0..header.len], header);
+    const body = data[8 + header.len ..];
+    @memset(body, 0);
+    @memcpy(body[36..40], std.mem.asBytes(&@as(f32, 0.5)));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &data });
+    const dir = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(dir);
+    var ck = try ckpt.Checkpoint.openModel(gpa, io, dir);
+    defer ck.close();
+    const l = try Linear.read(&ck, "l");
+    try std.testing.expectEqual(@as(usize, 0), ck.unused());
+    try std.testing.expectEqual(@as(f32, 0.5), l.global);
+    try std.testing.expectEqual(@as(usize, 2), l.n);
+    try std.testing.expectEqual(@as(usize, 32), l.k);
 }

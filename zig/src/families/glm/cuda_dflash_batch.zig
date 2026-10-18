@@ -2,9 +2,10 @@ const std = @import("std");
 const state = @import("cuda_dflash_state.zig");
 const policy = @import("cuda_draft_policy.zig");
 const Sampling = @import("cuda_sampler.zig").Sampling;
+const verify = @import("cuda_verify_plan.zig");
 
 pub const max_lanes = 8;
-pub const max_depth = 3;
+pub const max_depth = verify.max_drafts;
 pub const vocab = 154880;
 pub const Request = struct {
     slot: usize,
@@ -23,13 +24,17 @@ pub const Plan = struct {
     capacity: usize = 0,
 
     pub fn build(lanes: *const [max_lanes]state.Lane, capacity: usize, requests: []const Request) !Plan {
+        return buildWithPlan(lanes, capacity, requests, .baseline);
+    }
+
+    pub fn buildWithPlan(lanes: *const [max_lanes]state.Lane, capacity: usize, requests: []const Request, verify_plan: verify.Plan) !Plan {
         if (requests.len == 0 or requests.len > max_lanes) return error.BadDraftBatch;
         var seen: [max_lanes]bool = @splat(false);
         var plan: Plan = .{ .total = requests.len, .capacity = capacity };
         for (requests, 0..) |r, i| {
             if (r.slot >= max_lanes or seen[r.slot]) return error.BadDraftSlot;
             seen[r.slot] = true;
-            if (r.pending >= vocab or r.depth > max_depth) return error.BadDraftRequest;
+            if (r.pending >= vocab or r.depth > verify_plan.drafts()) return error.BadDraftRequest;
             const lane = lanes[r.slot];
             if (!lane.healthy) return error.DraftFailed;
             if (lane.pending != null or lane.end != r.end) return error.BadDraftRequest;

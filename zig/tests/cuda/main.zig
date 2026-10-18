@@ -104,7 +104,9 @@ const usage =
     \\  glm-grammar               GLM first and multirow masked greedy and sampled draws
     \\  kernel-contract           the registered kernels through the contract's gates, each planted control red (needs -Dnvcc)
     \\  kernel-contract-limits DIR   each registered launch against sm_80/86/89/120/121 from the fatbins in DIR
+    \\  glm-attn-fp8load [rows]    FP8 attention byte parity and chunks-only timing (default 2048 rows, 32 heads)
     \\  glm-ref                   GLM projections (matmuls, router, attention, indexer, hc) against float64 (synthetic)
+    \\  glm-source-dense          source MXFP8/FP8_PB_WO: BF16 activations, FP64, both epilogues, 1-2048 rows
     \\  glm-vision-dump CKPT IMAGE OUT  export native BF16 projector rows for an independent oracle
     \\  glm-lanes-cover <ckpt> <dc.json> <rank> <world> <idfile>  copy drafts, cancels, discards, eos and max_new on one lanes.Engine across requests
     \\  glm-lanes-concurrent <ckpt> <dc.json> <rank> <world> <idfile>  concurrent streams on one lanes.Engine, each against its solo run
@@ -143,6 +145,8 @@ fn arg(rest: []const [:0]const u8, i: usize) ![]const u8 {
 }
 
 fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+    if (std.mem.eql(u8, cmd, "nvfp4-experts-bench")) return @import("nvfp4_experts_bench.zig").run(gpu, rest);
+    if (std.mem.eql(u8, cmd, "glm-source-dense")) return @import("glm_source_dense_tests.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "ck-dense")) return ck_dense_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "info")) return info(gpu);
     if (std.mem.eql(u8, cmd, "smoke")) return runtime_tests.smoke(gpu);
@@ -175,6 +179,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-precision-oracle")) return @import("glm_precision_tests.zig").oracle(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "glm-precision")) return @import("glm_precision_tests.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "glm-grammar")) return @import("glm_precision_tests.zig").grammar(gpu);
+    if (std.mem.eql(u8, cmd, "glm-attn-fp8load")) return @import("glm_attn_fp8load.zig").run(gpu, rest);
     if (std.mem.eql(u8, cmd, "glm-ref")) return glm_ref_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-vision-dump")) return @import("glm_vision_dump.zig").run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "modelopt")) return modelopt_tests.run(gpu);

@@ -12,7 +12,7 @@ const cache = @import("cuda_cache.zig");
 pub const prompt_att_rows = 512;
 
 /// The indexer's weights, replicated: [wk | weights_proj] [d + heads][dims], gate, key LayerNorm, pool bias, wq_b.
-pub const Index = struct { kw: u64, kw_q: ?cuda.qlinear.Weight = null, gate: u64, ln_w: u64, ln_b: u64, ape: u64, qb: b16.Proj, heads: usize, d: usize };
+pub const Index = struct { kw: b16.Proj, gate: u64, ln_w: u64, ln_b: u64, ape: u64, qb: b16.Proj, heads: usize, d: usize };
 
 pub const InputProjection = union(enum) {
     combined_bf16: u64,
@@ -69,7 +69,12 @@ pub const Scratch = struct {
 };
 
 /// The kernels: the captured Triton set and glm_ops (the token lists and position offsets).
-pub const Kernels = struct { set: glue.Set, ops: cuda.Module, owner: ?@import("cuda_kv_owner.zig").Transport = null };
+pub const Kernels = struct {
+    set: glue.Set,
+    ops: cuda.Module,
+    owner: ?@import("cuda_kv_owner.zig").Transport = null,
+    slot: usize = 0,
+};
 
 /// forward.dsa_block (latent path) of `rows` rows at pos to an fp32 partial; `nch`: 512-key chunks, `part_rows`: block.
 pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize, out: u64) !void {
@@ -95,6 +100,49 @@ pub fn sparseRows(l: Layer, host_pos: usize, rows: usize) bool {
     return host_pos + rows - 1 >= l.dense_limit;
 }
 
+const replica_slots = 16;
+const replica_floor_rows: usize = 262144;
+
+const Replica = struct { buf: ?cuda.DeviceBuffer = null };
+
+var replicas: [replica_slots]Replica = @splat(.{});
+
+fn localAttn(rows: usize) bool {
+    if (rows < latent.prompt_rows) return false;
+    const v = std.c.getenv("TF_GLM_PREFILL_ATTN_LOCAL") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
+fn ensureReplica(d: *const cuda.Driver, stream: cuda.Stream, slot: usize, bytes: usize) !u64 {
+    if (slot >= replica_slots) return error.BadPrefillSlot;
+    var slot_buf = &replicas[slot];
+    if (slot_buf.buf) |*old| {
+        if (old.len >= bytes) return old.ptr;
+        var neu = try cuda.DeviceBuffer.alloc(d, bytes);
+        errdefer neu.free();
+        try d.check(d.api.cuMemcpyDtoDAsync_v2(neu.ptr, old.ptr, old.len, stream.handle), "cuMemcpyDtoDAsync");
+        old.free();
+        slot_buf.buf = neu;
+        return neu.ptr;
+    }
+    slot_buf.buf = try cuda.DeviceBuffer.alloc(d, bytes);
+    return slot_buf.buf.?.ptr;
+}
+
+fn attendLocal(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, owner: u32, pos: u64, host_pos: usize, rows: usize, nch: usize, part_rows: usize, scale: f32, sparse_any: bool) !void {
+    const transport = k.owner orelse return error.NoKvOwnerTransport;
+    const stride = cache.Format.rowBytes(c.lc.format, l.lw);
+    const need = @max((host_pos + rows) * stride, replica_floor_rows * stride);
+    const off = host_pos * stride;
+    const n = rows * stride;
+    const base = if (transport.rank == owner) c.lc.ptr else try ensureReplica(transport.d, stream, k.slot, need);
+    try transport.carry(stream, owner, 1 - owner, base + off, base + off, n);
+    var caches = c;
+    caches.lc.ptr = base;
+    if (host_pos < l.dense_limit) try denseAttention(k, stream, l, caches, s, pos, rows, nch, part_rows, scale, latent.headBlock(rows));
+    if (sparse_any) try latent.sparseAttention(k.set, stream, s.qa, caches.lc, s.tokens, s.counts, sparse.width, s.partials, s.ol, rows, l.heads, l.lw, scale);
+}
+
 /// The block's row-by-row part for a shared window: projections, norms, q_b, indexer, absorbed query, `qi`'s query.
 pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool) !void {
     const width = l.q_lora + l.lw;
@@ -114,7 +162,7 @@ pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
     }
     try b16.proj(set, stream, s.qr, l.q_lora, l.q_b, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
     const ix = l.index;
-    try b16.proj(set, stream, x, x_stride, if (ix.kw_q) |q| .{ .q = q } else .{ .b16 = ix.kw }, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
+    try b16.proj(set, stream, x, x_stride, ix.kw, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
     try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
     try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk, l.lw);
     if (qi) try b16.proj(set, stream, s.qr, l.q_lora, ix.qb, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
@@ -138,25 +186,29 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
     const sparse_any = sparseRows(l, host_pos, rows);
     if (sparse_any) try sparse.selectTokens(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts);
     if (c.owner) |owner| {
-        const transport = k.owner orelse return error.NoKvOwnerTransport;
-        var first: usize = 0;
-        while (first < rows) {
-            const n = @min(part_rows, rows - first);
-            var tile = v;
-            tile.qa += first * l.heads * l.lw * 2;
-            tile.ol += first * l.heads * l.lw * 2;
-            tile.tokens += first * sparse.width * 4;
-            tile.counts += first * 4;
-            var at = pos;
-            if (first > 0) {
-                var args: cuda.Args = .{};
-                inline for (.{ pos, @as(c_int, @intCast(first)), v.at }) |value| args.add(value);
-                try cuda.launch.launch(try k.ops.function("tf_glm_add_i32"), .{ .grid = .{}, .block = .{ .x = 32 } }, stream, &args);
-                at = v.at;
+        if (localAttn(rows)) {
+            try attendLocal(k, stream, l, c, v, owner, pos, host_pos, rows, nch, part_rows, scale, sparse_any);
+        } else {
+            const transport = k.owner orelse return error.NoKvOwnerTransport;
+            var first: usize = 0;
+            while (first < rows) {
+                const n = @min(part_rows, rows - first);
+                var tile = v;
+                tile.qa += first * l.heads * l.lw * 2;
+                tile.ol += first * l.heads * l.lw * 2;
+                tile.tokens += first * sparse.width * 4;
+                tile.counts += first * 4;
+                var at = pos;
+                if (first > 0) {
+                    var args: cuda.Args = .{};
+                    inline for (.{ pos, @as(c_int, @intCast(first)), v.at }) |value| args.add(value);
+                    try cuda.launch.launch(try k.ops.function("tf_glm_add_i32"), .{ .grid = .{}, .block = .{ .x = 32 } }, stream, &args);
+                    at = v.at;
+                }
+                var work: Attention = .{ .k = k, .stream = stream, .l = l, .c = c, .s = tile, .pos = at, .host_pos = host_pos + first, .rows = n, .nch = nch, .scale = scale, .hb = latent.headBlock(rows) };
+                try transport.attention(stream, owner, tile.qa, tile.ol, v.owner_q, v.owner_out, n * l.heads * l.lw * 2, .{ .ctx = &work, .run = Attention.run });
+                first += n;
             }
-            var work: Attention = .{ .k = k, .stream = stream, .l = l, .c = c, .s = tile, .pos = at, .host_pos = host_pos + first, .rows = n, .nch = nch, .scale = scale, .hb = latent.headBlock(rows) };
-            try transport.attention(stream, owner, tile.qa, tile.ol, v.owner_q, v.owner_out, n * l.heads * l.lw * 2, .{ .ctx = &work, .run = Attention.run });
-            first += n;
         }
     } else {
         if (host_pos < l.dense_limit) try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale, latent.headBlock(rows));

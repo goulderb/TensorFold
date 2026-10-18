@@ -231,7 +231,7 @@ test "a write never follows a link planted where a partial file or the start sta
     const payload = payloadOf(&pay, 5);
     const outside = "not the tier's";
     var vp: [512]u8 = undefined;
-    const victim = try std.fmt.bufPrintSentinel(&vp, "{s}/victim", .{root.path}, 0);
+    const victim = try std.fmt.bufPrintSentinel(&vp, "{s}/victim", .{std.fs.path.dirname(root.path).?}, 0);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = victim, .data = outside });
     var ap: [std.c.PATH_MAX]u8 = undefined;
     const target = std.c.realpath(victim, &ap) orelse return error.NoVictim;
@@ -537,7 +537,7 @@ test "settings come from TENSORFOLD_SPILL_*: off without a size, GLM's defaults,
     try std.testing.expectEqual(@as(u64, 50 << 30), s.min_free);
     try std.testing.expectEqual(@as(f64, 60), s.flush_s);
     var buf: [128]u8 = undefined;
-    try std.testing.expectEqualStrings("spill=204800/0.7/8192/51200/60/1", try s.text(&buf));
+    try std.testing.expectEqualStrings("spill=204800/0.7/8192/51200/60/1/0", try s.text(&buf));
     const t = (try spill.Settings.fromEnv(gpa, Env{ .vars = &.{ .{ "TENSORFOLD_SPILL_GIB", "1.5" }, .{ "TENSORFOLD_SPILL_DIR", "/nvme/spill" }, .{ "TENSORFOLD_SPILL_HIGHWATER", "1.0" }, .{ "TENSORFOLD_SPILL_MIN_TOKENS", "4096" }, .{ "TENSORFOLD_SPILL_MIN_FREE_GIB", "10" }, .{ "TENSORFOLD_SPILL_FLUSH_S", "30" } } })).?;
     defer gpa.free(t.dir);
     try std.testing.expectEqualStrings("/nvme/spill", t.dir);

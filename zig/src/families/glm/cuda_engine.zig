@@ -17,6 +17,7 @@ const vision_binding = @import("cuda_vision_binding.zig");
 const vision_runtime = @import("cuda_vision_runtime.zig");
 const dflash_mod = @import("cuda_dflash.zig");
 const mia = @import("cuda_experts_mia.zig");
+const verify_plan = @import("cuda_verify_plan.zig");
 pub const persistence = @import("cuda_persistence.zig");
 pub const spill_payload = @import("cuda_spill_payload.zig");
 
@@ -56,14 +57,14 @@ test "converted KDA validates every TP rank from shared geometry" {
 pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
 
 /// The most drafts a chain holds (decode.DepthPolicy's top depth).
-pub const max_drafts = 3;
+pub const max_drafts = verify_plan.max_drafts;
 
 /// A prompt pass's chunk rows (decode.prefill's).
 pub const prompt_rows = fw.prefill_rows;
 
-/// A shared verify's max rows and streams: under hc_pre's 64-row block change, 8 streams of 4 rows.
-pub const shared_rows = 32;
-pub const max_shared = 8;
+/// Storage ceiling; verifyPlan selects the active row limit below hc_pre's 64-row change.
+pub const shared_rows = verify_plan.max_rows;
+pub const max_shared = verify_plan.max_streams;
 
 /// One stream's window of a shared verify: its slot, its ids, and its drawn tokens.
 pub const Part = struct { slot: u32, ids: []const u32, out: []u32 };
@@ -151,10 +152,11 @@ pub const Engine = struct {
         const cfg_path = try std.fs.path.join(a, &.{ checkpoint, "config.json" });
         const text = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, a, .limited(1 << 24));
         var why: modelopt.Why = .{};
-        _ = @import("cuda_checkpoint.zig").admit(gpa, text, &why) catch |err| {
+        var admission = @import("cuda_checkpoint.zig").Admission.read(gpa, text, &why) catch |err| {
             std.log.err("{s}: {s}", .{ cfg_path, why.text() });
             return err;
         };
+        defer admission.deinit();
         const c = try config.parse(gpa, text);
         var stream = try cuda.Stream.init(d, false);
         errdefer stream.deinit();
@@ -199,6 +201,14 @@ pub const Engine = struct {
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
         var m = try fw.Modules.load(d, ctx);
         errdefer m.deinit();
+        if (settings.weight_dense.source()) {
+            var source_problem: ?anyerror = null;
+            m.enableSourceDense(d) catch |err| {
+                source_problem = err;
+            };
+            try ranks.gather(u32, d, lib, comm, stream, rank, @intFromBool(source_problem == null), startup);
+            for (startup) |ready| if (ready == 0) return source_problem orelse error.PeerSourceDenseRefused;
+        }
         if (settings.weight_dense.native()) {
             var native_problem: ?anyerror = null;
             m.enableNativeDense(d, ctx) catch |err| {
@@ -218,6 +228,7 @@ pub const Engine = struct {
         var wt = e.m.tools();
         wt.precision = .{ .dense = o.settings.weight_dense, .head = o.settings.weight_head };
         wt.exl3_routed = settings.exl3_routed;
+        wt.recipes = if (admission.recipes) |*t| t else null;
         if (rank == 0) {
             var policy_text: [256]u8 = undefined;
             const policy_hash = o.settings.weight_dense.digest();
@@ -251,7 +262,9 @@ pub const Engine = struct {
         errdefer e.bd.deinit();
         e.bm = if (o.settings.kv_shard) try fw.Buffers.initOwned(d, &e.w, fw.window_rows, false, o.capacity) else try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bm.deinit();
-        if (with_mtp or settings.draft == .dflash2) e.bs = if (o.settings.kv_shard) try fw.Buffers.initSharedOwned(d, &e.w, shared_rows, o.capacity) else try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
+        const verify_rows = settings.dflash_verify.active(settings.draft == .dflash2).rows();
+        if (rank == 0 and settings.draft == .dflash2 and settings.dflash_verify == .dflash6) std.log.info("GLM DFlash verify plan: drafts=6 lane_rows=7 shared_rows=56", .{});
+        if (with_mtp or settings.draft == .dflash2) e.bs = if (o.settings.kv_shard) try fw.Buffers.initSharedOwned(d, &e.w, verify_rows, o.capacity) else try fw.Buffers.initShared(d, &e.w, verify_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
         errdefer if (e.dflash) |drafter| drafter.deinit();
         if (settings.draft == .dflash2) {
@@ -273,7 +286,7 @@ pub const Engine = struct {
         errdefer e.shared_buf.free();
         if (settings.draft == .dflash2) {
             var draft_problem: ?anyerror = null;
-            e.dflash = dflash_mod.DFlash.open(gpa, io, checkpoint, settings.draft_dir.?, max_shared, o.capacity, .{ .driver = d, .context = ctx, .stream = stream, .embed = e.w.embed, .lib = lib, .comm = comm, .rank = rank, .world = world, .kernels_dir = o.draft_kernels }) catch |err| blk: {
+            e.dflash = dflash_mod.DFlash.open(gpa, io, checkpoint, settings.draft_dir.?, max_shared, o.capacity, .{ .driver = d, .context = ctx, .stream = stream, .embed = e.w.embed, .lib = lib, .comm = comm, .rank = rank, .world = world, .kernels_dir = o.draft_kernels, .verify_plan = settings.dflash_verify }) catch |err| blk: {
                 draft_problem = err;
                 break :blk null;
             };
@@ -335,7 +348,7 @@ pub const Engine = struct {
 
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .vision = if (b == &e.bp) if (e.cur.vision) |*vision| .{ .owner = vision.table(), .generation = vision.table().generation } else null else null };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .vision = if (b == &e.bp) if (e.cur.vision) |*vision| .{ .owner = vision.table(), .generation = vision.table().generation } else null else null };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -810,7 +823,7 @@ pub const Engine = struct {
         var ids: [shared_rows]u32 = undefined;
         var rows: usize = 0;
         for (parts, 0..) |p, i| {
-            if (p.ids.len == 0 or p.ids.len > fw.window_rows or rows + p.ids.len > shared_rows) return error.WindowTooWide;
+            if (p.ids.len == 0 or p.ids.len > 1 + e.verifyPlan().drafts() or rows + p.ids.len > b.rows) return error.WindowTooWide;
             for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
             try e.bind(p.slot);
             segs[i] = .{ .st = &e.cur.st, .row0 = rows, .rows = p.ids.len };
@@ -818,7 +831,7 @@ pub const Engine = struct {
             rows += p.ids.len;
         }
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .kda_wide = e.settings.kda_wide };
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load };
         try f.run(@ptrCast(ids[0..rows]));
         for (parts, segs[0..parts.len]) |p, g| {
             try e.bind(p.slot);
@@ -856,11 +869,15 @@ pub const Engine = struct {
         return e.mtp or e.dflash != null;
     }
 
+    pub fn verifyPlan(e: *const Engine) verify_plan.Plan {
+        return e.settings.dflash_verify.active(e.dflash != null);
+    }
+
     fn resolveDraftBatch(e: *const Engine, parts: []const DraftPart, out: *[max_shared]dflash_mod.BatchRequest) !void {
         const d = e.dflash orelse return error.NoDraftHead;
         if (parts.len == 0 or parts.len > max_shared) return error.BadDraftBatch;
         for (parts, 0..) |p, i| {
-            if (p.depth > max_drafts or p.position == 0) return error.BadDraftRequest;
+            if (p.depth > e.verifyPlan().drafts() or p.position == 0) return error.BadDraftRequest;
             const end = try e.slotPos(p.slot);
             if (p.position != end + 1) return error.PositionMismatch;
             out[i] = .{ .slot = p.slot, .end = end, .pending = p.pending, .depth = p.depth, .sampling = e.seqs.items[p.slot].?.sampling };
@@ -885,10 +902,10 @@ pub const Engine = struct {
     }
 
     pub fn draft(e: *Engine, from_prompt: bool, follow: []const u32, depth: usize, out: []u32) !usize {
-        if (depth > max_drafts or depth > out.len or follow.len == 0) return error.BadDraftRequest;
+        if (depth > e.verifyPlan().drafts() or depth > out.len or follow.len == 0) return error.BadDraftRequest;
         if (e.dflash) |drafter| return drafter.propose(e.slot, follow[follow.len - 1], e.cur.sampling, out[0..depth]);
         if (!e.mtp) return error.NoDraftHead;
-        if (depth > max_drafts) return error.TooDeep;
+        if (depth > verify_plan.Plan.baseline.drafts()) return error.TooDeep;
         var one: [1]fw.Rank = undefined;
         const f = e.view(&e.bm, &one);
         const D = e.c.hidden;

@@ -17,6 +17,7 @@ pub const Kernels = struct { set: glue.Set, linear: cuda.qlinear.Linear, copy_ro
 fn mm(k: Kernels, stream: cuda.Stream, p: b16.Proj, x: u64, ldx: usize, rows: usize, out: u64, part: u64, n: usize, dims: usize, wide: bool, prompt: bool) !void {
     const q = switch (p) {
         .b16 => |w| return b16.matmul(k.set, stream, x, ldx, w, out, part, rows, n, dims, wide),
+        .source => return b16.proj(k.set, stream, x, ldx, p, out, part, rows, n, dims, wide),
         .q => |w| w,
     };
     if (q == .affine4 and !prompt) try b16.groupSums(k.set, stream, x, ldx, part, rows, dims);

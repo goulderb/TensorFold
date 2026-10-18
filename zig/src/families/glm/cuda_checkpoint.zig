@@ -2,7 +2,22 @@
 const std = @import("std");
 const modelopt = @import("core").modelopt;
 
-pub const Format = enum { nvfp4, exl3, routed_exl3 };
+pub const Format = enum { nvfp4, modelopt_mixed, exl3, routed_exl3 };
+
+pub const Admission = struct {
+    format: Format,
+    recipes: ?modelopt.Table = null,
+
+    pub fn read(gpa: std.mem.Allocator, bytes: []const u8, why: *modelopt.Why) !Admission {
+        const format = try admit(gpa, bytes, why);
+        return .{ .format = format, .recipes = if (format == .modelopt_mixed) try modelopt.mixed(gpa, bytes, why) else null };
+    }
+
+    pub fn deinit(self: *Admission) void {
+        if (self.recipes) |*t| t.deinit();
+        self.* = undefined;
+    }
+};
 
 pub fn admit(gpa: std.mem.Allocator, bytes: []const u8, why: *modelopt.Why) !Format {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
@@ -17,6 +32,7 @@ pub fn admit(gpa: std.mem.Allocator, bytes: []const u8, why: *modelopt.Why) !For
     if (method != .string) return error.InvalidQuantization;
     if (std.ascii.eqlIgnoreCase(method.string, "modelopt")) {
         try modelopt.admit(gpa, bytes, why);
+        if (q.object.get("quant_algo")) |algo| if (algo == .string and std.ascii.eqlIgnoreCase(algo.string, "MIXED_PRECISION")) return .modelopt_mixed;
         return .nvfp4;
     }
     if (!std.mem.eql(u8, method.string, "exl3")) return error.UnsupportedQuant;

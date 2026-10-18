@@ -11,6 +11,7 @@ const policy = @import("cuda_draft_policy.zig");
 const state = @import("cuda_dflash_state.zig");
 const batch = @import("cuda_dflash_batch.zig");
 const pinned_aot = @import("cuda_dflash_aot.zig");
+const verify = @import("cuda_verify_plan.zig");
 const Sampling = @import("cuda_sampler.zig").Sampling;
 pub const BatchRequest = batch.Request;
 pub const BatchResult = batch.Result;
@@ -49,6 +50,7 @@ pub const Dependencies = struct {
     rank: usize,
     world: usize,
     kernels_dir: ?[]const u8 = null,
+    verify_plan: verify.Plan = .baseline,
 };
 
 pub const DFlash = struct {
@@ -62,6 +64,7 @@ pub const DFlash = struct {
     pred: []f32,
     succ: []f32,
     capacity: usize,
+    verify_plan: verify.Plan = .baseline,
     lanes: [8]state.Lane = @splat(.{}),
     pending: [8]cuda.DeviceBuffer,
     max_packed_width: usize = 0,
@@ -82,6 +85,7 @@ pub const DFlash = struct {
         errdefer gpa.destroy(p);
         p.gpa = gpa;
         p.capacity = capacity;
+        p.verify_plan = deps.verify_plan;
         p.lanes = @splat(.{});
         p.max_packed_width = 0;
         p.width_histogram = .{};
@@ -231,11 +235,11 @@ pub const DFlash = struct {
         l.end = start + rows;
     }
     pub fn validateBatch(d: *const DFlash, requests: []const BatchRequest) !void {
-        _ = try batch.Plan.build(&d.lanes, d.capacity, requests);
+        _ = try batch.Plan.buildWithPlan(&d.lanes, d.capacity, requests, d.verify_plan);
     }
     pub fn proposeBatch(d: *DFlash, requests: []const BatchRequest, out: []BatchResult) !void {
         if (out.len != requests.len) return error.BadDraftBatch;
-        const plan = try batch.Plan.build(&d.lanes, d.capacity, requests);
+        const plan = try batch.Plan.buildWithPlan(&d.lanes, d.capacity, requests, d.verify_plan);
         var results: [batch.max_lanes]BatchResult = @splat(.{});
         if (plan.count == 0) {
             @memcpy(out, results[0..requests.len]);
@@ -338,6 +342,7 @@ fn testPackage(driver: *const cuda.Driver) DFlash {
     var d: DFlash = undefined;
     const stream: cuda.Stream = .{ .d = driver, .handle = null };
     d.capacity = 8192;
+    d.verify_plan = .baseline;
     d.lanes = @splat(.{});
     d.max_packed_width = 0;
     d.width_histogram = .{};

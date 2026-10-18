@@ -68,14 +68,15 @@ pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: cache_rows.
 /// latent._dense_chunks (sparse false: keys through pos + r) and _sparse_chunks (row r's `counts` tokens of `tokens`).
 fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: cache_rows.Cache, pos: u64, tokens: u64, counts: u64, p: Partials, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, hb: usize, sparse: bool) !void {
     if (lw != 512) return error.LatentShape;
+    const fp8load = useFP8Load(set, cache.format, hb);
     const f = switch (hb) {
         heads_tile => if (cache.format == .fp8) set.glue.chunks_16_fp8 else set.glue.chunks_16,
-        heads_tile_wide => if (cache.format == .fp8) set.glue.chunks_32_fp8 else set.glue.chunks_32,
+        heads_tile_wide => if (fp8load) set.glue.chunks_32_fp8load else if (cache.format == .fp8) set.glue.chunks_32_fp8 else set.glue.chunks_32,
         else => return error.HeadBlock,
     };
     var a: cuda.Args = .{};
     inline for (.{ qa, cache.ptr, pos, tokens, counts, p.po, p.pm, p.pl, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(w)), scale, @as(c_int, @intFromBool(sparse)) }) |v| a.add(v);
-    const shared = if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
+    const shared = if (fp8load) glue.chunksFP8LoadSmem() else if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = 256 }, .shared = shared }, stream, &a);
 }
 
@@ -95,6 +96,21 @@ fn merge(set: glue.Set, stream: cuda.Stream, p: Partials, out: u64, counts: u64,
     var a: cuda.Args = .{};
     inline for (.{ p.po, p.pm, p.pl, out, counts, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(c_int, @intCast(nch)), @as(c_int, @intFromBool(sparse)) }) |v| a.add(v);
     try cuda.launch.launch(set.glue.merge, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(heads) }, .block = .{ .x = 128 } }, stream, &a);
+}
+
+fn useFP8Load(set: glue.Set, format: cache_rows.Format, hb: usize) bool {
+    return set.attn_fp8load and format == .fp8 and hb == heads_tile_wide;
+}
+
+test "FP8 attention load opt-in is confined to HB32 FP8 with matching shared storage" {
+    const off: glue.Set = .{ .glue = undefined };
+    const on: glue.Set = .{ .glue = undefined, .attn_fp8load = true };
+    try std.testing.expect(!useFP8Load(off, .fp8, 32));
+    try std.testing.expect(useFP8Load(on, .fp8, 32));
+    try std.testing.expect(!useFP8Load(on, .bf16, 32));
+    try std.testing.expect(!useFP8Load(on, .fp8, 16));
+    try std.testing.expectEqual(@as(u32, 101120), glue.chunksSmem(32));
+    try std.testing.expectEqual(@as(u32, 101376), glue.chunksFP8LoadSmem());
 }
 
 test "latent.py's tiling rules" {

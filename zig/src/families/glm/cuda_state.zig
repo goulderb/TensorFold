@@ -89,11 +89,28 @@ pub fn mixedPartBytes(w: *const weights.Weights, rows: usize) usize {
         mm = @max(mm, rows * (shape.k / 64) * 4);
         mm = @max(mm, lanePartBytes(rows, shape.n, shape.k));
         const mode = w.precision.dense.get(shape.group);
+        if (mode == .source) mm = @max(mm, b16.sourcePartBytes(rows, shape.k));
         if (mode == .fp8_native or mode == .nvfp4_native) {
             mm = @max(mm, cuda.ck.workspaceBytes(if (mode == .fp8_native) .fp8 else .nvfp4, rows, shape.n, shape.k) catch unreachable);
         }
     }
     return mm;
+}
+
+test "source dense scratch covers every TP2 projection and stays bounded at sixteen rows" {
+    const c = @import("config.zig").Config{};
+    for (0..2) |rank| {
+        var w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try @import("cuda_shard.zig").Share.of(&c, rank, 2) };
+        w.precision.dense = .uniform(.source);
+        for ([_]usize{ 1, 7, 16, 17, 64, 2048 }) |rows| for (projectionShapes(&w)) |shape| {
+            const need = b16.sourcePartBytes(rows, shape.k);
+            try std.testing.expect(need <= mixedPartBytes(&w, rows));
+            try std.testing.expect(need <= 16 * shape.k * 4);
+        };
+        try std.testing.expectEqual(@as(usize, 0), b16.sourcePartBytes(0, c.hidden));
+        try std.testing.expectEqual(@as(usize, 256 << 10), b16.sourcePartBytes(2048, 4096));
+        try std.testing.expectEqual(@as(usize, 384 << 10), b16.sourcePartBytes(2048, w.share.dense.len()));
+    }
 }
 
 test "native projection workspaces fit the physical arena for every TP2 shape and row bucket" {

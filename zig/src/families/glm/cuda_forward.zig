@@ -50,12 +50,18 @@ pub const Modules = struct {
     affine4: cuda.qlinear.Affine4Kernels,
     mia: ?mia.Kernels = null,
     ck: ?cuda.ck.Ck = null,
+    source_mods: ?[2]cuda.Module = null,
+    source_dense: ?cuda.exlr8.Dense = null,
+    source_upcast: ?cuda.Function = null,
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
         var m: Modules = undefined;
         m.mia = null;
         m.ck = null;
+        m.source_mods = null;
+        m.source_dense = null;
+        m.source_upcast = null;
         var n: usize = 0;
         errdefer for (m.mods[0..n]) |*x| x.unload();
         for (&m.mods, [_][]const u8{ k.glm_kda, k.glm_ops, k.experts, k.affine4_pack, k.glm_quant, k.qmm_group, k.glm_glue, k.qmm_prefill, k.lane_gemv }) |*x, image| {
@@ -96,11 +102,25 @@ pub const Modules = struct {
         m.ck = try cuda.ck.Ck.load(d, 12, @intCast(try ctx.attribute(.multiprocessor_count)));
     }
 
+    pub fn enableSourceDense(m: *Modules, d: *const cuda.Driver) !void {
+        if (m.source_mods != null) return;
+        var dm = try cuda.Module.load(d, cuda.kernels.exlr8_dense);
+        errdefer dm.unload();
+        var pm = try cuda.Module.load(d, cuda.kernels.torch_pointwise);
+        errdefer pm.unload();
+        const dense = try cuda.exlr8.Dense.resolve(dm);
+        const cast = try pm.function("tf_bf16_to_f32_kernel");
+        m.source_mods = .{ dm, pm };
+        m.source_dense = dense;
+        m.source_upcast = cast;
+    }
+
     pub fn ops(m: *const Modules) cuda.Module {
         return m.mods[1];
     }
 
     pub fn deinit(m: *Modules) void {
+        if (m.source_mods) |*mods| for (mods) |*x| x.unload();
         if (m.ck) |*c| c.unload();
         if (m.mia) |*k| k.unload();
         for (&m.mods) |*x| x.unload();
@@ -189,13 +209,14 @@ pub const Forward = struct {
     stream: cuda.Stream,
     ranks: []const Rank, // every rank of a local check, or this process's one
     exchange: Exchange,
+    attn_fp8load: bool = false,
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE (the Python family's default): decode windows on KDA's three-kernel chain
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
     vision: ?@import("cuda_vision_binding.zig").Binding = null,
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue, .linear = f.linear(), .copy_rows = f.m.copy_rows };
+        return .{ .glue = &f.m.glue, .linear = f.linear(), .copy_rows = f.m.copy_rows, .exlr8_dense = if (f.m.source_dense) |*d| d else null, .source_upcast = f.m.source_upcast, .attn_fp8load = f.attn_fp8load };
     }
 
     /// qlinear over every format a GLM checkpoint brings: NVFP4 (lane and prompt GEMM) and EXL3.
@@ -268,7 +289,9 @@ pub const Forward = struct {
                 if (b.prefill) st.cur[li] = 1 - cur; // a prompt chunk keeps every row: the layer commits now
             },
             .mla => |a| {
-                try dsa_block.body(f.dsaKernels(r), f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows);
+                var ks = f.dsaKernels(r);
+                ks.slot = di;
+                try dsa_block.body(ks, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows);
                 if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
             },
         }
@@ -597,7 +620,9 @@ pub const Forward = struct {
             try b16.proj(f.set(), f.stream, b.mcat, 2 * D, m.eh, b.mx, b.kda.mm_part, n, D, 2 * D, false);
             try glue.rmsnorm(f.set(), f.stream, b.mx, D, m.layer.in_norm, b.normed, D, b.xs, c.eps, n, D);
             const nch = @min(latent.chunksFor(r.st.mtp_len + n), b.nch);
-            try dsa_block.block(f.dsaKernels(r), f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
+            var ks = f.dsaKernels(r);
+            ks.slot = 12;
+            try dsa_block.block(ks, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
         }
         try f.gather(n);
         for (f.ranks) |r| {

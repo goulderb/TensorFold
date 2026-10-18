@@ -4,7 +4,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 
 /// What the forward's kernels launch from: our glue's functions.
-pub const Set = struct { glue: *const Kernels, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null };
+pub const Set = struct { glue: *const Kernels, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, exlr8_dense: ?*const cuda.exlr8.Dense = null, source_upcast: ?cuda.Function = null, attn_fp8load: bool = false };
 
 /// Our glm_glue.cu's functions.
 pub const Kernels = struct {
@@ -53,6 +53,7 @@ pub const Kernels = struct {
     chunks_32: cuda.Function,
     chunks_16_fp8: cuda.Function,
     chunks_32_fp8: cuda.Function,
+    chunks_32_fp8load: cuda.Function,
     merge: cuda.Function,
     scores: cuda.Function,
     scores_fp8: cuda.Function,
@@ -66,6 +67,7 @@ pub const Kernels = struct {
         try k.chunks_32.allowDynamicShared(chunksSmem(32));
         try k.chunks_16_fp8.allowDynamicShared(chunksSmem(16));
         try k.chunks_32_fp8.allowDynamicShared(chunksSmem(32));
+        try k.chunks_32_fp8load.allowDynamicShared(chunksFP8LoadSmem());
         return k;
     }
 };
@@ -141,6 +143,11 @@ pub const bmm_tile1_smem = [2]u32{ 3 * (128 + 128) * 32 * 2, 128 * (128 + 4) * 4
 /// glm_glue_attn.cuh's wide_smem<hb>(): q (hb x 512), two 32-key tiles, p (hb x 32) in bf16, then max/sum scratch.
 pub fn chunksSmem(comptime hb: u32) u32 {
     return (hb * 512 + 2 * 32 * 512 + hb * 32) * 2 + (hb * 4 + 2 * hb) * 4;
+}
+
+/// The vector-load kernel appends two 32-key FP32 scale tiles after the unchanged BF16/scratch layout.
+pub fn chunksFP8LoadSmem() u32 {
+    return chunksSmem(32) + 2 * 32 * 4;
 }
 
 /// K slices of the router's dot (glue.ROUTER_KS): fixed by the shape, as the sliced and the single pass differ in bits.

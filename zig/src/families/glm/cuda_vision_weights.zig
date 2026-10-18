@@ -3,6 +3,10 @@
 const std = @import("std");
 const st = @import("core").safetensors;
 const Config = @import("cuda_vision_config.zig").Config;
+const core = @import("core");
+const source = @import("cuda_weight_source.zig");
+
+const Converted = union(enum) { fp8: source.Source, fp4: source.Fp4 };
 
 pub const Root = enum { patch_weight, patch_bias, post_norm, downsample_weight, downsample_bias, projection, projection_norm, projection_bias, gate, up, down };
 pub const Block = enum { norm1, qkv_weight, qkv_bias, q_norm, k_norm, attention_weight, attention_bias, norm2, gate_weight, gate_bias, up_weight, up_bias, down_weight, down_bias };
@@ -130,6 +134,61 @@ fn checkTensor(t: st.Tensor, shape: []const usize) !void {
 pub const Weights = struct {
     c: Config,
     tensors: []st.Tensor,
+    quantized: []?Converted = &.{},
+
+    pub fn loadMixed(a: std.mem.Allocator, c: Config, ck: *core.Checkpoint, table: *const core.modelopt.Table) !Weights {
+        var specs = try Specs.init(c);
+        const tensors = try a.alloc(st.Tensor, specs.count());
+        errdefer a.free(tensors);
+        const quantized = try a.alloc(?Converted, specs.count());
+        @memset(quantized, null);
+        const w: Weights = .{ .c = c, .tensors = tensors, .quantized = quantized };
+        errdefer {
+            for (quantized) |*q| if (q.*) |*v| if (v.* == .fp4) v.fp4.deinit(a);
+            a.free(quantized);
+        }
+        var buf: [256]u8 = undefined;
+        var i: usize = 0;
+        while (try specs.next(&buf)) |spec| : (i += 1) {
+            const rec = if (std.mem.endsWith(u8, spec.name, ".weight")) source.recipe(table, spec.name[0 .. spec.name.len - 7]) else null;
+            if (rec) |r| {
+                if (spec.rank != 2) return error.InvalidVisionWeightShape;
+                if (r.algo == .nvfp4 or r.algo == .w4a16_nvfp4) {
+                    quantized[i] = .{ .fp4 = try source.Fp4.read(a, ck, table, spec.name[0 .. spec.name.len - 7]) };
+                    const l = quantized[i].?.fp4.linear;
+                    if (l.n != spec.shape[0] or l.k != spec.shape[1]) return error.InvalidVisionWeightShape;
+                } else {
+                    const src = try source.Source.read(ck, table, spec.name);
+                    if (!std.mem.eql(usize, src.weight.shape[0..src.weight.rank], spec.dims())) return error.InvalidVisionWeightShape;
+                    quantized[i] = .{ .fp8 = src };
+                }
+                tensors[i] = .{ .dtype = .bf16, .rank = spec.rank, .shape = spec.shape, .bytes = &.{} };
+            } else {
+                const t = try ck.get(spec.name);
+                try checkTensor(t, spec.dims());
+                tensors[i] = t;
+            }
+        }
+        if (ck.unused() != 0) return error.UnusedVisionTensors;
+        return w;
+    }
+
+    pub fn converted(self: *const Weights, a: std.mem.Allocator, i: usize) ![]u16 {
+        if (self.quantized.len != 0) if (self.quantized[i]) |q| {
+            const t = self.tensors[i];
+            const out = try a.alloc(u16, t.numel());
+            errdefer a.free(out);
+            const rows: source.Span = .{ .lo = 0, .hi = t.dim(0) };
+            const cols: source.Span = .{ .lo = 0, .hi = t.dim(1) };
+            switch (q) {
+                .fp8 => |s| try s.bf16(rows, cols, out),
+                .fp4 => |s| try s.bf16(rows, cols, out),
+            }
+            for (out) |v| if (v & 0x7f80 == 0x7f80) return error.NonFiniteVisionWeight;
+            return out;
+        };
+        return toBf16(a, self.tensors[i]);
+    }
     /// Maps must outlive this table. Missing/wrong tensors never produce a partly loaded table.
     pub fn load(a: std.mem.Allocator, c: Config, files: []const st.File) !Weights {
         var specs = try Specs.init(c);
@@ -157,6 +216,8 @@ pub const Weights = struct {
         return self.tensors[roots.len + @as(usize, layer) * blocks.len + @backingInt(kind)];
     }
     pub fn deinit(self: *Weights, a: std.mem.Allocator) void {
+        for (self.quantized) |*q| if (q.*) |*v| if (v.* == .fp4) v.fp4.deinit(a);
+        a.free(self.quantized);
         a.free(self.tensors);
         self.* = undefined;
     }

@@ -25,7 +25,14 @@ pub const Service = struct {
         errdefer gpa.destroy(self);
         var checkpoint = try core.Checkpoint.openModelPrefix(gpa, io, dir, "model.visual.");
         defer checkpoint.close();
-        var host_weights = try host.Weights.load(gpa, probe.config, checkpoint.files.items);
+        const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+        defer gpa.free(path);
+        const json = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
+        defer gpa.free(json);
+        var why: core.modelopt.Why = .{};
+        var admission = try @import("cuda_checkpoint.zig").Admission.read(gpa, json, &why);
+        defer admission.deinit();
+        var host_weights = if (admission.recipes) |*table| try host.Weights.loadMixed(gpa, probe.config, &checkpoint, table) else try host.Weights.load(gpa, probe.config, checkpoint.files.items);
         defer host_weights.deinit(gpa);
         const weights = try memory.DeviceWeights.init(gpa, d, &host_weights, 2 * 1024 * 1024 * 1024);
         errdefer {

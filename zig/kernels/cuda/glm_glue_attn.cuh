@@ -51,7 +51,7 @@ constexpr int wide_smem() {
   return (HB * LW + 2 * KT * LW + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4;
 }
 
-template <int HB, bool FP8 = false>
+template <int HB, bool FP8 = false, bool FP8LOAD = false>
 __device__ void chunks_wide(const __nv_bfloat16* qa, const void* lc, const int* pos, const int* tok,
                             const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
                             float scale, int sparse) {
@@ -62,6 +62,8 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const void* lc, const int* 
   __nv_bfloat16* ps = kvs + 2 * KT * LW;
   float* red = reinterpret_cast<float*>(ps + HB * KT);
   float* stat = red + HB * 4;
+  float* key_scales = stat + 2 * HB;
+  static_assert(!FP8LOAD || FP8);
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, q = lane & 3;
   const int kg = warp & 3, hh = warp >> 2;
   const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
@@ -70,15 +72,46 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const void* lc, const int* 
   auto load_kv = [&](int tile) {
     __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
     const int64_t first = start + tile * KT;
-    for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
-      const int key = idx / (LW / 8), u = idx % (LW / 8);
-      const int64_t ki = first + key;
-      const bool ok = sparse ? ki < n : ki <= limit;
-      const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-      if constexpr (FP8)
-        glm_cache::load8<LW>(dst + wide(key, u), lc, src, u * 8, ok);
-      else
-        cp16(dst + wide(key, u), static_cast<const __nv_bfloat16*>(lc) + src * LW + u * 8, ok);
+    if constexpr (FP8LOAD) {
+      // A warp owns one key: lane 0 fetches its index and scale, then lanes load aligned 16-byte spans.
+      for (int key = warp; key < KT; key += 8) {
+        const int64_t ki = first + key;
+        const bool ok = sparse ? ki < n : ki <= limit;
+        int64_t src = 0;
+        if (lane == 0) {
+          src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+          key_scales[(tile & 1) * KT + key] = ok ? glm_cache::scale<LW>(lc, src) : 1.0f;
+        }
+        const uint32_t lo = __shfl_sync(0xffffffffu, (uint32_t)src, 0);
+        const uint32_t hi = __shfl_sync(0xffffffffu, (uint32_t)((uint64_t)src >> 32), 0);
+        src = (int64_t)(((uint64_t)hi << 32) | lo);
+        uint32_t packed[4] = {};
+        if (ok) {
+          const uint8_t* p = static_cast<const uint8_t*>(lc) + src * (LW + 16) + lane * 16;
+          asm volatile("ld.global.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+                       : "=r"(packed[0]), "=r"(packed[1]), "=r"(packed[2]), "=r"(packed[3]) : "l"(p));
+        }
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+          __nv_bfloat16* out = dst + wide(key, lane * 2 + half);
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            const uint8_t code = (uint8_t)(packed[half * 2 + j / 4] >> ((j & 3) * 8));
+            out[j] = __float2bfloat16_rn(glm_cache::decode(code));
+          }
+        }
+      }
+    } else {
+      for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
+        const int key = idx / (LW / 8), u = idx % (LW / 8);
+        const int64_t ki = first + key;
+        const bool ok = sparse ? ki < n : ki <= limit;
+        const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+        if constexpr (FP8)
+          glm_cache::load8<LW>(dst + wide(key, u), lc, src, u * 8, ok);
+        else
+          cp16(dst + wide(key, u), static_cast<const __nv_bfloat16*>(lc) + src * LW + u * 8, ok);
+      }
     }
   };
   float m[MT][2], l[MT][2], o[MT][8][4];
@@ -123,8 +156,13 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const void* lc, const int* 
         const int64_t ki = first + kg * 8 + q * 2 + e;
         const bool ok = sparse ? ki < n : ki <= limit;
         if constexpr (FP8) {
-          const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-          const float ks = ok ? glm_cache::scale<LW>(lc, src) : 1.0f;
+          float ks;
+          if constexpr (FP8LOAD) {
+            ks = key_scales[(tile & 1) * KT + kg * 8 + q * 2 + e];
+          } else {
+            const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+            ks = ok ? glm_cache::scale<LW>(lc, src) : 1.0f;
+          }
           acc[e] = __fmul_rn(acc[e], ks);
           acc[e + 2] = __fmul_rn(acc[e + 2], ks);
         }
@@ -164,8 +202,13 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const void* lc, const int* 
             for (int e = 0; e < 2; ++e) {
               const int64_t ki = first + col + e;
               const bool ok = sparse ? ki < n : ki <= limit;
-              const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-              const float ks = ok ? glm_cache::scale<LW>(lc, src) : 1.0f;
+              float ks;
+              if constexpr (FP8LOAD) {
+                ks = key_scales[(tile & 1) * KT + col + e];
+              } else {
+                const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+                ks = ok ? glm_cache::scale<LW>(lc, src) : 1.0f;
+              }
               scaled[e] = __fmul_rn(p[e], ks);
             }
           }
@@ -243,6 +286,13 @@ extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks_32_fp8(const __nv_bfloat16* qa, const void* lc, const int* pos, const int* tok, const int* cnt,
                          float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
   glm_attn::chunks_wide<32, true>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse);
+}
+
+// Opt-in FP8 key vector loads and tile-local scales; arithmetic and tile count match chunks_32_fp8.
+extern "C" __global__ void __launch_bounds__(256)
+    tf_glm_chunks_32_fp8load(const __nv_bfloat16* qa, const void* lc, const int* pos, const int* tok, const int* cnt,
+                            float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
+  glm_attn::chunks_wide<32, true, true>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse);
 }
 
 // latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
