@@ -37,11 +37,13 @@ at loopback port 11439. The fleet task worktree's
 `docs/plans/ornith35-shared-host-trial-20261018.md` owns the exact HTTP checks,
 physical-memory abort guard, bounded window and restoration procedure. That
 recipe and procedure require their own CPU validation before requesting the
-window. That validation is now complete in fleet commit `ce244f57`: 139 targeted
+window. That validation is now complete in fleet commits `ce244f57` and
+`cc846d46`: 140 targeted
 tests pass, Ruff and `fleet.verify fast` pass, and the coordinator's default
 preflight hashes every runtime and checkpoint pin without starting an outage.
-A separate five-test safety review exercises missing/below-floor readings,
-readiness failure and restoration mocks. The controller uses the existing
+A separate safety review and six runner tests exercise missing/below-floor
+readings, mixed-address ownership, readiness failure and restoration mocks.
+The controller uses the existing
 `fleet.launch.start` API to own the native process handle immediately; no
 production launcher implementation changes were needed. Its approved run
 starts detached, aborts on a missing or below-floor physical GPU reading, and

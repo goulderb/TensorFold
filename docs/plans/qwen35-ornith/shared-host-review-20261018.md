@@ -64,3 +64,37 @@ both projection paths share CPU PyTorch matmul. vLLM separately changes 39
 FP8 fusion groups, so a later serving discrepancy requires interpretation.
 These remain explicit qualification boundaries; no limits were relaxed and
 no production promotion was made.
+
+## Final trail review and live-host correction
+
+Fable's second read-only pass verified the candidate file pins, baseline
+provenance and restore-helper bounds. Its full response is
+`.artifacts/shared-host-review-20261018/fable-r2.md`. It found a real
+controller defect: ownership lookup matched ports on all addresses, including
+the tailnet forwarder. Reading that privileged forwarder's executable fails,
+so the trial would abort before its outage and restoration identity checks
+would also be wrong.
+
+Fleet commit `cc846d46` filters ownership to exact `127.0.0.1` LISTEN sockets.
+The mixed-address regression fails before the fix and passes afterward.
+Six runner behavior tests and 140 combined targeted tests pass. Ruff,
+`fleet.verify fast`, and the actual default pinned preflight pass after this
+final source change. Fleet artifacts `ornith-loopback-red.log`,
+`ornith-loopback-green.log`, `ornith-loopback-targeted.log`,
+`ornith-loopback-preflight.log`, and `ornith-loopback-live-identities.json`
+record the proof. The live check finds the preserved Nemotron and Clef
+loopback engines and an unused trial port, without reading the forwarder's
+executable or taking any service action.
+
+The review also requested explicit sampler and baseline boundaries. The
+runbook now states that continuous samples cover candidate load/requests;
+the restoration helper records a separate final physical-floor checkpoint.
+It also states that a hash mismatch against the earlier source's serial
+receipt requires diagnosis and cannot distinguish a host regression from
+arithmetic drift by itself. Limits and expected hashes remain fixed.
+
+The first controller safety review separately replaced child discovery by
+polling with immediate ownership of the `Popen` handle returned by the
+existing `fleet.launch.start` API. A readiness-failure mock verifies cleanup
+and attempted restoration. These fixes are CPU-tested; their device behavior
+remains part of the prepared, still unapproved window.
