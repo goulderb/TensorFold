@@ -279,15 +279,16 @@ pub const Nvfp4Experts = struct {
     fns: [4]Function, // by Epi, then relu^2 up
     resident: [4]usize, // blocks the grid may hold: per SM times SMs
     prompt_fns: [3]Function, // relu^2 up, SwiGLU gate-up, bf16 sums down
-    candidate_fns: [3][4]Function,
-    candidate_resident: [3][4]usize,
+    candidate_fns: [candidates.len][4]Function,
+    candidate_resident: [candidates.len][4]usize,
     candidates_loaded: bool = false,
 
-    pub const Variant = enum { baseline, pipe4, n16, n16_pipe4 };
+    pub const Variant = enum { baseline, pipe4, n16, n16_pipe4, warp_scales };
+    const candidates = std.meta.tags(Variant)[1..];
 
     pub fn decodeGrid(variant: Variant, items: usize, nb: usize, resident: usize) usize {
         const slices: usize = switch (variant) {
-            .baseline, .pipe4 => 1,
+            .baseline, .pipe4, .warp_scales => 1,
             .n16, .n16_pipe4 => 2,
         };
         return @min((items * nb * slices + 3) / 4, resident);
@@ -336,7 +337,7 @@ pub const Nvfp4Experts = struct {
     }
 
     pub fn loadCandidates(e: *Nvfp4Experts, sms: usize) !void {
-        inline for (.{ Variant.pipe4, Variant.n16, Variant.n16_pipe4 }, 0..) |variant, vi| {
+        inline for (candidates, 0..) |variant, vi| {
             inline for (0..4) |ei| {
                 e.candidate_fns[vi][ei] = try e.mod.function(candidateSymbol(variant, ei));
                 e.candidate_resident[vi][ei] = @max(1, try e.candidate_fns[vi][ei].occupancy(128, 0)) * sms;

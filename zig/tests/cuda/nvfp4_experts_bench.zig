@@ -13,14 +13,17 @@ const max_rounds = 31;
 const Case = struct {
     rows: usize,
     distinct: bool = false,
+    groups: usize = slots,
 
     fn used(c: Case) usize {
-        return if (c.distinct) c.rows * slots else slots;
+        return if (c.distinct) c.rows * slots else @min(c.rows * slots, c.groups);
     }
 };
 const cases = [_]Case{
-    .{ .rows = 1 },                   .{ .rows = 2 }, .{ .rows = 4 }, .{ .rows = 8 }, .{ .rows = 16 },
-    .{ .rows = 8, .distinct = true },
+    .{ .rows = 1 },                   .{ .rows = 2 },                 .{ .rows = 4 },                 .{ .rows = 8 },  .{ .rows = 16 },
+    .{ .rows = 8, .distinct = true }, .{ .rows = 3 },                 .{ .rows = 7 },                 .{ .rows = 9 },  .{ .rows = 15 },
+    .{ .rows = 17 },                  .{ .rows = 30 },                .{ .rows = 32 },                .{ .rows = 48 }, .{ .rows = 56 },
+    .{ .rows = 30, .groups = 64 },    .{ .rows = 30, .groups = 128 }, .{ .rows = 56, .groups = 128 },
 };
 
 pub fn run(gpu: check.Gpu, args: []const [:0]const u8) !void {
@@ -31,6 +34,20 @@ pub fn run(gpu: check.Gpu, args: []const [:0]const u8) !void {
     var ex = try X.load(gpu.d, sms);
     defer ex.unload();
     try ex.loadCandidates(sms);
+    var scale_errors = try cuda.DeviceBuffer.alloc(gpu.d, 4);
+    defer scale_errors.free();
+    try scale_errors.fill32(0, null);
+    var scale_args: cuda.Args = .{};
+    scale_args.add(scale_errors.ptr);
+    const scale_check = try ex.mod.function("tf_nvfp4_warp_scale_check");
+    var scale_stream = try cuda.Stream.init(gpu.d, false);
+    defer scale_stream.deinit();
+    try cuda.launch.launch(scale_check, .{ .grid = .{ .x = 256 }, .block = .{ .x = 32 } }, scale_stream, &scale_args);
+    try scale_stream.synchronize();
+    var scale_result: u32 = undefined;
+    try scale_errors.download(0, std.mem.asBytes(&scale_result));
+    try check.expect(scale_result == 0, "warp scale transport differs in {d} cases", .{scale_result});
+    check.pass("warp scales: all 256 FP8 encodings, 131072 float-bit comparisons, including signed zero and NaNs", .{});
     var mod = try cuda.Module.load(gpu.d, cuda.kernels.experts);
     defer mod.unload();
     const router = try cuda.grouped.Router.resolve(mod);
@@ -118,8 +135,8 @@ fn oneCase(gpu: check.Gpu, ex: *const X, router: cuda.grouped.Router, s: cuda.St
     const pairs = c.rows * slots;
     const banks = experts / c.used();
     const bound = cuda.grouped.maxItems(pairs, experts, 16);
-    var picks: [16 * slots]i32 = undefined;
-    for (picks[0..pairs], 0..) |*p, i| p.* = @intCast(if (c.distinct) i else i % slots);
+    var picks: [56 * slots]i32 = undefined;
+    for (picks[0..pairs], 0..) |*p, i| p.* = @intCast(if (c.distinct) i else i % c.used());
     var dpicks = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(picks[0..pairs]));
     defer dpicks.free();
     var members = try cuda.DeviceBuffer.alloc(gpu.d, pairs * 4);
@@ -133,7 +150,10 @@ fn oneCase(gpu: check.Gpu, ex: *const X, router: cuda.grouped.Router, s: cuda.St
     try s.synchronize();
     var actual: [2]i32 = undefined;
     try counts.download(0, std.mem.asBytes(&actual));
-    try check.expect(actual[0] == c.used(), "plan item count {d} expected {d}", .{ actual[0], c.used() });
+    const quotient = pairs / c.used();
+    const remainder = pairs % c.used();
+    const expected_items = (c.used() - remainder) * ((quotient + 15) / 16) + remainder * ((quotient + 16) / 16);
+    try check.expect(actual[0] == expected_items, "plan item count {d} expected {d}", .{ actual[0], expected_items });
     const host_x = try gpu.gpa.alloc(u16, (if (up) c.rows else pairs) * k);
     defer gpu.gpa.free(host_x);
     var state: u32 = 0x102453;
@@ -231,9 +251,9 @@ test "benchmark GLM TP2 shapes and rotating banks cover 288 experts without over
     try std.testing.expectEqual(@as(usize, 4096 * 1024 * 9 / 8), X.bytes(1, width, dims, 2));
     for (cases) |c| {
         const banks = experts / c.used();
-        try std.testing.expect(banks >= 4);
+        try std.testing.expect(banks >= 2);
         try std.testing.expect(banks * c.used() <= experts);
-        try std.testing.expect(c.rows <= 16);
+        try std.testing.expect(c.rows <= 56);
         const l: cuda.experts.Layer = .{ .format = .nvfp4, .up = 0, .down = 0, .up_scale = 0, .down_scale = 0, .width = width, .dims = dims, .experts = experts };
         const b = bankLayer(l, c, banks - 1, X.bytes(1, width, dims, 2), true);
         try std.testing.expect(b.up + X.bytes(c.used(), width, dims, 2) <= X.bytes(experts, width, dims, 2));
