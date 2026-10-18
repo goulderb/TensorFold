@@ -21,7 +21,7 @@ const controls = struct {
 
 /// The embedded image a registration names (the controls' only when this binary was built with -Dnvcc).
 fn image(name: []const u8) []const u8 {
-    inline for (.{ "norms", "nemotron_route", "qmm_group", "lane_gemv", "prompt16", "qmmf", "rank_sum", "prefill_attention", "vit" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
+    inline for (.{ "norms", "nemotron_route", "qmm_group", "lane_gemv", "prompt16", "qmmf", "rank_sum", "prefill_attention", "vit", "glm_glue", "nvfp4_experts", "exlr8_dense", "torch_pointwise", "dflash_qmm" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
     return if (options.controls) &controls.bytes else &.{};
 }
 
@@ -92,6 +92,9 @@ pub fn run(gpu: check.Gpu) !void {
     var t: g.Tally = .{};
     const t0 = check.now(gpu.io);
     try g.runAll(a, kernels.items, 0x6b63, &t);
+    if (cap == 121) {
+        try @import("contract_glm.zig").run(gpu, s, &affine4, &t);
+    } else std.debug.print("N/A GLM FP4-Local contracts: registered for sm_121 only, not sm_{d}\n", .{cap});
     const t1 = check.now(gpu.io);
     const lim = try live(gpu);
     const t2 = check.now(gpu.io);
@@ -121,6 +124,7 @@ fn live(gpu: check.Gpu) !usize {
         std.debug.print("{s} limits live sm_{d} {s}: the driver says {d}, the table {d}\n", .{ if (got == d[2]) "PASS" else "FAIL", sm, d[0], got, d[2] });
     }
     for (registry.cuda ++ registry.cuda_controls) |r| {
+        if (!r.applies(sm)) continue;
         const control = std.mem.startsWith(u8, r.launch.name, "control");
         var mod = try cuda.Module.load(gpu.d, image(r.launch.image));
         defer mod.unload();
@@ -140,47 +144,9 @@ fn live(gpu: check.Gpu) !usize {
     return n;
 }
 
-/// tf-cuda-test kernel-contract-limits DIR: each record against the fatbins in DIR, every SM image they hold.
+/// Compatibility wrapper; the CLI enters the offline checker before opening the CUDA driver.
 pub fn fatbins(gpu: check.Gpu, dir: []const u8) !void {
-    const a = gpu.gpa;
-    var n: usize = 0;
-    for (registry.cuda ++ registry.cuda_controls) |r| {
-        const control = std.mem.startsWith(u8, r.launch.name, "control");
-        const path = try std.fmt.allocPrint(a, "{s}/{s}.fatbin", .{ dir, r.launch.image });
-        defer a.free(path);
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(gpu.io, path, a, .limited(1 << 28));
-        defer a.free(bytes);
-        const imgs = try contract.cubin.images(a, bytes);
-        defer a.free(imgs);
-        var red: usize = 0;
-        var line: std.ArrayList(u8) = .empty;
-        defer line.deinit(a);
-        for (limits.sms, 0..) |t, i| {
-            const img = for (imgs) |im| {
-                if (im.sm == t.sm) break im;
-            } else {
-                std.debug.print("FAIL limits {s}: {s} holds no sm_{d} image (build with -Dsm=80,86,89,120,121)\n", .{ r.launch.name, path, t.sm });
-                n += 1;
-                continue;
-            };
-            const ks = try contract.cubin.kernels(a, img.elf, t.sm);
-            defer a.free(ks);
-            const k = for (ks) |kv| {
-                if (std.mem.eql(u8, kv.name, r.launch.symbol)) break kv;
-            } else return error.SymbolNotInImage;
-            var out: std.ArrayList(u8) = .empty;
-            defer out.deinit(a);
-            red += try limits.cuda(r.launch, k.usage, t, &out, a);
-            const current = std.meta.eql(k.usage, r.usage[i]);
-            if (!control and !current) n += 1;
-            std.debug.print("{s} limits sm_{d} {s}: {d} registers, {d} static shared bytes, bound {d} (record {s}){s}", .{ if (out.items.len > 0) (if (control) "RED " else "FAIL") else "PASS", t.sm, r.launch.name, k.usage.regs, k.usage.static, k.usage.bound, if (current) "current" else "stale", if (out.items.len > 0) ": " else "\n" });
-            if (out.items.len > 0) std.debug.print("{s}", .{out.items});
-            try line.print(a, ".{{ .regs = {d}, .static = {d}, .bound = {d} }}, ", .{ k.usage.regs, k.usage.static, k.usage.bound });
-        }
-        std.debug.print("RECORD {s}: .usage = .{{ {s}}}\n", .{ r.launch.name, line.items });
-        if (control and red == 0) n += 1;
-        if (!control) n += red;
-    }
-    try check.expect(n == 0, "kernel-contract-limits: {d} problems", .{n});
-    check.pass("kernel-contract-limits: every registered launch fits sm_80, sm_86, sm_89, sm_120 and sm_121, every control red", .{});
+    const path = try gpu.gpa.dupeZ(u8, dir);
+    defer gpu.gpa.free(path);
+    try @import("contract_limits.zig").run(gpu.gpa, gpu.io, &.{path});
 }

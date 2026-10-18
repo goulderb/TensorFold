@@ -73,7 +73,14 @@ TEXT, `--offline DIR` adds the M1/M2 compiles, and `--repro` prints the smallest
 On a CUDA machine, build with `-Dnvcc` (the controls are compiled only then), and run `zig build kernel-contract
 -Dnvcc=/usr/local/cuda/bin/nvcc`. For the limits of every SM, `zig build fatbins kernel-contract-fatbins -Dnvcc=...
 -Dsm=80,86,89,120,121`, then `tf-cuda-test kernel-contract-limits zig-out/fatbin`. Its `RECORD` lines are the values
-`registry.zig` holds.
+`registry.zig` holds. That command reads only the fatbins and never opens the CUDA driver, so it runs on a build
+machine without a GPU. `--sm SM` limits the run and its claim to one target; `--only TEXT` prints a PARTIAL summary.
+
+A record with `target_sm` set (GLM-5.3-Flash's, in `registry_glm.zig`) is checked on that SM alone, offline and
+live, because only that target's compile was measured; the other SMs' gate 5 says nothing about it. Its measured
+image hashes stay in `zig/src/core/contract/fixtures/`, and a host test holds the records equal to that receipt.
+`zig build test-kernel-contract-host` runs the CUDA tests' CPU parts: references, planted inputs, the GLM records
+against their production launchers, and the offline checker's own tests.
 
 Every run ends with a `SUMMARY` line: kernels passing gates 1 to 4, known findings, controls red, and limit problems.
 The program exits 1 on any failed gate, any control that stayed green, or any limit problem.
@@ -107,4 +114,8 @@ tile_qmm's pipelines and GLM-5.3-Flash's hc_expand_10.
 CUDA: the RMS norm rows (16-byte form and the fp32-out tree), Nemotron's router logits and top-k, qmm_group's cluster
 tile, lane_gemv and its split-K form (both bit-equal to it), prompt16's FP4 tile with bf16 and fp32 out, qmmf's FP4
 tiles with fp32 out (K slices met in a cluster, fused, or by `reduce_kernel<true>`), and the reduce-scatter's
-`tf_rank_sum`.
+`tf_rank_sum`. On sm_121 only, GLM-5.3-Flash FP4-Local: the latent attention chunks (bf16 and FP8 caches, 16- and
+32-head blocks, dense and sparse; the FP8 key loads bit-equal to `tf_glm_chunks_32_fp8`) and their merge, the
+checkpoint-source MXFP8 and FP8_PB_WO projections at every `tf_exlr8_dense_N` row capacity and the bf16 upcast, the
+DFlash MXFP8 head's `glm_qmm` tiles, and the NVFP4 expert decode variants (bit-equal to the baseline) and prompt
+epilogues, each SwiGLU also with its clamp.

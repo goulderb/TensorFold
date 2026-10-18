@@ -1,0 +1,354 @@
+{
+  "schema": 1,
+  "source_commit": "960ed42570b0277971e11e127931530dcffb159f",
+  "build_label": "glm53-land-measure",
+  "scope": "sm_121 compile-resource records only; no GPU execution or other-SM qualification",
+  "parser": "zig/src/core/contract/cubin.zig",
+  "parser_sha256": "fe2ae15238ac1d5ddbf636b044b10977b3e7e06d0ae9d241cf6a3aa76aa8145e",
+  "static_shared_accounting": "Per-driver bytes: sm_121 reserved 1024 bytes removed from .nv.shared by cubin.zig",
+  "images": [
+    {
+      "image": "dflash_qmm.fatbin",
+      "sha256": "fde20744d5ab41832660864a7a8aa7e398ccd720454f5d016dff9760799420b1",
+      "sm": 121,
+      "records": [
+        {
+          "symbol": "glm_qmm_16_0_0",
+          "regs": 64,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 17664
+        },
+        {
+          "symbol": "glm_qmm_32_0_0",
+          "regs": 78,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 26112
+        },
+        {
+          "symbol": "glm_qmm_64_0_0",
+          "regs": 124,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 43008
+        }
+      ]
+    },
+    {
+      "image": "exlr8_dense.fatbin",
+      "sha256": "481fff255df9a6306208f8b4ad7dfb46e9358d3fa039b1f9035e95335e720936",
+      "sm": 121,
+      "records": [
+        {
+          "symbol": "tf_exlr8_dense_1",
+          "regs": 76,
+          "static": 512,
+          "bound": 256,
+          "threads": 256,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_exlr8_dense_16",
+          "regs": 252,
+          "static": 8192,
+          "bound": 256,
+          "threads": 256,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_exlr8_dense_2",
+          "regs": 64,
+          "static": 1024,
+          "bound": 256,
+          "threads": 256,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_exlr8_dense_4",
+          "regs": 125,
+          "static": 2048,
+          "bound": 256,
+          "threads": 256,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_exlr8_dense_8",
+          "regs": 128,
+          "static": 4096,
+          "bound": 256,
+          "threads": 256,
+          "dynamic": 0
+        }
+      ]
+    },
+    {
+      "image": "glm_glue.fatbin",
+      "sha256": "c2b2b6d23f5aa51ffed1d21659e0c93a5e13a552bbfee9b3a0e78ffb1693f369",
+      "sm": 121,
+      "records": [
+        {
+          "symbol": "tf_glm_chunks_16",
+          "regs": 121,
+          "static": 0,
+          "bound": 256,
+          "threads": 256,
+          "dynamic": 83328
+        },
+        {
+          "symbol": "tf_glm_chunks_16_fp8",
+          "regs": 67,
+          "static": 0,
+          "bound": 256,
+          "threads": 256,
+          "dynamic": 83328
+        },
+        {
+          "symbol": "tf_glm_chunks_32",
+          "regs": 128,
+          "static": 0,
+          "bound": 256,
+          "threads": 256,
+          "dynamic": 101120
+        },
+        {
+          "symbol": "tf_glm_chunks_32_fp8",
+          "regs": 130,
+          "static": 0,
+          "bound": 256,
+          "threads": 256,
+          "dynamic": 101120
+        },
+        {
+          "symbol": "tf_glm_chunks_32_fp8load",
+          "regs": 128,
+          "static": 0,
+          "bound": 256,
+          "threads": 256,
+          "dynamic": 101376
+        },
+        {
+          "symbol": "tf_glm_merge",
+          "regs": 34,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        }
+      ]
+    },
+    {
+      "image": "nvfp4_experts.fatbin",
+      "sha256": "361db1a561a0cefd7b81db5e9e486d46c82a08f25205b7283ef72ebf5ed6740c",
+      "sm": 121,
+      "records": [
+        {
+          "symbol": "_ZN16tf_nvfp4_experts19nvfp4_expert_kernelILi1ELi0ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi",
+          "regs": 96,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "_ZN16tf_nvfp4_experts19nvfp4_expert_kernelILi1ELi1ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi",
+          "regs": 96,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "_ZN16tf_nvfp4_experts19nvfp4_expert_kernelILi1ELi3ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi",
+          "regs": 96,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "_ZN16tf_nvfp4_experts19nvfp4_expert_kernelILi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4PKfiiPKiSA_SA_Pvifi",
+          "regs": 128,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_nvfp4_n16_down_bf16",
+          "regs": 80,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_nvfp4_n16_down_f32",
+          "regs": 80,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_nvfp4_n16_pipe4_down_bf16",
+          "regs": 117,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_nvfp4_n16_pipe4_down_f32",
+          "regs": 117,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_nvfp4_n16_pipe4_relu2",
+          "regs": 117,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_nvfp4_n16_pipe4_swiglu",
+          "regs": 158,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_nvfp4_n16_relu2",
+          "regs": 80,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_nvfp4_n16_swiglu",
+          "regs": 120,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_nvfp4_pipe4_down_bf16",
+          "regs": 128,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_nvfp4_pipe4_down_f32",
+          "regs": 128,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_nvfp4_pipe4_relu2",
+          "regs": 128,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_nvfp4_pipe4_swiglu",
+          "regs": 166,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 0
+        },
+        {
+          "symbol": "tf_nvfp4_prompt_down",
+          "regs": 126,
+          "static": 0,
+          "bound": 256,
+          "threads": 256,
+          "dynamic": 34816,
+          "launch": {
+            "source": "zig/src/cuda/experts.zig::Nvfp4Experts.runPrompt",
+            "grid": {
+              "x": "items * ceil((N / 32) / warps)",
+              "y": 1,
+              "z": 1
+            },
+            "warps": 8,
+            "parts": 1,
+            "pairs_per_item": 64,
+            "N": "width for up; dims for down"
+          }
+        },
+        {
+          "symbol": "tf_nvfp4_prompt_relu2",
+          "regs": 126,
+          "static": 0,
+          "bound": 256,
+          "threads": 256,
+          "dynamic": 34816,
+          "launch": {
+            "source": "zig/src/cuda/experts.zig::Nvfp4Experts.runPrompt",
+            "grid": {
+              "x": "items * ceil((N / 32) / warps)",
+              "y": 1,
+              "z": 1
+            },
+            "warps": 8,
+            "parts": 1,
+            "pairs_per_item": 64,
+            "N": "width for up; dims for down"
+          }
+        },
+        {
+          "symbol": "tf_nvfp4_prompt_swiglu",
+          "regs": 208,
+          "static": 0,
+          "bound": 128,
+          "threads": 128,
+          "dynamic": 34816,
+          "launch": {
+            "source": "zig/src/cuda/experts.zig::Nvfp4Experts.runPrompt",
+            "grid": {
+              "x": "items * ceil((N / 32) / warps)",
+              "y": 1,
+              "z": 1
+            },
+            "warps": 4,
+            "parts": 2,
+            "pairs_per_item": 64,
+            "N": "width for up; dims for down"
+          }
+        }
+      ]
+    },
+    {
+      "image": "torch_pointwise.fatbin",
+      "sha256": "b784ed09041e6b8e3eed592b502ae7e2373ab2a23b3e246d559056ced183a8fe",
+      "sm": 121,
+      "records": [
+        {
+          "symbol": "tf_bf16_to_f32_kernel",
+          "regs": 14,
+          "static": 0,
+          "bound": 0,
+          "threads": 256,
+          "dynamic": 0
+        }
+      ]
+    }
+  ]
+}
