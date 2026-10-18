@@ -1,5 +1,9 @@
 # Native Qwen3.5 / Qwen3.6 ModelOpt text inference
 
+The delivery target is now a runnable production deployment. Follow the
+[production plan](production.md) for the shared-engine integration and
+qualification work after this initial correctness baseline.
+
 Use candidate A's CUDA-local checkpoint and execution boundary. The independent
 cross-judge preferred it on completeness, quantization semantics, state
 ownership, existing-backend isolation and verification. Candidate B's shared
