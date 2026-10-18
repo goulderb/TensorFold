@@ -46,6 +46,16 @@ zero-token request, while the serial adapter emits none. Preserve the serial
 contract through a tested zero-output completion in the shared core. Warm
 prefill behavior remains on its existing host path.
 
+This corrects the direct engine contract for every family that reaches the
+core, including GLM without warm turns. Warm-turn engines take `warmPass`
+before the core; that behavior is unchanged. The OpenAI HTTP layer treats
+`max_tokens: 0` as the configured default and always requests at least one
+output token (`server/openai.zig:148`, `server/chat.zig:108`). It therefore
+does not expose this engine-only zero-output path. Source searches found no
+GLM caller depending on the former extra token. This is source evidence, not
+a GLM device qualification. Preserve the existing HTTP fallback semantics in
+the device trial.
+
 CPU tests first cover direct request refusal before prefill, exact-once
 completion, cancellation during stepped prefill, reuse after refusal and
 failure, zero output, one-row backend contracts, and keyed sample positions.
