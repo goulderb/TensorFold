@@ -66,6 +66,32 @@ pub const Host = struct {
         h.a.free(h.x);
     }
 
+    /// The served SwiGLU limit, with inputs scaled 64x so the sums cross it on both sides.
+    pub fn clamp(h: *Host, limit: f32) void {
+        h.limit = limit;
+        for (h.x) |*v| v.* = c.toBf16(c.fromBf16(v.*) * 64);
+    }
+
+    /// Outputs whose bf16 gate exceeds the limit, whose up exceeds it, falls below its negative, and neither clamps.
+    pub fn clampRegions(h: Host) ![4]usize {
+        const t = try h.a.alloc(f64, h.shape.k);
+        defer h.a.free(t);
+        var out: [4]usize = @splat(0);
+        for (0..h.shape.rows * slots) |p| for (0..h.shape.n) |j| {
+            var sums: [2]f64 = @splat(0);
+            for (&sums, 0..) |*sum, m| {
+                h.terms(p, m, j, t);
+                for (t) |v| sum.* += v;
+                sum.* = bf(sum.* * h.scale(h.expert(p), m));
+            }
+            const gate = sums[0] > h.limit;
+            const high = sums[1] > h.limit;
+            const low = sums[1] < -h.limit;
+            for ([_]bool{ gate, high, low, !gate and !high and !low }, &out) |hit, *n| n.* += @intFromBool(hit);
+        };
+        return out;
+    }
+
     pub fn stride(h: Host) usize {
         return h.shape.k + 8;
     }
@@ -145,15 +171,16 @@ pub const Host = struct {
                 break :blk v * v;
             },
             .swiglu => blk: {
-                var gv = bf(gate);
-                var uv = bf(up_value);
-                if (h.limit > 0) {
-                    gv = -maxNumber(-gv, -h.limit);
-                    uv = -maxNumber(-maxNumber(uv, -h.limit), -h.limit);
-                }
+                const gv, const uv = h.clamped(bf(gate), bf(up_value));
                 break :blk bf(gv / (1 + @exp(-gv))) * uv;
             },
         };
+    }
+
+    /// minNumber(gate, limit) and up clamped to [-limit, limit] by maxNumber/minNumber; unchanged without a limit.
+    fn clamped(h: Host, gate: f64, up_value: f64) struct { f64, f64 } {
+        if (h.limit <= 0) return .{ gate, up_value };
+        return .{ -maxNumber(-gate, -h.limit), -maxNumber(-maxNumber(up_value, -h.limit), -h.limit) };
     }
 
     fn terms(h: Host, pair: usize, m: usize, j: usize, out: []f64) void {
@@ -184,7 +211,10 @@ pub const Host = struct {
             if (mag) |out| out[at] = switch (h.epi) {
                 .down_f32, .down_bf16 => abs[0],
                 .relu2 => 2 * @max(@abs(sums[0]), 1) * abs[0] + c.gamma(@floatFromInt(h.shape.k / 16 + 4), c.unit(.f32)) * abs[0] * abs[0],
-                .swiglu => 1.1 * @abs(bf(sums[1])) * abs[0] + @abs(bf(sums[0])) * abs[1],
+                .swiglu => blk: {
+                    const gv, const uv = h.clamped(bf(sums[0]), bf(sums[1]));
+                    break :blk 1.1 * @abs(uv) * abs[0] + @abs(gv) * abs[1];
+                },
             };
         };
     }

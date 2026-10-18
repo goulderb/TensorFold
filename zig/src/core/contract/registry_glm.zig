@@ -57,3 +57,34 @@ pub fn records(comptime R: type) [34]R {
         launch(R, "dflash_qmm", "glm_qmm_64_0_0", 128, 43008, .{ .regs = 124, .static = 0, .bound = 128 }),
     };
 }
+
+test "the GLM records equal the retained sm_121 measurements, one record per measured symbol" {
+    const std = @import("std");
+    const Record = struct { symbol: []const u8, regs: u32, static: u32, bound: u32, threads: u32, dynamic: u32 };
+    const Image = struct { image: []const u8, sha256: []const u8, sm: u32, records: []const Record };
+    const Fixture = struct { images: []const Image };
+    const a = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(Fixture, a, @embedFile("fixtures/glm-sm121-960ed42.json"), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const R = @import("registry.zig").CudaRecord;
+    const table = records(R);
+    const at = for (limits.sms, 0..) |t, i| {
+        if (t.sm == 121) break i;
+    } else unreachable;
+    var measured: usize = 0;
+    for (parsed.value.images) |image| for (image.records) |m| {
+        try std.testing.expectEqual(@as(u32, 121), image.sm);
+        var found: usize = 0;
+        for (table) |r| if (std.mem.eql(u8, r.launch.symbol, m.symbol)) {
+            found += 1;
+            try std.testing.expect(std.mem.startsWith(u8, image.image, r.launch.image));
+            try std.testing.expectEqualStrings(".fatbin", image.image[r.launch.image.len..]);
+            try std.testing.expectEqual(U{ .regs = m.regs, .static = m.static, .bound = m.bound }, r.usage[at]);
+            try std.testing.expectEqual(m.threads, r.launch.threads);
+            try std.testing.expectEqual(m.dynamic, r.launch.dynamic);
+        };
+        try std.testing.expectEqual(@as(usize, 1), found);
+        measured += 1;
+    };
+    try std.testing.expectEqual(table.len, measured);
+}

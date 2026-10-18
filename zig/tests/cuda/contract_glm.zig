@@ -2,6 +2,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
+const glm = @import("glm_cuda");
 const check = @import("check.zig");
 const attn = @import("contract_glm_attention.zig");
 const merge = @import("contract_glm_attention_merge.zig");
@@ -16,6 +17,7 @@ pub fn run(gpu: check.Gpu, s: cuda.Stream, affine4: *const cuda.qlinear.Affine4K
     const a = gpu.gpa;
     var glue = try cuda.Module.load(gpu.d, cuda.kernels.glm_glue);
     defer glue.unload();
+    const glue_kernels = try glm.glue.Kernels.load(glue);
     var pointwise = try cuda.Module.load(gpu.d, cuda.kernels.torch_pointwise);
     defer pointwise.unload();
     var qmm = try cuda.Module.load(gpu.d, cuda.kernels.dflash_qmm);
@@ -35,7 +37,7 @@ pub fn run(gpu: check.Gpu, s: cuda.Stream, affine4: *const cuda.qlinear.Affine4K
     var na: usize = 0;
     defer for (attention[0..na]) |*v| v.deinit();
     for (kinds, &attention) |kind, *v| {
-        v.* = try attn.Attention.init(gpu, s, glue, kind);
+        v.* = attn.Attention.init(gpu, s, &glue_kernels, kind);
         na += 1;
         try kernels.append(a, v.kernel());
     }
@@ -53,6 +55,13 @@ pub fn run(gpu: check.Gpu, s: cuda.Stream, affine4: *const cuda.qlinear.Affine4K
     };
     defer for (&projections) |*v| v.deinit();
     for (&projections) |*v| try kernels.append(a, v.kernel());
+    const dense_kinds = std.enums.values(dense.Kind);
+    var capacities: [dense_kinds.len * dense.capacities.len]dense.Source = undefined;
+    for (dense_kinds, 0..) |kind, i| for (0..dense.capacities.len) |j| {
+        capacities[i * dense.capacities.len + j] = .{ .rig = .{ .gpu = gpu, .s = s }, .dense = &source, .cast = upcast, .kind = kind, .capacity = j };
+    };
+    defer for (&capacities) |*v| v.deinit();
+    for (&capacities) |*v| try kernels.append(a, v.kernel());
     var conversion: cast.Cast = .{ .rig = .{ .gpu = gpu, .s = s }, .f = upcast };
     defer conversion.deinit();
     try kernels.append(a, conversion.kernel());

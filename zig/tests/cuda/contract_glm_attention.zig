@@ -55,13 +55,14 @@ fn fast(kind: Kind) bool {
     return kind == .fp8load_dense or kind == .fp8load_sparse;
 }
 
-pub fn symbol(kind: Kind) [:0]const u8 {
+/// The production loader's handle, so its dynamic shared opt-in is the one these launches rely on.
+pub fn function(k: *const glm.glue.Kernels, kind: Kind) cuda.Function {
     return switch (kind) {
-        .bf16_16_dense, .bf16_16_sparse => "tf_glm_chunks_16",
-        .bf16_32_dense, .bf16_32_sparse => "tf_glm_chunks_32",
-        .fp8_16_dense, .fp8_16_sparse => "tf_glm_chunks_16_fp8",
-        .fp8_32_dense, .fp8_32_sparse => "tf_glm_chunks_32_fp8",
-        .fp8load_dense, .fp8load_sparse => "tf_glm_chunks_32_fp8load",
+        .bf16_16_dense, .bf16_16_sparse => k.chunks_16,
+        .bf16_32_dense, .bf16_32_sparse => k.chunks_32,
+        .fp8_16_dense, .fp8_16_sparse => k.chunks_16_fp8,
+        .fp8_32_dense, .fp8_32_sparse => k.chunks_32_fp8,
+        .fp8load_dense, .fp8load_sparse => k.chunks_32_fp8load,
     };
 }
 
@@ -125,13 +126,9 @@ pub const Attention = struct {
     ready: []bool = &.{},
     old: std.ArrayList(u8) = .empty,
 
-    pub fn init(gpu: check_.Gpu, s: cuda.Stream, module: cuda.Module, kind: Kind) !Attention {
-        const f = try module.function(symbol(kind));
-        const baseline = try module.function(if (fast(kind)) "tf_glm_chunks_32_fp8" else symbol(kind));
-        const shared = baselineShared(kind);
-        try f.allowDynamicShared(if (fast(kind)) glm.glue.chunksFP8LoadSmem() else shared);
-        try baseline.allowDynamicShared(shared);
-        return .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .f = f, .baseline = baseline };
+    pub fn init(gpu: check_.Gpu, s: cuda.Stream, k: *const glm.glue.Kernels, kind: Kind) Attention {
+        const baseline = if (fast(kind)) k.chunks_32_fp8 else function(k, kind);
+        return .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .f = function(k, kind), .baseline = baseline };
     }
 
     pub fn deinit(self: *Attention) void {

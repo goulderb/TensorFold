@@ -29,6 +29,9 @@ const clamped_labels = blk: {
     break :blk result;
 };
 
+/// The clamped cases' SwiGLU limit (clamp10); stress inputs run unclamped because their sums must stay exact.
+pub const limit: f32 = 10;
+
 fn depth(s: c.Shape) usize {
     return s.k / 16 + 16;
 }
@@ -150,10 +153,7 @@ pub const Expert = struct {
         if (shape.rows == 0 or shape.rows > (if (self.prompt) @as(usize, 2048) else 56) or shape.n == 0 or shape.n % 32 != 0 or shape.k == 0 or shape.k % 32 != 0) return false;
         const a = self.rig.gpu.gpa;
         var h = try data.Host.init(a, shape, self.epi, fill, seed);
-        h.limit = if (self.clamped and fill != .stress) 10 else 0;
-        if (h.limit > 0) for (h.x) |*v| {
-            v.* = c.toBf16(c.fromBf16(v.*) * 64);
-        };
+        if (self.clamped and fill != .stress) h.clamp(limit);
         self.host = h;
         const words = try h.packedWords();
         defer a.free(words);
@@ -309,4 +309,33 @@ test "expert stress references prove both low precision accumulators inadequate 
             }
         }
     }
+}
+
+test "clamped SwiGLU inputs reach every clamp region at each served shape the CPU checks quickly" {
+    const a = std.testing.allocator;
+    for ([_][]const c.Shape{ up_shapes[2..], prompt_up_shapes[2..] }) |shapes| for (shapes) |shape| {
+        var h = try data.Host.init(a, shape, .swiglu, .random, 0x5388);
+        defer h.deinit();
+        h.clamp(limit);
+        const regions = try h.clampRegions();
+        for (regions) |n| try std.testing.expect(n > 0);
+    };
+}
+
+test "at served depth a SwiGLU clamped at 11, not 10, leaves the bound for over a quarter of outputs" {
+    const a = std.testing.allocator;
+    const shape: c.Shape = .{ .rows = 7, .n = 64, .k = up_shapes[0].k };
+    var h = try data.Host.init(a, shape, .swiglu, .random, 0x5388);
+    defer h.deinit();
+    h.clamp(limit);
+    const n = shape.rows * data.slots * shape.n;
+    const want = try a.alloc(f64, 3 * n);
+    defer a.free(want);
+    try h.calculate(null, .sequential, want[0..n], want[n .. 2 * n]);
+    h.limit = limit + 1;
+    try h.calculate(null, .sequential, want[2 * n ..], null);
+    const s = spec(.baseline, .swiglu);
+    var outside: usize = 0;
+    for (want[0..n], want[n .. 2 * n], want[2 * n ..]) |w, m, wrong| outside += @intFromBool(!(@abs(wrong - w) <= c.bound(s, shape, w, m)));
+    try std.testing.expect(4 * outside > n);
 }

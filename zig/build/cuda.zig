@@ -267,7 +267,8 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = host }) })).step);
     const cuda = runtime(b, host, .debug, &.{});
     const mods = family(b, host, .debug, cuda, draft_ids);
-    const contract_host = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "cuda", .module = cuda } } });
+    const contract_glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);
+    const contract_host = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = contract_glm } } });
     const contract_run = b.addRunArtifact(b.addTest(.{ .root_module = contract_host }));
     step.dependOn(&contract_run.step);
     b.step("test-kernel-contract-host", "Contract reference fixtures and offline metadata tests (CPU only)").dependOn(&contract_run.step);
