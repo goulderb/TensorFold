@@ -8,13 +8,12 @@ const turn = @import("qwen35_sampler_turn.zig");
 const generation_graph = @import("qwen35_generation_graph.zig");
 const expert_screen = @import("qwen35_expert_screen.zig");
 const router_screen = @import("qwen35_router_screen.zig");
-const gdn_screen = @import("qwen35_gdn_screen.zig");
 
 comptime {
     if (options.engine_optimization != .fast) @compileError("diagnostics require ReleaseFast engine");
 }
 
-const Input = struct { prompt: []const u32, token: u32, repetitions: usize = 16, expert_fixture: ?[]const u8 = null, expert_fixture_sha256: ?[]const u8 = null, router_screen: bool = false, router_candidate: bool = false, router_turns: bool = false, gdn_screen: bool = false };
+const Input = struct { prompt: []const u32, token: u32, repetitions: usize = 16, expert_fixture: ?[]const u8 = null, expert_fixture_sha256: ?[]const u8 = null, router_screen: bool = false, router_candidate: bool = false, router_turns: bool = false };
 const Journal = struct {
     a: std.mem.Allocator,
     io: std.Io,
@@ -175,7 +174,6 @@ fn step(s: *qwen.Session, token: u32, position: usize, graphs: ?[]const Captured
 fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     const input = try std.json.parseFromSliceLeaky(Input, a, bytes, .{});
-    if (input.gdn_screen and (input.expert_fixture != null or input.expert_fixture_sha256 != null or input.router_screen or input.router_candidate or input.router_turns)) return error.ConflictingDiagnosticModes;
     if (input.router_turns and (input.expert_fixture != null or input.expert_fixture_sha256 != null or input.router_screen or input.router_candidate)) return error.ConflictingDiagnosticModes;
     if ((input.expert_fixture == null) != (input.expert_fixture_sha256 == null)) return error.InvalidExpertFixturePin;
     if (input.router_screen and input.expert_fixture == null) return error.RouterScreenRequiresPinnedFixture;
@@ -483,12 +481,6 @@ pub fn main(init: std.process.Init) !u8 {
         _ = try parse(a, init.io, args[2]);
         return 0;
     }
-    if (args.len == 3 and std.mem.eql(u8, args[1], "--check-gdn-input")) {
-        const input = try parse(a, init.io, args[2]);
-        if (!input.gdn_screen) return error.GdnScreenRequired;
-        try gdn_screen.checkInput(init.gpa);
-        return 0;
-    }
     if (args.len == 3 and std.mem.eql(u8, args[1], "--check-router-input")) {
         const input = try parse(a, init.io, args[2]);
         if (!input.router_screen) return error.RouterScreenRequired;
@@ -515,17 +507,7 @@ fn execute(init: std.process.Init, model_dir: []const u8, input: Input, j: Journ
     var driver_open = true;
     defer if (driver_open) driver.close();
     const identities = try admitted.verify(a, &driver);
-    try j.write(.{ .kind = "start", .source_commit = options.source_commit, .identities = identities, .scope = if (input.gdn_screen) gdn_screen.scope else if (input.router_turns) "matched changing-token changing-position graph turns; router and router plus expert up; not production qualification" else if (input.router_screen) router_screen.scope else if (input.expert_fixture != null) "real layer0 expert seam with rotating banks" else "fixed-token fixed-position evolving-state forward diagnostic; not generation throughput", .position = input.prompt.len, .token = input.token, .repetitions = input.repetitions });
-    if (input.gdn_screen) {
-        for (identities) |identity| {
-            var context = try cuda.Context.init(&driver, identity.ordinal);
-            defer context.deinit();
-            const gpu: @import("check.zig").Gpu = .{ .d = &driver, .ctx = &context, .gpa = init.gpa, .io = init.io };
-            try gdn_screen.run(gpu, j);
-        }
-        try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = gdn_screen.scope, .production_qualification = false });
-        return;
-    }
+    try j.write(.{ .kind = "start", .source_commit = options.source_commit, .identities = identities, .scope = if (input.router_turns) "matched changing-token changing-position graph turns; router and router plus expert up; not production qualification" else if (input.router_screen) router_screen.scope else if (input.expert_fixture != null) "real layer0 expert seam with rotating banks" else "fixed-token fixed-position evolving-state forward diagnostic; not generation throughput", .position = input.prompt.len, .token = input.token, .repetitions = input.repetitions });
     if (input.expert_fixture) |fixture_dir| {
         for (identities) |identity| {
             var context = try cuda.Context.init(&driver, identity.ordinal);

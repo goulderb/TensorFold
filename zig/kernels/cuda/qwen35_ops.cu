@@ -18,8 +18,6 @@
 // The cooperative router stages products while retaining ordered FP32 additions.
 // The optional parallel selector retains stable ties and the serial softmax order.
 
-// The optional tiled GDN step coalesces state access without changing its layout.
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <math.h>
@@ -129,60 +127,6 @@ extern "C" __global__ void tf_qwen35_gdn_step(
     for (int key = 0; key < D; ++key) {
         row[key] += ks[key] * delta;
         y += row[key] * qs[key];
-    }
-    out[h * D + value] = y;
-}
-
-extern "C" __global__ void tf_qwen35_gdn_step_tiled(
-    const float* q, const float* k, const B* v, const float* decay, const float* beta,
-    float* state, float* out) {
-    __shared__ float qs[D], ks[D];
-    // Padding keeps each owner's fixed-key access on a distinct shared-memory bank.
-    __shared__ float tile[D][9];
-    const int h = blockIdx.x, value = threadIdx.x, key_head = h / (ValueHeads / KeyHeads);
-    qs[value] = q[key_head * D + value];
-    ks[value] = k[key_head * D + value];
-    __syncthreads();
-    float* head_state = state + h * D * D;
-    const float retain = expf(decay[h]);
-    float memory = 0.0f;
-    for (int base = 0; base < D; base += 8) {
-        for (int flat = value; flat < D * 8; flat += D) {
-            const int row = flat / 8, offset = flat % 8;
-            tile[row][offset] = head_state[row * D + base + offset];
-        }
-        __syncthreads();
-        for (int offset = 0; offset < 8; ++offset) {
-            const int key = base + offset;
-            tile[value][offset] *= retain;
-            memory += tile[value][offset] * ks[key];
-        }
-        __syncthreads();
-        for (int flat = value; flat < D * 8; flat += D) {
-            const int row = flat / 8, offset = flat % 8;
-            head_state[row * D + base + offset] = tile[row][offset];
-        }
-        __syncthreads();
-    }
-    const float delta = (f(v[h * D + value]) - memory) * beta[h];
-    float y = 0.0f;
-    for (int base = 0; base < D; base += 8) {
-        for (int flat = value; flat < D * 8; flat += D) {
-            const int row = flat / 8, offset = flat % 8;
-            tile[row][offset] = head_state[row * D + base + offset];
-        }
-        __syncthreads();
-        for (int offset = 0; offset < 8; ++offset) {
-            const int key = base + offset;
-            tile[value][offset] += ks[key] * delta;
-            y += tile[value][offset] * qs[key];
-        }
-        __syncthreads();
-        for (int flat = value; flat < D * 8; flat += D) {
-            const int row = flat / 8, offset = flat % 8;
-            head_state[row * D + base + offset] = tile[row][offset];
-        }
-        __syncthreads();
     }
     out[h * D + value] = y;
 }

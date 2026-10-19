@@ -28,3 +28,33 @@ Full-turn payoff is projected from 191 appends and 15 GDN layers per partition:
 above 5% of the 1.711066-second optimized turn earns a model trial. This is
 approximately 14.93 microseconds per call averaged over the two GPUs. A screen
 alone cannot establish model throughput or production correctness.
+
+## Result: reject shared staging
+
+The [strict analyzer](evidence/gdn-tuning-20261019/r1/analysis.json) accepts the
+complete pinned trial at e60ac0c0ddbc80929fdb95a76439d6728f7340d0. Every
+measured pair is slower on both GPUs. Original/tiled median microseconds per
+call are 37.917/38.698 on GPU0 and 38.0415/38.9325 on GPU1. Original ranges
+are 37.885-37.925 and 38.0055-38.1125; tiled ranges are 38.628-38.713 and
+38.9207-39.0192. Median paired savings are negative: -0.7865/-0.89425 us.
+
+All 32 changing-input correctness steps and all 24 timed final bank payloads
+pass finite, bit-exact equality. Both poison and altered-state/output controls
+pass. Actual minimum in-process free memory is 14721/14773 MiB. The projection
+is 4.82 ms added per turn (0.28%), and fails the 5% full-trial gate. No model
+trial or production performance claim follows. Improved access grouping did
+not overcome this implementation's staging/barrier cost; no profiler counters
+were collected to apportion the loss.
+
+The candidate kernel, profile mode and harness are reverted from the active
+source. Commit e60ac0c0d retains the exact reproducer and build provenance;
+the accepted router/up implementation remains unchanged. The independent
+analyzer and corruption tests retain the evidence contract.
+
+The controller completed and all owned processes ended. Nemotron was restored
+at 16:52:19 UTC, canonical local completion READY with request
+5d7f4cf8-83ef-4ea8-abd6-6f5420dc36d4, production PID2792; Clef stayed unchanged.
+
+Persistent state transposition remains a distinct hypothesis, with migration
+and snapshot costs to justify first. For production, independent reference
+numerics and live server integration remain ahead of further kernel tuning.
