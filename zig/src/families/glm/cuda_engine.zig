@@ -19,6 +19,8 @@ const dflash_mod = @import("cuda_dflash.zig");
 const mia = @import("cuda_experts_mia.zig");
 const verify_plan = @import("cuda_verify_plan.zig");
 const route_trace = @import("cuda_route_trace.zig");
+const target_graph = @import("cuda_target_graph.zig");
+const target_forward = @import("cuda_target_forward.zig");
 pub const persistence = @import("cuda_persistence.zig");
 pub const spill_payload = @import("cuda_spill_payload.zig");
 
@@ -70,6 +72,28 @@ pub const prompt_rows = fw.prefill_rows;
 /// Storage ceiling; verifyPlan selects the active row limit below hc_pre's 64-row change.
 pub const shared_rows = verify_plan.max_rows;
 pub const max_shared = verify_plan.max_streams;
+
+fn targetWarmWindow(rows: usize) !struct { rows: [2]usize, count: usize } {
+    const profile = @import("cuda_draft_profile.zig");
+    if (rows == 0 or rows > profile.shared_rows) return error.BadTargetGraphWarmupShape;
+    const first = @min(rows, profile.target_rows);
+    return .{ .rows = .{ first, rows - first }, .count = if (rows > first) 2 else 1 };
+}
+
+test "production target warmup covers every shared width with at most two sixteen-row slots" {
+    try std.testing.expectError(error.BadTargetGraphWarmupShape, targetWarmWindow(0));
+    try std.testing.expectError(error.BadTargetGraphWarmupShape, targetWarmWindow(33));
+    for (1..33) |rows| {
+        const w = try targetWarmWindow(rows);
+        var total: usize = 0;
+        for (w.rows[0..w.count]) |n| {
+            try std.testing.expect(n > 0 and n <= 16);
+            total += n;
+        }
+        try std.testing.expectEqual(rows, total);
+        try std.testing.expect(w.count <= 2);
+    }
+}
 
 /// One stream's window of a shared verify: its slot, its ids, and its drawn tokens.
 pub const Part = struct { slot: u32, ids: []const u32, out: []u32 };
@@ -130,6 +154,10 @@ pub const Engine = struct {
     bs: ?fw.Buffers = null, // shared verify windows (with the MTP head, as the lane core shares only then)
     verify_widths: [shared_rows + 1]u64 = @splat(0),
     route_trace: ?route_trace.Trace = null,
+    ffn_graphs: ?target_graph.Bank = null,
+    full_graphs: ?target_forward.Runtime = null,
+    /// Proof tools may compare eager/replay at drained boundaries; serving leaves this enabled when configured.
+    target_graphs_active: bool = true,
     pairs: cuda.DeviceBuffer, // every rank's (value, id) of a greedy draw
     smp: sampler.Sampler,
     seqs: std.ArrayList(?*Seq) = .empty, // every stream's sequence by slot (the lane backend's), slot 0 made at init
@@ -266,7 +294,7 @@ pub const Engine = struct {
         }
         try e.bind(0);
         errdefer {
-            e.free(0);
+            for (0..e.seqs.items.len) |slot| e.free(slot);
             e.seqs.deinit(gpa);
         }
         e.bp = if (o.settings.kv_shard) try fw.Buffers.initOwned(d, &e.w, fw.prefill_rows, true, o.capacity) else try fw.Buffers.init(d, &e.w, fw.prefill_rows, true, o.capacity);
@@ -331,13 +359,132 @@ pub const Engine = struct {
             try ranks.gather(u64, d, lib, comm, stream, rank, @intFromBool(failed == null), rooms);
             for (rooms) |ready| if (ready == 0) return failed orelse error.PeerKvPoolFailed;
         }
-        try e.stream.synchronize();
+        errdefer if (e.ffn_graphs) |*bank| bank.deinit();
+        if (settings.target_graphs == .ffn) {
+            var graph_problem: ?anyerror = null;
+            if (route_samples > 0) graph_problem = error.TargetGraphsWithRouteTrace else {
+                e.ffn_graphs = target_graph.Bank.init(gpa, e.w.layers.len) catch |err| blk: {
+                    graph_problem = err;
+                    break :blk null;
+                };
+            }
+            if (!try e.pairedReady(graph_problem == null)) return graph_problem orelse error.PeerTargetGraphsRefused;
+            std.log.info("GLM partial target graphs rank={d}: FFN sites only; exact rows 1..{d}; attention remains eager", .{ rank, target_graph.max_rows });
+        }
+        errdefer if (e.full_graphs) |*runtime| runtime.deinit();
+        if (settings.target_graphs == .full) {
+            var graph_problem: ?anyerror = null;
+            if (route_samples > 0) graph_problem = error.TargetGraphsWithRouteTrace else {
+                e.full_graphs = target_forward.Runtime.init(gpa, d, &e.w, e.m.mods[0], settings.kv, o.capacity, settings.kv_shard) catch |err| blk: {
+                    graph_problem = err;
+                    break :blk null;
+                };
+            }
+            if (!try e.pairedReady(graph_problem == null)) return graph_problem orelse error.PeerTargetGraphsRefused;
+            std.log.info("GLM complete target graphs rank={d}: embedding, all target layers, taps and head; exact rows 1..{d}", .{ rank, target_graph.max_rows });
+            if (settings.draft_profile.enabled) {
+                e.prepareTargetGraphs() catch |err| {
+                    e.pair_failure(err);
+                    return err;
+                };
+                if (ctx.memInfo()) |room| {
+                    std.log.info("GLM complete target graph settled memory rank={d}: free_bytes={d} total_bytes={d}", .{ rank, room.free, room.total });
+                } else |err| std.log.warn("GLM complete target graph settled memory rank={d}: unavailable ({s})", .{ rank, @errorName(err) });
+            } else std.log.info("GLM complete target graphs rank={d}: nonproduction profile, lazy first-use capture", .{rank});
+        }
+        e.stream.synchronize() catch |err| {
+            if (e.ffn_graphs != null or e.full_graphs != null) e.pair_failure(err);
+            return err;
+        };
         return e;
+    }
+
+    /// Production admissions see a complete exact-width bank, without allocating eight capacity-sized sequences.
+    fn prepareTargetGraphs(e: *Engine) !void {
+        const profile = @import("cuda_draft_profile.zig");
+        const runtime = if (e.full_graphs) |*r| r else return error.NoFullTargetGraphs;
+        const b = if (e.bs) |*scratch| scratch else return error.NoSharedWindows;
+        if (e.capacity < profile.target_rows or b.rows < profile.shared_rows) return error.BadTargetGraphWarmupShape;
+        const started = std.Io.Clock.awake.now(e.io).toNanoseconds();
+        const before = runtime.bank.stats.site_captures;
+        try e.reserveTargetWarmSlot(0);
+        try e.reserveTargetWarmSlot(1);
+        const ids: [profile.shared_rows]i32 = @splat(0);
+        for (1..profile.shared_rows + 1) |rows| {
+            try e.resetTargetWarmSlots();
+            const window = try targetWarmWindow(rows);
+            var segs: [2]fw.Seg = undefined;
+            var row0: usize = 0;
+            for (window.rows[0..window.count], 0..) |n, slot| {
+                segs[slot] = .{ .st = &e.seqs.items[slot].?.st, .row0 = row0, .rows = n };
+                row0 += n;
+            }
+            var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..window.count] }};
+            const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .full_target = runtime, .target_buffer = .shared, .target_failure = e.pair_failure };
+            try f.run(ids[0..rows]);
+        }
+        for (1..profile.target_rows + 1) |rows| {
+            try e.resetTargetWarmSlots();
+            var one: [1]fw.Rank = undefined;
+            const f = e.view(&e.bd, &one);
+            try f.run(ids[0..rows]);
+        }
+        try e.resetTargetWarmSlots();
+        try e.stream.synchronize();
+        e.release(1);
+        e.release(0);
+        const captures = runtime.bank.stats.site_captures - before;
+        if (captures != profile.shared_rows + profile.target_rows) return error.IncompleteTargetGraphWarmup;
+        const elapsed = @max(0, std.Io.Clock.awake.now(e.io).toNanoseconds() - started);
+        std.log.info("GLM complete target graph warmup rank={d}: elapsed_ns={d} captures={d} shared=1..{d} lone=1..{d} temporary_slots=2", .{ e.share.rank, elapsed, captures, profile.shared_rows, profile.target_rows });
+    }
+
+    fn reserveTargetWarmSlot(e: *Engine, slot: u32) !void {
+        var problem: ?anyerror = null;
+        var region: ?cache_pool.extent.Region = null;
+        e.bind(slot) catch |err| {
+            problem = err;
+        };
+        if (problem == null) region = e.placement(@import("cuda_draft_profile.zig").shared_rows) catch |err| blk: {
+            problem = err;
+            break :blk null;
+        };
+        if (!try e.pairedReady(problem == null)) return problem orelse error.PeerTargetGraphWarmupRefused;
+        if (region) |r| try e.reservePaired(slot, r);
+    }
+
+    fn resetTargetWarmSlots(e: *Engine) !void {
+        for (0..2) |slot| {
+            var problem: ?anyerror = null;
+            e.bind(@intCast(slot)) catch |err| {
+                problem = err;
+            };
+            if (problem == null) e.begin(null) catch |err| {
+                problem = err;
+            };
+            if (!try e.pairedReady(problem == null)) return problem orelse error.PeerTargetGraphWarmupRefused;
+        }
+        try e.bind(0);
     }
 
     pub fn deinit(e: *Engine) void {
         if (e.disk) |p| p.close(p.ctx);
-        e.stream.synchronize() catch {};
+        e.stream.synchronize() catch |err| {
+            if (e.ffn_graphs != null or e.full_graphs != null) {
+                e.pair_failure(err);
+                return;
+            }
+        };
+        if (e.ffn_graphs) |*bank| {
+            const s = bank.stats;
+            std.log.info("GLM partial target graph sites rank={d}: eager={d} captures={d} replays={d}", .{ e.share.rank, s.site_eager, s.site_captures, s.site_replays });
+            bank.deinit();
+        }
+        if (e.full_graphs) |*runtime| {
+            const s = runtime.bank.stats;
+            std.log.info("GLM complete target graphs rank={d}: eager={d} captures={d} replays={d}", .{ e.share.rank, s.site_eager, s.site_captures, s.site_replays });
+            runtime.deinit();
+        }
         if (e.route_trace) |*trace| trace.deinit();
         var it = e.snaps.valueIterator();
         while (it.next()) |s| e.freeSnap(s);
@@ -367,9 +514,24 @@ pub const Engine = struct {
         return .{ .nccl = .{ .lib = e.lib, .comm = e.comm } };
     }
 
+    fn graphBank(e: *Engine) ?*target_graph.Bank {
+        if (!e.target_graphs_active) return null;
+        return if (e.ffn_graphs) |*bank| bank else null;
+    }
+
+    fn fullGraph(e: *Engine) ?*target_forward.Runtime {
+        if (!e.target_graphs_active) return null;
+        return if (e.full_graphs) |*runtime| runtime else null;
+    }
+
+    pub fn targetGraphStats(e: *const Engine) target_graph.Stats {
+        if (e.full_graphs) |runtime| return runtime.bank.stats;
+        return if (e.ffn_graphs) |bank| bank.stats else .{};
+    }
+
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .vision = if (b == &e.bp) if (e.cur.vision) |*vision| .{ .owner = vision.table(), .generation = vision.table().generation } else null else null };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .target_graphs = if (b == &e.bd) e.graphBank() else null, .full_target = if (b == &e.bd) e.fullGraph() else null, .target_buffer = .lone, .target_failure = e.pair_failure, .vision = if (b == &e.bp) if (e.cur.vision) |*vision| .{ .owner = vision.table(), .generation = vision.table().generation } else null else null };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -862,6 +1024,7 @@ pub const Engine = struct {
     }
 
     fn verifyWithMask(e: *Engine, ids: []const u32, out: []u32, masked: bool) !void {
+        errdefer if (e.full_graphs != null) e.pair_failure(error.FullTargetVerificationFailed);
         if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
         var one: [1]fw.Rank = undefined;
         const f = e.view(&e.bd, &one);
@@ -874,6 +1037,7 @@ pub const Engine = struct {
 
     /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
     pub fn verifyShared(e: *Engine, parts: []const Part) !void {
+        errdefer if (e.full_graphs != null) e.pair_failure(error.FullTargetVerificationFailed);
         const b = if (e.bs) |*x| x else return error.NoSharedWindows;
         if (parts.len == 0 or parts.len > max_shared) return error.WindowTooWide;
         var segs: [max_shared]fw.Seg = undefined;
@@ -890,7 +1054,7 @@ pub const Engine = struct {
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
         const trace = if (e.route_trace) |*t| t.begin(rows) else null;
         errdefer if (trace) |t| t.abort(e.stream);
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .route_trace = trace };
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .route_trace = trace, .target_graphs = e.graphBank(), .full_target = e.fullGraph(), .target_buffer = .shared, .target_failure = e.pair_failure };
         try f.run(@ptrCast(ids[0..rows]));
         if (trace) |t| try t.finish(e.stream);
         for (parts, segs[0..parts.len]) |p, g| {

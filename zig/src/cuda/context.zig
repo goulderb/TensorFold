@@ -41,8 +41,9 @@ pub const Context = struct {
     }
 
     /// Waits for all work, then drops this retain; resources made in it must be released first.
+    /// A failed bind keeps this retain and its spare sources so teardown can be retried safely.
     pub fn deinit(self: *Context) void {
-        self.makeCurrent() catch {};
+        self.makeCurrent() catch return;
         self.d.synchronize() catch {};
         @import("copy_source.zig").dropSpares(self.d, self.handle); // their pinned bytes go with the context
         _ = self.d.api.cuDevicePrimaryCtxRelease_v2(self.device);

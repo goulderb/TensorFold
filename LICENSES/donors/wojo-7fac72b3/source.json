@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/wojo/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold",
+  "commit": "7fac72b346eb85549edc0d1783b6bbb3d998a5af",
+  "files_sha256": {
+    "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "NOTICE": "1ee72191f52fb49cacafcaca9a8add3f401c85e72602de2af0342bff424eb6a8",
+    "CREDITS.md": "b999b6567bc0359cc3685e602c603b52d1cce7d9c1fc1d9bf7d61d418722a6fb"
+  },
+  "content": "Original donor documents, unmodified; not a license for the enclosing repository."
+}

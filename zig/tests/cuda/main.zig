@@ -194,6 +194,7 @@ const usage =
     \\  glm-synth <dir>          a synthetic GLM-5.3-Flash checkpoint (2 layers, 16 experts) and its dc.json for the lane checks
     \\  glm-prefill-shared-check MODEL RANK WORLD IDS_JSON  bounded batched cold prompts against separate references
     \\  glm-prefill-batch-bench MODEL IDS_JSON OUT  alternating prompt batching in one loaded lane host
+    \\  glm-target-graph-check MODEL RANK WORLD IDFILE  bounded eager/capture/replay target proof; TF_GLM_TARGET_GRAPHS=full or ffn, TF_GLM_LAYERS=1..6
     \\  glm-verify-window-check MODEL  exact 32/56/63/64-row shared verification against reset/replay references
     \\  glm-verify-window-bench MODEL IDS_JSON OUT  alternating six/seven-draft c8 runs with prompt batching enabled
     \\
@@ -387,6 +388,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-lanes-cover")) return glm_lanes_tests.coverCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
     if (std.mem.eql(u8, cmd, "glm-shared-check")) return glm_lanes_tests.sharedCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
     if (std.mem.eql(u8, cmd, "glm-prefill-shared-check")) return glm_lanes_tests.prefillSharedCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
+    if (std.mem.eql(u8, cmd, "glm-target-graph-check")) return @import("glm_target_graph_check.zig").run(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "glm-verify-window-check")) return @import("glm_verify_window_check.zig").run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "glm-verify-window-bench")) return @import("glm_prefill_batch_bench.zig").verifyRun(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "glm-lanes-concurrent")) return glm_lanes_tests.concurrentCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));

@@ -3,6 +3,7 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
+#include "glm_target_meta.cuh"
 namespace {
 
 constexpr int DK = 128, DV = 128, TAPS = 4;
@@ -431,4 +432,121 @@ extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_out(
         int H, const __nv_bfloat16* __restrict__ y_in, const __nv_bfloat16* __restrict__ G, int g_stride,
         const __nv_bfloat16* __restrict__ norm_w, float eps, __nv_bfloat16* __restrict__ out) {
     out_kernel_body(H, y_in, G, g_stride, norm_w, eps, out);
+}
+
+// Segmented addressing adapted from MiaAI-Lab/wojo's production kda.cu
+// (sha256 f74056a38e6f18a5d1995cf994e0f3e0231b24a530da827a350f221aedfbdafc).
+// Changes: staged absolute pointers, sequence-owned projection/replay saves, and
+// engine-owned q/y rows. Retains this native port's FP32 conv weights, WARPS=8
+// update4 arithmetic and eager entries above. For donor attribution and retained
+// notices, see NOTICE and THIRD_PARTY_NOTICES.md; this addition does not replace them.
+
+// Separate from prep: every preceding projection row must be visible before a
+// different CTA reads it for convolution. Block (global row, projection tile).
+extern "C" __global__ void __launch_bounds__(256) tf_glm_target_kda_scatter(
+        const TfGlmTargetRow* __restrict__ row_map, const TfGlmTargetKdaSegment* __restrict__ segments,
+        const __nv_bfloat16* __restrict__ P, int p_stride) {
+    const int r = blockIdx.x;
+    const TfGlmTargetRow row = row_map[r];
+    if (row.segment >= TF_GLM_TARGET_MAX_SEGMENTS) return;
+    const TfGlmTargetKdaSegment seg = segments[row.segment];
+    if (row.local >= seg.rows) return;
+    const int c = blockIdx.y * blockDim.x + threadIdx.x;
+    if (c < p_stride)
+        reinterpret_cast<__nv_bfloat16*>(seg.proj)[(size_t)row.local * p_stride + c] = P[(size_t)r * p_stride + c];
+}
+
+// Native prep's arithmetic, with local convolution/save rows and global A/q rows.
+extern "C" __global__ void __launch_bounds__(512) tf_glm_target_kda_prep(
+        int H, const TfGlmTargetRow* __restrict__ row_map,
+        const TfGlmTargetKdaSegment* __restrict__ segments, int p_stride, int b_off,
+        const __nv_bfloat16* __restrict__ A, int a_stride, const float* __restrict__ cw,
+        const float* __restrict__ a_log, const float* __restrict__ dt_bias, float lower,
+        float* __restrict__ q_out) {
+    const int C = 3 * H * DK;
+    const int r = blockIdx.x, h = blockIdx.y;
+    const TfGlmTargetRow row = row_map[r];
+    if (row.segment >= TF_GLM_TARGET_MAX_SEGMENTS) return;
+    const TfGlmTargetKdaSegment seg = segments[row.segment];
+    if (row.local >= seg.rows) return;
+    const int local = row.local;
+    const auto* P = reinterpret_cast<const __nv_bfloat16*>(seg.proj);
+    const auto* cs = reinterpret_cast<const __nv_bfloat16*>(seg.conv);
+    auto* k_save = reinterpret_cast<float*>(seg.k);
+    auto* v_save = reinterpret_cast<__nv_bfloat16*>(seg.v);
+    auto* g_save = reinterpret_cast<float*>(seg.g);
+    auto* b_save = reinterpret_cast<float*>(seg.b);
+    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
+    __shared__ float qs[DK], ks[DK];
+    const size_t base = ((size_t)local * H + h) * DK;
+    const size_t qbase = ((size_t)r * H + h) * DK;
+    if (t < 3 * DK) {
+        const int c = (t / DK) * H * DK + h * DK + (t % DK);
+        float acc = 0.0f;
+#pragma unroll
+        for (int tap = 0; tap < TAPS; ++tap) {
+            const int at = local + tap;
+            const float x = at < TAPS - 1 ? __bfloat162float(cs[(size_t)at * C + c])
+                                          : __bfloat162float(P[(size_t)(at - (TAPS - 1)) * p_stride + c]);
+            acc = acc + cw[(size_t)c * TAPS + tap] * x;
+        }
+        const float act = bf(acc / (1.0f + expf(-acc)));
+        if (t < DK) qs[t] = act;
+        else if (t < 2 * DK) ks[t - DK] = act;
+        else v_save[base + t - 2 * DK] = __float2bfloat16_rn(act);
+    } else {
+        const int i = t - 3 * DK;
+        const float decay_rate = expf(a_log[h]);
+        const float a = __bfloat162float(A[(size_t)r * a_stride + h * DK + i]) + dt_bias[h * DK + i];
+        g_save[base + i] = expf(lower * sigmoidf_(decay_rate * a));
+        if (i == 0) b_save[local * H + h] = bf(sigmoidf_(__bfloat162float(P[(size_t)local * p_stride + b_off + h])));
+    }
+    __syncthreads();
+    if (warp < 2) {
+        const float* x = warp == 0 ? qs : ks;
+        float v4[4], ss = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) { v4[i] = x[lane * 4 + i]; ss = ss + v4[i] * v4[i]; }
+        ss = warp_sum(ss);
+        float inv = 1.0f / sqrtf(ss + 1e-6f);
+        float* dst = warp == 0 ? q_out : k_save;
+        const size_t dst_base = warp == 0 ? qbase : base;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            float y = v4[i] * inv;
+            if (warp == 0) y = y * (1.0f / sqrtf((float)DK));
+            dst[dst_base + lane * 4 + i] = y;
+        }
+    }
+}
+
+// Block (head, value part, segment): no captured sequence pointer or row count.
+extern "C" __global__ void __launch_bounds__(256) tf_glm_target_kda_step(
+        int H, const TfGlmTargetKdaSegment* __restrict__ segments, const float* __restrict__ q_in,
+        __nv_bfloat16* __restrict__ y_out) {
+    const TfGlmTargetKdaSegment seg = segments[blockIdx.z];
+    if (seg.rows == 0) return;
+    const size_t base = (size_t)seg.row0 * H * DK;
+    step_kernel_body<8, 16>(
+        H, reinterpret_cast<const float*>(seg.state_in), q_in + base,
+        reinterpret_cast<const float*>(seg.k), reinterpret_cast<const __nv_bfloat16*>(seg.v),
+        reinterpret_cast<const float*>(seg.g), reinterpret_cast<const float*>(seg.b), seg.rows,
+        y_out + base, reinterpret_cast<float*>(seg.state_out));
+}
+
+// Preserve the eager fused choice when the runtime does not request wide KDA.
+extern "C" __global__ void __launch_bounds__(1024) tf_glm_target_kda_chain(
+        int H, const TfGlmTargetKdaSegment* __restrict__ segments, int p_stride, int b_off,
+        const __nv_bfloat16* __restrict__ A, int a_stride, const __nv_bfloat16* __restrict__ G, int g_stride,
+        const float* __restrict__ cw, const float* __restrict__ a_log, const float* __restrict__ dt_bias,
+        const __nv_bfloat16* __restrict__ norm_w, float eps, float lower, __nv_bfloat16* __restrict__ out) {
+    const TfGlmTargetKdaSegment seg = segments[blockIdx.y];
+    if (seg.rows == 0) return;
+    chain_kernel_body(
+        H, reinterpret_cast<const __nv_bfloat16*>(seg.proj), p_stride, b_off,
+        A + (size_t)seg.row0 * a_stride, a_stride, G + (size_t)seg.row0 * g_stride, g_stride,
+        reinterpret_cast<const __nv_bfloat16*>(seg.conv), cw, reinterpret_cast<const float*>(seg.state_in),
+        a_log, dt_bias, norm_w, eps, lower, seg.rows, out + (size_t)seg.row0 * H * DV,
+        reinterpret_cast<float*>(seg.state_out), reinterpret_cast<float*>(seg.k),
+        reinterpret_cast<__nv_bfloat16*>(seg.v), reinterpret_cast<float*>(seg.g), reinterpret_cast<float*>(seg.b));
 }
