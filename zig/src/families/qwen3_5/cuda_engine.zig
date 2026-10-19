@@ -53,6 +53,7 @@ const Buffers = struct {
     mixed: u64,
     full_k: u64,
     full_v: u64,
+    route_scores: u64,
     picks: u64,
     route_weights: u64,
     members: u64,
@@ -70,11 +71,11 @@ const Buffers = struct {
 };
 
 const scratch_sizes = [_]usize{
-    2048 * 2,    2048 * 2,     2048 * 2, 8192 * 2, 4096 * 2, 32 * 2,    32 * 2,
-    2048 * 4,    2048 * 4,     4096 * 2, 32 * 4,   32 * 4,   4096 * 4,  8192 * 2,
-    512 * 2,     512 * 2,      8 * 4,    9 * 4,    8 * 4,    8 * 3 * 4, 2 * 4,
-    8 * 512 * 2, 8 * 2048 * 4, 512 * 2,  512 * 2,  512 * 2,  2048 * 2,  8192,
-    8 << 20,     248320 * 2,
+    2048 * 2, 2048 * 2,    2048 * 2,     8192 * 2, 4096 * 2, 32 * 2,   32 * 2,
+    2048 * 4, 2048 * 4,    4096 * 2,     32 * 4,   32 * 4,   4096 * 4, 8192 * 2,
+    512 * 2,  512 * 2,     257 * 4,      8 * 4,    9 * 4,    8 * 4,    8 * 3 * 4,
+    2 * 4,    8 * 512 * 2, 8 * 2048 * 4, 512 * 2,  512 * 2,  512 * 2,  2048 * 2,
+    8192,     8 << 20,     248320 * 2,
 };
 
 fn scratchBytes() usize {
@@ -230,7 +231,7 @@ const Partition = struct {
         try o.rms(s, b.residual, layer.post_norm, b.x, 2048, 1e-6);
         try tap.mark(.residual_norm);
         const m = layer.moe;
-        try o.route(s, b.x, m.router, m.shared_gate, b.picks, b.route_weights);
+        try o.route(s, b.x, m.router, m.shared_gate, b.picks, b.route_weights, b.route_scores);
         try tap.mark(.route);
         const plan: cuda.grouped.Plan = .{ .members = b.members, .items = b.items, .counts = b.counts, .rank = 0, .hist = 0 };
         try o.router.route(s, b.picks, 8, 256, 16, plan);

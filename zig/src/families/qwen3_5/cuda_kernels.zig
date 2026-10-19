@@ -31,6 +31,9 @@ pub const Ops = struct {
     attention_kv_fn: cuda.Function,
     attention_fn: cuda.Function,
     route_fn: cuda.Function,
+    route_products_fn: cuda.Function,
+    route_select_fn: cuda.Function,
+    cooperative_route: bool = false,
     combine_fn: cuda.Function,
 
     pub fn load(ctx: *const cuda.Context) !Ops {
@@ -73,6 +76,8 @@ pub const Ops = struct {
             .attention_kv_fn = try image.function("tf_qwen35_attention_kv"),
             .attention_fn = try image.function("tf_qwen35_attention"),
             .route_fn = try image.function("tf_qwen35_route"),
+            .route_products_fn = try image.function("tf_qwen35_route_products"),
+            .route_select_fn = try image.function("tf_qwen35_route_select"),
             .combine_fn = try image.function("tf_qwen35_combine"),
         };
     }
@@ -159,7 +164,16 @@ pub const Ops = struct {
         try go(self.attention_fn, s, attention_heads, head_dim, &args);
     }
 
-    pub fn route(self: *const Ops, s: cuda.Stream, x: u64, router_bf16: u64, shared_gate_bf16: u64, picks_i32: u64, weights_f32: u64) !void {
+    pub fn route(self: *const Ops, s: cuda.Stream, x: u64, router_bf16: u64, shared_gate_bf16: u64, picks_i32: u64, weights_f32: u64, scores_f32: u64) !void {
+        if (self.cooperative_route) {
+            if (scores_f32 == 0) return error.MissingRouteScores;
+            var products: cuda.Args = .{};
+            for ([_]u64{ x, router_bf16, shared_gate_bf16, scores_f32 }) |address| products.add(address);
+            try go(self.route_products_fn, s, 257, 256, &products);
+            var select: cuda.Args = .{};
+            for ([_]u64{ scores_f32, picks_i32, weights_f32 }) |address| select.add(address);
+            return go(self.route_select_fn, s, 1, 256, &select);
+        }
         var args: cuda.Args = .{};
         for ([_]u64{ x, router_bf16, shared_gate_bf16, picks_i32, weights_f32 }) |address| args.add(address);
         try go(self.route_fn, s, 1, 256, &args);

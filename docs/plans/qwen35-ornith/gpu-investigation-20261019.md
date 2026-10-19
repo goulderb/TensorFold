@@ -67,3 +67,38 @@ The controller restored Nemotron at 13:49:42 UTC as PID 16488 and obtained a
 fresh canonical `READY`, request `9c2173d4-34cb-4603-9942-64371b17f4b9`, with
 paid fallback disabled. Clef remained unchanged. The overall first window is
 marked failed because its diagnostic child failed, despite successful recovery.
+
+## Completed phase measurement and router experiment
+
+The repaired run (`826b665e`) passed the entire detached window. Five measured
+alternating pairs gave fixed-step medians 31.679 ms eager and 28.325 ms graph
+(10.59% less latency). Explicit-event instrumentation adds 7.86% in its separate
+control comparison. Its largest category is route: 20.058 ms across forty layers;
+routed up is 2.329 ms, mixer inputs 2.011 ms, and GDN step 1.282 ms. These are
+diagnostic intervals, not exact fractions of uninstrumented latency. Six pair
+comparisons and sixteen intermediate state/logits digests match exactly.
+Minimum physical free memory was 5358/6105 MiB. Nemotron restored at 13:53:39 UTC
+as PID 19624 with canonical READY request d64f4219-04b8-4ba4-a367-36ecd794eefd.
+Raw receipt and results remain in the fleet task worktree's
+`.artifacts/qwen35-decode-profile-window-r2`; the analyzer rejects failed R1.
+
+The router is the earned optimization target. Independent Astra and Sol
+sketches considered cooperative product staging versus transposed weight
+storage; a fresh Sol judge selected product staging to avoid a new checkpoint
+layout. The build flags disable FMA contraction: exact parity requires a
+separately rounded FP32 multiply, followed by the original ascending FP32 sum.
+Each of 257 blocks computes one expert/shared gate's 2048 products into shared
+memory, then its lane zero sums in the original order. A second block applies
+the literal original strict-greater, ascending-index top-eight selection and
+softmax order. The BF16 boundary and shared-gate sigmoid stay unchanged.
+This preserves existing Qwen/Hugging Face attribution; the cooperative staging
+is local work, with no external kernel code imported.
+
+The original router stays the default. A diagnostic-only runtime flag selects
+the candidate. The probe compares both routers for saved rows and zero ties
+at all forty layers, all sixteen evolving fixed-step states, and every consumed
+BF16 row and output token of a synthetic 64-input/128-output greedy turn.
+Five alternating measured pairs then time both real complete turns and fixed
+steps; warmup and correctness capture are excluded. Fixed-step graph timings
+remain distinct from generation throughput. Independent reference-model
+numerical qualification remains open regardless of self-parity or speed.

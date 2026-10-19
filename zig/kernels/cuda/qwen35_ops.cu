@@ -15,6 +15,7 @@
 // limitations under the License.
 // Local changes: fixed 35B geometry, serial persistent state, online causal
 // attention, deterministic top-eight routing and address-only CUDA entry points.
+// The cooperative router stages products while retaining ordered FP32 additions.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -210,6 +211,46 @@ extern "C" __global__ void tf_qwen35_route(
     float shared = 0.0f;
     for (int d = 0; d < Hidden; ++d) shared += f(x[d]) * f(shared_gate[d]);
     weights[8] = sigmoid(rounded(shared));
+}
+
+extern "C" __global__ void tf_qwen35_route_products(
+    const B* x, const B* router, const B* shared_gate, float* scores) {
+    __shared__ float products[Hidden];
+    const int expert = blockIdx.x;
+    const B* row = expert < 256 ? router + expert * Hidden : shared_gate;
+    for (int d = threadIdx.x; d < Hidden; d += blockDim.x)
+        products[d] = __fmul_rn(f(x[d]), f(row[d]));
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    float value = 0.0f;
+    for (int d = 0; d < Hidden; ++d) value = __fadd_rn(value, products[d]);
+    scores[expert] = expert < 256 ? rounded(value) : value;
+}
+
+extern "C" __global__ void tf_qwen35_route_select(
+    const float* scores, int32_t* picks, float* weights) {
+    __shared__ float logits[256];
+    logits[threadIdx.x] = scores[threadIdx.x];
+    __syncthreads();
+    if (threadIdx.x != 0) return;
+    float chosen[8];
+    for (int slot = 0; slot < 8; ++slot) {
+        int best = -1;
+        for (int candidate = 0; candidate < 256; ++candidate) {
+            bool used = false;
+            for (int prior = 0; prior < slot; ++prior) used |= picks[prior] == candidate;
+            if (!used && (best < 0 || logits[candidate] > logits[best])) best = candidate;
+        }
+        picks[slot] = best;
+        chosen[slot] = logits[best];
+    }
+    float denominator = 0.0f;
+    for (int slot = 0; slot < 8; ++slot) {
+        weights[slot] = expf(chosen[slot] - chosen[0]);
+        denominator += weights[slot];
+    }
+    for (int slot = 0; slot < 8; ++slot) weights[slot] /= denominator;
+    weights[8] = sigmoid(rounded(scores[256]));
 }
 
 extern "C" __global__ void tf_qwen35_combine(

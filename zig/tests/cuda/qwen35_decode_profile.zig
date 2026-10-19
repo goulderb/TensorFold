@@ -4,6 +4,7 @@ const options = @import("qwen_bench_options");
 const qwen = @import("qwen35_cuda");
 const cuda = @import("cuda");
 const admission = @import("qwen35_probe_device.zig");
+const turn = @import("qwen35_sampler_turn.zig");
 
 comptime {
     if (options.engine_optimization != .fast) @compileError("diagnostics require ReleaseFast engine");
@@ -175,6 +176,59 @@ fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     return input;
 }
 
+fn routeMode(s: *qwen.Session, cooperative: bool) void {
+    for (s.engine.partitions) |*p| p.ops.cooperative_route = cooperative;
+}
+
+fn routeParity(s: *qwen.Session, j: Journal) !void {
+    for (s.engine.partitions, 0..) |*p, rank| {
+        try p.context.makeCurrent();
+        for (0..2) |fixture| {
+            if (fixture == 1) try p.scratch.fill8(0, p.stream.handle);
+            for (p.weights.layers, p.first..) |layer, index| {
+                var picks: [2][8]i32 = undefined;
+                var weights: [2][9]u32 = undefined;
+                for (0..2) |arm| {
+                    p.ops.cooperative_route = arm == 1;
+                    try p.ops.route(p.stream, p.b.x, layer.moe.router, layer.moe.shared_gate, p.b.picks, p.b.route_weights, p.b.route_scores);
+                    try p.stream.synchronize();
+                    try p.scratch.download(@intCast(p.b.picks - p.scratch.ptr), std.mem.asBytes(&picks[arm]));
+                    try p.scratch.download(@intCast(p.b.route_weights - p.scratch.ptr), std.mem.asBytes(&weights[arm]));
+                }
+                if (!std.mem.eql(i32, &picks[0], &picks[1]) or !std.mem.eql(u32, &weights[0], &weights[1])) return error.RouterParityMismatch;
+                if (fixture == 1) for (picks[1], 0..) |id, expected| {
+                    if (id != expected) return error.RouterTieMismatch;
+                };
+                try j.write(.{ .kind = "router_parity", .rank = rank, .layer = index, .fixture = if (fixture == 1) "zero-ties" else "saved-real-row", .exact_picks_and_fp32_weights = true });
+            }
+        }
+    }
+    routeMode(s, false);
+}
+
+fn generation(init: std.process.Init, s: *qwen.Session, input: Input, j: Journal) !void {
+    const a = init.arena.allocator();
+    var sampler = try turn.Sampler.init(init.gpa, s.logits.len);
+    defer sampler.deinit();
+    var output: [128]u32 = undefined;
+    var reference: [128]u32 = undefined;
+    const reference_rows = try a.alloc(u16, 128 * s.logits.len);
+    const candidate_rows = try a.alloc(u16, reference_rows.len);
+    routeMode(s, false);
+    _ = try turn.run(true, init.io, s, &sampler, .current, input.prompt, &reference, reference_rows);
+    routeMode(s, true);
+    _ = try turn.run(true, init.io, s, &sampler, .current, input.prompt, &output, candidate_rows);
+    if (!std.mem.eql(u32, &reference, &output) or !std.mem.eql(u16, reference_rows, candidate_rows)) return error.GenerationParityMismatch;
+    try j.write(.{ .kind = "generation_parity", .rows = 128, .exact_consumed_bf16_rows_and_tokens = true, .reference_tokens = reference });
+    for (0..6) |pair| for (0..2) |order| {
+        const candidate = (pair + order) % 2 == 1;
+        routeMode(s, candidate);
+        const timing = try turn.run(false, init.io, s, &sampler, .current, input.prompt, &output, &.{});
+        if (!std.mem.eql(u32, &reference, &output)) return error.GenerationRepeatMismatch;
+        try j.write(.{ .kind = "generation_turn", .pair = pair, .order = order, .warmup = pair == 0, .cooperative = candidate, .times = timing, .tokens = output });
+    };
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
@@ -292,6 +346,37 @@ fn execute(init: std.process.Init, model_dir: []const u8, input: Input, j: Journ
             }
         }
     }
+    try baseline.restore(&s);
+    try routeParity(&s, j);
+    try baseline.restore(&s);
+    routeMode(&s, true);
+    var cooperative: [2]Captured = undefined;
+    for (&cooperative, 0..) |*graph, rank| graph.* = try capture(&s, rank, input.token, position, qwen.DiagnosticNoTap{});
+    defer for (&cooperative, 0..) |*g, rank| {
+        e.partitions[rank].context.makeCurrent() catch {};
+        g.exec.deinit();
+    };
+    try j.write(.{ .kind = "router_graph_nodes", .total = cooperative[0].nodes + cooperative[1].nodes });
+    try baseline.restore(&s);
+    for (references, 0..) |expected, i| {
+        try step(&s, input.token, position, &cooperative);
+        const actual = try stateHash(&s, hash_buffer);
+        if (!std.mem.eql(u8, &expected, &actual)) return error.CooperativeIntermediateMismatch;
+        try j.write(.{ .kind = "cooperative_step_parity", .step = i, .state_and_logits_sha256 = &actual });
+    }
+    for (0..2) |graph_mode| for (0..6) |pair| for (0..2) |order| {
+        const candidate = (pair + order) % 2 == 1;
+        routeMode(&s, candidate);
+        try baseline.restore(&s);
+        const selected: ?[]const Captured = if (graph_mode == 0) null else if (candidate) &cooperative else &graphs;
+        const began = now(init.io);
+        for (0..input.repetitions) |_| try step(&s, input.token, position, selected);
+        const elapsed = now(init.io) - began;
+        const digest = try stateHash(&s, hash_buffer);
+        if (!std.mem.eql(u8, &digest, &references[15])) return error.CooperativeFinalMismatch;
+        try j.write(.{ .kind = "router_turn", .graph = graph_mode == 1, .pair = pair, .order = order, .warmup = pair == 0, .cooperative = candidate, .elapsed_ns = elapsed, .steps = input.repetitions, .exact_state_and_logits = true });
+    };
+    try generation(init, &s, input, j);
     try floor(e);
-    try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "fixed-step greedy self-parity only; independent numerical gate remains open", .new_generation_speed_claim = false });
+    try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "fixed-step and synthetic 64/128 greedy router self-parity; independent numerical gate remains open", .production_qualification = false });
 }

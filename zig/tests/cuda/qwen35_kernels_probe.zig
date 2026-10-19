@@ -290,6 +290,7 @@ fn routing(r: *Rig) !void {
     const shared_dev = try r.bfloats(shared_gate);
     const picks_dev = try r.alloc(i32, 8);
     const weights_dev = try r.alloc(f32, 9);
+    const scores_dev = try r.alloc(f32, 257);
     for (0..2) |round| {
         var logits: [256]f32 = @splat(0);
         if (round == 1) {
@@ -300,7 +301,7 @@ fn routing(r: *Rig) !void {
         for (logits, 0..) |logit, expert| router[expert * 2048] = logit;
         const router_dev = try r.bfloats(router);
         const want = ref.route(logits, -0.75);
-        try r.ops.route(r.stream, x_dev.ptr, router_dev.ptr, shared_dev.ptr, picks_dev.ptr, weights_dev.ptr);
+        try r.ops.route(r.stream, x_dev.ptr, router_dev.ptr, shared_dev.ptr, picks_dev.ptr, weights_dev.ptr, scores_dev.ptr);
         const got_picks = try r.download(i32, picks_dev, 8);
         if (!std.mem.eql(i32, got_picks, &want.picks)) return error.RoutePickMismatch;
         try r.checkF32(if (round == 0) "route_equal_ties" else "route_fractional_weights", weights_dev, &want.weights, gate_tolerance);
