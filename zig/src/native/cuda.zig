@@ -329,6 +329,7 @@ fn openQwen(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     };
     try h.serve(io, qwen35.facts, 1, .{
         .name = "qwen35-cuda-lanes",
+        .call_gates = true,
         .lanes = 1,
         .context_window = @intCast(loaded.context),
         .max_queued = o.max_queued orelse 8,
@@ -814,12 +815,16 @@ test "the Qwen host profile preserves memory reporting, direct refusals and zero
         done: ?api.Reason = null,
         terminals: usize = 0,
         tokens: usize = 0,
+        first_token: ?u32 = null,
         fn event(ctx: *anyopaque, _: api.Id, ev: *const api.Event) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             self.mutex.lockUncancelable(std.testing.io);
             defer self.mutex.unlock(std.testing.io);
             switch (ev.*) {
-                .tokens => |t| self.tokens += t.len,
+                .tokens => |t| {
+                    if (self.first_token == null and t.len > 0) self.first_token = t[0];
+                    self.tokens += t.len;
+                },
                 .finished => |f| {
                     self.done = f.reason;
                     self.terminals += 1;
@@ -854,7 +859,7 @@ test "the Qwen host profile preserves memory reporting, direct refusals and zero
         .memory_source = .{ .read = Fixture.memory },
         .request_refusal = qwen35.requestRefusal,
     };
-    try h.serve(std.testing.io, qwen35.facts, 1, .{ .lanes = 1, .plain_only = true, .thinking_budget = false }, null);
+    try h.serve(std.testing.io, qwen35.facts, 1, .{ .lanes = 1, .plain_only = true, .thinking_budget = false, .call_gates = true }, null);
     defer {
         h.host.stop();
         h.core.deinit();
@@ -863,6 +868,7 @@ test "the Qwen host profile preserves memory reporting, direct refusals and zero
     const e = h.host.engine();
     try std.testing.expectEqual(@as(u64, 23), e.memory(false).?.active);
     try std.testing.expect(e.info().plain_only and e.info().loop_guard);
+    try std.testing.expect(e.info().call_gates);
     try std.testing.expectEqual(@as(u32, 0), e.info().prefill_step);
     try std.testing.expect(!h.host.decoded_rows);
     var refused: Fixture = .{};
@@ -883,6 +889,28 @@ test "the Qwen host profile preserves memory reporting, direct refusals and zero
     try std.testing.expectEqual(@as(usize, 1), refused.terminals);
     try std.testing.expectEqual(@as(usize, 1), empty.terminals);
     try std.testing.expectEqual(@as(usize, 1), next.terminals);
+    const Lex = struct {
+        fn blank(_: *anyopaque, _: u32) bool {
+            return false;
+        }
+        fn text(_: *anyopaque, _: std.mem.Allocator, _: u32) ![]const u8 {
+            return "body";
+        }
+        fn encode(_: *anyopaque, _: std.mem.Allocator, _: []const u8) ![]const u32 {
+            return &.{};
+        }
+    };
+    var called: Fixture = .{};
+    const call: api.Request = .{
+        .prompt = bad.prompt,
+        .max_tokens = 3,
+        .call = .{ .opener = 9, .lex = .{ .ctx = &called, .blank = Lex.blank, .text = Lex.text, .encode = Lex.encode } },
+    };
+    try e.submit(4, &call, .{ .ctx = &called, .event = Fixture.event });
+    try std.testing.expectEqual(api.Reason.length, try called.wait());
+    try std.testing.expectEqual(@as(?u32, 9), called.first_token);
+    try std.testing.expectEqual(@as(usize, 3), called.tokens);
+    try std.testing.expectEqual(@as(usize, 1), called.terminals);
 }
 
 test "a cancel during a long prompt stops it, and the next request's reply is unchanged (#291)" {

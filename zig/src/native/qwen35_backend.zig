@@ -70,7 +70,7 @@ pub fn Adapter(comptime Session: type) type {
             if (self.active != null) return error.LaneMemory;
             if (s.prompt_len == 0 or s.prompt_len > self.capacity or s.max_new > self.capacity - s.prompt_len)
                 return error.ContextFull;
-            if (s.vision != null or s.images.len > 0 or s.grammar != null or s.gate != null or
+            if (s.vision != null or s.images.len > 0 or s.grammar != null or
                 s.logprobs != null or s.prompt_logprobs != null or s.think_budget != 0 or
                 s.decode_spans.len > 0 or s.reuse.saved != null or s.reuse.at != 0)
                 return error.UnsupportedRequest;
@@ -242,6 +242,64 @@ test "Qwen adapter serves complete shared-engine rounds and releases zero-output
         for (s.emitted()) |token| try std.testing.expectEqual(@as(u32, 3), token);
         try std.testing.expect(adapter.active == null);
         try std.testing.expectEqual(@as(usize, 2 + (max_new -| 1)), session.position);
+    }
+}
+
+test "Qwen call gates feed corrected opener and multi-token names into the model" {
+    const gpa = std.testing.allocator;
+    const Session = struct {
+        position: usize = 0,
+        logits: [6]u16 = .{ 0, 0, 0, 0, 0x4080, 0 },
+        fed: [32]u32 = undefined,
+        fn reset(s: *@This()) !void {
+            s.position = 0;
+        }
+        fn append(s: *@This(), tokens: []const u32) !void {
+            @memcpy(s.fed[s.position..][0..tokens.len], tokens);
+            s.position += tokens.len;
+        }
+    };
+    const Lex = struct {
+        fn blank(_: *anyopaque, _: u32) bool {
+            return false;
+        }
+        fn text(_: *anyopaque, _: Allocator, token: u32) ![]const u8 {
+            return ([_][]const u8{ "<function=", "<tool_call>", "foo", ">", "wrong", "other" })[token];
+        }
+        fn encode(_: *anyopaque, _: Allocator, value: []const u8) ![]const u32 {
+            if (std.mem.eql(u8, value, "<function=")) return &.{0};
+            if (std.mem.eql(u8, value, "foo>")) return &.{ 2, 3 };
+            return error.UnexpectedText;
+        }
+    };
+    var session: Session = .{};
+    var adapter = try Adapter(Session).init(gpa, &session, 32);
+    defer adapter.deinit();
+    var cfg = try lanes.Config.init(gpa, facts, 1, 0);
+    defer cfg.deinit(gpa);
+    try std.testing.expect(!cfg.pipelined);
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, adapter.backend(), clock.clock());
+    defer core.deinit();
+    for ([_][]const []const u8{ &.{ "foo", "other" }, &.{"foo"} }) |names| {
+        var s = try lanes.Stream.init(gpa, .{
+            .id = "call",
+            .prompt = &.{0},
+            .max_new = 6,
+            .call = .{
+                .opener = 1,
+                .lead = "<function=",
+                .names = names,
+                .tail = ">",
+                .lex = .{ .ctx = &session, .blank = Lex.blank, .text = Lex.text, .encode = Lex.encode },
+            },
+        });
+        defer s.deinit(gpa);
+        try core.addStream(&s);
+        while (core.activeCount() > 0) try core.step();
+        try std.testing.expectEqualSlices(u32, &.{ 1, 0, 2, 3, 4, 4 }, s.emitted());
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 0, 2, 3, 4 }, session.fed[0..session.position]);
+        try std.testing.expect(adapter.active == null);
     }
 }
 

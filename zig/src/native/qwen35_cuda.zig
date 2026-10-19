@@ -20,7 +20,7 @@ pub fn refusal(o: api.Open) ?[]const u8 {
 }
 
 pub fn requestRefusal(r: *const api.Request) ?[]const u8 {
-    if (r.call != null or r.structure != null) return "Qwen CUDA call gates and structured decoding are not qualified";
+    if (r.structure != null) return "Qwen CUDA structured decoding is not qualified";
     if (r.images.len > 0 or r.vision != null) return "Qwen CUDA serves text only";
     if (r.logprobs != null or r.prompt_logprobs != null) return "Qwen CUDA logprob responses are not qualified";
     if (r.think_budget != 0) return "Qwen CUDA thinking budgets are not qualified";
