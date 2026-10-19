@@ -19,7 +19,7 @@ scan already reduced the sampler's first-draw cost from about 17.5 to 0.31 ms.
 Further sampler or head work has a much smaller plausible payoff than the
 remaining model path.
 
-## The evidence supports an 80 tok/s target, with conditions
+## Logical weight traffic does not rule out 80 tok/s
 
 The baseline is five alternating paired measurements from source
 `312d4f5d950a2c95cd2028e9136c742928841523`. Current decode is median 30.605 tok/s,
@@ -40,6 +40,8 @@ uncached, one-read streaming calculation gives 2.443 ms. This is an idealized
 reference, not a measured DRAM cost or a critical-path lower bound. Repacking,
 padding, repeated reads, activations, recurrent state, KV, and caches change
 actual traffic. The calculation makes 12.5 ms plausible but cannot promise it.
+The audit assumes partition 0 uses the 960 GB/s card and partition 1 the
+896 GB/s card. It does not independently verify CUDA ordinal assignment.
 [NVIDIA's published bandwidths](https://www.nvidia.com/en-us/geforce/news/rtx-50-series-graphics-cards-gpu-laptop-announcements/?linkId=100000326874210)
 support the hardware inputs.
 
@@ -50,6 +52,9 @@ MoE work serially. `Session.append` at line 383 finishes the first partition,
 copies a 4 KiB residual through pinned host memory, then executes the second
 partition and downloads 496,640 bytes of BF16 logits. This is layer splitting,
 not tensor parallelism.
+The benchmark also prefills through repeated one-token append calls. There is
+no batched prompt path in this measurement. Decode tuning and proper batched
+prefill are separate work needed for a runnable production instance.
 
 The static selected-path launch ledger is 953 per token. This count is derived
 from source and checkpoint projection formats, not an observed API trace:
@@ -92,6 +97,15 @@ and tensor-core router/shared-expert implementations. The current tree also
 has graph support in `zig/src/cuda/graph.zig` and Nemotron's engine. Existing
 expert variants originate in `87b322035fd68e5ba4be04c3a6ae8371fe14f25e`.
 These are concrete reuse candidates, not a request to invent another stack.
+
+The final audit also found an in-family donor we initially missed. Qwen's HIP
+backend already captures lane rounds by shape in
+`backend/hip/engine/round_graphs.zig` and `round.zig:132`, including staged token
+and position metadata before replay. Relevant history is
+`c67a80678e7534f867e251d21ecf6973a563f78c`, by BlivionIaG, present at the frozen
+runtime pin. Reuse that family's changing-input design with the shared CUDA
+graph API. HIP calls and TP collectives are not direct CUDA replacements.
+Graph absence here refers specifically to the measured CUDA engine.
 
 GDN's existing specialization uses BF16 Q/K where current Qwen uses FP32.
 The historical router ranks FP32 logits and rounds route weights to BF16;
@@ -139,6 +153,8 @@ submit time, the three synchronization intervals, copies, memory-query time,
 and GPU stream intervals around router, GDN, attention, expert, and projection
 groups. Read events after the existing synchronization boundaries. Do not add
 a synchronization after every layer or kernel.
+Keep the per-token GPU floor guard throughout the initial experiment. Timing
+the query does not authorize removing or weakening the 1536 MiB floor.
 
 Broad CUDA-event intervals include stream idle time caused by late host
 submission. They are not equivalent to kernel-busy time. Separate the current
@@ -193,3 +209,7 @@ reads metadata only, never initializes CUDA, and writes its JSON beside itself.
 Production was restored after the preceding trial and is untouched by this
 investigation. No runtime code, recipe, deployment, or serving configuration
 changes are part of this unit.
+
+The independent [Fable trail audit](evidence/performance-deep-dive-20261019/review-fable-r2.md)
+accepts the investigation without blockers. Its flags and the parent responses
+are retained in [review-response-r2.md](evidence/performance-deep-dive-20261019/review-response-r2.md).
