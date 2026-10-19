@@ -312,6 +312,10 @@ Checkpoint packing uses TensorFold's existing ModelOpt, qlinear and NVFP4
 expert implementations. The two-device coordinator transfers both residual
 buffers through pinned host memory and shares the upstream Qwen layer body.
 No additional external kernel source is imported by this consolidation.
+`zig/kernels/cuda/qwen35_gdn_layout.cu` retains the same attributed HF arithmetic
+and changes only persistent recurrence indexing from value/key to key/value.
+The local host overlay records cache layout in graph identity and preserves
+the baseline binding for exact comparisons. It imports no further donor code.
 
 ## Pictures in the native engine
 

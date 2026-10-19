@@ -192,7 +192,7 @@ fn layoutAB(init: std.process.Init, c: *qwen.Engine, input: Input, output: []con
         const g = p.engine.g;
         if (p.engine.kv8 or g.recBytes() != g.v_heads * 128 * 128 * 4 or g.kvBytes(c.context, false) != g.attentions() * 2 * g.kv_heads * c.context * 256 * 2) return error.UnsupportedCanonicalStateGeometry;
     }
-    var baseline = try c.createSession();
+    var baseline = try c.createSessionWithLayout(.value_key);
     defer baseline.deinit();
     var candidate = try c.createSessionWithLayout(.key_value);
     defer candidate.deinit();

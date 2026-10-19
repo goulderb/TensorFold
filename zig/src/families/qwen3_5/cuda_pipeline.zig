@@ -112,7 +112,7 @@ pub const Chain = struct {
     }
 
     pub fn createSession(c: *Chain) !Session {
-        return c.createSessionWithLayout(.value_key);
+        return c.createSessionWithLayout(.key_value);
     }
 
     pub fn createSessionWithLayout(c: *Chain, layout: engine.Cache.GdnLayout) !Session {
