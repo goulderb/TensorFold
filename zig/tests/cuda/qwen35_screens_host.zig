@@ -20,4 +20,5 @@ test {
     _ = @import("qwen35_terminal_graph_screen.zig");
     _ = @import("qwen35_shared_branch_screen.zig");
     _ = @import("qwen35_slice_format_screen.zig");
+    _ = @import("qwen35_layout_ab_input.zig");
 }

@@ -23,6 +23,7 @@ const moe_semantics_screen = @import("qwen35_moe_semantics_screen.zig");
 const terminal_graph_screen = @import("qwen35_terminal_graph_screen.zig");
 const shared_branch_screen = @import("qwen35_shared_branch_screen.zig");
 const slice_format_screen = @import("qwen35_slice_format_screen.zig");
+const layout_ab_input = @import("qwen35_layout_ab_input.zig");
 
 comptime {
     if (options.engine_optimization != .fast) @compileError("diagnostics require ReleaseFast engine");
@@ -53,6 +54,7 @@ const Input = struct {
     prefill_operator_screen: bool = false,
     prefill_ab: bool = false,
     combined_ab: bool = false,
+    layout_ab: bool = false,
     operator_suite: ?operator_suite.Suite = null,
     slice_major_screen: ?slice_major_input.Screen = null,
     boundary_screen: ?boundary_input.Screen = null,
@@ -103,6 +105,7 @@ fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     try operator_suite.validateInput(input);
     try slice_major_input.validateInput(input);
     try boundary_input.validateInput(input);
+    try layout_ab_input.validate(input);
     if ((input.prefill_ab or input.combined_ab) and (input.prompt.len != 64 or input.output_tokens != 128 or input.context != 4096 or input.cut != 20)) return error.InvalidInput;
     if (input.router_screen or input.router_candidate) return error.ArchivedDiagnosticMode;
     if (input.gdn_layout_ab and input.expert_n8_ab) return error.InvalidInput;
@@ -646,6 +649,99 @@ fn prefillAB(init: std.process.Init, c: *qwen.Engine, input: Input, output: []co
     try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = if (input.combined_ab) "shared Engine retained-candidate bundle parity and matched C=1 turns" else "shared Engine bounded prefill parity and matched C=1 turns", .production_qualification = false, .independent_hf_quality_gate = "unchanged FAIL" });
 }
 
+const LayoutReference = struct { rows: []u16, tokens: []u32, state: ?[]u8 = null };
+
+fn layoutModelArm(init: std.process.Init, dir: []const u8, input: Input, j: Journal, pair: usize, order: usize, reference: *LayoutReference) !void {
+    const candidate = (pair + order) % 2 == 1;
+    const layout: cuda.experts.Nvfp4UpLayout = if (candidate) .slice_major_v1 else .lane_major;
+    const opened = now(init.io);
+    const c = try qwen.Engine.open(init.gpa, init.io, dir, .{ .context = input.context, .cut = input.cut, .captured = true, .prefill_rows = 16, .expert_up_layout = layout, .terminal_greedy = false });
+    defer c.deinit();
+    prefillMode(c, 16, true, true);
+    if (c.partitions.len != 2) return error.PrefillRequiresTwoRanks;
+    for (c.partitions) |p| {
+        const e = p.engine;
+        if (e.terminal != null or e.expert_up_layout != layout or !e.expert_up_split_m or !e.expert_up_n8 or !e.reuse_fp8_quant or !e.bounded_hf_prefill) return error.LayoutTrialSelection;
+        for (e.layers) |layer| if (layer.mlp == .moe and layer.mlp.moe.experts.nvfp4_up_layout != layout) return error.LayoutTrialSelection;
+        e.verify_gdn_graphs = true;
+        e.verify_expert_graphs = true;
+    }
+    var s = try c.createSession();
+    defer s.deinit();
+    if (s.logits.len != 248320) return error.UnsupportedCanonicalVocabulary;
+    const rows = try init.gpa.alloc(u16, reference.rows.len);
+    defer init.gpa.free(rows);
+    const tokens = try init.gpa.alloc(u32, reference.tokens.len);
+    defer init.gpa.free(tokens);
+    try j.write(.{ .kind = "layout_model_arm", .pair = pair, .order = order, .layout = @tagName(layout), .fresh_chain = true, .one_model_resident = true, .prefill_rows = c.prefill_rows, .split_m = true, .n8_enabled = true, .n8_dispatched = false, .terminal_greedy = false, .reuse_fp8_quant = true, .load_ns = now(init.io) - opened });
+    if (pair == 0) {
+        var peer = try c.createSession();
+        defer peer.deinit();
+        var controls = input;
+        controls.combined_ab = true;
+        try j.write(.{ .kind = "layout_model_controls_begin", .pair = pair, .order = order, .layout = @tagName(layout) });
+        try prefillSessionControls(init, &s, &peer, controls, j);
+        try j.write(.{ .kind = "layout_model_controls_end", .pair = pair, .order = order, .layout = @tagName(layout), .passed = true });
+        prefillMode(c, 16, true, true);
+    }
+    _ = try run(init.io, &s, input, tokens, rows);
+    const qualification = try canonicalState(init.gpa, &s);
+    defer init.gpa.free(qualification);
+    if (reference.state == null) {
+        if (candidate or pair != 0 or order != 0) return error.LayoutTrialReference;
+        @memcpy(reference.rows, rows);
+        @memcpy(reference.tokens, tokens);
+        reference.state = try init.gpa.dupe(u8, qualification);
+        try prefillFile(j, "layout-reference-logits.bf16", std.mem.sliceAsBytes(rows));
+        try prefillFile(j, "layout-reference-state.bin", qualification);
+    }
+    const qualified = std.mem.eql(u16, rows, reference.rows) and std.mem.eql(u32, tokens, reference.tokens) and std.mem.eql(u8, qualification, reference.state.?);
+    if (!qualified) {
+        try prefillFile(j, try std.fmt.allocPrint(j.a, "layout-pair{d}-order{d}-qualification-failure-logits.bf16", .{ pair, order }), std.mem.sliceAsBytes(rows));
+        try prefillFile(j, try std.fmt.allocPrint(j.a, "layout-pair{d}-order{d}-qualification-failure-state.bin", .{ pair, order }), qualification);
+        return error.LayoutTrialParity;
+    }
+    var shapes: [2]usize = undefined;
+    var nodes: [2]usize = undefined;
+    for (c.partitions, 0..) |*p, rank| {
+        const e = p.engine;
+        if (e.expert_graph_nodes_split_m == 0 or e.expert_graph_nodes_n8 != 0 or e.expert_graph_nodes_baseline != 0 or e.gdn_graph_nodes_candidate == 0 or e.gdn_graph_nodes_baseline != 0 or e.quant_graph_nodes_reuse == 0 or e.quant_graph_nodes_baseline != 0 or e.quant_graphs_verified == 0) return error.LayoutTrialBindingProof;
+        try p.context.makeCurrent();
+        const experts = e.modelopt.?.nvfp4_experts;
+        const binding = (if (candidate) experts.slice_major_up else experts.split_m_up) orelse return error.LayoutTrialBindingProof;
+        try bundleResources(j, rank, @tagName(layout), binding.function, binding.resident, cuda.experts.Nvfp4Experts.SplitMUp.threads, 128);
+        for (e.expert_graph_roster.items) |node| try j.write(.{ .kind = "layout_model_geometry", .pair = pair, .order = order, .rank = rank, .layout = @tagName(layout), .node = node });
+        try j.write(.{ .kind = "layout_model_bindings", .pair = pair, .order = order, .rank = rank, .layout = @tagName(layout), .split_m_nodes = e.expert_graph_nodes_split_m, .gdn_nodes = e.gdn_graph_nodes_candidate, .quant_reuse_nodes = e.quant_graph_nodes_reuse, .quant_graphs_verified = e.quant_graphs_verified, .cached_shapes = e.graphs.count(), .graph_nodes = e.graph_nodes });
+        shapes[rank] = e.graphs.count();
+        nodes[rank] = e.graph_nodes;
+        e.verify_gdn_graphs = false;
+        e.verify_expert_graphs = false;
+    }
+    captured(c, true);
+    const timing = try run(init.io, &s, input, tokens, rows);
+    const state = try canonicalState(init.gpa, &s);
+    defer init.gpa.free(state);
+    const exact = std.mem.eql(u16, rows, reference.rows) and std.mem.eql(u32, tokens, reference.tokens) and std.mem.eql(u8, state, reference.state.?);
+    if (pair == 0 or !exact) {
+        try prefillFile(j, try std.fmt.allocPrint(j.a, "layout-pair{d}-order{d}-logits.bf16", .{ pair, order }), std.mem.sliceAsBytes(rows));
+        try prefillFile(j, try std.fmt.allocPrint(j.a, "layout-pair{d}-order{d}-state.bin", .{ pair, order }), state);
+    }
+    if (!exact) return error.LayoutTrialParity;
+    try prefillMetadata(&s);
+    for (c.partitions, 0..) |p, rank| if (p.engine.graphs.count() != shapes[rank] or p.engine.graph_nodes != nodes[rank] or p.engine.verify_expert_graphs or p.engine.verify_gdn_graphs) return error.LayoutTrialUnqualifiedGraph;
+    if (prefillLaunches(c) != 262) return error.PrefillGraphWorkCount;
+    try j.write(.{ .kind = "layout_model_turn", .pair = pair, .order = order, .warmup = pair == 0, .layout = @tagName(layout), .times = timing, .body_calls_per_rank = 131, .graph_launches = prefillLaunches(c), .validators_enabled = false, .qualified_graph_cache_unchanged = true, .all_consumed_logits_tokens_and_state_exact = true, .logits_sha256 = &hash(std.mem.sliceAsBytes(rows)), .state_sha256 = &hash(state), .tokens = tokens });
+}
+
+fn layoutModelAB(init: std.process.Init, dir: []const u8, input: Input, j: Journal) !void {
+    var reference: LayoutReference = .{ .rows = try init.gpa.alloc(u16, input.output_tokens * 248320), .tokens = try init.gpa.alloc(u32, input.output_tokens) };
+    defer init.gpa.free(reference.rows);
+    defer init.gpa.free(reference.tokens);
+    defer if (reference.state) |state| init.gpa.free(state);
+    for (0..6) |pair| for (0..2) |order| try layoutModelArm(init, dir, input, j, pair, order, &reference);
+    try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "shared Engine immutable expert layout matched C=1 turns", .production_qualification = false, .independent_hf_quality_gate = "unchanged FAIL" });
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
@@ -715,6 +811,10 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
         };
         try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "isolated operator parity and timing screens", .production_qualification = false });
         return;
+    }
+    if (input.layout_ab) {
+        try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = "shared Engine immutable expert layout matched C=1 turns", .prefill_rows = 16, .layout_ab = true, .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
+        return layoutModelAB(init, dir, input, j);
     }
     const c = try qwen.Engine.open(init.gpa, init.io, dir, .{ .context = input.context, .cut = input.cut, .captured = !input.gdn_layout_ab and !input.expert_n8_ab and !input.verify_default_policy and !input.prefill_ab and !input.combined_ab, .prefill_rows = if (input.prefill_ab or input.combined_ab) 16 else 1 });
     defer c.deinit();
