@@ -187,3 +187,13 @@ and 4096 tokens have device evidence; cache, batched prefill, long context,
 soak and supervised restart remain unqualified. The user's conditional request
 to size and fully verify for promotion has therefore not been reached.
 No full fleet promotion run or public selection is claimed.
+
+Fable round 7 found no new medium or high issue and confirmed that those
+dispositions match the evidence. Its full report is
+[Fable round 7](evidence/approved-hour-20261019/fable-r7.md). Its durability
+observation is addressed by the supplementary full-logit archive: twelve rows
+and six receipts now reproduce all original and block-policy metrics and
+unchanged limits from extracted files. The Windows follow-up is committed
+separately and [passes the broad CPU build](windows-cpu-20261019.md), including
+the final allocator-leak cleanup. The remaining thinking-on device and
+production qualification boundaries are unchanged.
