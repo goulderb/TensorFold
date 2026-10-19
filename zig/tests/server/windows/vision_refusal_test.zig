@@ -30,6 +30,8 @@ pub fn main(init: std.process.Init) !u8 {
         return 2;
     }
     const result = try run(init, argv[1], true);
+    defer init.gpa.free(result.stdout);
+    defer init.gpa.free(result.stderr);
     const code: ?u8 = switch (result.term) {
         .exited => |c| c,
         else => null,
@@ -39,6 +41,8 @@ pub fn main(init: std.process.Init) !u8 {
     std.debug.print("{s} the server exits 1 on --vision (got {?d})\n", .{ if (exit_ok) "PASS" else "FAIL", code });
     std.debug.print("{s} the refusal names --vision and the reason (stderr: {s})\n", .{ if (message_ok) "PASS" else "FAIL", std.mem.trim(u8, result.stderr, " \r\n") });
     const control = try run(init, argv[1], false);
+    defer init.gpa.free(control.stdout);
+    defer init.gpa.free(control.stderr);
     const control_ok = std.mem.indexOf(u8, control.stderr, want_message) == null;
     std.debug.print("{s} red control: without --vision the refusal is absent\n", .{if (control_ok) "PASS" else "FAIL"});
     const ok = exit_ok and message_ok and control_ok;
