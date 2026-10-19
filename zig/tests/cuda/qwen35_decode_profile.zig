@@ -21,6 +21,8 @@ const terminal_greedy_screen = @import("qwen35_terminal_greedy_screen.zig");
 const shared_activation_screen = @import("qwen35_shared_activation_screen.zig");
 const moe_semantics_screen = @import("qwen35_moe_semantics_screen.zig");
 const terminal_graph_screen = @import("qwen35_terminal_graph_screen.zig");
+const shared_branch_screen = @import("qwen35_shared_branch_screen.zig");
+const slice_format_screen = @import("qwen35_slice_format_screen.zig");
 
 comptime {
     if (options.engine_optimization != .fast) @compileError("diagnostics require ReleaseFast engine");
@@ -707,6 +709,8 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
                 .terminal_graph => |f| try terminal_graph_screen.run(gpu, f.fixture, f.fixture_sha256, j),
                 .shared_activation => |f| try shared_activation_screen.run(gpu, f.fixture, f.fixture_sha256, f.image, f.image_sha256, j),
                 .moe_semantics => |f| try moe_semantics_screen.run(gpu, f.fixture, f.fixture_sha256, f.image, f.image_sha256, j),
+                .shared_branch => |f| try shared_branch_screen.run(gpu, f.fixture, f.fixture_sha256, f.image, f.image_sha256, j),
+                .slice_format => |f| try slice_format_screen.run(gpu, f.fixture, f.fixture_sha256, j),
             };
         };
         try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "isolated operator parity and timing screens", .production_qualification = false });
