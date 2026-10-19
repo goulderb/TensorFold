@@ -303,6 +303,16 @@ fallback for nonfinite scores. Expert screens reuse TensorFold's existing
 NVFP4 kernels and adapt its existing benchmark. No external router kernel
 is imported, and the original notices and donor credits remain applicable.
 
+The shared-engine ModelOpt overlay adapts these retained operations in
+`zig/kernels/cuda/qwen35_hf.cu` to upstream Qwen's Geo/Seg tables, read-only
+convolution tails and head-major KV layout. Its residual normalization follows
+TensorFold's existing `norms.cu` vector reduction. The overlay preserves the
+cooperative router products, parallel stable selector and ordered softmax.
+Checkpoint packing uses TensorFold's existing ModelOpt, qlinear and NVFP4
+expert implementations. The two-device coordinator transfers both residual
+buffers through pinned host memory and shares the upstream Qwen layer body.
+No additional external kernel source is imported by this consolidation.
+
 ## Pictures in the native engine
 
 `zig/src/core/picture/` reads PNG, JPEG and WebP pictures to the RGB pixels Pillow loads them as (Pillow 12.3 for

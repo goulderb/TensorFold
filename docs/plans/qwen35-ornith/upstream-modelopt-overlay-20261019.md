@@ -125,3 +125,33 @@ primitive rows, eager/captured parity, alternating-session state isolation,
 reset/poison behavior and a canonical restored Nemotron completion. Profiled
 runs remain separate from performance measurements. Fleet full verification
 is reserved for a candidate that passes prerequisite production gates.
+
+## Continue tuning after shared-path acceptance
+
+Preserve the earned cooperative router products and parallel stable selector
+when adapting their ABI. The old up-only n16_pipe4 choice remains a candidate
+until it passes a new shared-path comparison. A source port cannot inherit the
+old 107.144 tok/s result. Rebuild a changing-token, changing-position baseline
+and inspect actual graph functions and launch dimensions before comparing it.
+
+The next experiments each change one mechanism:
+
+| Mechanism | Cheapest useful experiment | Condition for a full model trial |
+| --- | --- | --- |
+| Expert CTA grouping | Compare the existing one-warp decode with four-warp baseline and n16_pipe4 on retained real expert banks. Keep up and down decisions separate. | Exact outputs and a repeatable saving whose call-count projection clears the turn-time gate. |
+| GDN persistent layout | Transpose state at initialization and compare all logical state and output bytes through changing inputs over 64 rotating states. Keep ordered scalar arithmetic. | A projected saving above 5% of the new matched turn time. The rejected shared-staging experiment does not answer this layout question. |
+| Dense projection input quantization | Audit actual shared input scales, then time reuse of one quantized activation across compatible projections. The a and b projections are BF16. | The affected time must justify integration. Do not concatenate projections with incompatible scaling or promote a sub-1% bound into a full trial. |
+| Tensor parallel transport | Measure pinned-host round trips at the real residual payload and collective count before designing tensor splits. | A critical-path model, including collective latency and reduced kernel efficiency, predicts a material gain on this physical pair. |
+| Remaining memory or issue bottleneck | Collect a bounded exact-symbol counter report only when it distinguishes the next two candidate changes. | Validate kernel, device and finite counter rows separately from report existence. Use an unprofiled run for the speed comparison. |
+
+The historical 409 tok/s calculation is an uncached logical weight-stream
+reference for the serial layer split. The ratio of observed throughput to
+that reference is not measured bandwidth utilization. Repacked weights,
+state, KV traffic, cache residency, launch cost and idle time need separate
+accounting. Two GPUs' peak bandwidths cannot be added for serial stages.
+
+Stop at diminishing returns only when the material mechanisms have measured
+outcomes or falsified payoff bounds on the accepted path. Keep numerical
+correctness, serving features, capacity and promotion as explicit gates.
+Missing features or a failed reference comparison do not demonstrate a
+hardware scaling limit.

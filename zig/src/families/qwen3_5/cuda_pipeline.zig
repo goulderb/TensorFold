@@ -187,8 +187,8 @@ pub const Session = struct {
             try checkCapacity((try p.context.memInfo()).free, floor_bytes);
         }
         for (s.caches[0..c.partitions.len]) |*cache| {
-            cache.len += 1;
-            cache.written = cache.len;
+            const parts = [_]engine.Part{.{ .cache = cache, .rows = 1 }};
+            engine.Engine.commit(&parts, false);
         }
         @memcpy(s.logits, s.caches[c.partitions.len - 1].logits);
         s.position += 1;

@@ -504,6 +504,7 @@ pub const Engine = struct {
     }
 
     pub fn execute(e: *Engine, shape: Shape) !void {
+        if (e.observer != null and e.captured) return error.QwenObserverRequiresEager;
         if (shape.prompt and e.numerics == .mlx_sanitized or !e.captured) {
             // uncaptured: a prompt chunk's GEMMs dwarf its launches, and each length's graph would pay the stall
             try e.body(shape);
@@ -667,7 +668,7 @@ pub const Engine = struct {
                 },
                 .moe => |m| try e.routedRows(m.router, m.experts, m.shared, e.x, e.r, total, prompt and total > most_window),
             }
-            if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
+            if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == e.placement.first + i) {
                 try e.run(e.fns.tap, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
             };
         }
