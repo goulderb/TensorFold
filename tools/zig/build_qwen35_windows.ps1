@@ -1,7 +1,7 @@
 #requires -Version 7.0
 [CmdletBinding()]
 param(
-    [ValidateSet('test-qwen35-cuda-host', 'native', 'fatbins', 'qwen35-probe', 'qwen35-kernels-probe')]
+    [ValidateSet('test-qwen35-cuda-host', 'test-qwen35-sampler-turn', 'native', 'fatbins', 'qwen35-probe', 'qwen35-kernels-probe', 'qwen35-head-cost', 'qwen35-sampler-ab')]
     [string]$Target = 'test-qwen35-cuda-host',
     [string]$Zig = 'C:/Users/developer/tools/zig-0.17.0/zig-x86_64-windows-0.17.0/zig.exe',
     [string]$CudaRoot = 'C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8',
@@ -9,11 +9,17 @@ param(
     [string]$MsvcVersion = '14.44.35207',
     [ValidateRange(1, 32)]
     [int]$Jobs = 2,
+    [string]$SourceCommit = '',
     [switch]$WithoutKernels
 )
 
 $ErrorActionPreference = 'Stop'
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '../..')).Path
+if (-not $SourceCommit) {
+    $SourceCommit = (& git -C $repo rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve probe source revision' }
+}
+if ($SourceCommit -cnotmatch '^[0-9a-f]{40}$') { throw 'SourceCommit must be a full lowercase commit SHA' }
 $vcvars = Join-Path $BuildTools 'VC/Auxiliary/Build/vcvars64.bat'
 $compiler = Join-Path $BuildTools "VC/Tools/MSVC/$MsvcVersion/bin/Hostx64/x64/cl.exe"
 $nvcc = Join-Path $CudaRoot 'bin/nvcc.exe'
@@ -56,6 +62,7 @@ $build.Environment['INCLUDE'] = (Join-Path $BuildTools "VC/Tools/MSVC/$MsvcVersi
 foreach ($argument in @('build', $Target, "-j$Jobs", '--summary', 'all')) {
     $build.ArgumentList.Add($argument)
 }
+$build.ArgumentList.Add("-Dqwen35-probe-source=$SourceCommit")
 if (-not $WithoutKernels) {
     $build.ArgumentList.Add("-Dnvcc=$nvcc")
     $build.ArgumentList.Add('-Dsm=120')

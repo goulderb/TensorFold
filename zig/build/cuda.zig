@@ -149,6 +149,28 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         },
     }) });
     b.step("qwen35-kernels-probe", "Build only the Qwen35 device-kernel parity probe; never run it").dependOn(&b.addInstallArtifact(qwen_kernels_probe, .{}).step);
+    const qwen_bench_options = b.addOptions();
+    qwen_bench_options.addOption(std.builtin.OptimizeMode, "engine_optimization", optimize);
+    qwen_bench_options.addOption([]const u8, "source_commit", b.option([]const u8, "qwen35-probe-source", "Source revision embedded in the Qwen tuning probes") orelse "unrecorded");
+    const qwen_head_cost = b.addExecutable(.{ .name = "tf-qwen35-head-cost", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/qwen35_head_cost.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core) }, .{ .name = "cuda", .module = cuda } },
+    }) });
+    qwen_head_cost.root_module.addOptions("qwen_bench_options", qwen_bench_options);
+    b.step("qwen35-head-cost", "Build only the Qwen35 final norm and head cost probe; never run it").dependOn(&b.addInstallArtifact(qwen_head_cost, .{}).step);
+    const sampler_before = b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/qwen35/sampler_before.zig"), .target = target, .optimize = .ReleaseFast });
+    const qwen_sampler_ab = b.addExecutable(.{ .name = "tf-qwen35-sampler-ab", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/qwen35_sampler_ab.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core) }, .{ .name = "cuda", .module = cuda }, .{ .name = "lanes", .module = mods.lanes }, .{ .name = "sampler_before", .module = sampler_before } },
+    }) });
+    qwen_sampler_ab.root_module.addOptions("qwen_bench_options", qwen_bench_options);
+    b.step("qwen35-sampler-ab", "Build only the paired Qwen35 sampler turn benchmark; never run it").dependOn(&b.addInstallArtifact(qwen_sampler_ab, .{}).step);
     return server_exe;
 }
 
@@ -384,6 +406,17 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     qwen35_run.has_side_effects = true;
     const qwen35_step = b.step("test-qwen35-cuda-host", "Qwen35 CUDA checkpoint and execution contracts without GPU work");
     qwen35_step.dependOn(&qwen35_run.step);
+    const sampler_turn = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/qwen35_sampler_turn.zig"),
+        .target = host,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "lanes", .module = mods.lanes },
+            .{ .name = "sampler_before", .module = b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/qwen35/sampler_before.zig"), .target = host, .optimize = .ReleaseFast }) },
+        },
+    });
+    b.step("test-qwen35-sampler-turn", "CPU-only sampler turn call-count and fixed-work contracts").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = sampler_turn })).step);
     const qwen35_probe_admission = b.createModule(.{
         .root_source_file = b.path("zig/tests/cuda/qwen35_probe_device.zig"),
         .target = host,

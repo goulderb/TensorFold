@@ -216,6 +216,19 @@ and notices remain unchanged.
 
 ## Retain notices in future changes and releases
 
+The next tuning probes retain the entire original shared sampler at local
+revision `ad247b3daf045015d59bd106a88591bff961e488` as
+`zig/tests/fixtures/qwen35/sampler_before.zig`. It is a byte-identical
+benchmark control, not newly authored sampling logic. Its SHA256 is
+`c8656618cdcabd582388cf25dca2dc0b1d05333266311aebf1cfb0b61b206c41`.
+The head probe reuses the existing Qwen loader and shared norm/NVFP4 CUDA
+operators. `tools/zig/record_qwen35_head.py` reuses the existing Qwen CPU
+reference implementation to generate residual, norm and head-output data;
+the fixture manifest pins that reference source. No new external kernel,
+checkpoint weight or license text is imported by these probes. Original
+and transitive TensorFold, Qwen, NVIDIA and other retained donor credits
+continue to apply to their existing implementations.
+
 Keep original copyright headers, licenses, `NOTICE`, and credit files.
 Record immutable source revisions and state what changed. Preserve transitive
 donor credits and distinguish adaptations from design-only references.
