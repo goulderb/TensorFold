@@ -268,8 +268,10 @@ const Buffers = struct {
                 b.dtoh_bytes += row_bytes;
                 try stream.synchronize();
                 b.row_sync_count += 1;
-                const dst = b.snapshots[index * vocab ..][0..vocab];
-                @memcpy(dst, b.host_logits.slice(u16)[guard / 2 ..][0..vocab]);
+                if (qualify) {
+                    const dst = b.snapshots[index * vocab ..][0..vocab];
+                    @memcpy(dst, b.host_logits.slice(u16)[guard / 2 ..][0..vocab]);
+                }
                 b.picks[index] = .{ .token = try argmax(b.host_logits.slice(u16)[guard / 2 ..][0..vocab]), .nonfinite = 0 };
             },
             .device => {
@@ -320,7 +322,7 @@ fn evidence(gpu: check.Gpu, b: *Buffers, source: []const u8, expected: []const u
     const guard_name = try std.fmt.allocPrint(gpu.gpa, "{s}_device_guard", .{name});
     defer gpu.gpa.free(guard_name);
     try save(gpu, journal, guard_name, raw_pick);
-    if (arm == .host or qualify) {
+    if (qualify) {
         const snapshot_name = try std.fmt.allocPrint(gpu.gpa, "{s}_copied_rows", .{name});
         defer gpu.gpa.free(snapshot_name);
         const snapshot = std.mem.sliceAsBytes(b.snapshots);
@@ -480,7 +482,7 @@ pub fn run(gpu: check.Gpu, fixture_dir: []const u8, manifest_sha: []const u8, jo
     try save(gpu, journal, "consumed_logits", uploaded);
     try canaries(uploaded, source.len);
     try check.sameBytes("terminal uploaded logits", uploaded[guard..][0..source.len], source);
-    try journal.write(.{ .kind = "terminal_graph_scope", .ordinal = gpu.ctx.device_ordinal, .manifest_sha256 = manifest_sha, .fixture_sha256 = manifest.sha256, .tree_image_sha256 = manifest.tree_image_sha256, .argmax_sha256 = manifest.argmax_sha256, .rows = rows, .vocab = vocab, .input_ptr = buffers.logits.ptr + guard, .hot_ptr = buffers.hot.ptr + guard, .pick_ptr = buffers.pick.ptr + guard, .input_guard_bytes = guard, .pick_bytes = @sizeOf(Pick), .host_row_bytes = row_bytes, .included = "common captured D2D carrier+one graph launch per row; full-row pinned D2H+row sync+diagnostic memcpy/hot-row argmax versus graph strict argmax+8byte pinned D2H+row sync+CPU status/token validation", .excluded = "Engine cache.logits copy, Session.logits copy, model/head compute and fullmodel saving", .launch_mode = "128 immutable captured graphs per arm; one serial graph launch per row; no graph node updates", .event_scope = "whole stream span including host gaps; not isolated kernel time", .free_bytes = try freeBytes(gpu) });
+    try journal.write(.{ .kind = "terminal_graph_scope", .ordinal = gpu.ctx.device_ordinal, .manifest_sha256 = manifest_sha, .fixture_sha256 = manifest.sha256, .tree_image_sha256 = manifest.tree_image_sha256, .argmax_sha256 = manifest.argmax_sha256, .rows = rows, .vocab = vocab, .input_ptr = buffers.logits.ptr + guard, .hot_ptr = buffers.hot.ptr + guard, .pick_ptr = buffers.pick.ptr + guard, .input_guard_bytes = guard, .pick_bytes = @sizeOf(Pick), .host_row_bytes = row_bytes, .included = "common captured D2D carrier+one graph launch per row; full-row pinned D2H+row sync+pinned hot-row argmax without archival copy versus graph strict argmax+8byte pinned D2H+row sync+CPU status/token validation", .excluded = "Engine cache.logits copy, Session.logits copy, model/head compute and fullmodel saving", .launch_mode = "128 immutable captured graphs per arm; one serial graph launch per row; no graph node updates", .event_scope = "whole stream span including host gaps; not isolated kernel time", .free_bytes = try freeBytes(gpu) });
     try journal.write(.{ .kind = "terminal_graph_resources", .ordinal = gpu.ctx.device_ordinal, .symbol = try kernelName(kernels.argmax_fn), .function_handle = @intFromPtr(kernels.argmax_fn.handle), .regs = try kernels.argmax_fn.attribute(.num_regs), .local_bytes = try kernels.argmax_fn.attribute(.local_size_bytes), .static_shared_bytes = try kernels.argmax_fn.attribute(.shared_size_bytes), .dynamic_shared_bytes = 0, .grid = [_]u32{ 1, 1, 1 }, .block = [_]u32{ 256, 1, 1 }, .evidence = "actual resolved function/resources plus captured kernel ABI/function/geometry/dependency readback; memcpy source/destination/bytes are request-only" });
     try semantics(gpu, &kernels, stream, &buffers, journal);
     for ([_]Arm{ .host, .device }) |arm| {
@@ -517,7 +519,7 @@ pub fn run(gpu: check.Gpu, fixture_dir: []const u8, manifest_sha: []const u8, jo
             walls[ai][pair - 1] = wall_ms;
             events[ai][pair - 1] = event_ms;
         }
-        try journal.write(.{ .kind = "terminal_graph_sample", .ordinal = gpu.ctx.device_ordinal, .arm = @tagName(arm), .pair = pair, .order = order, .warmup = pair == 0, .rows = rows, .dtoh_count = buffers.dtoh_count, .dtoh_bytes = buffers.dtoh_bytes, .row_sync_count = buffers.row_sync_count, .event_sync_count = 1, .kernel_launches = buffers.kernel_launches, .graph_launches = buffers.graph_launches, .producer_copies = buffers.producer_copies, .producer_bytes = buffers.producer_bytes, .qualification_dtoh_count = buffers.qualification_dtoh_count, .diagnostic_copy_bytes = if (arm == .host) rows * row_bytes else @as(usize, 0), .cpu_argmax_count = if (arm == .host) rows else @as(usize, 0), .cpu_pick_validation_count = if (arm == .device) rows else @as(usize, 0), .wall_ms = wall_ms, .event_ms = event_ms, .outputs_consumed = rows, .free_bytes = try freeBytes(gpu) });
+        try journal.write(.{ .kind = "terminal_graph_sample", .ordinal = gpu.ctx.device_ordinal, .arm = @tagName(arm), .pair = pair, .order = order, .warmup = pair == 0, .rows = rows, .dtoh_count = buffers.dtoh_count, .dtoh_bytes = buffers.dtoh_bytes, .row_sync_count = buffers.row_sync_count, .event_sync_count = 1, .kernel_launches = buffers.kernel_launches, .graph_launches = buffers.graph_launches, .producer_copies = buffers.producer_copies, .producer_bytes = buffers.producer_bytes, .qualification_dtoh_count = buffers.qualification_dtoh_count, .diagnostic_copy_bytes = @as(usize, 0), .cpu_argmax_count = if (arm == .host) rows else @as(usize, 0), .cpu_pick_validation_count = if (arm == .device) rows else @as(usize, 0), .wall_ms = wall_ms, .event_ms = event_ms, .outputs_consumed = rows, .free_bytes = try freeBytes(gpu) });
     };
     for ([_]Arm{ .host, .device }, 0..) |arm, ai| {
         const name = try std.fmt.allocPrint(gpu.gpa, "after_{s}", .{@tagName(arm)});
@@ -699,29 +701,36 @@ test "terminal graph row launches one carrier graph and consumes the pinned hot 
     const copied = archive[vocab..][0..vocab];
     try std.testing.expect(pinned.ptr != copied.ptr);
     try std.testing.expectEqualSlices(u16, source[vocab..], pinned);
+    for (copied) |value| try std.testing.expectEqual(@as(u16, 0xffff), value);
+    try std.testing.expectEqual(@as(u32, 7), b.picks[1].token);
+    try b.row(gpu, &graphs, stream, .host, 1, true);
     try std.testing.expectEqualSlices(u16, pinned, copied);
     try std.testing.expectEqual(@as(u32, 7), b.picks[1].token);
     copied[7] = 0;
     try std.testing.expectEqual(@as(u32, 257), try argmax(copied));
     try std.testing.expectEqual(@as(u32, 7), try argmax(pinned));
+    try b.row(gpu, &graphs, stream, .host, 1, false);
+    try std.testing.expectEqual(@as(u32, 257), try argmax(copied));
+    try std.testing.expectEqual(@as(u32, 7), b.picks[1].token);
     try b.row(gpu, &graphs, stream, .device, 1, false);
     try std.testing.expectEqual(@as(u32, 7), b.picks[1].token);
-    try std.testing.expectEqual(@as(usize, 2), b.graph_launches);
-    try std.testing.expectEqual(@as(usize, 2), b.producer_copies);
-    try std.testing.expectEqual(@as(usize, 2 * row_bytes), b.producer_bytes);
+    try std.testing.expectEqual(@as(u32, 257), try argmax(copied));
+    try std.testing.expectEqual(@as(usize, 4), b.graph_launches);
+    try std.testing.expectEqual(@as(usize, 4), b.producer_copies);
+    try std.testing.expectEqual(@as(usize, 4 * row_bytes), b.producer_bytes);
     try std.testing.expectEqual(@as(usize, 1), b.kernel_launches);
-    try std.testing.expectEqual(@as(usize, 2), b.dtoh_count);
-    try std.testing.expectEqual(@as(usize, row_bytes + @sizeOf(Pick)), b.dtoh_bytes);
+    try std.testing.expectEqual(@as(usize, 4), b.dtoh_count);
+    try std.testing.expectEqual(@as(usize, 3 * row_bytes + @sizeOf(Pick)), b.dtoh_bytes);
     try std.testing.expectEqual(@as(usize, 0), b.qualification_dtoh_count);
-    try std.testing.expectEqual(@as(usize, 2), Fake.graphs);
-    try std.testing.expectEqual(@as(usize, 2), Fake.copies);
-    try std.testing.expectEqual(@as(usize, 2), Fake.syncs);
+    try std.testing.expectEqual(@as(usize, 4), Fake.graphs);
+    try std.testing.expectEqual(@as(usize, 4), Fake.copies);
+    try std.testing.expectEqual(@as(usize, 4), Fake.syncs);
     try b.row(gpu, &graphs, stream, .device, 1, true);
     try std.testing.expectEqualSlices(u16, source[vocab..], copied);
     try std.testing.expectEqual(@as(usize, 1), b.qualification_dtoh_count);
-    try std.testing.expectEqual(@as(usize, 3), Fake.graphs);
-    try std.testing.expectEqual(@as(usize, 4), Fake.copies);
-    try std.testing.expectEqual(@as(usize, 4), Fake.syncs);
+    try std.testing.expectEqual(@as(usize, 5), Fake.graphs);
+    try std.testing.expectEqual(@as(usize, 6), Fake.copies);
+    try std.testing.expectEqual(@as(usize, 6), Fake.syncs);
     for ([_][]const u8{ host, hot }) |bytes| try canaries(bytes, row_bytes);
     for ([_][]const u8{ host_pick, pick }) |bytes| try canaries(bytes, @sizeOf(Pick));
 }
