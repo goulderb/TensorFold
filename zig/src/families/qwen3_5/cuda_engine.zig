@@ -56,6 +56,23 @@ pub const Images = struct {
     pos: []const i32, // [3][prompt]: t, h and w rotary positions (get_rope_index)
 };
 
+test "GDN layouts have distinct graph keys for identical forward geometry" {
+    const baseline: Engine.Shape = .{ .total = 1, .nseg = 1, .record = false, .prompt = true, .taps = false };
+    var candidate = baseline;
+    candidate.gdn_layout = .key_value;
+    try std.testing.expectEqual(@as(u32, 1 << 19), baseline.key() ^ candidate.key());
+}
+
+test "mixed GDN layouts fail before settling caches or touching CUDA" {
+    var e: Engine = undefined;
+    var baseline: Cache = undefined;
+    baseline.gdn_layout = .value_key;
+    var candidate: Cache = undefined;
+    candidate.gdn_layout = .key_value;
+    const parts = [_]Part{ .{ .cache = &baseline, .rows = 1 }, .{ .cache = &candidate, .rows = 1 } };
+    try std.testing.expectError(error.MixedQwenGdnLayouts, e.prepare(&parts, &.{ 0, 0 }, .last));
+}
+
 /// What a forward keeps: a prompt chunk its last row's logits, a verify window every row's draw or logits and log.
 pub const Keep = union(enum) { last, draws: []const Draw, logits };
 
@@ -75,6 +92,9 @@ pub const Engine = struct {
     captured: bool = true,
     graph_nodes: usize = 0,
     graph_launches: usize = 0,
+    verify_gdn_graphs: bool = false,
+    gdn_graph_nodes_baseline: usize = 0,
+    gdn_graph_nodes_candidate: usize = 0,
     observer: ?Observer = null,
     observed_layer: usize = 0,
     geo: Geo,
@@ -186,6 +206,9 @@ pub const Engine = struct {
         e.captured = true;
         e.graph_nodes = 0;
         e.graph_launches = 0;
+        e.verify_gdn_graphs = false;
+        e.gdn_graph_nodes_baseline = 0;
+        e.gdn_graph_nodes_candidate = 0;
         e.observer = null;
         e.observed_layer = 0;
         e.geo = .{ .hid = @intCast(g.hidden), .nk = @intCast(g.k_heads), .nv = @intCast(g.v_heads), .qh = @intCast(g.q_heads), .kvh = @intCast(g.kv_heads), .nl = @intCast(g.deltas()) };
@@ -437,6 +460,10 @@ pub const Engine = struct {
     }
 
     pub fn prepare(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !Shape {
+        if (parts.len == 0 or parts.len > max_segs) return error.InvalidQwenSegments;
+        const gdn_layout = parts[0].cache.gdn_layout;
+        for (parts[1..]) |p| if (p.cache.gdn_layout != gdn_layout) return error.MixedQwenGdnLayouts;
+        try gdn_layout.validate(e.numerics);
         const g = e.g;
         if (e.numerics == .hf_modelopt) {
             if (parts.len != 1 or ids.len != 1 or parts[0].rows != 1 or keep != .last) return error.UnsupportedQwenWindow;
@@ -498,13 +525,14 @@ pub const Engine = struct {
         const lone = total == 1 and parts.len == 1;
         const bucket: usize = if (lone) 1 else if (total <= 16) 16 else most_verify;
         const windows: usize = if (lone) 1 else max_segs;
-        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0 };
+        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout };
         e.features = if (images) |im| im.features else 0;
         return shape;
     }
 
     pub fn execute(e: *Engine, shape: Shape) !void {
         if (e.observer != null and e.captured) return error.QwenObserverRequiresEager;
+        try shape.gdn_layout.validate(e.numerics);
         if (shape.prompt and e.numerics == .mlx_sanitized or !e.captured) {
             // uncaptured: a prompt chunk's GEMMs dwarf its launches, and each length's graph would pay the stall
             try e.body(shape);
@@ -522,12 +550,53 @@ pub const Engine = struct {
                 var captured = try cuda.graph.endCapture(e.stream);
                 defer captured.deinit();
                 const nodes = try captured.nodeCount();
+                const gdn_nodes = if (e.verify_gdn_graphs) try e.verifyGdnGraph(captured, shape, nodes) else 0;
                 gop.value_ptr.* = try captured.instantiate();
                 e.graph_nodes += nodes;
+                switch (shape.gdn_layout) {
+                    .value_key => e.gdn_graph_nodes_baseline += gdn_nodes,
+                    .key_value => e.gdn_graph_nodes_candidate += gdn_nodes,
+                }
             }
             try gop.value_ptr.launchOn(e.stream);
             e.graph_launches += 1;
         }
+    }
+
+    fn verifyGdnGraph(e: *const Engine, graph: cuda.graph.Graph, shape: Shape, node_count: usize) !usize {
+        const bindings = e.modelopt orelse return error.UnsupportedQwenGdnLayout;
+        const baseline = e.fns.gdn_chain.handle;
+        const candidate = bindings.gdn_chain_transposed.handle;
+        if (baseline == candidate) return error.QwenGdnGraphKernelMismatch;
+        const expected = switch (shape.gdn_layout) {
+            .value_key => baseline,
+            .key_value => candidate,
+        };
+        const storage = try e.gpa.alloc(cuda.graph.Node, node_count);
+        defer e.gpa.free(storage);
+        const nodes = try graph.nodes(storage);
+        if (nodes.len != node_count) return error.QwenGdnGraphWorkCountMismatch;
+        const launch: hf.Launches = .{};
+        var layers_seen: [geometry.max_layers]bool = @splat(false);
+        var count: usize = 0;
+        for (nodes) |node| {
+            var params: cuda.abi.KernelNodeParams = undefined;
+            try e.d.check(e.d.api.cuGraphKernelNodeGetParams_v2(node, &params), "cuGraphKernelNodeGetParams");
+            if (params.func != baseline and params.func != candidate) continue;
+            if (params.func != expected or params.grid_x != 1 or params.grid_y != launch.gdn_chain_grid_y or
+                params.grid_z != e.g.v_heads * shape.nseg or params.block_x != launch.gdn_chain[0] or
+                params.block_y != launch.gdn_chain[1] or params.block_z != launch.gdn_chain[2] or params.shared_bytes != 0)
+                return error.QwenGdnGraphKernelMismatch;
+            const args = params.params orelse return error.QwenGdnGraphMissingArguments;
+            const layer: *const c_int = @ptrCast(@alignCast(args[8] orelse return error.QwenGdnGraphMissingArguments));
+            if (layer.* < 0 or layer.* >= e.g.deltas()) return error.QwenGdnGraphLayerMismatch;
+            const index: usize = @intCast(layer.*);
+            if (layers_seen[index]) return error.QwenGdnGraphLayerMismatch;
+            layers_seen[index] = true;
+            count += 1;
+        }
+        if (count != e.g.deltas()) return error.QwenGdnGraphWorkCountMismatch;
+        return count;
     }
 
     pub fn commit(parts: []const Part, record: bool) void {
@@ -576,9 +645,10 @@ pub const Engine = struct {
         record: bool,
         prompt: bool,
         taps: bool,
+        gdn_layout: Cache.GdnLayout = .value_key,
 
         fn key(s: Shape) u32 {
-            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18;
+            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19;
         }
     };
 
@@ -604,6 +674,10 @@ pub const Engine = struct {
         const group = g.q_heads / g.kv_heads;
         const is_hf = e.numerics == .hf_modelopt;
         const launch: hf.Launches = .{};
+        const gdn_chain = switch (shape.gdn_layout) {
+            .value_key => e.fns.gdn_chain,
+            .key_value => e.modelopt.?.gdn_chain_transposed,
+        };
 
         e.observed_layer = e.placement.first;
         try e.mark(.begin);
@@ -630,7 +704,7 @@ pub const Engine = struct {
                     try e.mark(.gdn_pre);
                     try e.run(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
                     try e.mark(.conv_commit);
-                    try e.run(e.fns.gdn_chain, .{ 1, if (is_hf) launch.gdn_chain_grid_y else geometry.dk / 4, g.v_heads * nseg }, if (is_hf) launch.gdn_chain else .{ 32, 4, 1 }, .{ geo, e.q, e.k, e.v, e.g_, e.beta, t_segs, t_par, layer, e.y, t_params });
+                    try e.run(gdn_chain, .{ 1, if (is_hf) launch.gdn_chain_grid_y else geometry.dk / 4, g.v_heads * nseg }, if (is_hf) launch.gdn_chain else .{ 32, 4, 1 }, .{ geo, e.q, e.k, e.v, e.g_, e.beta, t_segs, t_par, layer, e.y, t_params });
                     try e.mark(.gdn_chain);
                     try e.run(e.fns.gdn_post, .{ 1, g.v_heads, total }, .{ if (is_hf) launch.gdn_post else 32, 1, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params });
                     try e.mark(.gdn_post);

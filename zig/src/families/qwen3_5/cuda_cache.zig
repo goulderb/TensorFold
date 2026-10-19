@@ -15,6 +15,17 @@ pub const Seg = extern struct { rec: u64, conv: u64, kv: u64, tap: u64, log: u64
 pub const Path = extern struct { n: c_int, rows: [engine.most_window]c_int };
 
 pub const Cache = struct {
+    pub const GdnLayout = enum(u1) {
+        value_key,
+        key_value,
+
+        pub fn validate(layout: GdnLayout, numerics: @import("cuda_checkpoint.zig").Numerics) !void {
+            if (layout == .key_value and numerics != .hf_modelopt) return error.UnsupportedQwenGdnLayout;
+        }
+    };
+
+    /// Fixed when allocated. Reset preserves the recurrence's physical axes.
+    gdn_layout: GdnLayout = .value_key,
     state: DeviceBuffer,
     kv: DeviceBuffer,
     /// A drafter's tapped rows (`Engine.taps`), a ring of tap_rows: the row at position p in slot p % tap_rows.
@@ -32,6 +43,11 @@ pub const Cache = struct {
     delta: i32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, e: *const Engine, cap: usize) !Cache {
+        return initWithLayout(gpa, e, cap, .value_key);
+    }
+
+    pub fn initWithLayout(gpa: std.mem.Allocator, e: *const Engine, cap: usize, layout: GdnLayout) !Cache {
+        try layout.validate(e.numerics);
         var state = try DeviceBuffer.alloc(e.d, e.g.stateBytes());
         errdefer state.free();
         try state.fill8(0, null);
@@ -47,7 +63,7 @@ pub const Cache = struct {
             try tap.?.fill8(0, null);
         }
         errdefer if (tap) |*t| t.free();
-        return .{ .state = state, .kv = kv, .tap = tap, .log = log, .cap = cap, .logits = try gpa.alloc(u16, e.g.vocab) };
+        return .{ .gdn_layout = layout, .state = state, .kv = kv, .tap = tap, .log = log, .cap = cap, .logits = try gpa.alloc(u16, e.g.vocab) };
     }
 
     /// Ready for another stream: no rows, the recurrences and tails zero (on the engine's stream, before its forwards).
@@ -102,3 +118,9 @@ pub const Cache = struct {
         try self.keep(e, all[0..last.rows]);
     }
 };
+
+test "MLX rejects candidate GDN state before allocating device memory" {
+    var e: Engine = undefined;
+    e.numerics = .mlx_sanitized;
+    try std.testing.expectError(error.UnsupportedQwenGdnLayout, Cache.initWithLayout(std.testing.allocator, &e, 1, .key_value));
+}

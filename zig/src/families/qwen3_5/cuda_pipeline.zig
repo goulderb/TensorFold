@@ -112,6 +112,11 @@ pub const Chain = struct {
     }
 
     pub fn createSession(c: *Chain) !Session {
+        return c.createSessionWithLayout(.value_key);
+    }
+
+    pub fn createSessionWithLayout(c: *Chain, layout: engine.Cache.GdnLayout) !Session {
+        for (c.partitions) |p| try layout.validate(p.engine.numerics);
         var s: Session = .{ .chain = c, .caches = undefined, .logits = try c.gpa.alloc(u16, c.config.geometry.vocab) };
         errdefer c.gpa.free(s.logits);
         var made: usize = 0;
@@ -122,7 +127,7 @@ pub const Chain = struct {
         for (c.partitions, 0..) |*p, i| {
             try p.context.makeCurrent();
             try checkCapacity((try p.context.memInfo()).free, p.engine.streamBytes(c.context) + floor_bytes);
-            s.caches[i] = try engine.Cache.init(c.gpa, p.engine, c.context);
+            s.caches[i] = try engine.Cache.initWithLayout(c.gpa, p.engine, c.context, layout);
             made += 1;
             try checkCapacity((try p.context.memInfo()).free, floor_bytes);
         }

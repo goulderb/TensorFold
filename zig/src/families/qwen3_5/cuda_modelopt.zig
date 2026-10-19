@@ -4,6 +4,8 @@ const layers = @import("cuda_layers.zig");
 
 pub const Bindings = struct {
     image: cuda.Module,
+    gdn_layout_image: cuda.Module,
+    gdn_chain_transposed: cuda.Function,
     lane: cuda.qmmf.Lane,
     prompt: cuda.nvfp4.Prompt,
     nvfp4_experts: cuda.experts.Nvfp4Experts,
@@ -19,6 +21,9 @@ pub const Bindings = struct {
         const sms: usize = @intCast(try ctx.attribute(.multiprocessor_count));
         var image = try cuda.Module.load(ctx.d, cuda.kernels.qwen35_hf);
         errdefer image.unload();
+        var gdn_layout_image = try cuda.Module.load(ctx.d, cuda.kernels.qwen35_gdn_layout);
+        errdefer gdn_layout_image.unload();
+        const gdn_chain_transposed = try gdn_layout_image.function("tf_q35_hf_gdn_chain_transposed");
         var lane = try cuda.qmmf.Lane.load(ctx.d, major);
         errdefer lane.unload();
         var prompt = try cuda.nvfp4.Prompt.load(ctx.d);
@@ -30,7 +35,7 @@ pub const Bindings = struct {
         var ck = try cuda.ck.Ck.load(ctx.d, major, sms);
         errdefer ck.unload();
         try hf.bind(image, fns);
-        return .{ .image = image, .lane = lane, .prompt = prompt, .nvfp4_experts = experts, .pack = pack, .ck = ck, .router = try hf.Router.resolve(image) };
+        return .{ .image = image, .gdn_layout_image = gdn_layout_image, .gdn_chain_transposed = gdn_chain_transposed, .lane = lane, .prompt = prompt, .nvfp4_experts = experts, .pack = pack, .ck = ck, .router = try hf.Router.resolve(image) };
     }
 
     pub fn unload(b: *Bindings) void {
@@ -39,6 +44,7 @@ pub const Bindings = struct {
         b.nvfp4_experts.unload();
         b.prompt.unload();
         b.lane.unload();
+        b.gdn_layout_image.unload();
         b.image.unload();
     }
 
