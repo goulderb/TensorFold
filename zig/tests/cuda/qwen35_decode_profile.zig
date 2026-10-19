@@ -188,6 +188,10 @@ fn layoutControls(init: std.process.Init, s: *qwen.Session, peer: *qwen.Session,
 
 fn layoutAB(init: std.process.Init, c: *qwen.Engine, input: Input, output: []const u8, j: Journal) !void {
     const a = init.gpa;
+    for (c.partitions) |p| {
+        const g = p.engine.g;
+        if (p.engine.kv8 or g.recBytes() != g.v_heads * 128 * 128 * 4 or g.kvBytes(c.context, false) != g.attentions() * 2 * g.kv_heads * c.context * 256 * 2) return error.UnsupportedCanonicalStateGeometry;
+    }
     var baseline = try c.createSession();
     defer baseline.deinit();
     var candidate = try c.createSessionWithLayout(.key_value);
