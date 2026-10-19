@@ -1,7 +1,7 @@
 # Moving beyond 81.7 tok/s
 
-This is a source- and evidence-based plan after independent Astra, Fable5.1
-and KimiK3 consultation. Source is 2daf7f4ef00753013137b57ba7b02629b9a77033.
+This is a source- and evidence-based plan after independent Astra, Fable 5.1
+and Kimi K3 consultation. Source is 2daf7f4ef00753013137b57ba7b02629b9a77033.
 The [completed device investigation](gpu-investigation-20261019.md) remains
 the measured baseline. No new GPU experiment or outage occurred for this plan.
 
@@ -31,11 +31,12 @@ per decoded token; these gates are not interchangeable. For work affecting all
 
 1. **Expert tile/pipeline variants.** Qwen dispatches baseline at
    `zig/src/cuda/experts.zig:352`; pipe4, n16 and n16_pipe4 already exist.
-   At top8, hidden2048 and intermediate512, up has 32 blocks while n16 exposes
+   At top 8, hidden 2048 and intermediate 512, up has 32 blocks while n16 exposes
    64 before the resident cap. Down has 128 baseline blocks. This is a concrete
    occupancy hypothesis, not measured SM utilization. Up/down phase intervals
-   are 2.326/0.634 ms. Adapt the existing rotating-bank benchmark's hard-coded
-   GLM geometry, preserving Qwen's SwiGLU and FP32 down outputs. Use real routes
+   are 2.326/0.634 ms. Adapt the existing rotating-bank benchmark,
+   `zig/tests/cuda/nvfp4_experts_bench.zig`, from its hard-coded GLM geometry,
+   preserving Qwen's SwiGLU and FP32 down outputs. Use real routes
    and multiple weight banks on both GPUs. Exact outputs, finite values and
    five alternating pairs are mandatory; no repeat-cached-bank speed claims.
 
@@ -61,11 +62,11 @@ per decoded token; these gates are not interchangeable. For work affecting all
    donor's BF16 Q/K cannot replace the current FP32 interface unchanged.
 
 4. **Share compatible input quantization; tune actual projection shapes.**
-   A header/scalar check finds equal input_scale values for QKV/Z in all30 GDN
-   layers and Q/K/V in all10 attention layers of this checkpoint. Their weight
+   A header/scalar check finds equal input_scale values for QKV/Z in all 30 GDN
+   layers and Q/K/V in all 10 attention layers of this checkpoint. Their weight
    scales differ. Reuse the same activation codes while preserving every
    projection's weight scale and accumulation order. GDN a/b weights are BF16
-   in all30 layers, so a four-way FP8 GEMM is not an exact replacement. Candidate
+   in all 30 layers, so a four-way FP8 GEMM is not an exact replacement. Candidate
    fusion needs per-segment weight scaling and appropriate mixed dtypes.
    This could save 50 quantization launches/token, but graph replay already
    removes most host dispatch cost; GPU saving must be measured. The 2.868 ms
@@ -114,10 +115,10 @@ independent lane state, buffers and ownership. The current serial append does
 not already pipeline requests, and no free doubling is established.
 
 True TP may help c1 or aggregate throughput, but neither benefit is established.
-Measure the existing Windows transport at actual 4KiB payloads and collective
-counts on this pair before a port. Forty4KiB payloads at hypothetical25GB/s
-take 6.55 microseconds of payload time, not6 milliseconds. Software, driver,
-synchronization and collective latency can dominate. The ideal823tok/s
+Measure the existing Windows transport at actual 4 KiB payloads and collective
+counts on this pair before a port. Forty 4 KiB payloads at hypothetical 25 GB/s
+take 6.55 microseconds of payload time, not 6 milliseconds. Software, driver,
+synchronization and collective latency can dominate. The ideal 823 tok/s
 weight-only parallel model ignores these costs and smaller per-rank tiles.
 Moving the cut between serial partitions cannot add their bandwidths for c1.
 
@@ -131,16 +132,16 @@ not three independent performance measurements.
 Mechanical checks supersede these review claims:
 
 - Kimi's runtime packing factor is not additional expert scale traffic over
-  the audit: a32x32 tile is576bytes both before and after packing when its
+  the audit: a 32-by-32 tile is 576 bytes both before and after packing when its
   checkpoint scales are included. Padding exists elsewhere, but material
   overall inflation was not demonstrated by that argument.
 - Kimi's four-FP8-projection premise is false; a/b are BF16. Activation scales
   match within the checked groups, while weight scales differ. A single
   global-scale concatenated GEMM is not established as exact.
-- Kimi's TP payload arithmetic is off by1000, and aggregate-only TP benefit
+- Kimi's TP payload arithmetic is off by 1000, and aggregate-only TP benefit
   is unsupported. Neither consultation proves PCIe latency on this host.
-- Fable's 2–3microsecond in-graph kernel floor, 75% bandwidth assumption,
-  150–180tok/s forecast and attribution of the fixed-step/generation gap to
+- Fable's 2–3 microsecond in-graph kernel floor, 75% bandwidth assumption,
+  150–180 tok/s forecast and attribution of the fixed-step/generation gap to
   seams lack measurements. Its phase targets are hypotheses, not promises.
 - Fable's free two-lane pipelining/doubling claim requires scheduler and state
   work, and its CUDA fixture timing cannot be performed on the CPU.
