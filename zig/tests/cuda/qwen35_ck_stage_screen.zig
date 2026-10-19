@@ -46,7 +46,8 @@ fn kernelName(f: cuda.Function) ![]const u8 {
     return std.mem.span(name orelse return error.MissingSymbol);
 }
 fn validateCluster(v: cuda.abi.LaunchAttributeValue, policy: cuda.abi.LaunchAttributeValue, sk: u32) !void {
-    if (v.cluster_dim.x != 1 or v.cluster_dim.y != 1 or v.cluster_dim.z != sk or policy.int != 0) return error.CkStageClusterAttributes;
+    // Driver 610.88 returned SPREAD for omitted/default policy in all 24 pinned captures.
+    if (v.cluster_dim.x != 1 or v.cluster_dim.y != 1 or v.cluster_dim.z != sk or policy.int != 1) return error.CkStageClusterAttributes;
 }
 fn inputBits(row: usize, column: usize, layer: usize) u16 {
     var x: u32 = @truncate((row + 1) *% 0x9e3779b1 +% column *% 0x85ebca6b +% layer *% 65537);
@@ -219,9 +220,9 @@ fn capture(gpu: check.Gpu, banks: []const Bank, s: cuda.Stream, functions: [2]cu
         if (sk > 1) {
             try gpu.d.check(get_attr(nodes[at], .cluster_dimension, &cluster_value), "cuGraphKernelNodeGetAttribute");
             try gpu.d.check(get_attr(nodes[at], .cluster_scheduling_policy_preference, &policy_value), "cuGraphKernelNodeGetAttribute");
-            try validateCluster(cluster_value, policy_value, sk);
         }
-        try j.write(.{ .kind = "ck_stage_node", .ordinal = gpu.ctx.device_ordinal, .stage = stage, .rows = rows, .index = index, .bank = index % banks.len, .grid = [_]u32{ p.grid_x, p.grid_y, p.grid_z }, .block = [_]u32{ p.block_x, p.block_y, p.block_z }, .shared_bytes = p.shared_bytes, .abi_count = want.count, .arguments_sha256 = &std.fmt.bytesToHex(digest, .lower), .function_identity_checked = true, .serial_dependency_checked = true, .cluster_requested = [_]u32{ 1, 1, sk }, .cluster_actual = [_]u32{ cluster_value.cluster_dim.x, cluster_value.cluster_dim.y, cluster_value.cluster_dim.z }, .cluster_policy = policy_value.int, .cluster_attributes_readback = sk > 1 });
+        try j.write(.{ .kind = "ck_stage_node", .ordinal = gpu.ctx.device_ordinal, .stage = stage, .rows = rows, .index = index, .bank = index % banks.len, .grid = [_]u32{ p.grid_x, p.grid_y, p.grid_z }, .block = [_]u32{ p.block_x, p.block_y, p.block_z }, .shared_bytes = p.shared_bytes, .abi_count = want.count, .arguments_sha256 = &std.fmt.bytesToHex(digest, .lower), .function_identity_checked = true, .serial_dependency_checked = true, .cluster_requested = [_]u32{ 1, 1, sk }, .cluster_actual = [_]u32{ cluster_value.cluster_dim.x, cluster_value.cluster_dim.y, cluster_value.cluster_dim.z }, .cluster_policy = policy_value.int, .cluster_policy_request = "omitted_default", .cluster_dimensions_raw64 = &std.fmt.bytesToHex(cluster_value.pad, .lower), .cluster_policy_raw64 = &std.fmt.bytesToHex(policy_value.pad, .lower), .cluster_attributes_readback = sk > 1 });
+        if (sk > 1) try validateCluster(cluster_value, policy_value, sk);
         prior = nodes[at];
     }
     var exec = try graph.instantiate();
@@ -342,7 +343,7 @@ test "stage screen CUDA cluster ABI and mutated dimensions policy" {
     try std.testing.expectEqual(@as(u32, 4), @backingInt(cuda.abi.LaunchAttributeId.cluster_dimension));
     try std.testing.expectEqual(@as(u32, 5), @backingInt(cuda.abi.LaunchAttributeId.cluster_scheduling_policy_preference));
     var v: cuda.abi.LaunchAttributeValue = .{ .cluster_dim = .{ .x = 1, .y = 1, .z = 4 } };
-    var policy: cuda.abi.LaunchAttributeValue = .{ .int = 0 };
+    var policy: cuda.abi.LaunchAttributeValue = .{ .int = 1 };
     try validateCluster(v, policy, 4);
     v.cluster_dim.x = 2;
     try std.testing.expectError(error.CkStageClusterAttributes, validateCluster(v, policy, 4));
@@ -350,6 +351,8 @@ test "stage screen CUDA cluster ABI and mutated dimensions policy" {
     v.cluster_dim.z = 2;
     try std.testing.expectError(error.CkStageClusterAttributes, validateCluster(v, policy, 4));
     v.cluster_dim.z = 4;
-    policy.int = 1;
+    policy.int = 0;
+    try std.testing.expectError(error.CkStageClusterAttributes, validateCluster(v, policy, 4));
+    policy.int = 2;
     try std.testing.expectError(error.CkStageClusterAttributes, validateCluster(v, policy, 4));
 }
