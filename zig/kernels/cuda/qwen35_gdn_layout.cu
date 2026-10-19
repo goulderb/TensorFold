@@ -50,4 +50,3 @@ extern "C" __global__ void __launch_bounds__(128) tf_q35_hf_gdn_chain_transposed
     }
     Y[(size_t(row) * geo.nv + h) * DK + value] = out;
 }
-
