@@ -173,4 +173,3 @@ def test_rejects_greedy_tie_break_and_payload_hash(window):
     journal.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
     with pytest.raises(ValueError, match="lowest-id"):
         analyzer.analyze(root)
-

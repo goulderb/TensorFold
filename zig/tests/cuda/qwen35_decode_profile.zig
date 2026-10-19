@@ -25,6 +25,7 @@ const Input = struct {
     router_candidate: bool = false,
     expert_fixture: ?[]const u8 = null,
     expert_fixture_sha256: ?[]const u8 = null,
+    expert_wn2_screen: bool = false,
     gdn_layout_screen: bool = false,
     gdn_layout_ab: bool = false,
 };
@@ -59,6 +60,7 @@ fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     if (input.prompt.len == 0 or input.output_tokens == 0 or input.output_tokens > 1024 or input.context > 262144 or input.context < input.output_tokens or input.prompt.len > input.context - input.output_tokens or input.forced.len > input.output_tokens or input.repetitions == 0) return error.InvalidInput;
     if (input.router_screen or input.router_candidate) return error.ArchivedDiagnosticMode;
     if (input.gdn_layout_ab and (input.expert_fixture != null or input.gdn_layout_screen or input.forced.len != 0)) return error.InvalidInput;
+    if (input.expert_wn2_screen and (input.expert_fixture == null or input.gdn_layout_screen)) return error.InvalidInput;
     if ((input.expert_fixture == null) != (input.expert_fixture_sha256 == null)) return error.InvalidExpertFixture;
     if (input.expert_fixture_sha256) |sha| {
         if (sha.len != 64) return error.InvalidExpertFixture;
@@ -384,7 +386,9 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
             var context = try cuda.Context.init(&driver, identity.ordinal);
             defer context.deinit();
             const gpu: @import("check.zig").Gpu = .{ .d = &driver, .ctx = &context, .gpa = init.gpa, .io = init.io };
-            if (input.expert_fixture) |fixture| try expert_screen.run(gpu, fixture, input.expert_fixture_sha256.?, j);
+            if (input.expert_fixture) |fixture| {
+                if (input.expert_wn2_screen) try expert_screen.runWn2(gpu, fixture, input.expert_fixture_sha256.?, j) else try expert_screen.run(gpu, fixture, input.expert_fixture_sha256.?, j);
+            }
             if (input.gdn_layout_screen) try gdn_layout_screen.run(gpu, j);
         }
         try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "isolated operator parity and timing screens", .production_qualification = false });
