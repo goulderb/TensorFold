@@ -37,7 +37,7 @@ pub const Scratch = struct {
 };
 
 /// Routed experts over `total` normed rows at x into out; `wide` rows take the prefill kernels, else decode's.
-pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, shared: @import("cuda_layers.zig").SharedExpert, x: u64, out: u64, total: usize, wide: bool) !void {
+pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, shared: @import("cuda_layers.zig").SharedExpert, x: u64, out: u64, total: usize, wide: bool, expert_up_n8: bool) !void {
     const g = e.g;
     const s = e.routed;
     const slots = if (shared == .projected) g.top_k else g.slots();
@@ -63,7 +63,9 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, shared: @impor
         try e.mark(.expert_up);
         try grouped.prompt(e.stream, .down_bf16, act_in, layer, plan, s.y, items, -1);
     } else {
-        try grouped.decode(e.stream, .up, rows_in, layer, plan, s.act, items, -1);
+        if (expert_up_n8) {
+            try e.modelopt.?.nvfp4_experts.runN8Up(e.stream, rows_in, layer, plan, s.act, items, -1);
+        } else try grouped.decode(e.stream, .up, rows_in, layer, plan, s.act, items, -1);
         try e.mark(.expert_up);
         try grouped.decode(e.stream, .down_f32, act_in, layer, plan, s.y, items, -1);
     }

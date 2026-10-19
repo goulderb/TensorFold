@@ -347,6 +347,18 @@ pub const Nvfp4Experts = struct {
     candidate_fns: [3][4]Function,
     candidate_resident: [3][4]usize,
     candidates_loaded: bool = false,
+    n8_up: ?N8Up = null,
+
+    pub const N8Up = struct {
+        function: Function,
+        resident: usize,
+        pub const slices = 4;
+        pub const threads = 128;
+
+        pub fn grid(binding: N8Up, items: usize, nb: usize) usize {
+            return @min((items * nb * slices + threads / 32 - 1) / (threads / 32), binding.resident);
+        }
+    };
 
     pub const Variant = enum { baseline, pipe4, n16, n16_pipe4 };
 
@@ -437,6 +449,25 @@ pub const Nvfp4Experts = struct {
         e.candidates_loaded = true;
     }
 
+    pub fn loadN8Up(e: *Nvfp4Experts, sms: usize) !void {
+        const f = try e.mod.function("tf_nvfp4_n8_pipe4_swiglu");
+        e.n8_up = .{ .function = f, .resident = @max(1, try f.occupancy(N8Up.threads, 0)) * sms };
+    }
+
+    pub fn validateN8Up(l: Layer) !void {
+        if (l.format != .nvfp4 or l.relu2) return error.UnsupportedN8ExpertUp;
+        if (l.width == 0 or l.width % cols != 0 or l.dims == 0 or l.dims % 32 != 0) return error.UnsupportedN8ExpertUp;
+    }
+
+    pub fn runN8Up(e: *const Nvfp4Experts, s: Stream, in: Rows, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
+        try validateN8Up(l);
+        const binding = e.n8_up orelse return error.CandidateNotLoaded;
+        const grid = binding.grid(items, l.width / cols);
+        if (grid == 0) return;
+        var args = decodeArgs(.up, in, l, p, out, skip);
+        try launch_.launch(binding.function, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = N8Up.threads, .y = 1, .z = 1 } }, s, &args);
+    }
+
     pub fn unload(e: *Nvfp4Experts) void {
         e.mod.unload();
     }
@@ -450,7 +481,6 @@ pub const Nvfp4Experts = struct {
         if (variant != .baseline and e.warps != 4) return error.BadExpertWarps;
         if (variant != .baseline and !e.candidates_loaded) return error.CandidateNotLoaded;
         const gate = epi == .up;
-        const kg = (if (gate) l.dims else l.width) / 32;
         const nb = (if (gate) l.width else l.dims) / cols;
         const ei: usize = if (gate and l.relu2) 3 else @backingInt(epi);
         const vi = @backingInt(variant);
@@ -458,19 +488,26 @@ pub const Nvfp4Experts = struct {
         const resident = if (variant == .baseline) e.resident[ei] else e.candidate_resident[vi - 1][ei];
         const grid = decodeGridWarps(variant, items, nb, resident, e.warps);
         if (grid < 1) return;
+        var a = decodeArgs(epi, in, l, p, out, skip);
+        try launch_.launch(f, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = @intCast(e.warps * 32), .y = 1, .z = 1 } }, s, &a);
+    }
+
+    pub fn decodeArgs(epi: Epi, in: Rows, l: Layer, p: Plan, out: u64, skip: i32) launch_.Args {
+        const gate = epi == .up;
+        const nb = (if (gate) l.width else l.dims) / cols;
         var a: launch_.Args = .{};
         a.add(in.x);
         a.add(@as(i32, @intCast(in.stride)));
         a.add(@as(i32, @intCast(if (gate) in.slots else 0)));
         a.add(if (gate) l.up else l.down);
         a.add(if (gate) l.up_scale else l.down_scale);
-        a.add(@as(i32, @intCast(kg)));
+        a.add(@as(i32, @intCast((if (gate) l.dims else l.width) / 32)));
         a.add(@as(i32, @intCast(nb)));
         for ([_]u64{ p.items, p.counts, p.members, out }) |v| a.add(v);
         a.add(@as(i32, @intCast(if (gate) l.width else l.dims)));
         a.add(if (gate) l.limit else @as(f32, 0.0));
         a.add(skip);
-        try launch_.launch(f, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = @intCast(e.warps * 32), .y = 1, .z = 1 } }, s, &a);
+        return a;
     }
 
     /// Prompt rows on a plan of at most `items` items of 64 pairs: up (relu^2 or SwiGLU by the layer), bf16 sums down.
@@ -647,4 +684,33 @@ test "NVFP4 grid follows the selected warp count and candidates refuse single wa
 
 test {
     _ = @import("experts_decode_test.zig");
+}
+
+test "N8 up rejects unsupported layers before CUDA and requires a loaded binding" {
+    var e: Nvfp4Experts = undefined;
+    e.n8_up = null;
+    var l: Layer = .{ .format = .nvfp4, .up = 0, .down = 0, .width = 512, .dims = 2048, .experts = 256, .relu2 = true };
+    try std.testing.expectError(error.UnsupportedN8ExpertUp, e.runN8Up(undefined, undefined, l, undefined, 0, 1, -1));
+    l.relu2 = false;
+    l.format = .affine4;
+    try std.testing.expectError(error.UnsupportedN8ExpertUp, e.runN8Up(undefined, undefined, l, undefined, 0, 1, -1));
+    l.format = .nvfp4;
+    l.width = 511;
+    try std.testing.expectError(error.UnsupportedN8ExpertUp, e.runN8Up(undefined, undefined, l, undefined, 0, 1, -1));
+    l.width = 512;
+    try std.testing.expectError(error.CandidateNotLoaded, e.runN8Up(undefined, undefined, l, undefined, 0, 1, -1));
+}
+
+test "N8 up covers four slices per block with the common 14 argument ABI" {
+    const binding: Nvfp4Experts.N8Up = .{ .function = undefined, .resident = 192 };
+    try std.testing.expectEqual(@as(usize, 128), binding.grid(8, 512 / 32));
+    try std.testing.expectEqual(@as(usize, 192), binding.grid(20, 512 / 32));
+    try std.testing.expectEqual(@as(usize, 0), binding.grid(0, 512 / 32));
+    const l: Layer = .{ .format = .nvfp4, .up = 101, .down = 102, .up_scale = 103, .down_scale = 104, .width = 512, .dims = 2048, .experts = 256, .limit = 2.0 };
+    const p: Plan = .{ .items = 201, .counts = 202, .members = 203, .rank = 204, .hist = 205 };
+    const args = Nvfp4Experts.decodeArgs(.up, .{ .x = 301, .stride = 2048, .slots = 8 }, l, p, 302, -1);
+    const values = [_]u64{ 301, 2048, 8, 101, 103, 64, 16, 201, 202, 203, 302, 512, @as(u32, @bitCast(@as(f32, 2.0))), @as(u32, @bitCast(@as(i32, -1))) };
+    try std.testing.expectEqual(@as(usize, 14), args.count);
+    try std.testing.expectEqualSlices(u16, &.{ 8, 4, 4, 8, 8, 4, 4, 8, 8, 8, 8, 4, 4, 4 }, args.sizes[0..args.count]);
+    for (values, 0..) |value, i| try std.testing.expectEqual(value, args.integer(i).?);
 }

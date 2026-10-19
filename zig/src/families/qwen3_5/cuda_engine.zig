@@ -63,6 +63,26 @@ test "GDN layouts have distinct graph keys for identical forward geometry" {
     try std.testing.expectEqual(@as(u32, 1 << 19), baseline.key() ^ candidate.key());
 }
 
+test "expert up choices have distinct graph keys independent of GDN layout" {
+    const baseline: Engine.Shape = .{ .total = 1, .nseg = 1, .record = false, .prompt = true, .taps = false, .gdn_layout = .key_value };
+    var candidate = baseline;
+    candidate.expert_up_n8 = true;
+    try std.testing.expectEqual(@as(u32, 1 << 20), baseline.key() ^ candidate.key());
+    candidate.gdn_layout = .value_key;
+    try std.testing.expectEqual(@as(u32, (1 << 20) | (1 << 19)), baseline.key() ^ candidate.key());
+}
+
+test "N8 up rejects MLX before CUDA or graph lookup" {
+    var e: Engine = undefined;
+    e.numerics = .mlx_sanitized;
+    const shape: Engine.Shape = .{ .total = 1, .nseg = 1, .record = false, .prompt = true, .taps = false, .expert_up_n8 = true };
+    try std.testing.expectError(error.UnsupportedQwenExpertUp, e.execute(shape));
+    var cache: Cache = undefined;
+    cache.gdn_layout = .value_key;
+    e.expert_up_n8 = true;
+    try std.testing.expectError(error.UnsupportedQwenExpertUp, e.prepare(&.{.{ .cache = &cache, .rows = 1 }}, &.{0}, .last));
+}
+
 test "mixed GDN layouts fail before settling caches or touching CUDA" {
     var e: Engine = undefined;
     var baseline: Cache = undefined;
@@ -92,6 +112,10 @@ pub const Engine = struct {
     captured: bool = true,
     graph_nodes: usize = 0,
     graph_launches: usize = 0,
+    expert_up_n8: bool = false,
+    verify_expert_graphs: bool = false,
+    expert_graph_nodes_baseline: usize = 0,
+    expert_graph_nodes_n8: usize = 0,
     verify_gdn_graphs: bool = false,
     gdn_graph_nodes_baseline: usize = 0,
     gdn_graph_nodes_candidate: usize = 0,
@@ -206,6 +230,10 @@ pub const Engine = struct {
         e.captured = true;
         e.graph_nodes = 0;
         e.graph_launches = 0;
+        e.expert_up_n8 = false;
+        e.verify_expert_graphs = false;
+        e.expert_graph_nodes_baseline = 0;
+        e.expert_graph_nodes_n8 = 0;
         e.verify_gdn_graphs = false;
         e.gdn_graph_nodes_baseline = 0;
         e.gdn_graph_nodes_candidate = 0;
@@ -464,6 +492,7 @@ pub const Engine = struct {
         const gdn_layout = parts[0].cache.gdn_layout;
         for (parts[1..]) |p| if (p.cache.gdn_layout != gdn_layout) return error.MixedQwenGdnLayouts;
         try gdn_layout.validate(e.numerics);
+        if (e.expert_up_n8 and e.numerics != .hf_modelopt) return error.UnsupportedQwenExpertUp;
         const g = e.g;
         if (e.numerics == .hf_modelopt) {
             if (parts.len != 1 or ids.len != 1 or parts[0].rows != 1 or keep != .last) return error.UnsupportedQwenWindow;
@@ -525,12 +554,13 @@ pub const Engine = struct {
         const lone = total == 1 and parts.len == 1;
         const bucket: usize = if (lone) 1 else if (total <= 16) 16 else most_verify;
         const windows: usize = if (lone) 1 else max_segs;
-        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout };
+        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8 };
         e.features = if (images) |im| im.features else 0;
         return shape;
     }
 
     pub fn execute(e: *Engine, shape: Shape) !void {
+        if (shape.expert_up_n8 and (e.numerics != .hf_modelopt or (shape.prompt and shape.total > most_window))) return error.UnsupportedQwenExpertUp;
         if (e.observer != null and e.captured) return error.QwenObserverRequiresEager;
         try shape.gdn_layout.validate(e.numerics);
         if (shape.prompt and e.numerics == .mlx_sanitized or !e.captured) {
@@ -551,7 +581,11 @@ pub const Engine = struct {
                 defer captured.deinit();
                 const nodes = try captured.nodeCount();
                 const gdn_nodes = if (e.verify_gdn_graphs) try e.verifyGdnGraph(captured, shape, nodes) else 0;
+                const expert_nodes = if (e.verify_expert_graphs) try e.verifyExpertGraph(captured, shape, nodes) else 0;
                 gop.value_ptr.* = try captured.instantiate();
+                if (shape.expert_up_n8) {
+                    e.expert_graph_nodes_n8 += expert_nodes;
+                } else e.expert_graph_nodes_baseline += expert_nodes;
                 e.graph_nodes += nodes;
                 switch (shape.gdn_layout) {
                     .value_key => e.gdn_graph_nodes_baseline += gdn_nodes,
@@ -596,6 +630,59 @@ pub const Engine = struct {
             count += 1;
         }
         if (count != e.g.deltas()) return error.QwenGdnGraphWorkCountMismatch;
+        return count;
+    }
+
+    fn verifyExpertGraph(e: *const Engine, graph: cuda.graph.Graph, shape: Shape, node_count: usize) !usize {
+        const bindings = e.modelopt orelse return error.UnsupportedQwenExpertUp;
+        const experts = bindings.nvfp4_experts;
+        const n8 = experts.n8_up orelse return error.CandidateNotLoaded;
+        const baseline = experts.fns[0].handle;
+        const candidate = n8.function.handle;
+        if (baseline == candidate) return error.QwenExpertGraphKernelMismatch;
+        const expected = if (shape.expert_up_n8) candidate else baseline;
+        const storage = try e.gpa.alloc(cuda.graph.Node, node_count);
+        defer e.gpa.free(storage);
+        const nodes = try graph.nodes(storage);
+        if (nodes.len != node_count) return error.QwenExpertGraphWorkCountMismatch;
+        var layers_seen: [geometry.max_layers]bool = @splat(false);
+        var count: usize = 0;
+        for (nodes) |node| {
+            var params: cuda.abi.KernelNodeParams = undefined;
+            try e.d.check(e.d.api.cuGraphKernelNodeGetParams_v2(node, &params), "cuGraphKernelNodeGetParams");
+            if (params.func != baseline and params.func != candidate) continue;
+            if (params.func != expected) return error.QwenExpertGraphKernelMismatch;
+            const args = params.params orelse return error.QwenExpertGraphMissingArguments;
+            const up: *const u64 = @ptrCast(@alignCast(args[3] orelse return error.QwenExpertGraphMissingArguments));
+            var matched = false;
+            for (e.layers, 0..) |layer, index| {
+                if (layer.mlp != .moe or layer.mlp.moe.experts.up != up.*) continue;
+                if (layers_seen[index]) return error.QwenExpertGraphLayerMismatch;
+                const m = layer.mlp.moe;
+                try cuda.experts.Nvfp4Experts.validateN8Up(m.experts);
+                const slots = if (m.shared == .projected) e.g.top_k else e.g.slots();
+                const expert_count = if (m.shared == .projected) e.g.experts else e.g.experts + 1;
+                const items = cuda.grouped.maxItems(@as(usize, shape.total) * slots, expert_count, 16);
+                const nb = m.experts.width / cuda.experts.Nvfp4Experts.cols;
+                const grid = if (shape.expert_up_n8) n8.grid(items, nb) else cuda.experts.Nvfp4Experts.decodeGridWarps(.baseline, items, nb, experts.resident[0], experts.warps);
+                const threads = if (shape.expert_up_n8) cuda.experts.Nvfp4Experts.N8Up.threads else experts.warps * 32;
+                if (params.grid_x != grid or params.grid_y != 1 or params.grid_z != 1 or params.block_x != threads or
+                    params.block_y != 1 or params.block_z != 1 or params.shared_bytes != 0) return error.QwenExpertGraphKernelMismatch;
+                const plan: cuda.grouped.Plan = .{ .members = e.routed.members, .items = e.routed.items, .counts = e.routed.counts, .rank = e.routed.rank, .hist = e.routed.hist };
+                const expected_args = cuda.experts.Nvfp4Experts.decodeArgs(.up, .{ .x = e.x, .stride = e.g.hidden, .slots = slots }, m.experts, plan, e.routed.act, -1);
+                for (0..expected_args.count) |a| {
+                    const actual: [*]const u8 = @ptrCast(args[a] orelse return error.QwenExpertGraphMissingArguments);
+                    const bytes = expected_args.storage[expected_args.offsets[a]..][0..expected_args.sizes[a]];
+                    if (!std.mem.eql(u8, actual[0..bytes.len], bytes)) return error.QwenExpertGraphArgumentMismatch;
+                }
+                layers_seen[index] = true;
+                matched = true;
+                count += 1;
+                break;
+            }
+            if (!matched) return error.QwenExpertGraphLayerMismatch;
+        }
+        if (count != e.g.layers) return error.QwenExpertGraphWorkCountMismatch;
         return count;
     }
 
@@ -646,9 +733,10 @@ pub const Engine = struct {
         prompt: bool,
         taps: bool,
         gdn_layout: Cache.GdnLayout = .value_key,
+        expert_up_n8: bool = false,
 
         fn key(s: Shape) u32 {
-            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19;
+            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20;
         }
     };
 
@@ -740,7 +828,7 @@ pub const Engine = struct {
                     try e.proj(m.down, e.act, e.r, total, prompt);
                     try e.mark(.dense);
                 },
-                .moe => |m| try e.routedRows(m.router, m.experts, m.shared, e.x, e.r, total, prompt and total > most_window),
+                .moe => |m| try routed.rows(e, m.router, m.experts, m.shared, e.x, e.r, total, prompt and total > most_window, shape.expert_up_n8),
             }
             if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == e.placement.first + i) {
                 try e.run(e.fns.tap, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
@@ -753,10 +841,75 @@ pub const Engine = struct {
         try e.mark(.head);
     }
 
-    pub const routedRows = routed.rows;
+    pub fn routedRows(e: *Engine, router: u64, layer: cuda.experts.Layer, shared: layers.SharedExpert, x: u64, out: u64, total: usize, wide_rows: bool) !void {
+        return routed.rows(e, router, layer, shared, x, out, total, wide_rows, false);
+    }
 
     /// Row `i`'s logits from the newest forward that kept logits.
     pub fn rowLogits(e: *const Engine, i: usize) []const u16 {
         return e.host_logits.slice(u16)[i * e.g.vocab ..][0..e.g.vocab];
     }
 };
+
+test "expert graph verification rejects opposite arms, wrong arguments, duplicates and missing work" {
+    const Fake = struct {
+        var params: cuda.abi.KernelNodeParams = undefined;
+        var count: usize = 1;
+        fn nodes(_: cuda.abi.Graph, out: ?[*]cuda.graph.Node, n: *usize) callconv(.c) cuda.abi.Result {
+            if (out) |dst| for (0..@min(n.*, count)) |i| {
+                dst[i] = @ptrFromInt(i + 1);
+            };
+            n.* = count;
+            return cuda.abi.success;
+        }
+        fn get(_: cuda.graph.Node, out: *cuda.abi.KernelNodeParams) callconv(.c) cuda.abi.Result {
+            out.* = params;
+            return cuda.abi.success;
+        }
+    };
+    var driver: cuda.Driver = undefined;
+    driver.api.cuGraphGetNodes = Fake.nodes;
+    driver.api.cuGraphKernelNodeGetParams_v2 = Fake.get;
+    var bindings: modelopt.Bindings = undefined;
+    bindings.nvfp4_experts.fns[0] = .{ .d = &driver, .handle = @ptrFromInt(1) };
+    bindings.nvfp4_experts.resident[0] = 192;
+    bindings.nvfp4_experts.warps = 4;
+    bindings.nvfp4_experts.n8_up = .{ .function = .{ .d = &driver, .handle = @ptrFromInt(2) }, .resident = 192 };
+    const expert_layer: cuda.experts.Layer = .{ .format = .nvfp4, .up = 101, .down = 102, .up_scale = 103, .down_scale = 104, .width = 512, .dims = 2048, .experts = 256 };
+    var local_layers: [1]Layer = undefined;
+    local_layers[0].mlp = .{ .moe = .{ .router = 0, .experts = expert_layer, .shared = .{ .projected = undefined } } };
+    var e: Engine = undefined;
+    e.gpa = std.testing.allocator;
+    e.d = &driver;
+    e.modelopt = bindings;
+    e.g = undefined;
+    e.g.layers = 1;
+    e.g.top_k = 8;
+    e.g.experts = 256;
+    e.g.hidden = 2048;
+    e.layers = &local_layers;
+    e.x = 301;
+    e.routed = .{ .items = 201, .counts = 202, .members = 203, .rank = 204, .hist = 205, .act = 302 };
+    const plan: cuda.grouped.Plan = .{ .items = 201, .counts = 202, .members = 203, .rank = 204, .hist = 205 };
+    var args = cuda.experts.Nvfp4Experts.decodeArgs(.up, .{ .x = 301, .stride = 2048, .slots = 8 }, expert_layer, plan, 302, -1);
+    Fake.params = .{ .func = @ptrFromInt(1), .grid_x = 32, .grid_y = 1, .grid_z = 1, .block_x = 128, .block_y = 1, .block_z = 1, .shared_bytes = 0, .params = args.pointers(), .extra = null };
+    Fake.count = 1;
+    const graph: cuda.graph.Graph = .{ .d = &driver, .handle = null };
+    var shape: Engine.Shape = .{ .total = 1, .nseg = 1, .record = false, .prompt = true, .taps = false };
+    try std.testing.expectEqual(@as(usize, 1), try e.verifyExpertGraph(graph, shape, 1));
+    shape.expert_up_n8 = true;
+    try std.testing.expectError(error.QwenExpertGraphKernelMismatch, e.verifyExpertGraph(graph, shape, 1));
+    Fake.params.func = @ptrFromInt(2);
+    Fake.params.grid_x = 128;
+    try std.testing.expectEqual(@as(usize, 1), try e.verifyExpertGraph(graph, shape, 1));
+    Fake.params.block_x = 32;
+    try std.testing.expectError(error.QwenExpertGraphKernelMismatch, e.verifyExpertGraph(graph, shape, 1));
+    Fake.params.block_x = 128;
+    args.storage[args.offsets[10]] ^= 1;
+    try std.testing.expectError(error.QwenExpertGraphArgumentMismatch, e.verifyExpertGraph(graph, shape, 1));
+    args.storage[args.offsets[10]] ^= 1;
+    Fake.count = 2;
+    try std.testing.expectError(error.QwenExpertGraphLayerMismatch, e.verifyExpertGraph(graph, shape, 2));
+    Fake.count = 0;
+    try std.testing.expectError(error.QwenExpertGraphWorkCountMismatch, e.verifyExpertGraph(graph, shape, 0));
+}

@@ -30,6 +30,7 @@ pub const Bindings = struct {
         errdefer prompt.unload();
         var experts = try cuda.experts.Nvfp4Experts.load(ctx.d, sms);
         errdefer experts.unload();
+        try experts.loadN8Up(sms);
         var pack = try cuda.modelopt.Packer.load(ctx.d);
         errdefer pack.unload();
         var ck = try cuda.ck.Ck.load(ctx.d, major, sms);
