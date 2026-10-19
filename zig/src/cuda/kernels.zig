@@ -45,6 +45,7 @@ pub const sample: []const u8 = if (available) &Blob("fatbin_sample").bytes else 
 pub const train: []const u8 = if (available) &Blob("fatbin_train").bytes else &.{};
 pub const qwen35: []const u8 = if (available) &Blob("fatbin_qwen35").bytes else &.{};
 pub const qwen35_hf: []const u8 = if (available) &Blob("fatbin_qwen35_hf").bytes else &.{};
+pub const qwen35_gdn_layout: []const u8 = if (available) &Blob("fatbin_qwen35_gdn_layout").bytes else &.{};
 pub const qwen35_draft: []const u8 = if (available) &Blob("fatbin_qwen35_draft").bytes else &.{};
 pub const qwen35_keep: []const u8 = if (available) &Blob("fatbin_qwen35_keep").bytes else &.{};
 pub const qwen_vision: []const u8 = if (available) &Blob("fatbin_qwen_vision").bytes else &.{};
