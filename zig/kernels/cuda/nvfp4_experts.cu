@@ -394,5 +394,6 @@ TF_NVFP4_PROMPT(tf_nvfp4_prompt_down, 1, 3, 8)
 TF_NVFP4_DECODE_SET(pipe4, 4, 4, 4)
 TF_NVFP4_DECODE_SET(n16, 4, 2, 2)
 TF_NVFP4_DECODE_SET(n16_pipe4, 4, 4, 2)
+TF_NVFP4_DECODE(tf_nvfp4_wn2_n16_pipe4_swiglu, 2, 2, 2, 4, 2)
 #undef TF_NVFP4_DECODE_SET
 #undef TF_NVFP4_DECODE
