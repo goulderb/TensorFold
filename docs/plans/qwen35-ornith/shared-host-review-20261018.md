@@ -197,3 +197,29 @@ unchanged limits from extracted files. The Windows follow-up is committed
 separately and [passes the broad CPU build](windows-cpu-20261019.md), including
 the final allocator-leak cleanup. The remaining thinking-on device and
 production qualification boundaries are unchanged.
+
+Fable round 8 reviews Windows source `45e303381` and verifies every member of
+the supplementary logit archive against its inventory. It finds no medium or
+high issue and confirms exact reproduction of the failed comparisons. See
+[Fable round 8](evidence/approved-hour-20261019/fable-r8.md). Its uncommitted
+evidence observation is closed by `88b8eefd`. The parent reviewed the four
+capture-buffer frees in `02818b408`; the post-fix broad log is the accepted
+leak-free receipt. The Windows archive builder verifies every member's bytes
+and hash, while Linux execution remains unperformed.
+
+The review's cache-path concern is bounded by the pinned Zig implementation:
+`lib/std/testing.zig:613-619` always creates `.zig-cache/tmp` beneath the
+current directory, independent of the build cache argument. The loader
+fixture uses that same directory and current working directory. No change is
+needed for a custom build cache with this pinned version; future Zig API
+changes could require updating the fixture.
+
+A fresh closing proxy check at 01:03:49 UTC returns HTTP200, exact READY and
+no paid spillover. Exact loopback identities remain Nemotron PID 16512 on
+the preserved executable and Clef PID 21392; private port 11439 has no listener.
+Final physical readings meet the floor, and engine source bytes retain their
+original hash with no instrumentation. The two receipts are preserved as
+`final-identities.json` and `final-production-restored-proxy.json` in the
+approved-hour evidence directory. All owned jobs and reviews have completed.
+No further outage is started in the approved hour. Production selection,
+numerical limits and the conditional promotion boundaries remain unchanged.
