@@ -16,6 +16,7 @@
 // Local changes: fixed 35B geometry, serial persistent state, online causal
 // attention, deterministic top-eight routing and address-only CUDA entry points.
 // The cooperative router stages products while retaining ordered FP32 additions.
+// The optional parallel selector retains stable ties and the serial softmax order.
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -249,6 +250,92 @@ extern "C" __global__ void tf_qwen35_route_select(
     }
     #pragma unroll
     for (int slot = 0; slot < 8; ++slot) picks[slot] = selected[slot];
+    float denominator = 0.0f;
+    for (int slot = 0; slot < 8; ++slot) {
+        weights[slot] = expf(chosen[slot] - chosen[0]);
+        denominator += weights[slot];
+    }
+    for (int slot = 0; slot < 8; ++slot) weights[slot] /= denominator;
+    weights[8] = sigmoid(rounded(scores[256]));
+}
+
+extern "C" __global__ void tf_qwen35_route_select_parallel(
+    const float* scores, int32_t* picks, float* weights) {
+    __shared__ float logits[256], chosen[8];
+    __shared__ unsigned warp_score_bits[8];
+    __shared__ int warp_indices[8], selected_id;
+    const int expert = threadIdx.x, lane = expert & 31, warp = expert >> 5;
+    const float score = scores[expert];
+    logits[expert] = score;
+    if (__syncthreads_or(!isfinite(score))) {
+        if (threadIdx.x != 0) return;
+        float chosen[8];
+        int selected[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+        #pragma unroll
+        for (int slot = 0; slot < 8; ++slot) {
+            int best = -1;
+            for (int candidate = 0; candidate < 256; ++candidate) {
+                bool used = false;
+                #pragma unroll
+                for (int prior = 0; prior < 8; ++prior) used |= selected[prior] == candidate;
+                if (!used && (best < 0 || logits[candidate] > logits[best])) best = candidate;
+            }
+            selected[slot] = best;
+            chosen[slot] = logits[best];
+        }
+        #pragma unroll
+        for (int slot = 0; slot < 8; ++slot) picks[slot] = selected[slot];
+        float denominator = 0.0f;
+        for (int slot = 0; slot < 8; ++slot) {
+            weights[slot] = expf(chosen[slot] - chosen[0]);
+            denominator += weights[slot];
+        }
+        for (int slot = 0; slot < 8; ++slot) weights[slot] /= denominator;
+        weights[8] = sigmoid(rounded(scores[256]));
+        return;
+    }
+    bool selected = false;
+    for (int slot = 0; slot < 8; ++slot) {
+        unsigned best_bits = selected ? 0xff800000u : __float_as_uint(score);
+        int best = selected ? 256 : expert;
+        #pragma unroll
+        for (int offset = 16; offset; offset >>= 1) {
+            const unsigned other_bits = __shfl_down_sync(0xffffffffu, best_bits, offset);
+            const int other = __shfl_down_sync(0xffffffffu, best, offset);
+            const float value = __uint_as_float(best_bits), other_value = __uint_as_float(other_bits);
+            if (other_value > value || (other_value == value && other < best)) {
+                best_bits = other_bits;
+                best = other;
+            }
+        }
+        if (lane == 0) {
+            warp_score_bits[warp] = best_bits;
+            warp_indices[warp] = best;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            best_bits = lane < 8 ? warp_score_bits[lane] : 0xff800000u;
+            best = lane < 8 ? warp_indices[lane] : 256;
+            #pragma unroll
+            for (int offset = 16; offset; offset >>= 1) {
+                const unsigned other_bits = __shfl_down_sync(0xffffffffu, best_bits, offset);
+                const int other = __shfl_down_sync(0xffffffffu, best, offset);
+                const float value = __uint_as_float(best_bits), other_value = __uint_as_float(other_bits);
+                if (other_value > value || (other_value == value && other < best)) {
+                    best_bits = other_bits;
+                    best = other;
+                }
+            }
+            if (lane == 0) {
+                selected_id = best;
+                picks[slot] = best;
+                chosen[slot] = __uint_as_float(best_bits);
+            }
+        }
+        __syncthreads();
+        selected |= expert == selected_id;
+    }
+    if (expert != 0) return;
     float denominator = 0.0f;
     for (int slot = 0; slot < 8; ++slot) {
         weights[slot] = expf(chosen[slot] - chosen[0]);

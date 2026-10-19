@@ -75,8 +75,10 @@ For n16_pipe4, up median is 53.475 to 42.979 microseconds on GPU 0 and
 53.374 to 42.860 on GPU 1. Its paired up savings range from 10.463 to
 10.814 microseconds on GPU 0 and 10.412 to 10.828 on GPU 1. Down savings
 are much smaller, median 0.266 and 0.242 microseconds. All five pairs
-improve for each of those four groups. n16 alone has similar up savings
-but a small down regression. pipe4 alone regresses up by about 3 microseconds.
+improve for each of those four groups. The independent review found a roughly
+0.2-microsecond order effect in down, so these small down deltas do not support
+a down-kernel choice. Retain the clear up result only. n16 alone has similar
+up savings. pipe4 alone regresses up by about 3 microseconds.
 
 The wider variant changes the up grid from 32 to 64 blocks. That is a
 plausible explanation for the latency change, not a measurement of achieved
@@ -91,7 +93,10 @@ serving or runtime default changed. Next, split products and selection in
 the remaining router cost before choosing a kernel change.
 
 The [window receipt](evidence/expert-tuning-20261019/r1/window.json) passes.
-Minimum sampled free memory was 15963/15499 MiB. Production was restored
+Minimum controller-sampled free memory was 15963/15499 MiB, from only two
+samples. GPU 0 was not sampled while holding the short-lived fixture; the
+in-process allocation and sample checks enforced the floor. These minima
+are not a sustained under-load memory qualification. Production was restored
 and the local proxy returned exact READY at 16:15:53.606914 UTC, request
 45be6335-abf8-4e5a-aa97-d94be56bba22. Clef was unchanged, cleanup and sampler
 errors were empty, and both owned controller and child processes ended.
@@ -111,3 +116,27 @@ repetitions alternate stage order. Every timed output is checked after the
 events. This is an arithmetic diagnostic with warm L2, not a model bandwidth
 measurement. Its purpose is to identify which component can plausibly save
 enough complete-turn time to deserve a candidate kernel.
+
+## Router split result and candidate
+
+The [router split](evidence/router-tuning-20261019/r1/analysis.json) passes all
+six saved rows on both GPUs. Combined median is 71.738/71.760 microseconds;
+products are 6.158/6.144 and selection is 65.587/65.666. Selection therefore
+dominates this measured seam. Leave products unchanged. Nemotron was restored
+with exact local proxy READY at 16:22:52.522906 UTC, request
+16028f22-205c-412d-842f-874f1855a7a3; Clef was unchanged.
+
+Compare per-candidate ranking over all 256 scores with eight hierarchical
+warp/CTA argmax rounds. The latter avoids a full 256-by-256 comparison matrix
+and is the selected candidate. Carry score bits and original index together;
+break finite ties toward the lowest index. Keep the existing ordered softmax
+and shared-gate calculation. Any nonfinite expert score uses the copied
+legacy serial selection body, preserving its exceptional-value behavior.
+
+The falsifiable screen is at least 15 microseconds less combined route time
+on each GPU with all five pairs improving, exact captured outputs, and exact
+old/new outputs for planted ties, signed zeros and exceptional values. At
+40 layers and 191 appends, a 15-microsecond reduction projects 0.1146 seconds,
+just over the 5% full-turn gate. This remains a projection until the matched
+full changing-token/position graph trial passes. The new symbol is optional
+and no serving path selects it during the thin proof.

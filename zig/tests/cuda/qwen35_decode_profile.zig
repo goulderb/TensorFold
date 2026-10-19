@@ -13,7 +13,7 @@ comptime {
     if (options.engine_optimization != .fast) @compileError("diagnostics require ReleaseFast engine");
 }
 
-const Input = struct { prompt: []const u32, token: u32, repetitions: usize = 16, expert_fixture: ?[]const u8 = null, expert_fixture_sha256: ?[]const u8 = null, router_screen: bool = false };
+const Input = struct { prompt: []const u32, token: u32, repetitions: usize = 16, expert_fixture: ?[]const u8 = null, expert_fixture_sha256: ?[]const u8 = null, router_screen: bool = false, router_candidate: bool = false };
 const Journal = struct {
     a: std.mem.Allocator,
     io: std.Io,
@@ -176,6 +176,7 @@ fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     const input = try std.json.parseFromSliceLeaky(Input, a, bytes, .{});
     if ((input.expert_fixture == null) != (input.expert_fixture_sha256 == null)) return error.InvalidExpertFixturePin;
     if (input.router_screen and input.expert_fixture == null) return error.RouterScreenRequiresPinnedFixture;
+    if (input.router_candidate and !input.router_screen) return error.RouterCandidateRequiresRouterScreen;
     if (input.expert_fixture_sha256) |hash| {
         if (hash.len != 64 or input.expert_fixture.?.len == 0) return error.InvalidExpertFixturePin;
         for (hash) |char| if (!std.ascii.isDigit(char) and !(char >= 'a' and char <= 'f')) return error.InvalidExpertFixturePin;
@@ -371,7 +372,7 @@ fn execute(init: std.process.Init, model_dir: []const u8, input: Input, j: Journ
             if ((try context.memInfo()).free < qwen.floor_bytes) return error.GpuMemoryFloor;
             const gpu: @import("check.zig").Gpu = .{ .d = &driver, .ctx = &context, .gpa = init.gpa, .io = init.io };
             if (input.router_screen)
-                try router_screen.run(gpu, fixture_dir, input.expert_fixture_sha256.?, j)
+                try router_screen.run(gpu, fixture_dir, input.expert_fixture_sha256.?, input.router_candidate, j)
             else
                 try expert_screen.run(gpu, fixture_dir, input.expert_fixture_sha256.?, j);
             if ((try context.memInfo()).free < qwen.floor_bytes) return error.GpuMemoryFloor;
