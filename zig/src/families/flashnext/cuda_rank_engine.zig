@@ -1,5 +1,6 @@
 //! Leader-owned operations replayed on the other CUDA rank; sequence and cache identities survive map relocation.
 const std = @import("std");
+const platform = @import("sys");
 const cuda = @import("cuda");
 const prompt = @import("cuda_prompt.zig");
 const snaps = @import("cuda_snap.zig");
@@ -31,7 +32,7 @@ fn fileHash(a: std.mem.Allocator, io: std.Io, path: []const u8) ![32]u8 {
 }
 
 pub fn identity(a: std.mem.Allocator, io: std.Io, dir: []const u8, context: usize, chunk: usize) !Identity {
-    const digest = std.mem.span(std.c.getenv("TENSORFOLD_CHECKPOINT_SHA256") orelse return error.NoCheckpointIdentity);
+    const digest = std.mem.span(platform.c.getenv("TENSORFOLD_CHECKPOINT_SHA256") orelse return error.NoCheckpointIdentity);
     if (digest.len != 64) return error.NoCheckpointIdentity;
     var checkpoint: [32]u8 = undefined;
     _ = std.fmt.hexToBytes(&checkpoint, digest) catch return error.NoCheckpointIdentity;
@@ -95,7 +96,7 @@ pub const Session = struct {
         s.stopped = true;
         s.available.store(false, .release);
         s.collective.abort();
-        _ = std.c.shutdown(s.link.fd, std.posix.SHUT.RDWR);
+        _ = (if (platform.windows) platform.posix.system else std.c).shutdown(s.link.fd, platform.posix.SHUT.RDWR);
     }
 
     pub fn deinit(s: *Session) void {

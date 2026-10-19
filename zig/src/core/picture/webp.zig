@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("sys");
 const Allocator = std.mem.Allocator;
 const picture = @import("picture.zig");
 const tags = @import("tags.zig");
@@ -17,7 +18,7 @@ const needs = "WebP images need libwebp " ++ pinned ++ " (libwebpdecoder)";
 pub const missing = needs ++ ", which this server could not load; send PNG or JPEG, or install it and name the file in " ++ env;
 pub const wrong_version = needs ++ "; the one this server found is another release, whose pixels can differ";
 
-const library = if (builtin.os.tag == .macos) "libwebpdecoder.3.dylib" else "libwebpdecoder.so.3";
+const library = if (platform.windows) "libwebpdecoder.dll" else if (builtin.os.tag == .macos) "libwebpdecoder.3.dylib" else "libwebpdecoder.so.3";
 
 const Fns = struct {
     WebPGetDecoderVersion: *const fn () callconv(.c) c_int,
@@ -42,7 +43,7 @@ fn load(io: std.Io, a: Allocator) error{ NoWebpLibrary, WebpLibraryVersion }!Fns
 }
 
 fn find(io: std.Io, a: Allocator) Loaded {
-    if (std.c.getenv(env)) |named| return open(std.mem.span(named)) orelse .missing;
+    if (platform.c.getenv(env)) |named| return open(std.mem.span(named)) orelse .missing;
     var seen_wrong = false;
     if (std.process.executableDirPathAlloc(io, a)) |exe| {
         defer a.free(exe);
@@ -56,7 +57,7 @@ fn find(io: std.Io, a: Allocator) Loaded {
         }
     } else |_| {}
     const brew = [_][]const u8{ "/opt/homebrew/opt/webp/lib/" ++ library, "/usr/local/opt/webp/lib/" ++ library };
-    const fixed = if (builtin.os.tag == .macos) brew ++ [_][]const u8{library} else [_][]const u8{library};
+    const fixed = if (platform.windows) [_][]const u8{ library, "libwebp.dll", "webp.dll" } else if (builtin.os.tag == .macos) brew ++ [_][]const u8{library} else [_][]const u8{library};
     for (fixed) |p| switch (open(p) orelse continue) {
         .ready => |f| return .{ .ready = f },
         else => seen_wrong = true,
@@ -66,7 +67,7 @@ fn find(io: std.Io, a: Allocator) Loaded {
 
 /// One candidate: null when it does not load or lacks a function; `.wrong` when its version is not the pin.
 fn open(path: []const u8) ?Loaded {
-    var dl = std.DynLib.open(path) catch return null;
+    var dl = platform.DynLib.open(path) catch return null;
     var f: Fns = undefined;
     const info = @typeInfo(Fns).@"struct";
     inline for (info.field_names, info.field_types) |name, T| {
