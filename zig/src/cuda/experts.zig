@@ -16,11 +16,14 @@ const Stream = stream_.Stream;
 const Plan = grouped.Plan;
 const Affine3Experts = @import("experts3.zig").Affine3Experts;
 
+pub const Nvfp4UpLayout = enum(u1) { lane_major, slice_major_v1 };
+
 pub const Format = enum { affine4, affine3, fp8g, nvfp4, exl3, exl3_common, iq2xxs };
 
 /// One layer's experts on the device as each format's make() lays them out; a family stacks its shared ones last.
 pub const Layer = struct {
     format: Format,
+    nvfp4_up_layout: Nvfp4UpLayout = .lane_major,
     up: u64, // affine4 [E][NI/32][D/64][288] int32; fp8g [E][NI/32][D/32][2][32][2][4]; nvfp4 [E][NI/32][D/32][2][144]; iq2xxs [E][NI/16][D/256][1056] bytes (ggml.zig)
     // exl3: up the trellises [E][2] (gate, up), down [E]; the scales their suh then svh (exl3_experts.Stacks)
     down: u64, // affine4 [E][D/32][NI/64][288]; fp8g [E][D/32][NI/32][1][32][2][4]; nvfp4 [E][D/32][NI/32][1][144]; iq2xxs [E][D/16][NI/256][1056]
@@ -349,6 +352,7 @@ pub const Nvfp4Experts = struct {
     candidates_loaded: bool = false,
     n8_up: ?N8Up = null,
     split_m_up: ?SplitMUp = null,
+    slice_major_up: ?SplitMUp = null,
 
     pub const N8Up = struct {
         function: Function,
@@ -476,7 +480,24 @@ pub const Nvfp4Experts = struct {
         e.split_m_up = .{ .function = f, .resident = per_sm * sms };
     }
 
+    pub fn loadSliceMajorUp(e: *Nvfp4Experts, sms: usize) !void {
+        var handle: @import("abi.zig").Function = null;
+        const result = e.mod.d.api.cuModuleGetFunction(&handle, e.mod.handle, "tf_nvfp4_n8_split_m_slice_major_swiglu");
+        if (result == @import("abi.zig").error_not_found) return error.CandidateNotLoaded;
+        try e.mod.d.check(result, "cuModuleGetFunction slice-major up");
+        const f: Function = .{ .d = e.mod.d, .handle = handle };
+        const per_sm = try f.occupancy(SplitMUp.threads, 0);
+        if (per_sm == 0 or sms == 0) return error.NoResidentExpertBlock;
+        e.slice_major_up = .{ .function = f, .resident = per_sm * sms };
+    }
+
+    pub fn validateUpGeometry(l: Layer) !void {
+        if (l.format != .nvfp4 or l.relu2 or l.width == 0 or l.width % cols != 0 or l.dims == 0 or l.dims % 32 != 0)
+            return error.UnsupportedN8ExpertUp;
+    }
+
     pub fn validateN8Up(l: Layer) !void {
+        if (l.nvfp4_up_layout != .lane_major) return error.IncompatibleExpertUpLayout;
         if (l.format != .nvfp4 or l.relu2) return error.UnsupportedN8ExpertUp;
         if (l.width == 0 or l.width % cols != 0 or l.dims == 0 or l.dims % 32 != 0) return error.UnsupportedN8ExpertUp;
     }
@@ -497,7 +518,10 @@ pub const Nvfp4Experts = struct {
 
     pub fn runSplitMUp(e: *const Nvfp4Experts, s: Stream, in: Rows, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
         try validateSplitMUp(l);
-        const binding = e.split_m_up orelse return error.CandidateNotLoaded;
+        const binding = (switch (l.nvfp4_up_layout) {
+            .lane_major => e.split_m_up,
+            .slice_major_v1 => e.slice_major_up,
+        }) orelse return error.CandidateNotLoaded;
         const grid = binding.grid(items, l.width / cols);
         if (grid == 0) return;
         var args = decodeArgs(.up, in, l, p, out, skip);
@@ -514,6 +538,7 @@ pub const Nvfp4Experts = struct {
     }
 
     pub fn runVariant(e: *const Nvfp4Experts, variant: Variant, s: Stream, epi: Epi, in: Rows, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
+        if (epi == .up and l.nvfp4_up_layout != .lane_major) return error.IncompatibleExpertUpLayout;
         if (variant != .baseline and e.warps != 4) return error.BadExpertWarps;
         if (variant != .baseline and !e.candidates_loaded) return error.CandidateNotLoaded;
         const gate = epi == .up;
@@ -548,6 +573,7 @@ pub const Nvfp4Experts = struct {
 
     /// Prompt rows on a plan of at most `items` items of 64 pairs: up (relu^2 or SwiGLU by the layer), bf16 sums down.
     pub fn runPrompt(e: *const Nvfp4Experts, s: Stream, epi: Epi, in: Rows, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
+        if (epi == .up and l.nvfp4_up_layout != .lane_major) return error.IncompatibleExpertUpLayout;
         if (epi == .down_f32) return error.EpilogueNotBuilt;
         const gate = epi == .up;
         const parts: usize = if (gate and !l.relu2) 2 else 1;
@@ -582,17 +608,21 @@ pub const Nvfp4Experts = struct {
 
     /// One expert's words [n, k/2] (low nibble first) and e4m3 scales [n, k/16] as blocks [n/32][k/32][144] (_pack).
     pub fn packOne(out: []u32, codes: []const u8, scales: []const u8, n: usize, k: usize) void {
-        packPart(out, 1, 0, codes, scales, n, k);
+        packPart(out, 1, 0, codes, scales, n, k, .lane_major);
     }
 
     /// Gate and up interleaved as make() stacks them, [n/32][k/32][2][144], packed in place (a loader packs thousands).
     pub fn packGateUp(out: []u32, gate: [2][]const u8, up: [2][]const u8, n: usize, k: usize) void {
-        packPart(out, 2, 0, gate[0], gate[1], n, k);
-        packPart(out, 2, 1, up[0], up[1], n, k);
+        packGateUpLayout(out, gate, up, n, k, .lane_major);
+    }
+
+    pub fn packGateUpLayout(out: []u32, gate: [2][]const u8, up: [2][]const u8, n: usize, k: usize, layout: Nvfp4UpLayout) void {
+        packPart(out, 2, 0, gate[0], gate[1], n, k, layout);
+        packPart(out, 2, 1, up[0], up[1], n, k, layout);
     }
 
     /// packOne into matrix `part` of `parts` stacked per (column block, k32 group).
-    fn packPart(out: []u32, parts: usize, part: usize, codes: []const u8, scales: []const u8, n: usize, k: usize) void {
+    fn packPart(out: []u32, parts: usize, part: usize, codes: []const u8, scales: []const u8, n: usize, k: usize, layout: Nvfp4UpLayout) void {
         const kg = k / 32;
         std.debug.assert(n % cols == 0 and k % 32 == 0 and out.len == n / cols * kg * parts * words and part < parts);
         std.debug.assert(codes.len == n * k / 2 and scales.len == n * k / 16);
@@ -607,7 +637,8 @@ pub const Nvfp4Experts = struct {
                     const nib: u32 = if (input & 1 == 0) byte & 0xF else byte >> 4;
                     w |= nib << slot(h, q);
                 };
-                block[(gq * 4 + t) * 4 + j] = w;
+                const word = (gq * 4 + t) * 4 + j;
+                block[if (layout == .slice_major_v1) 32 * (word % 4) + word / 4 else word] = w;
             };
             const sc = std.mem.sliceAsBytes(block[128..]);
             for (0..4) |t| for (0..2) |h| for (0..4) |j| for (0..2) |c| {
@@ -882,8 +913,9 @@ test "split-M retains source rows skip and all 14 decode arguments" {
     var e: Nvfp4Experts = undefined;
     e.split_m_up = .{ .function = .{ .d = &d, .handle = @ptrFromInt(1) }, .resident = 192 };
     e.n8_up = .{ .function = .{ .d = &d, .handle = @ptrFromInt(2) }, .resident = 192 };
+    e.slice_major_up = .{ .function = .{ .d = &d, .handle = @ptrFromInt(3) }, .resident = 192 };
     const stream: Stream = .{ .d = &d, .handle = null };
-    const l: Layer = .{ .format = .nvfp4, .up = 101, .down = 102, .up_scale = 103, .down_scale = 104, .width = 512, .dims = 2048, .experts = 256, .limit = 2.0 };
+    var l: Layer = .{ .format = .nvfp4, .up = 101, .down = 102, .up_scale = 103, .down_scale = 104, .width = 512, .dims = 2048, .experts = 256, .limit = 2.0 };
     const p: Plan = .{ .items = 201, .counts = 202, .members = 203, .rank = 204, .hist = 205 };
     for ([_]usize{ 1, 20 }) |items| for ([_]usize{ 0, 8 }) |slots| for ([_]i32{ -1, 0, 1, 255 }) |skip| {
         const in: Rows = .{ .x = 301, .stride = 2112, .slots = slots };
@@ -899,9 +931,106 @@ test "split-M retains source rows skip and all 14 decode arguments" {
         try std.testing.expectEqual([3]u32{ @intCast(@min(items * 16, 192)), 1, 1 }, Mock.grid);
         try std.testing.expectEqual([3]u32{ 128, 1, 1 }, Mock.block);
         try std.testing.expectEqualSlices(u64, &values, &Mock.values);
+        l.nvfp4_up_layout = .slice_major_v1;
+        try e.runSplitMUp(stream, in, l, p, 302, items, skip);
+        try std.testing.expectEqual(@as(usize, 3), Mock.function);
+        try std.testing.expectEqual([3]u32{ @intCast(@min(items * 16, 128)), 1, 1 }, Mock.grid);
+        try std.testing.expectEqual([3]u32{ 256, 1, 1 }, Mock.block);
+        try std.testing.expectEqualSlices(u64, &values, &Mock.values);
+        l.nvfp4_up_layout = .lane_major;
         const args = Nvfp4Experts.decodeArgs(.up, in, l, p, 302, skip);
         try std.testing.expectEqual(@as(usize, 14), args.count);
         try std.testing.expectEqualSlices(u16, &.{ 8, 4, 4, 8, 8, 4, 4, 8, 8, 8, 8, 4, 4, 4 }, args.sizes[0..args.count]);
         for (values, 0..) |value, i| try std.testing.expectEqual(value, args.integer(i).?);
     };
+}
+
+test "split-M slice-major host packing is the exact code-word permutation with unchanged scale suffixes" {
+    const n = 64;
+    const k = 96;
+    var codes: [2][n * k / 2]u8 = undefined;
+    var scales: [2][n * k / 16]u8 = undefined;
+    for (&codes, 0..) |*part, m| for (part, 0..) |*v, i| {
+        v.* = @truncate(i * 37 + m * 53);
+    };
+    for (&scales, 0..) |*part, m| for (part, 0..) |*v, i| {
+        v.* = @truncate(i * 13 + m * 71);
+    };
+    var legacy: [n / 32 * (k / 32) * 2 * 144]u32 = undefined;
+    var candidate: @TypeOf(legacy) = undefined;
+    Nvfp4Experts.packGateUp(&legacy, .{ &codes[0], &scales[0] }, .{ &codes[1], &scales[1] }, n, k);
+    Nvfp4Experts.packGateUpLayout(&candidate, .{ &codes[0], &scales[0] }, .{ &codes[1], &scales[1] }, n, k, .slice_major_v1);
+    for (0..legacy.len / 144) |b| {
+        for (0..32) |lane| for (0..4) |slice| {
+            try std.testing.expectEqual(legacy[b * 144 + 4 * lane + slice], candidate[b * 144 + 32 * slice + lane]);
+        };
+        try std.testing.expectEqualSlices(u32, legacy[b * 144 + 128 ..][0..16], candidate[b * 144 + 128 ..][0..16]);
+    }
+    try std.testing.expect(!std.mem.eql(u32, &legacy, &candidate));
+}
+
+test "split-M slice-major legacy up consumers fail before touching an undefined CUDA driver even for no work" {
+    var e: Nvfp4Experts = undefined;
+    e.slice_major_up = null;
+    const l: Layer = .{ .format = .nvfp4, .nvfp4_up_layout = .slice_major_v1, .up = 101, .down = 102, .width = 512, .dims = 2048, .experts = 256 };
+    for ([_]usize{ 0, 1 }) |items| {
+        try std.testing.expectError(error.IncompatibleExpertUpLayout, e.runN8Up(undefined, undefined, l, undefined, 0, items, -1));
+        inline for (.{ Nvfp4Experts.Variant.baseline, Nvfp4Experts.Variant.pipe4, Nvfp4Experts.Variant.n16, Nvfp4Experts.Variant.n16_pipe4 }) |variant| {
+            try std.testing.expectError(error.IncompatibleExpertUpLayout, e.runVariant(variant, undefined, .up, undefined, l, undefined, 0, items, -1));
+        }
+        try std.testing.expectError(error.IncompatibleExpertUpLayout, e.runPrompt(undefined, .up, undefined, l, undefined, 0, items, -1));
+        try std.testing.expectError(error.CandidateNotLoaded, e.runSplitMUp(undefined, undefined, l, undefined, 0, items, -1));
+    }
+    var legacy = l;
+    legacy.nvfp4_up_layout = .lane_major;
+    const in: Rows = .{ .x = 301, .stride = 512 };
+    const p: Plan = .{ .items = 201, .counts = 202, .members = 203, .rank = 204, .hist = 205 };
+    inline for (.{ Epi.down_f32, Epi.down_bf16 }) |epi| {
+        const a = Nvfp4Experts.decodeArgs(epi, in, legacy, p, 302, -1);
+        const b = Nvfp4Experts.decodeArgs(epi, in, l, p, 302, -1);
+        for (0..a.count) |i| try std.testing.expectEqual(a.integer(i), b.integer(i));
+    }
+}
+
+test "split-M slice-major loader requires its exact symbol and positive occupancy without fallback" {
+    const abi = @import("abi.zig");
+    const Fake = struct {
+        var result: abi.Result = abi.error_not_found;
+        var blocks: c_int = 0;
+        var exact: bool = false;
+        var occupancy_calls: usize = 0;
+        fn function(out: *abi.Function, _: abi.Module, name: [*:0]const u8) callconv(.c) abi.Result {
+            exact = std.mem.eql(u8, std.mem.span(name), "tf_nvfp4_n8_split_m_slice_major_swiglu");
+            out.* = if (result == abi.success) @ptrFromInt(7) else null;
+            return result;
+        }
+        fn occupancy(out: *c_int, _: abi.Function, block: c_int, shared: usize) callconv(.c) abi.Result {
+            occupancy_calls += 1;
+            if (block != 256 or shared != 0) return 1;
+            out.* = blocks;
+            return abi.success;
+        }
+    };
+    var d: Driver = .{ .lib = undefined, .api = undefined };
+    d.api.cuModuleGetFunction = Fake.function;
+    d.api.cuOccupancyMaxActiveBlocksPerMultiprocessor = Fake.occupancy;
+    var e: Nvfp4Experts = undefined;
+    e.mod = .{ .d = &d, .handle = null };
+    e.slice_major_up = null;
+    e.split_m_up = .{ .function = undefined, .resident = 168 };
+    Fake.result = abi.error_not_found;
+    Fake.occupancy_calls = 0;
+    try std.testing.expectError(error.CandidateNotLoaded, e.loadSliceMajorUp(84));
+    try std.testing.expect(Fake.exact);
+    try std.testing.expectEqual(@as(usize, 0), Fake.occupancy_calls);
+    try std.testing.expect(e.slice_major_up == null);
+    try std.testing.expectEqual(@as(usize, 168), e.split_m_up.?.resident);
+    Fake.result = abi.success;
+    Fake.blocks = 0;
+    try std.testing.expectError(error.NoResidentExpertBlock, e.loadSliceMajorUp(84));
+    Fake.blocks = 2;
+    try std.testing.expectError(error.NoResidentExpertBlock, e.loadSliceMajorUp(0));
+    try e.loadSliceMajorUp(84);
+    try std.testing.expectEqual(@as(usize, 168), e.slice_major_up.?.resident);
+    try std.testing.expectEqual(@as(abi.Function, @ptrFromInt(7)), e.slice_major_up.?.function.handle);
 }

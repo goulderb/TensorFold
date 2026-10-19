@@ -51,6 +51,7 @@ pub const Scratch = struct {
 /// Routed experts over `total` normed rows at x into out; `wide` rows take the prefill kernels, else decode's.
 pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, shared: @import("cuda_layers.zig").SharedExpert, x: u64, out: u64, total: usize, wide: bool, expert_up_n8: bool, expert_up_split_m: bool) !void {
     try validateSplitMDispatch(wide, expert_up_n8, expert_up_split_m);
+    if (layer.nvfp4_up_layout == .slice_major_v1 and (wide or !expert_up_n8 or !expert_up_split_m or total == 0 or total > E.hf_prefill_rows)) return error.IncompatibleExpertUpLayout;
     const g = e.g;
     const s = e.routed;
     const slots = if (shared == .projected) g.top_k else g.slots();
@@ -140,4 +141,12 @@ test "split-M dispatch refuses wide or non-N8 scheduling before CUDA" {
     try std.testing.expectError(error.UnsupportedSplitMExpertUp, rows(undefined, 0, undefined, undefined, 0, 0, 1, false, false, true));
     try std.testing.expectError(error.UnsupportedSplitMExpertUp, rows(undefined, 0, undefined, undefined, 0, 0, 1, true, true, true));
     try std.testing.expectError(error.UnsupportedSplitMExpertUp, rows(undefined, 0, undefined, undefined, 0, 0, 1, true, false, true));
+}
+
+test "slice-major routed dispatch refuses incompatible scheduling before router or CUDA access" {
+    const std = @import("std");
+    const l: cuda.experts.Layer = .{ .format = .nvfp4, .nvfp4_up_layout = .slice_major_v1, .up = 101, .down = 102, .width = 512, .dims = 2048, .experts = 256 };
+    try std.testing.expectError(error.IncompatibleExpertUpLayout, rows(undefined, 0, l, undefined, 0, 0, 1, false, true, false));
+    try std.testing.expectError(error.IncompatibleExpertUpLayout, rows(undefined, 0, l, undefined, 0, 0, 1, true, false, false));
+    try std.testing.expectError(error.IncompatibleExpertUpLayout, rows(undefined, 0, l, undefined, 0, 0, 17, false, true, true));
 }

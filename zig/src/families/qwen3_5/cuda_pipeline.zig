@@ -12,6 +12,7 @@ pub const Options = struct {
     cut: usize = 20,
     captured: bool = true,
     prefill_rows: usize = 1,
+    expert_up_layout: cuda.experts.Nvfp4UpLayout = .lane_major,
 };
 
 fn validatePrefillRows(rows: usize) !void {
@@ -100,7 +101,7 @@ pub const Chain = struct {
         };
         for (c.partitions, placements[0..c.partitions.len]) |*p, placement| {
             try p.context.makeCurrent();
-            p.engine = try engine.Engine.initPlaced(gpa, io, &p.context, dir, admitted, placement, false);
+            p.engine = try engine.Engine.initPlacedWithOptions(gpa, io, &p.context, dir, admitted, placement, false, .{ .expert_up_layout = options.expert_up_layout });
             engines += 1;
             p.engine.captured = options.captured;
             p.engine.bounded_hf_prefill = options.prefill_rows > 1;

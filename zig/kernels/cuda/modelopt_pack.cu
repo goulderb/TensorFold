@@ -72,7 +72,8 @@ extern "C" __global__ void __launch_bounds__(256) tf_pack_fp4_scales(const uint8
 }
 
 // Experts' codes [E][n][ks/2] and scales [E][n][ks/16], inputs k0..k0+k, as part m of [E][n/32][k/32][parts][144].
-extern "C" __global__ void __launch_bounds__(144) tf_pack_fp4_experts(const uint8_t* __restrict__ codes,
+template <bool SLICE_MAJOR>
+__device__ __forceinline__ void pack_fp4_experts(const uint8_t* __restrict__ codes,
                                                                       const uint8_t* __restrict__ scales,
                                                                       uint32_t* __restrict__ out, int n, int ks, int k0,
                                                                       int k, int parts, int m) {
@@ -93,7 +94,7 @@ extern "C" __global__ void __launch_bounds__(144) tf_pack_fp4_experts(const uint
         const uint32_t nib = (input & 1) ? byte >> 4 : byte & 0xF;
         word |= nib << (4 * (2 * h + q / 2 + 4 * (q % 2)));
       }
-    dst[w] = word;
+    dst[SLICE_MAJOR ? 32 * (w % 4) + w / 4 : w] = word;
   } else {
     uint32_t word = 0;
 #pragma unroll
@@ -106,3 +107,11 @@ extern "C" __global__ void __launch_bounds__(144) tf_pack_fp4_experts(const uint
     dst[w] = word;
   }
 }
+
+#define TF_PACK_FP4_EXPERTS(NAME, SLICE_MAJOR) \
+extern "C" __global__ void __launch_bounds__(144) NAME(const uint8_t* __restrict__ codes, \
+ const uint8_t* __restrict__ scales, uint32_t* __restrict__ out, int n, int ks, int k0, \
+ int k, int parts, int m) { pack_fp4_experts<SLICE_MAJOR>(codes, scales, out, n, ks, k0, k, parts, m); }
+TF_PACK_FP4_EXPERTS(tf_pack_fp4_experts, false)
+TF_PACK_FP4_EXPERTS(tf_pack_fp4_experts_slice_major, true)
+#undef TF_PACK_FP4_EXPERTS

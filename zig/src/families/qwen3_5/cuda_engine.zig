@@ -34,7 +34,8 @@ pub const ExpertGraphNode = struct {
     heads_all: bool,
     layer_local: usize,
     layer_global: usize,
-    arm: enum { baseline, n8, split_m },
+    arm: enum { baseline, n8, split_m, slice_major },
+    up_layout: cuda.experts.Nvfp4UpLayout = .lane_major,
     grid: [3]u32,
     block: [3]u32,
     shared_bytes: u32,
@@ -184,6 +185,7 @@ pub const Engine = struct {
     captured: bool = true,
     graph_nodes: usize = 0,
     graph_launches: usize = 0,
+    expert_up_layout: cuda.experts.Nvfp4UpLayout = .lane_major,
     expert_up_n8: bool = false,
     expert_up_split_m: bool = false,
     reuse_fp8_quant: bool = false,
@@ -291,8 +293,15 @@ pub const Engine = struct {
         return initPlaced(gpa, io, ctx, dir, .{ .geometry = g, .encoding = .mlx }, .{ .first = 0, .end = g.layers, .total = g.layers }, kv8);
     }
 
+    pub const InitOptions = struct { expert_up_layout: cuda.experts.Nvfp4UpLayout = .lane_major };
+
     pub fn initPlaced(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, admitted: checkpoint.Admitted, placement: checkpoint.Placement, kv8: bool) !*Engine {
+        return initPlacedWithOptions(gpa, io, ctx, dir, admitted, placement, kv8, .{});
+    }
+
+    pub fn initPlacedWithOptions(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, admitted: checkpoint.Admitted, placement: checkpoint.Placement, kv8: bool, options: InitOptions) !*Engine {
         const g = try placement.localGeometry(admitted.geometry);
+        if (options.expert_up_layout == .slice_major_v1 and (admitted.numerics() != .hf_modelopt or g.hidden != 2048 or g.intermediate != 512 or g.experts != 256)) return error.UnsupportedQwenExpertUpLayout;
         if (admitted.numerics() == .hf_modelopt and kv8) return error.UnsupportedQwenKv;
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var ck = try core.Checkpoint.openModel(gpa, io, dir);
@@ -312,7 +321,8 @@ pub const Engine = struct {
         e.graph_nodes = 0;
         e.graph_launches = 0;
         e.expert_up_n8 = e.numerics == .hf_modelopt;
-        e.expert_up_split_m = false;
+        e.expert_up_layout = options.expert_up_layout;
+        e.expert_up_split_m = options.expert_up_layout == .slice_major_v1;
         e.reuse_fp8_quant = false;
         e.bounded_hf_prefill = false;
         e.verify_expert_graphs = false;
@@ -363,7 +373,7 @@ pub const Engine = struct {
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
         e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
-        if (e.numerics == .hf_modelopt) e.modelopt = try modelopt.Bindings.load(ctx, &e.fns);
+        if (e.numerics == .hf_modelopt) e.modelopt = try modelopt.Bindings.loadWithUpLayout(ctx, &e.fns, options.expert_up_layout);
         errdefer if (e.modelopt) |*m| m.unload();
         e.layers = try gpa.alloc(Layer, g.layers);
         errdefer gpa.free(e.layers);
@@ -616,6 +626,7 @@ pub const Engine = struct {
         try gdn_layout.validate(e.numerics);
         if (e.expert_up_n8 and e.numerics != .hf_modelopt) return error.UnsupportedQwenExpertUp;
         try validateCombined(e.numerics, e.expert_up_n8, e.expert_up_split_m, e.reuse_fp8_quant);
+        try e.validateUpLayout(e.expert_up_layout, e.expert_up_n8, e.expert_up_split_m, ids.len);
         const g = e.g;
         try validateHfWindow(e.numerics, e.bounded_hf_prefill, parts, ids.len, keep);
         var total: usize = 0;
@@ -679,7 +690,7 @@ pub const Engine = struct {
         const lone = total == 1 and parts.len == 1;
         const bucket: usize = if (lone) 1 else if (total <= 16) 16 else most_verify;
         const windows: usize = if (lone) 1 else max_segs;
-        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant };
+        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant, .expert_up_layout = e.expert_up_layout };
         e.features = if (images) |im| im.features else 0;
         return shape;
     }
@@ -691,6 +702,7 @@ pub const Engine = struct {
         if (e.numerics == .hf_modelopt and (shape.total == 0 or shape.total > hf_prefill_rows or shape.nseg != 1 or shape.record or !shape.prompt or shape.taps or
             (!e.bounded_hf_prefill and (shape.total != 1 or shape.heads_all)))) return error.UnsupportedQwenWindow;
         if (e.observer != null and e.captured) return error.QwenObserverRequiresEager;
+        try e.validateUpLayout(shape.expert_up_layout, shape.expert_up_n8, shape.expert_up_split_m, shape.total);
         try shape.gdn_layout.validate(e.numerics);
         if (e.verify_gdn_graphs and e.numerics == .hf_modelopt and shape.total > 1) try e.verifyHfChainTables(shape);
         if (shape.prompt and e.numerics == .mlx_sanitized or !e.captured) {
@@ -732,6 +744,12 @@ pub const Engine = struct {
             try gop.value_ptr.launchOn(e.stream);
             e.graph_launches += 1;
         }
+    }
+
+    fn validateUpLayout(e: *const Engine, layout: cuda.experts.Nvfp4UpLayout, n8: bool, split: bool, total: usize) !void {
+        if (layout != e.expert_up_layout) return error.QwenExpertUpLayoutMismatch;
+        if (layout == .slice_major_v1 and (e.numerics != .hf_modelopt or !e.expert_up_n8 or !e.expert_up_split_m or !n8 or !split or total == 0 or total > hf_prefill_rows)) return error.UnsupportedQwenExpertUpLayout;
+        for (e.layers) |layer| if (layer.mlp == .moe and layer.mlp.moe.experts.nvfp4_up_layout != layout) return error.QwenExpertUpLayoutMismatch;
     }
 
     fn verifyHfChainTables(e: *const Engine, shape: Shape) !void {
@@ -1023,8 +1041,9 @@ pub const Engine = struct {
         const baseline = experts.fns[0].handle;
         const candidate = n8.function.handle;
         if (baseline == candidate) return error.QwenExpertGraphKernelMismatch;
-        const split = experts.split_m_up;
-        const split_function = if (split) |v| v.function.handle else null;
+        const legacy_split_function = if (experts.split_m_up) |v| v.function.handle else null;
+        const slice_function = if (experts.slice_major_up) |v| v.function.handle else null;
+        const split = if (shape.expert_up_layout == .slice_major_v1) experts.slice_major_up else experts.split_m_up;
         const expected = if (shape.expert_up_split_m) (split orelse return error.UnsupportedQwenExpertUp).function.handle else if (shape.expert_up_n8) candidate else baseline;
         const storage = try e.gpa.alloc(cuda.graph.Node, node_count);
         defer e.gpa.free(storage);
@@ -1035,7 +1054,7 @@ pub const Engine = struct {
         for (nodes) |node| {
             var params: cuda.abi.KernelNodeParams = undefined;
             try e.d.check(e.d.api.cuGraphKernelNodeGetParams_v2(node, &params), "cuGraphKernelNodeGetParams");
-            if (params.func != baseline and params.func != candidate and params.func != split_function) continue;
+            if (params.func != baseline and params.func != candidate and params.func != legacy_split_function and params.func != slice_function) continue;
             if (params.func != expected) return error.QwenExpertGraphKernelMismatch;
             const args = params.params orelse return error.QwenExpertGraphMissingArguments;
             const up: *const u64 = @ptrCast(@alignCast(args[3] orelse return error.QwenExpertGraphMissingArguments));
@@ -1044,7 +1063,9 @@ pub const Engine = struct {
                 if (layer.mlp != .moe or layer.mlp.moe.experts.up != up.*) continue;
                 if (layers_seen[index]) return error.QwenExpertGraphLayerMismatch;
                 const m = layer.mlp.moe;
-                try cuda.experts.Nvfp4Experts.validateN8Up(m.experts);
+                try cuda.experts.Nvfp4Experts.validateUpGeometry(m.experts);
+                if (m.experts.nvfp4_up_layout != shape.expert_up_layout) return error.QwenExpertUpLayoutMismatch;
+                if (shape.expert_up_layout == .slice_major_v1 and !shape.expert_up_split_m) return error.QwenExpertGraphKernelMismatch;
                 const slots = if (m.shared == .projected) e.g.top_k else e.g.slots();
                 const expert_count = if (m.shared == .projected) e.g.experts else e.g.experts + 1;
                 const items = cuda.grouped.maxItems(@as(usize, shape.total) * slots, expert_count, 16);
@@ -1072,7 +1093,8 @@ pub const Engine = struct {
                     .heads_all = shape.heads_all,
                     .layer_local = index,
                     .layer_global = e.placement.first + index,
-                    .arm = if (params.func == split_function) .split_m else if (params.func == candidate) .n8 else .baseline,
+                    .up_layout = shape.expert_up_layout,
+                    .arm = if (params.func == slice_function) .slice_major else if (params.func == legacy_split_function) .split_m else if (params.func == candidate) .n8 else .baseline,
                     .grid = .{ params.grid_x, params.grid_y, params.grid_z },
                     .block = .{ params.block_x, params.block_y, params.block_z },
                     .shared_bytes = params.shared_bytes,
@@ -1140,11 +1162,12 @@ pub const Engine = struct {
         gdn_layout: Cache.GdnLayout = .value_key,
         expert_up_n8: bool = false,
         expert_up_split_m: bool = false,
+        expert_up_layout: cuda.experts.Nvfp4UpLayout = .lane_major,
         reuse_fp8_quant: bool = false,
         heads_all: bool = false,
 
         fn key(s: Shape) u32 {
-            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21 | @as(u32, @intFromBool(s.expert_up_split_m)) << 22 | @as(u32, @intFromBool(s.reuse_fp8_quant)) << 23;
+            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21 | @as(u32, @intFromBool(s.expert_up_split_m)) << 22 | @as(u32, @intFromBool(s.reuse_fp8_quant)) << 23 | @as(u32, @backingInt(s.expert_up_layout)) << 24;
         }
     };
 
@@ -1294,6 +1317,7 @@ test "expert graph verification rejects opposite arms, wrong arguments, duplicat
     bindings.nvfp4_experts.warps = 4;
     bindings.nvfp4_experts.n8_up = .{ .function = .{ .d = &driver, .handle = @ptrFromInt(2) }, .resident = 192 };
     bindings.nvfp4_experts.split_m_up = .{ .function = .{ .d = &driver, .handle = @ptrFromInt(3) }, .resident = 168 };
+    bindings.nvfp4_experts.slice_major_up = .{ .function = .{ .d = &driver, .handle = @ptrFromInt(4) }, .resident = 168 };
     const expert_layer: cuda.experts.Layer = .{ .format = .nvfp4, .up = 101, .down = 102, .up_scale = 103, .down_scale = 104, .width = 512, .dims = 2048, .experts = 256 };
     var local_layers: [1]Layer = undefined;
     local_layers[0].mlp = .{ .moe = .{ .router = 0, .experts = expert_layer, .shared = .{ .projected = undefined } } };
@@ -1346,11 +1370,21 @@ test "expert graph verification rejects opposite arms, wrong arguments, duplicat
     try std.testing.expectError(error.QwenExpertGraphLayerMismatch, e.verifyExpertGraph(graph, shape, 2));
     Fake.count = 0;
     try std.testing.expectError(error.QwenExpertGraphWorkCountMismatch, e.verifyExpertGraph(graph, shape, 0));
-    try std.testing.expectEqual(@as(usize, 3), e.expert_graph_roster.items.len);
+    shape.expert_up_layout = .slice_major_v1;
+    Fake.count = 1;
+    Fake.params.func = @ptrFromInt(4);
+    try std.testing.expectError(error.QwenExpertUpLayoutMismatch, e.verifyExpertGraph(graph, shape, 1));
+    local_layers[0].mlp.moe.experts.nvfp4_up_layout = .slice_major_v1;
+    try std.testing.expectEqual(@as(usize, 1), try e.verifyExpertGraph(graph, shape, 1));
+    Fake.params.func = @ptrFromInt(3);
+    try std.testing.expectError(error.QwenExpertGraphKernelMismatch, e.verifyExpertGraph(graph, shape, 1));
+    try std.testing.expectEqual(@as(usize, 4), e.expert_graph_roster.items.len);
     const roster = e.expert_graph_roster.items;
     try std.testing.expectEqual(.baseline, roster[0].arm);
     try std.testing.expectEqual(.n8, roster[1].arm);
     try std.testing.expectEqual(.split_m, roster[2].arm);
+    try std.testing.expectEqual(.slice_major, roster[3].arm);
+    try std.testing.expectEqual(.slice_major_v1, roster[3].up_layout);
     try std.testing.expectEqual(@as(usize, 5), roster[2].layer_global);
     try std.testing.expectEqual(@as(usize, 14), roster[2].abi_count);
     try std.testing.expectEqual([3]u32{ 128, 1, 1 }, roster[2].grid);
@@ -1447,16 +1481,16 @@ test "bounded HF admission is opt in and does not imply recorded windows" {
 }
 
 test "bounded HF graph keys separate every row count layout expert arm and head mode" {
-    var keys: [512]u32 = undefined;
+    var keys: [1024]u32 = undefined;
     var count: usize = 0;
-    for (1..17) |rows| for ([_]Cache.GdnLayout{ .value_key, .key_value }) |layout| for ([_]bool{ false, true }) |n8| for ([_]bool{ false, true }) |heads| for ([_]bool{ false, true }) |split| for ([_]bool{ false, true }) |reuse| {
-        const shape: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .gdn_layout = layout, .expert_up_n8 = n8, .heads_all = heads, .expert_up_split_m = split, .reuse_fp8_quant = reuse };
+    for (1..17) |rows| for ([_]Cache.GdnLayout{ .value_key, .key_value }) |layout| for ([_]bool{ false, true }) |n8| for ([_]bool{ false, true }) |heads| for ([_]bool{ false, true }) |split| for ([_]bool{ false, true }) |reuse| for ([_]cuda.experts.Nvfp4UpLayout{ .lane_major, .slice_major_v1 }) |up_layout| {
+        const shape: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .gdn_layout = layout, .expert_up_n8 = n8, .heads_all = heads, .expert_up_split_m = split, .reuse_fp8_quant = reuse, .expert_up_layout = up_layout };
         const key = shape.key();
         try std.testing.expect(std.mem.indexOfScalar(u32, keys[0..count], key) == null);
         keys[count] = key;
         count += 1;
     };
-    try std.testing.expectEqual(@as(usize, 512), count);
+    try std.testing.expectEqual(@as(usize, 1024), count);
 }
 
 test "bounded HF chain views retain every state binding and reject field corruption" {
@@ -1597,4 +1631,28 @@ test "prompt logits finish copies every row and commits terminal cache logits on
     shape.heads_all = false;
     try e.finish(&parts, .logits, shape);
     try std.testing.expectEqualSlices(u16, &.{ 99, 98 }, &terminal);
+}
+
+test "immutable expert representation rejects stale shapes disabled consumers and mismatched layer tags before CUDA" {
+    var e: Engine = undefined;
+    e.numerics = .hf_modelopt;
+    e.expert_up_layout = .slice_major_v1;
+    e.expert_up_n8 = true;
+    e.expert_up_split_m = true;
+    var local: [1]Layer = undefined;
+    local[0].mlp = .{ .moe = .{ .router = 0, .experts = .{ .format = .nvfp4, .nvfp4_up_layout = .slice_major_v1, .up = 101, .down = 102, .width = 512, .dims = 2048, .experts = 256 }, .shared = .{ .projected = undefined } } };
+    e.layers = &local;
+    try e.validateUpLayout(.slice_major_v1, true, true, 16);
+    try std.testing.expectError(error.QwenExpertUpLayoutMismatch, e.validateUpLayout(.lane_major, true, true, 1));
+    try std.testing.expectError(error.UnsupportedQwenExpertUpLayout, e.validateUpLayout(.slice_major_v1, false, true, 1));
+    try std.testing.expectError(error.UnsupportedQwenExpertUpLayout, e.validateUpLayout(.slice_major_v1, true, false, 1));
+    for ([_]usize{ 0, 17, 128 }) |rows| try std.testing.expectError(error.UnsupportedQwenExpertUpLayout, e.validateUpLayout(.slice_major_v1, true, true, rows));
+    e.expert_up_split_m = false;
+    try std.testing.expectError(error.UnsupportedQwenExpertUpLayout, e.validateUpLayout(.slice_major_v1, true, true, 1));
+    e.expert_up_split_m = true;
+    e.expert_up_n8 = false;
+    try std.testing.expectError(error.UnsupportedQwenExpertUpLayout, e.validateUpLayout(.slice_major_v1, true, true, 1));
+    e.expert_up_n8 = true;
+    local[0].mlp.moe.experts.nvfp4_up_layout = .lane_major;
+    try std.testing.expectError(error.QwenExpertUpLayoutMismatch, e.validateUpLayout(.slice_major_v1, true, true, 1));
 }

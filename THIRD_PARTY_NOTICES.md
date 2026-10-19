@@ -374,3 +374,12 @@ TensorFold ships no Drama 3 weights and no codec weights. [fishaudio/drama-3](ht
 and its `codec.pth` are under the Fish Audio Community License Agreement v1.0: research and non-commercial use,
 commercial use below its revenue threshold, and no Hosted Service without a separate license from Fish Audio. Users
 obtain the checkpoint and accept that license themselves.
+
+
+The opt-in Qwen slice-major expert-up representation adapts TensorFold's existing
+`modelopt_pack.cu` packer and the retained `nvfp4/experts.cu` split-M arithmetic.
+It writes the code-word permutation directly into the original up allocation and
+adds an explicit split-M consumer with slice-contiguous scalar loads. Scale words,
+down packing and arithmetic retain the original implementation. This local tuning
+adaptation imports no new donor kernel. All original and transitive notices above
+remain applicable, and checkpoint provenance and licensing remain separate.

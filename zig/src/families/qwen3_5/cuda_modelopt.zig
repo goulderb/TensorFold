@@ -16,6 +16,10 @@ pub const Bindings = struct {
     part: u64 = 0,
 
     pub fn load(ctx: *const cuda.Context, fns: *layers.Fns) !Bindings {
+        return loadWithUpLayout(ctx, fns, .lane_major);
+    }
+
+    pub fn loadWithUpLayout(ctx: *const cuda.Context, fns: *layers.Fns, layout: cuda.experts.Nvfp4UpLayout) !Bindings {
         const major: u32 = @intCast(try ctx.attribute(.compute_capability_major));
         if (major < 12) return error.CheckpointMathNeedsBlackwell;
         const sms: usize = @intCast(try ctx.attribute(.multiprocessor_count));
@@ -34,6 +38,10 @@ pub const Bindings = struct {
         try experts.loadSplitMUp(sms);
         var pack = try cuda.modelopt.Packer.load(ctx.d);
         errdefer pack.unload();
+        if (layout == .slice_major_v1) {
+            try experts.loadSliceMajorUp(sms);
+            try pack.loadSliceMajorExperts();
+        }
         var ck = try cuda.ck.Ck.load(ctx.d, major, sms);
         errdefer ck.unload();
         try hf.bind(image, fns);

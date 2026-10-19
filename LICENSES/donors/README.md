@@ -312,3 +312,12 @@ addendum and the donor documents. The packaging regression checks the bytes
 in the resulting archives. Recheck the exact artifact before publication.
 Model licenses, compiled dependencies, and container licenses need separate
 review. No public fork or release is approved by this attribution backfill.
+
+
+The opt-in Qwen slice-major expert-up representation adapts TensorFold's existing
+`modelopt_pack.cu` packer and the retained `nvfp4/experts.cu` split-M arithmetic.
+It writes the code-word permutation directly into the original up allocation and
+adds an explicit split-M consumer with slice-contiguous scalar loads. Scale words,
+down packing and arithmetic retain the original implementation. This local tuning
+adaptation imports no new donor kernel. All original and transitive notices above
+remain applicable, and checkpoint provenance and licensing remain separate.

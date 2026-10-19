@@ -27,7 +27,7 @@ pub fn load(e: anytype, ck: *core.Checkpoint, stage: *cuda.DeviceBuffer, cfg: ch
     if (e.layers.len != placement.end - placement.first) return error.InvalidPartition;
     try checkpoint.validateText(ck, cfg, placement.first, placement.end, placement.ownsEmbedding(), placement.ownsHead());
     try checkpoint.refuseUnusedText(ck, placement.first, placement.end, placement.ownsEmbedding(), placement.ownsHead());
-    var l: Loader(false, *core.Checkpoint, @TypeOf(e)) = .{ .source = ck, .e = e, .stage = stage };
+    var l: Loader(false, *core.Checkpoint, @TypeOf(e)) = .{ .source = ck, .e = e, .stage = stage, .up_layout = e.expert_up_layout };
     try l.walk(cfg, placement);
 }
 
@@ -38,6 +38,7 @@ fn Loader(comptime planning: bool, comptime Source: type, comptime Target: type)
         e: Target = if (planning) {} else undefined,
         stage: if (planning) void else *cuda.DeviceBuffer = if (planning) {} else undefined,
         sizes: Plan = .{},
+        up_layout: cuda.experts.Nvfp4UpLayout = .lane_major,
 
         fn alloc(l: *Self, bytes: usize) !u64 {
             const aligned = try std.math.add(usize, bytes, 255);
@@ -161,13 +162,13 @@ fn Loader(comptime planning: bool, comptime Source: type, comptime Target: type)
             };
         }
 
-        fn packExpert(l: *Self, p: checkpoint.Part, out: u64, parts: usize, index: usize) !void {
+        fn packExpert(l: *Self, p: checkpoint.Part, out: u64, parts: usize, index: usize, layout: cuda.experts.Nvfp4UpLayout) !void {
             if (p.kind != .nvfp4) return error.UnsupportedQwenExperts;
             try l.stageNeed(p.n * p.k / 2 + p.n * p.k / 16);
             if (!planning) {
                 try l.stage.upload(0, p.w.bytes);
                 try l.stage.upload(p.w.bytes.len, p.blocks.?.bytes);
-                try l.e.modelopt.?.pack.fp4Experts(l.e.stream, l.stage.ptr, l.stage.ptr + p.w.bytes.len, out, 1, p.n, p.k, 0, p.k, parts, index);
+                try l.e.modelopt.?.pack.fp4ExpertsLayout(l.e.stream, l.stage.ptr, l.stage.ptr + p.w.bytes.len, out, 1, p.n, p.k, 0, p.k, parts, index, layout);
                 try l.e.stream.synchronize();
             }
         }
@@ -183,15 +184,16 @@ fn Loader(comptime planning: bool, comptime Source: type, comptime Target: type)
             for (0..256) |e| {
                 inline for (.{ "gate_proj", "up_proj" }, 0..) |suffix, m| {
                     const p = try l.part(try checkpoint.name(&buf, "{s}.experts.{d}.{s}", .{ pre, e, suffix }), 512, 2048);
-                    try l.packExpert(p, up + e * up_one, 2, m);
+                    try l.packExpert(p, up + e * up_one, 2, m, l.up_layout);
                     up_scales[2 * e + m] = p.scale;
                 }
                 const p = try l.part(try checkpoint.name(&buf, "{s}.experts.{d}.down_proj", .{ pre, e }), 2048, 512);
-                try l.packExpert(p, down + e * down_one, 1, 0);
+                try l.packExpert(p, down + e * down_one, 1, 0, .lane_major);
                 down_scales[e] = p.scale;
             }
             return .{
                 .format = .nvfp4,
+                .nvfp4_up_layout = l.up_layout,
                 .up = up,
                 .down = down,
                 .up_scale = try l.upload(std.mem.sliceAsBytes(&up_scales)),
@@ -299,10 +301,31 @@ test "recording arena loader matches planned allocation bytes for full and parti
             pub fn synchronize(_: @This()) !void {}
         } = .{},
         modelopt: ?struct { pack: struct {
+            var expected_up_layout: cuda.experts.Nvfp4UpLayout = .lane_major;
+            var up_calls: usize = 0;
+            var down_calls: usize = 0;
+            pub fn reset(layout: cuda.experts.Nvfp4UpLayout) void {
+                expected_up_layout = layout;
+                up_calls = 0;
+                down_calls = 0;
+            }
+            pub fn check(layer_count: usize) !void {
+                try std.testing.expectEqual(layer_count * 512, up_calls);
+                try std.testing.expectEqual(layer_count * 256, down_calls);
+            }
             pub fn bf16Lane(_: @This(), _: anytype, _: u64, _: u64, _: usize, _: usize) !void {}
             pub fn fp8Lane(_: @This(), _: anytype, _: u64, _: u64, _: usize, _: usize) !void {}
             pub fn fp4Lane(_: @This(), _: anytype, _: u64, _: u64, _: u64, _: u64, _: usize, _: usize) !void {}
-            pub fn fp4Experts(_: @This(), _: anytype, _: u64, _: u64, _: u64, _: usize, _: usize, _: usize, _: usize, _: usize, _: usize, _: usize) !void {}
+            pub fn fp4ExpertsLayout(_: @This(), _: anytype, _: u64, _: u64, _: u64, _: usize, _: usize, _: usize, _: usize, _: usize, parts: usize, _: usize, layout: cuda.experts.Nvfp4UpLayout) !void {
+                if (parts == 1) {
+                    down_calls += 1;
+                    try std.testing.expectEqual(cuda.experts.Nvfp4UpLayout.lane_major, layout);
+                } else {
+                    up_calls += 1;
+                    try std.testing.expectEqual(@as(usize, 2), parts);
+                    try std.testing.expectEqual(expected_up_layout, layout);
+                }
+            }
         } = .{} } = .{},
         allocations: std.ArrayList(Allocation) = .empty,
         arena_at: usize = 0,
@@ -357,11 +380,13 @@ test "recording arena loader matches planned allocation bytes for full and parti
             .{ .first = 0, .end = 40, .total = 40 },
             .{ .first = 0, .end = 3, .total = 40 },
             .{ .first = 3, .end = 40, .total = 40 },
-        }) |placement| {
+        }) |placement| for ([_]cuda.experts.Nvfp4UpLayout{ .lane_major, .slice_major_v1 }) |layout| {
             const expected = try plan(&header, cfg, placement);
             var recorded: Recording = .{ .gpa = a, .layers = try a.alloc(Layer, placement.end - placement.first) };
-            var loader: Loader(false, *Values, *Recording) = .{ .source = &values, .e = &recorded, .stage = &stage };
+            @TypeOf(recorded.modelopt.?.pack).reset(layout);
+            var loader: Loader(false, *Values, *Recording) = .{ .source = &values, .e = &recorded, .stage = &stage, .up_layout = layout };
             try loader.walk(cfg, placement);
+            try @TypeOf(recorded.modelopt.?.pack).check(placement.end - placement.first);
             try std.testing.expectEqual(expected, loader.sizes);
             try std.testing.expectEqual(expected.weights_bytes, std.mem.alignForward(usize, recorded.arena_at, 256));
             var cursor: usize = 0;
@@ -375,7 +400,8 @@ test "recording arena loader matches planned allocation bytes for full and parti
             for (recorded.layers, placement.first..) |layer, global| {
                 try std.testing.expectEqual(cfg.spec.full(global), layer.mixer == .attention);
                 try std.testing.expect(layer.mlp.moe.shared == .projected);
+                try std.testing.expectEqual(layout, layer.mlp.moe.experts.nvfp4_up_layout);
             }
-        }
+        };
     }
 }
