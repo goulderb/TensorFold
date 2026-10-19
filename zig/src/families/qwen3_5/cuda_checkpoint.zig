@@ -1,8 +1,63 @@
 const std = @import("std");
 const core = @import("core");
-const general = @import("qwen35").config;
+const general = @import("config.zig");
+const checks = @import("config_checks.zig");
+const dimensions = @import("cuda_geometry.zig");
+pub const Geometry = dimensions.Geometry;
 const Tensor = core.checkpoint.Tensor;
 const DType = core.checkpoint.DType;
+
+pub const Numerics = enum { mlx_sanitized, hf_modelopt };
+pub const Encoding = union(enum) { mlx, modelopt: Config };
+pub const Admitted = struct {
+    geometry: Geometry,
+    encoding: Encoding,
+
+    pub fn numerics(a: Admitted) Numerics {
+        return switch (a.encoding) {
+            .mlx => .mlx_sanitized,
+            .modelopt => .hf_modelopt,
+        };
+    }
+};
+
+pub const Placement = struct {
+    first: usize,
+    end: usize,
+    total: usize,
+
+    pub fn validate(p: Placement) !void {
+        if (p.first >= p.end or p.end > p.total or p.total > dimensions.max_layers) return error.InvalidPartition;
+    }
+
+    pub fn ownsEmbedding(p: Placement) bool {
+        return p.first == 0;
+    }
+    pub fn ownsHead(p: Placement) bool {
+        return p.end == p.total;
+    }
+
+    pub fn localGeometry(p: Placement, global: Geometry) !Geometry {
+        try p.validate();
+        if (p.total != global.layers) return error.InvalidPartition;
+        var local = global;
+        local.layers = p.end - p.first;
+        local.linear = @splat(false);
+        for (p.first..p.end, 0..) |i, j| {
+            local.linear[j] = global.linear[i];
+            local.bits.proj[j] = global.bits.proj[i];
+        }
+        return local;
+    }
+};
+
+pub fn admit(gpa: std.mem.Allocator, bytes: []const u8) !Admitted {
+    if (try claimsBytes(gpa, bytes)) {
+        const cfg = try Config.parse(gpa, bytes);
+        return .{ .geometry = cfg.geometry, .encoding = .{ .modelopt = cfg } };
+    }
+    return .{ .geometry = try dimensions.parse(gpa, bytes), .encoding = .mlx };
+}
 
 /// Claim the encoding before geometry validation so malformed ModelOpt never falls through to MLX.
 pub fn claims(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !bool {
@@ -26,6 +81,7 @@ pub fn claimsBytes(gpa: std.mem.Allocator, bytes: []const u8) !bool {
 pub const Config = struct {
     spec: general.Spec,
     context: usize,
+    geometry: Geometry,
 
     pub fn read(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Config {
         const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
@@ -40,15 +96,49 @@ pub const Config = struct {
         defer arena.deinit();
         const doc = try general.declared(arena.allocator(), bytes);
         const tower = try general.textTower(doc);
-        const dimensions = .{
+        try checks.computes(tower);
+        const expected_dimensions = .{
             .{ "hidden_size", 2048 },          .{ "vocab_size", 248320 },         .{ "num_hidden_layers", 40 },
             .{ "num_attention_heads", 16 },    .{ "num_key_value_heads", 2 },     .{ "head_dim", 256 },
             .{ "linear_num_key_heads", 16 },   .{ "linear_num_value_heads", 32 }, .{ "linear_key_head_dim", 128 },
             .{ "linear_value_head_dim", 128 }, .{ "linear_conv_kernel_dim", 4 },  .{ "num_experts", 256 },
             .{ "num_experts_per_tok", 8 },     .{ "moe_intermediate_size", 512 }, .{ "shared_expert_intermediate_size", 512 },
         };
-        inline for (dimensions) |d| if (!isInt(tower.get(d[0]), d[1])) return error.UnsupportedQwenGeometry;
-        const spec = try general.geometry(tower, 4, 16);
+        inline for (expected_dimensions) |d| if (!isInt(tower.get(d[0]), d[1])) return error.UnsupportedQwenGeometry;
+        const g = try dimensions.dimensions(doc);
+        var spec: general.Spec = .{
+            .hidden = g.hidden,
+            .intermediate = try optionalCount(tower, "intermediate_size"),
+            .n_layers = g.layers,
+            .heads = g.q_heads,
+            .kv_heads = g.kv_heads,
+            .head_dim = dimensions.head_dim,
+            .key_heads = g.k_heads,
+            .value_heads = g.v_heads,
+            .key_dim = dimensions.dk,
+            .value_dim = dimensions.dk,
+            .conv = dimensions.taps,
+            .vocab = g.vocab,
+            .eps = switch (tower.get("rms_norm_eps").?) {
+                .float => |v| v,
+                .integer => |v| @floatFromInt(v),
+                else => return error.UnsupportedQwenGeometry,
+            },
+            .rope_theta = dimensions.theta,
+            .rotary_dim = 64,
+            .full_every = 4,
+            .bits = 4,
+            .group = 16,
+            .experts = g.experts,
+            .top_k = g.top_k,
+            .moe_width = g.intermediate,
+            .shared_width = g.intermediate,
+            .mtp_layers = try optionalCount(tower, "mtp_num_hidden_layers"),
+            .max_position = g.context,
+        };
+        for (0..g.layers) |i| spec.full_layers[i] = !g.linear[i];
+        if (tower.get("full_attention_interval")) |v| if (!isInt(v, 4)) return error.UnsupportedQwenGeometry;
+        if (tower.get("norm_topk_prob")) |v| if (!isBool(v, true)) return error.UnsupportedQwenGeometry;
         try admitGeometry(spec);
         if (!isString(doc.get("model_type"), "qwen3_5_moe") or
             !isString(tower.get("model_type"), "qwen3_5_moe_text")) return error.UnsupportedQwenGeometry;
@@ -57,6 +147,7 @@ pub const Config = struct {
             if (tied != .bool or tied.bool) return error.UnsupportedTiedHead;
         }
         const rope = try object(tower.get("rope_parameters") orelse return error.UnsupportedQwenRotary);
+        spec.mrope = try checks.mrope(rope, spec.rotary_dim);
         if (!isString(rope.get("rope_type"), "default") or
             !std.meta.eql(spec.mrope.section, [3]usize{ 11, 11, 10 }) or !spec.mrope.interleaved)
             return error.UnsupportedQwenRotary;
@@ -68,17 +159,17 @@ pub const Config = struct {
         var nvfp4 = false;
         var it = groups.iterator();
         while (it.next()) |entry| {
-            const g = try object(entry.value_ptr.*);
-            const w = try object(g.get("weights") orelse return error.UnsupportedQwenQuantization);
+            const group = try object(entry.value_ptr.*);
+            const w = try object(group.get("weights") orelse return error.UnsupportedQwenQuantization);
             if (!isString(w.get("type"), "float") or !isBool(w.get("dynamic"), false)) return error.UnsupportedQwenQuantization;
             if (isInt(w.get("num_bits"), 8)) {
-                const a = try object(g.get("input_activations") orelse return error.UnsupportedQwenQuantization);
+                const a = try object(group.get("input_activations") orelse return error.UnsupportedQwenQuantization);
                 if (!isInt(a.get("num_bits"), 8) or !isString(a.get("type"), "float") or !isBool(a.get("dynamic"), false))
                     return error.UnsupportedQwenQuantization;
                 fp8 = true;
             } else if (isInt(w.get("num_bits"), 4) and isInt(w.get("group_size"), 16)) {
                 // ModelOpt's per-layer W4A16_NVFP4 tag overrides the generic group's activation metadata.
-                if (g.get("input_activations")) |activation| {
+                if (group.get("input_activations")) |activation| {
                     const a = try object(activation);
                     if (!isInt(a.get("num_bits"), 4) or !isString(a.get("type"), "float") or
                         !isBool(a.get("dynamic"), false) or !isInt(a.get("group_size"), 16))
@@ -97,7 +188,7 @@ pub const Config = struct {
             if (!isString(p.get("quant_algo"), "W4A16_NVFP4") or !isInt(p.get("group_size"), 16))
                 return error.UnsupportedQwenQuantization;
         }
-        return .{ .spec = spec, .context = spec.max_position };
+        return .{ .spec = spec, .context = spec.max_position, .geometry = g };
     }
 };
 
@@ -113,6 +204,11 @@ fn admitGeometry(s: general.Spec) !void {
 
 fn object(v: std.json.Value) !std.json.ObjectMap {
     return if (v == .object) v.object else error.UnsupportedQwenQuantization;
+}
+fn optionalCount(o: std.json.ObjectMap, key: []const u8) !usize {
+    const v = o.get(key) orelse return 0;
+    if (v != .integer or v.integer < 0) return error.UnsupportedQwenGeometry;
+    return @intCast(v.integer);
 }
 fn isString(v: ?std.json.Value, text: []const u8) bool {
     const x = v orelse return false;
@@ -189,23 +285,29 @@ pub const View = struct {
     }
 
     pub fn part(v: View, pre: []const u8, n: usize, k: usize) !Part {
-        const kind = try projectionLayout(v.ck, pre, n, k);
-        var buf: [256]u8 = undefined;
-        var p: Part = .{ .kind = kind, .w = try v.ck.get(try name(&buf, "{s}.weight", .{pre})), .n = n, .k = k };
-        switch (kind) {
-            .bf16 => {},
-            .fp8 => {
-                p.scale = try scalar(try v.ck.get(try name(&buf, "{s}.weight_scale", .{pre})));
-                p.act = try scalar(try v.ck.get(try name(&buf, "{s}.input_scale", .{pre})));
-            },
-            .nvfp4 => {
-                p.blocks = try v.ck.get(try name(&buf, "{s}.weight_scale", .{pre}));
-                p.scale = try scalar(try v.ck.get(try name(&buf, "{s}.weight_scale_2", .{pre})));
-            },
-        }
-        return p;
+        return readPart(v.ck, pre, n, k);
     }
 };
+
+pub fn readPart(source: anytype, pre: []const u8, n: usize, k: usize) !Part {
+    const kind = try projectionLayout(source, pre, n, k);
+    var buf: [256]u8 = undefined;
+    var p: Part = .{ .kind = kind, .w = try source.get(try name(&buf, "{s}.weight", .{pre})), .n = n, .k = k };
+    switch (kind) {
+        .bf16 => {},
+        .fp8 => {
+            p.scale = try scalar(try source.get(try name(&buf, "{s}.weight_scale", .{pre})));
+            p.act = try scalar(try source.get(try name(&buf, "{s}.input_scale", .{pre})));
+        },
+        .nvfp4 => {
+            p.blocks = try source.get(try name(&buf, "{s}.weight_scale", .{pre}));
+            p.scale = try scalar(try source.get(try name(&buf, "{s}.weight_scale_2", .{pre})));
+            const act = try name(&buf, "{s}.input_scale", .{pre});
+            if (source.has(act)) p.act = try scalar(try source.get(act));
+        },
+    }
+    return p;
+}
 
 pub fn refuseUnusedText(ck: *const core.Checkpoint, first: usize, end: usize, with_embed: bool, with_head: bool) !void {
     for (ck.files.items) |file| for (file.names.keys()) |n| {
@@ -279,7 +381,7 @@ pub fn validateText(source: anytype, cfg: Config, first: usize, end: usize, with
             inline for (.{ "gate_proj", "up_proj", "down_proj" }) |suffix| {
                 const down = comptime std.mem.eql(u8, suffix, "down_proj");
                 const kind = try projectionLayout(source, try name(&buf, "{s}.{s}", .{ expert, suffix }), if (down) 2048 else 512, if (down) 512 else 2048);
-                if (kind != .nvfp4) return error.UnsupportedQwenExperts;
+                if (e < 256 and kind != .nvfp4) return error.UnsupportedQwenExperts;
             }
         }
         if (cfg.spec.full(i)) {

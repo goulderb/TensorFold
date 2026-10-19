@@ -38,6 +38,7 @@ test "cuda Qwen checkpoint admits both official ModelOpt configs and refuses com
         try std.testing.expectEqual(@as(usize, 262144), cfg.context);
         try std.testing.expectEqual(@as(usize, 256), cfg.spec.experts);
         try std.testing.expectEqual(@as(usize, 4096), cfg.spec.valueWidth());
+        try std.testing.expectEqual(@as(usize, 1), cfg.spec.mtp_layers);
     }
     inline for (.{ "unsloth_qwen36_nvfp4", "unsloth_qwen36_nvfp4_fast" }) |fixture|
         try std.testing.expectError(error.UnsupportedQwenQuantization, ck.Config.parse(a, @embedFile("fixtures/" ++ fixture ++ "/config.json")));
@@ -192,4 +193,75 @@ test "ModelOpt encoding dispatch preserves MLX and claims malformed ModelOpt" {
     try std.testing.expect(try ck.claimsBytes(a, "{\"quantization_config\":{\"quant_algo\":\"MIXED_PRECISION\"}}"));
     try std.testing.expectError(error.UnsupportedQwenQuantization, ck.claimsBytes(a, "{\"quantization_config\":false}"));
     try std.testing.expectError(error.UnsupportedModel, ck.Config.parse(a, "{\"quantization_config\":{\"quant_method\":\"modelopt\"}}"));
+}
+
+test "shared admission selects numerics and global placement without changing MLX parsing" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("fixtures/ornith_nvfp4/config.json");
+    const admitted = try ck.admit(a, bytes);
+    try std.testing.expectEqual(ck.Numerics.hf_modelopt, admitted.numerics());
+    const p: ck.Placement = .{ .first = 3, .end = 7, .total = 40 };
+    const local = try p.localGeometry(admitted.geometry);
+    try std.testing.expectEqual(@as(usize, 4), local.layers);
+    try std.testing.expectEqual(@as(usize, 3), local.deltas());
+    try std.testing.expect(!local.linear[0]);
+    try std.testing.expect(!p.ownsEmbedding());
+    try std.testing.expect(!p.ownsHead());
+    try std.testing.expectError(error.InvalidPartition, (ck.Placement{ .first = 3, .end = 3, .total = 40 }).validate());
+    try std.testing.expectError(error.InvalidPartition, (ck.Placement{ .first = 0, .end = 40, .total = 39 }).validate());
+    try std.testing.expectError(error.InvalidPartition, (ck.Placement{ .first = 0, .end = 39, .total = 39 }).localGeometry(admitted.geometry));
+    const malformed = try std.mem.replaceOwned(u8, a, bytes, "MIXED_PRECISION", "unknown");
+    defer a.free(malformed);
+    try std.testing.expect(try ck.claimsBytes(a, malformed));
+    try std.testing.expectError(error.UnsupportedQwenQuantization, ck.admit(a, malformed));
+}
+
+test "shared expert projections admit mixed BF16 FP8 NVFP4 but routed experts stay NVFP4" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = try ck.Config.parse(a, @embedFile("fixtures/ornith_nvfp4/config.json"));
+    var h = try Header.parse(a, @embedFile("fixtures/ornith_nvfp4/headers.json.gz"));
+    const gate = "model.language_model.layers.0.mlp.shared_expert.gate_proj";
+    const up = "model.language_model.layers.0.mlp.shared_expert.up_proj";
+    const bf16 = try std.json.parseFromSliceLeaky(std.json.Value, a, "[\"BF16\",[512,2048]]", .{});
+    const fp8 = try std.json.parseFromSliceLeaky(std.json.Value, a, "[\"F8_E4M3\",[512,2048]]", .{});
+    const scalar = try std.json.parseFromSliceLeaky(std.json.Value, a, "[\"F32\",[]]", .{});
+    try h.entries.put(a, gate ++ ".weight", bf16);
+    _ = h.entries.swapRemove(gate ++ ".weight_scale");
+    _ = h.entries.swapRemove(gate ++ ".weight_scale_2");
+    try h.entries.put(a, up ++ ".weight", fp8);
+    try h.entries.put(a, up ++ ".weight_scale", scalar);
+    try h.entries.put(a, up ++ ".input_scale", scalar);
+    _ = h.entries.swapRemove(up ++ ".weight_scale_2");
+    try ck.validateText(&h, cfg, 0, 1, false, false);
+    try std.testing.expectEqual(ck.Kind.bf16, try ck.projectionLayout(&h, gate, 512, 2048));
+    try std.testing.expectEqual(ck.Kind.fp8, try ck.projectionLayout(&h, up, 512, 2048));
+    try std.testing.expectEqual(ck.Kind.nvfp4, try ck.projectionLayout(&h, "model.language_model.layers.0.mlp.shared_expert.down_proj", 2048, 512));
+    const routed = "model.language_model.layers.0.mlp.experts.0.gate_proj";
+    try h.entries.put(a, routed ++ ".weight", bf16);
+    _ = h.entries.swapRemove(routed ++ ".weight_scale");
+    _ = h.entries.swapRemove(routed ++ ".weight_scale_2");
+    try std.testing.expectError(error.UnsupportedQwenExperts, ck.validateText(&h, cfg, 0, 1, false, false));
+}
+
+test "NVFP4 parts retain optional input scale without changing the weight-only format" {
+    const Source = struct {
+        value: f32 = 3,
+        pub fn has(_: *@This(), _: []const u8) bool {
+            return true;
+        }
+        pub fn get(s: *@This(), key: []const u8) !Tensor {
+            if (std.mem.endsWith(u8, key, ".weight")) return .{ .dtype = .u8, .rank = 2, .shape = .{ 2, 32, 1, 1, 1 }, .bytes = &.{} };
+            if (std.mem.endsWith(u8, key, ".weight_scale")) return .{ .dtype = .f8_e4m3, .rank = 2, .shape = .{ 2, 4, 1, 1, 1 }, .bytes = &.{} };
+            return .{ .dtype = .f32, .rank = 0, .shape = @splat(1), .bytes = std.mem.asBytes(&s.value) };
+        }
+    };
+    var source: Source = .{};
+    const part = try ck.readPart(&source, "q", 2, 64);
+    try std.testing.expectEqual(ck.Kind.nvfp4, part.kind);
+    try std.testing.expectEqual(@as(f32, 3), part.scale);
+    try std.testing.expectEqual(@as(f32, 3), part.act);
+    source.value = std.math.inf(f32);
+    try std.testing.expectError(error.InvalidQwenScale, ck.readPart(&source, "q", 2, 64));
 }
