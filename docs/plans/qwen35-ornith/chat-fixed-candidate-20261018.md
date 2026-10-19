@@ -2,8 +2,8 @@
 
 The first shared-host trial failed ordinary chat and restored Nemotron at
 23:47:23 UTC on October 18. The two passive chat-metadata refusals are now
-corrected. This candidate is prepared for another bounded integration trial;
-it has not run a model and is not qualified for production.
+corrected. This candidate now passes the bounded thirteen-check shared-host
+integration trial. It is not qualified for production.
 
 The source pin is `973428fb85203e636a94c92c80fb8bb34a79369e`. The executable
 SHA256 is `d1f462a330bb04a13c40f47ad6ff5316d1a3cd8e5062721607488951b0413744`.
@@ -36,8 +36,15 @@ the two internal GPUs. This is layer splitting, not tensor parallelism.
 The thirteen-check HTTP probe adds a prior assistant turn. That new case
 checks successful nonempty output without claiming uncaptured serial parity.
 
-No second outage has run. Fresh approval is required before stopping Nemotron
-for the ten-minute experiment, with ten further minutes reserved for recovery.
+The user approved an hour of work and retesting beginning at 00:07:24 UTC on
+October 19. The first corrected attempt stopped after nine passing checks
+because the probe requested the dashboard-gated `/stats` route. Fleet commit
+`54f01886` switches the probe to `/health` live counts, with failing-before and
+passing-after regressions. The repeat passes all thirteen checks and the
+separate queued-zero/active-early cancellation log check. Nemotron returns
+exact local-only proxy READY at 00:11:35 UTC; Clef is unchanged. Fleet commit
+`d501489b` preserves both attempts and the original evidence bytes.
+
 The current production runtime and all failed-candidate pins are preserved.
 The four failed numerical rows, multi-lane execution, batched prefill, cache
 and the proposed two-lane 64K service profile remain unqualified.

@@ -12,11 +12,18 @@ window ended with Nemotron restored and a successful proxy completion.
 
 CPU preparation on 2026-10-18 merged the selected trunk and implemented the
 checkpoint-derived memory screen. The one-lane shared-host integration is
-implemented and CPU-tested; its native Windows executable builds. See the
+implemented and tested on the internal pair; its native Windows executable
+passes the thirteen-check HTTP lifecycle and separate cancellation log gate.
+See the
 [integration design and receipts](shared-host-design.md) and
-[layout budget](cpu-preparation-20261018.md). Device execution of this
-integration, numerical acceptance, multiple lanes, cache, service capacity,
-and production promotion remain open.
+[layout budget](cpu-preparation-20261018.md). The
+[corrected candidate](chat-fixed-candidate-20261018.md) records that bounded
+result. Numerical acceptance, multiple lanes, cache, service capacity and
+production promotion remain open.
+The later [required/named tool unit](call-gates-20261019.md) passes the same
+thirteen lifecycle checks and two explicit tool-choice requests on its own
+immutable binary. [Numerical boundary captures](numerical-diagnosis-20261019.md)
+explain several local differences but leave all four full-logit rows failed.
 
 ## Set the first production contract
 

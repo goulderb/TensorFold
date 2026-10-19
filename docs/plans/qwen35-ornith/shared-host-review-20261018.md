@@ -134,3 +134,56 @@ execute. Corrected chat, including history, has not run on hardware. The
 next probe has thirteen checks and requires a fresh approved outage because
 the first window ended with verified production restoration. CPU preparation
 and review do not close those boundaries.
+
+## Approved-hour round 6 and disposition
+
+Fable 5.1 reviewed the call-gate source `aa267a2f`, this run's decision trail,
+both shared-host attempts and both numerical windows. It then observed the
+completed tool window: all thirteen lifecycle checks, both required/named
+tool responses and restored Nemotron PID 16512 with exact proxy READY at
+00:50:40 UTC. Its complete report is retained as
+[approved-hour Fable round 6](evidence/approved-hour-20261019/fable-r6.md).
+Its initial timing observations remain in that report; the completed receipts
+and follow-up commits below resolve them.
+
+- **Uncommitted Windows fixtures and a failed intermediate green-named log.**
+  Commit `4f0377c9` contains only the three fixture files, independently of
+  call-gate changes. The authoritative `focused-green.log` reports 158 passes
+  and 30 skips; `focused-final.log` reruns recovery with 130 passes and 25
+  skips, with EXLR8 cached from its 28-pass/five-skip root. Both roots also
+  compile semantically for Linux, without executing there. The intermediate
+  `exlr8-green.log` failed and is not accepted evidence. The broad aggregate
+  remains failed at that checkpoint because XPU positional reads and GLM
+  fake-fabric/timing paths still depend on POSIX. Their follow-up is separate.
+- **Thinking and valid-name-prefix adapter coverage.** Test-only commit
+  `bbaf9463` adds both cases through the real adapter and synchronous shared
+  engine, checking emitted and model-fed tokens. The focused gate passes
+  47/47. This does not qualify reasoning-enabled tools on the device.
+- **Missing latest trail rows and uncommitted recipe evidence.** Append-only
+  rows now cover trace 2, call-gate design/device results, review timeboxes,
+  fixture checks and archive provenance. Fleet commit `1cd1dfd3` records the
+  separate inactive recipe and complete tools trial. Its targeted tests pass
+  152 cases, and the required fast gate and pre-commit checks pass.
+- **Recipe snapshot hash interpretation.** Rechecking every original member
+  directly in the lifecycle archive passes all sixteen SHA256 values,
+  including both candidate recipe snapshots. Those are hashes of original
+  bytes. They are not substituted canonical JSON digests. Later worktree
+  qualification-record text differs from the archived snapshots. The original
+  archive and inventory remain unchanged. The rerunnable receipt is
+  `.artifacts/lifecycle-archive-recheck.json`.
+- **Decision timestamps.** The five rows logged at 00:28 record earlier
+  decisions at the time they were written. Their receipts carry actual event
+  timestamps. An appended clarification retains that history and distinguishes
+  logging time from execution time.
+- **Diagnostic timings.** Raw correctness responses retain their timing fields.
+  They are short, serial, untuned requests without repeat samples or a paired
+  workload. No performance comparison or production sizing is inferred. Once
+  correctness is accepted, use the planned bounded workload matrix and the
+  benchmark checklist before selecting a capacity profile.
+
+Fable's production objections remain valid: the four logit rows fail fixed
+limits; an independent serving/quality baseline is missing; only one lane
+and 4096 tokens have device evidence; cache, batched prefill, long context,
+soak and supervised restart remain unqualified. The user's conditional request
+to size and fully verify for promotion has therefore not been reached.
+No full fleet promotion run or public selection is claimed.
