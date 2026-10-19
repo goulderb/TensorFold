@@ -109,18 +109,23 @@ def main():
     parser.add_argument("model", type=Path)
     parser.add_argument("capture", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--router", action="store_true")
     args = parser.parse_args()
     roundtrip()
     old = json.loads((args.capture.parent / "component-comparison.json").read_text())
-    names = {"input.bin": ("input.bf16", 4096), "hidden.bin": ("expert_hidden.bf16", 8192), "pairs.bin": ("pairs.f32", 65536)}
+    names = {"input.bin": ("pos-000-input.bf16", 4096), "hidden.bin": ("pos-000-expert_hidden.bf16", 8192), "pairs.bin": ("pos-000-pairs.f32", 65536)}
+    if args.router:
+        for position in range(6):
+            for label, suffix, size in [("input", "input.bf16", 4096), ("picks", "picks.i32", 32), ("weights", "weights.f32", 36)]:
+                names[f"route-{position:03d}-{label}.bin"] = (f"pos-{position:03d}-{suffix}", size)
     saved = {}
-    for filename, size in [*names.values(), ("picks.i32", 32)]:
-        path = args.capture / ("pos-000-" + filename)
+    for filename, size in [*names.values(), ("pos-000-picks.i32", 32)]:
+        path = args.capture / filename
         data = path.read_bytes()
         if len(data) != size or digest(data) != old["capture_sha256"][path.name]:
             raise ValueError(f"saved trace pin differs: {path.name}")
         saved[filename] = data
-    picks = np.frombuffer(saved["picks.i32"], dtype="<i4").tolist()
+    picks = np.frombuffer(saved["pos-000-picks.i32"], dtype="<i4").tolist()
     if len(set(picks)) != 8 or not all(0 <= v < 256 for v in picks):
         raise ValueError("invalid captured expert IDs")
     order = picks + [e for e in range(256) if e not in picks]
@@ -139,6 +144,10 @@ def main():
             weights, scale = store.projection(pre + ".down_proj", 2048, 512)
             down.write(weights.tobytes())
             ds.write(scale)
+    if args.router:
+        prefix = "model.language_model.layers.0.mlp."
+        (args.output / "router.bin").write_bytes(store.read(prefix + "gate.weight", [256, 2048], {"BF16"}))
+        (args.output / "shared-gate.bin").write_bytes(store.read(prefix + "shared_expert_gate.weight", [1, 2048], {"BF16"}))
     manifest = {"scope": "Ornith layer0 real weights and captured position0 input; bank0 maps captured route; other banks are controlled route substitutions", "expert_order": order, "capture_pins": old["capture_sha256"], "source_tensors": store.reads, "generator_sha256": digest(Path(__file__).read_bytes()), "packing_source_sha256": digest((Path(__file__).resolve().parents[2] / "zig/kernels/cuda/modelopt_pack.cu").read_bytes()), "files": {p.name: {"bytes": p.stat().st_size, "sha256": digest(p.read_bytes())} for p in sorted(args.output.iterdir())}}
     (args.output / "manifest.json").write_bytes((json.dumps(manifest, indent=2) + "\n").encode())
     print(json.dumps({"files": manifest["files"], "captured_experts": picks, "cpu_roundtrip": "pass", "gpu_initialized": False}))

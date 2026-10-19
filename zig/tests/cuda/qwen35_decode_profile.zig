@@ -7,12 +7,13 @@ const admission = @import("qwen35_probe_device.zig");
 const turn = @import("qwen35_sampler_turn.zig");
 const generation_graph = @import("qwen35_generation_graph.zig");
 const expert_screen = @import("qwen35_expert_screen.zig");
+const router_screen = @import("qwen35_router_screen.zig");
 
 comptime {
     if (options.engine_optimization != .fast) @compileError("diagnostics require ReleaseFast engine");
 }
 
-const Input = struct { prompt: []const u32, token: u32, repetitions: usize = 16, expert_fixture: ?[]const u8 = null, expert_fixture_sha256: ?[]const u8 = null };
+const Input = struct { prompt: []const u32, token: u32, repetitions: usize = 16, expert_fixture: ?[]const u8 = null, expert_fixture_sha256: ?[]const u8 = null, router_screen: bool = false };
 const Journal = struct {
     a: std.mem.Allocator,
     io: std.Io,
@@ -174,6 +175,7 @@ fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     const input = try std.json.parseFromSliceLeaky(Input, a, bytes, .{});
     if ((input.expert_fixture == null) != (input.expert_fixture_sha256 == null)) return error.InvalidExpertFixturePin;
+    if (input.router_screen and input.expert_fixture == null) return error.RouterScreenRequiresPinnedFixture;
     if (input.expert_fixture_sha256) |hash| {
         if (hash.len != 64 or input.expert_fixture.?.len == 0) return error.InvalidExpertFixturePin;
         for (hash) |char| if (!std.ascii.isDigit(char) and !(char >= 'a' and char <= 'f')) return error.InvalidExpertFixturePin;
@@ -335,6 +337,12 @@ pub fn main(init: std.process.Init) !u8 {
         _ = try parse(a, init.io, args[2]);
         return 0;
     }
+    if (args.len == 3 and std.mem.eql(u8, args[1], "--check-router-input")) {
+        const input = try parse(a, init.io, args[2]);
+        if (!input.router_screen) return error.RouterScreenRequired;
+        try router_screen.checkInput(init.gpa, init.io, input.expert_fixture.?, input.expert_fixture_sha256.?);
+        return 0;
+    }
     if (args.len != 4) return 2;
     try std.Io.Dir.cwd().createDir(init.io, args[3], .default_dir);
     const file = try std.Io.Dir.cwd().createFile(init.io, try std.fs.path.join(a, &.{ args[3], "results.jsonl" }), .{ .exclusive = true });
@@ -355,16 +363,20 @@ fn execute(init: std.process.Init, model_dir: []const u8, input: Input, j: Journ
     var driver_open = true;
     defer if (driver_open) driver.close();
     const identities = try admitted.verify(a, &driver);
-    try j.write(.{ .kind = "start", .source_commit = options.source_commit, .identities = identities, .scope = if (input.expert_fixture != null) "real layer0 expert seam with rotating banks" else "fixed-token fixed-position evolving-state forward diagnostic; not generation throughput", .position = input.prompt.len, .token = input.token, .repetitions = input.repetitions });
+    try j.write(.{ .kind = "start", .source_commit = options.source_commit, .identities = identities, .scope = if (input.router_screen) router_screen.scope else if (input.expert_fixture != null) "real layer0 expert seam with rotating banks" else "fixed-token fixed-position evolving-state forward diagnostic; not generation throughput", .position = input.prompt.len, .token = input.token, .repetitions = input.repetitions });
     if (input.expert_fixture) |fixture_dir| {
         for (identities) |identity| {
             var context = try cuda.Context.init(&driver, identity.ordinal);
             defer context.deinit();
             if ((try context.memInfo()).free < qwen.floor_bytes) return error.GpuMemoryFloor;
-            try expert_screen.run(.{ .d = &driver, .ctx = &context, .gpa = init.gpa, .io = init.io }, fixture_dir, input.expert_fixture_sha256.?, j);
+            const gpu: @import("check.zig").Gpu = .{ .d = &driver, .ctx = &context, .gpa = init.gpa, .io = init.io };
+            if (input.router_screen)
+                try router_screen.run(gpu, fixture_dir, input.expert_fixture_sha256.?, j)
+            else
+                try expert_screen.run(gpu, fixture_dir, input.expert_fixture_sha256.?, j);
             if ((try context.memInfo()).free < qwen.floor_bytes) return error.GpuMemoryFloor;
         }
-        try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "real layer0 expert seam with 32 rotating banks; saved bank0 and variant self-parity", .production_qualification = false });
+        try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = if (input.router_screen) router_screen.scope else "real layer0 expert seam with 32 rotating banks; saved bank0 and variant self-parity", .production_qualification = false });
         return;
     }
     driver.close();

@@ -61,3 +61,53 @@ Clef. Restore Nemotron and require the exact local proxy completion.
 
 This is native regression and performance work. Independent full-logit
 qualification remains failed, and this screen cannot authorize promotion.
+
+## R1 result
+
+The [retained journal and analysis](evidence/expert-tuning-20261019/r1/analysis.json)
+pass every exactness gate on both GPUs. There are 384 bank parity records,
+144 raw timing records (24 warmup and 120 measured), and four successful
+projection completion records. The measured source is
+81ea3e0b6b7fff280a400102103e651ab566c5de, executable SHA256
+17ed2bc1df8e2f1ef545af7a43fbac9b3b3cdc5e03911d89dee4a3a616f71326.
+
+For n16_pipe4, up median is 53.475 to 42.979 microseconds on GPU 0 and
+53.374 to 42.860 on GPU 1. Its paired up savings range from 10.463 to
+10.814 microseconds on GPU 0 and 10.412 to 10.828 on GPU 1. Down savings
+are much smaller, median 0.266 and 0.242 microseconds. All five pairs
+improve for each of those four groups. n16 alone has similar up savings
+but a small down regression. pipe4 alone regresses up by about 3 microseconds.
+
+The wider variant changes the up grid from 32 to 64 blocks. That is a
+plausible explanation for the latency change, not a measurement of achieved
+occupancy or bandwidth. The seam holds one real input fixed and substitutes
+routes through actual weights. It does not reproduce forty layers' working
+sets or their evolving activations.
+
+Even transferring n16_pipe4's savings unchanged to every layer projects only
+0.0822 seconds per turn, or 3.63%. Retain it as a measured candidate for a
+later combined trial; it does not earn a full model load by itself. No
+serving or runtime default changed. Next, split products and selection in
+the remaining router cost before choosing a kernel change.
+
+The [window receipt](evidence/expert-tuning-20261019/r1/window.json) passes.
+Minimum sampled free memory was 15963/15499 MiB. Production was restored
+and the local proxy returned exact READY at 16:15:53.606914 UTC, request
+45be6335-abf8-4e5a-aa97-d94be56bba22. Clef was unchanged, cleanup and sampler
+errors were empty, and both owned controller and child processes ended.
+
+## Router split preparation
+
+The next proof changes no kernel. It separately times the existing products,
+selection and combined two-kernel graphs using the actual first-layer router
+and six captured native input/pick/weight rows. Each correctness row must
+match the saved IDs and FP32 route weights exactly and produce 257 finite,
+repeatable scores. A poisoned-score negative control must fail.
+
+Timing uses position zero with fixed inputs and a warm, roughly 1 MiB router
+matrix. The three graph types perform 128 route repetitions, with 128 nodes
+for each component or 256 for the combined path. An excluded warmup and five
+repetitions alternate stage order. Every timed output is checked after the
+events. This is an arithmetic diagnostic with warm L2, not a model bandwidth
+measurement. Its purpose is to identify which component can plausibly save
+enough complete-turn time to deserve a candidate kernel.
