@@ -25,6 +25,11 @@ def analyze(window, require_greedy=False):
     plan = read_json(window / "plan.json")
     require(receipt.get("passed") is True and receipt.get("restored") is True, "window did not pass and restore")
     require(receipt.get("clef_unchanged") is True and not receipt.get("cleanup_errors") and not receipt.get("sampler_failures"), "receipt reports Clef, cleanup, or sampler failure")
+    samples = receipt.get("memory", [])
+    require(samples, "missing controller GPU memory samples")
+    for sample in samples:
+        free = sample.get("free_mib", {})
+        require(set(free) == set(UUIDS) and all(type(value) is int and value >= 1536 for value in free.values()), "controller GPU memory floor or identities failed")
     restoration = receipt.get("restoration") or {}
     require(restoration.get("passed") is True and restoration.get("clef_unchanged") is True, "restoration evidence failed")
     require(plan.get("source_commit") == receipt.get("plan", {}).get("source_commit"), "plan source differs from receipt")
@@ -116,6 +121,7 @@ def analyze(window, require_greedy=False):
         categories.setdefault(r["phase"], []).append(r["elapsed_ms"])
     result = {"source_commit": plan["source_commit"], "implementation": "shared-qwen-engine", "input": {"prompt_tokens": p, "output_tokens": n, "greedy": greedy}, "measured_pairs": 5,
               "scope": "synthetic C=1 shared-engine eager/captured profile; not HTTP throughput or promotion evidence",
+              "minimum_sampled_free_mib": {uuid: min(sample["free_mib"][uuid] for sample in samples) for uuid in UUIDS},
               "arms": {}, "phase_instrumentation": {"scope": "eager instrumented append categories; not a matched kernel profile and not critical-path utilization", "categories": {}}}
     for arm in ("eager", "graph"):
         samples = []

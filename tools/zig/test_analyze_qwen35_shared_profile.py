@@ -18,6 +18,7 @@ class AnalyzerTests(unittest.TestCase):
         (self.window / "profile-SOURCE_COMMIT").write_text(source)
         identity = [{"uuid": x} for x in analyzer.UUIDS]
         receipt = {"passed": True, "restored": True, "clef_unchanged": True, "cleanup_errors": [], "sampler_failures": [],
+                   "memory": [{"free_mib": {uuid: 4000 for uuid in analyzer.UUIDS}}],
                    "plan": {"source_commit": source}, "restoration": {"passed": True, "clef_unchanged": True}}
         (self.window / "window.json").write_text(json.dumps(receipt))
         p, n = 64, 128
@@ -72,6 +73,22 @@ class AnalyzerTests(unittest.TestCase):
 
     def test_rejects_source_mismatch(self):
         self.reject(lambda: self.rows[0].update(source_commit="wrong"))
+
+    def test_rejects_controller_memory_floor(self):
+        path = self.window / "window.json"
+        receipt = json.loads(path.read_text())
+        receipt["memory"][0]["free_mib"][analyzer.UUIDS[1]] = 1535
+        path.write_text(json.dumps(receipt))
+        with self.assertRaisesRegex(ValueError, "controller GPU memory"):
+            analyzer.analyze(self.window, require_greedy=True)
+
+    def test_rejects_missing_controller_gpu(self):
+        path = self.window / "window.json"
+        receipt = json.loads(path.read_text())
+        del receipt["memory"][0]["free_mib"][analyzer.UUIDS[1]]
+        path.write_text(json.dumps(receipt))
+        with self.assertRaisesRegex(ValueError, "controller GPU memory"):
+            analyzer.analyze(self.window, require_greedy=True)
 
     def test_rejects_missing_pair(self):
         self.reject(lambda: self.rows.remove(next(r for r in self.rows if r.get("kind") == "turn" and r.get("pair") == 5)))

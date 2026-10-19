@@ -4,6 +4,8 @@ const options = @import("qwen_bench_options");
 const qwen = @import("qwen35_cuda");
 const cuda = @import("cuda");
 const admission = @import("qwen35_probe_device.zig");
+const expert_screen = @import("qwen35_expert_screen.zig");
+const gdn_layout_screen = @import("qwen35_gdn_layout_screen.zig");
 
 comptime {
     if (options.engine_optimization != .fast) @compileError("diagnostics require ReleaseFast engine");
@@ -22,12 +24,13 @@ const Input = struct {
     router_candidate: bool = false,
     expert_fixture: ?[]const u8 = null,
     expert_fixture_sha256: ?[]const u8 = null,
+    gdn_layout_screen: bool = false,
 };
 const Journal = struct {
     a: std.mem.Allocator,
     io: std.Io,
     file: std.Io.File,
-    fn write(j: Journal, value: anytype) !void {
+    pub fn write(j: Journal, value: anytype) !void {
         var out: std.Io.Writer.Allocating = .init(j.a);
         defer out.deinit();
         try std.json.Stringify.value(value, .{}, &out.writer);
@@ -52,7 +55,12 @@ fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     const input = try std.json.parseFromSliceLeaky(Input, a, bytes, .{});
     if (input.prompt.len == 0 or input.output_tokens == 0 or input.output_tokens > 1024 or input.context > 262144 or input.context < input.output_tokens or input.prompt.len > input.context - input.output_tokens or input.forced.len > input.output_tokens or input.repetitions == 0) return error.InvalidInput;
-    if (input.router_screen or input.router_candidate or input.expert_fixture != null or input.expert_fixture_sha256 != null) return error.ArchivedDiagnosticMode;
+    if (input.router_screen or input.router_candidate) return error.ArchivedDiagnosticMode;
+    if ((input.expert_fixture == null) != (input.expert_fixture_sha256 == null)) return error.InvalidExpertFixture;
+    if (input.expert_fixture_sha256) |sha| {
+        if (sha.len != 64) return error.InvalidExpertFixture;
+        for (sha) |c| if (!(c >= '0' and c <= '9') and !(c >= 'a' and c <= 'f')) return error.InvalidExpertFixture;
+    }
     return input;
 }
 
@@ -231,7 +239,21 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
         defer driver.close();
         break :blk try admitted.verify(a, &driver);
     };
-    try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = "changing-token changing-position eager and captured shared Qwen forwards", .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
+    const micro = input.expert_fixture != null or input.gdn_layout_screen;
+    try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = if (micro) "isolated expert and GDN operator screens; no model load or model throughput claim" else "changing-token changing-position eager and captured shared Qwen forwards", .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
+    if (micro) {
+        for (identities) |identity| {
+            var driver = try cuda.Driver.open();
+            defer driver.close();
+            var context = try cuda.Context.init(&driver, identity.ordinal);
+            defer context.deinit();
+            const gpu: @import("check.zig").Gpu = .{ .d = &driver, .ctx = &context, .gpa = init.gpa, .io = init.io };
+            if (input.expert_fixture) |fixture| try expert_screen.run(gpu, fixture, input.expert_fixture_sha256.?, j);
+            if (input.gdn_layout_screen) try gdn_layout_screen.run(gpu, j);
+        }
+        try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "isolated operator parity and timing screens", .production_qualification = false });
+        return;
+    }
     const c = try qwen.Engine.open(init.gpa, init.io, dir, .{ .context = input.context, .cut = input.cut });
     defer c.deinit();
     var s = try c.createSession();

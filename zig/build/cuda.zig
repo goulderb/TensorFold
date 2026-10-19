@@ -415,6 +415,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
         .link_libc = true,
         .imports = &.{.{ .name = "cuda", .module = cuda }},
     });
+    const qwen35_screens = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/qwen35_screens_host.zig"),
+        .target = host,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+        .imports = &.{.{ .name = "cuda", .module = cuda }},
+    });
+    b.step("test-qwen35-screens-host", "CPU-only expert and GDN screen admission and layout controls").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen35_screens })).step);
     qwen35_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen35_probe_admission })).step);
     const qwen35_adapter = b.createModule(.{
         .root_source_file = b.path("zig/src/native/qwen35_cuda.zig"),
