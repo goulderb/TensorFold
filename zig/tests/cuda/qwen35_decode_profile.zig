@@ -430,7 +430,7 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
         try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "isolated operator parity and timing screens", .production_qualification = false });
         return;
     }
-    const c = try qwen.Engine.open(init.gpa, init.io, dir, .{ .context = input.context, .cut = input.cut, .captured = !input.gdn_layout_ab and !input.expert_n8_ab });
+    const c = try qwen.Engine.open(init.gpa, init.io, dir, .{ .context = input.context, .cut = input.cut, .captured = !input.gdn_layout_ab and !input.expert_n8_ab and !input.verify_default_policy });
     defer c.deinit();
     if (input.gdn_layout_ab or input.expert_n8_ab) {
         try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = "changing-token changing-position eager and captured shared Qwen forwards", .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
