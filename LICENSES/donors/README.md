@@ -282,6 +282,12 @@ The shared-activation screen extracts the existing Qwen HF activation,
 renames its control and adds a diagnostic BF16 intermediate round plus a
 separate recorder. It retains the original mathematical-reference credits
 above; the diagnostic candidate is not a newly authored model equation.
+The isolated expert-combine screen retains the same Qwen/Transformers
+reference and native combine control. Its candidate makes BF16 route,
+down, product and accumulator boundaries explicit and visits the selected
+experts in ascending ID order. A separate recorder checks those boundaries.
+Expected HF outputs remain host comparison data. This is a local diagnostic
+adaptation, not a new model equation or a change to checkpoint licensing.
 
 The next tuning probes retain the entire original shared sampler at local
 revision `ad247b3daf045015d59bd106a88591bff961e488` as

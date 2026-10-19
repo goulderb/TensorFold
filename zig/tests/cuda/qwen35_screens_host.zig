@@ -16,4 +16,6 @@ test {
     _ = @import("qwen35_boundary_input.zig");
     _ = @import("qwen35_terminal_greedy_screen.zig");
     _ = @import("qwen35_shared_activation_screen.zig");
+    _ = @import("qwen35_moe_semantics_screen.zig");
+    _ = @import("qwen35_terminal_graph_screen.zig");
 }
