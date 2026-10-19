@@ -13,8 +13,8 @@ small positive results.
 
 | Candidate | Evidence and current bound | Batch disposition | Interactions / required work |
 |---|---|---|---|
-| Split gate/up work across warps | Exact 32-bank and distinct-row device checks pass. Paired up savings 8.953748 / 8.761998 us project to 67.674 ms / 4.20644% of the historical turn. | Retain for the compatible batch; no runtime caller yet. | Revalidate actual row and route shapes after bounded prefill. The projection is not a full-model gain. [Evidence](upstream-split-m-20261019.md). |
-| Reuse FP8 activation quantization for compatible QKV/Z pairs and Q/K/V triples | Exact changing activations and outputs in the isolated screen. Projected 9.9724 ms saved per 191-append turn, 0.620% of the historical 1.6088229 s N8 turn. | Keep for the first compatible batch. | Add a narrow shared qlinear entry that preserves each projection's scale and GEMM order. Require identical input-scale bits. Revalidate after larger kernel/prefill changes. [Evidence](upstream-quant-transport-20261019.md). |
+| Split gate/up work across warps | Exact 32-bank and distinct-row device checks pass. The new full bundle with quant reuse saves 3.62974% median turn latency, with native outputs/state exact. | Qualified in an opt-in shared-Engine bundle; defaults unchanged. | Individual member attribution remains open. One-row grids are 128 in both arms; larger prefill grids differ and bundle prefill regresses about 5.6 ms. [Operator](upstream-split-m-20261019.md), [bundle](upstream-retained-bundle-20261019.md). |
+| Reuse FP8 activation quantization for compatible QKV/Z pairs and Q/K/V triples | Exact changing activations and outputs in the isolated screen, and full-model native parity in the split-M bundle. The measured combined saving supersedes the old 0.620% isolated projection for decisions. | Qualified in the same opt-in bundle; do not count its contribution twice. | Atomic qlinear group checks exact input-scale bits and preserves each lane's arithmetic/order. All forty checkpoint groups independently qualify. Individual contribution is unmeasured. [Operator](upstream-quant-transport-20261019.md), [bundle](upstream-retained-bundle-20261019.md). |
 | Elide final norm/head/copy for intermediate prompt positions whose logits are unused | Covered by qualified bounded prefill's terminal-only chunk head. Full 64/128 turn latency fell 24.1039% as a combined prefill change; no separate head gain was isolated. | Already covered; do not add the historical projection to the small-candidate bundle. | All-row diagnostics, canonical state and subsequent decode pass. Normal prefill keeps one head per chunk. [Evidence](upstream-bounded-prefill-20261019.md). |
 | Device greedy argmax / avoid the full BF16 download on ordinary greedy turns | Current transport micro measured 43 us for one full logit download. The prior sampler draw boundary was about 0.310 ms; that includes host work and is a historical estimate, not a current device-argmax saving. | Retain as a candidate requiring an isolated operator measurement. | Use shared upstream sampling where it fits. Preserve tie, nonfinite and token semantics and independently compare every full row outside timing. This changes the measured host boundary, so report the new scope explicitly. |
 | Slice-major N8 code-word packing | Strided scalar addresses verified; no measured saving. Four slice warps already share a CTA/L1. No counter evidence supports a fourfold physical-traffic claim. | Deferred optional combination after split-M. | Separate format affects prompt and decode consumers. First prove exact operand mapping in isolation. Split-M may alter the relevant latency and load pressure; the two benefits may overlap. Retain Fable/Kimi findings and root corrections. |
@@ -37,9 +37,12 @@ After the larger changes settle:
    benefit rather than the sum of isolated projections.
 
 Bounded shared prefill is now qualified against the unchanged native
-baseline. The first compatible batch is split-M plus identical-scale FP8
-reuse with prefill_rows=16 in both arms. Their historical percentages need
-refreshing: body calls and actual route shapes changed, and the runtime's
-N8 grid differs from the old capped micro control. Device greedy and
-coalesced packing remain separately unmeasured. The combined trial does not
-replace independent HF quality, serving, capacity or promotion gates.
+baseline. The first compatible batch, split-M plus identical-scale FP8
+reuse with prefill_rows=16 in both arms, passed the complete native gate.
+Five paired turns save 3.62974% median latency; decode improves while
+prefill regresses. Keep the measured net gain, retain the phase regression
+as a future ablation target, and do not add the old isolated projections.
+Device greedy and coalesced packing remain separately unmeasured on the
+live model. A current host scan/copy CPU seam is being checked before
+prioritizing device selection. The combined trial does not replace
+independent HF quality, serving, capacity or promotion gates.
