@@ -249,14 +249,24 @@ test "Qwen call gates feed corrected opener and multi-token names into the model
     const gpa = std.testing.allocator;
     const Session = struct {
         position: usize = 0,
-        logits: [6]u16 = .{ 0, 0, 0, 0, 0x4080, 0 },
+        logits: [9]u16 = .{ 0, 0, 0, 0, 0x4080, 0, 0, 0, 0 },
         fed: [32]u32 = undefined,
+        end_thinking: bool = false,
+        suggest_prefix: bool = false,
         fn reset(s: *@This()) !void {
             s.position = 0;
         }
         fn append(s: *@This(), tokens: []const u32) !void {
             @memcpy(s.fed[s.position..][0..tokens.len], tokens);
             s.position += tokens.len;
+            @memset(&s.logits, 0);
+            const next: usize = if (s.end_thinking and s.position == 1) 7 else if (s.suggest_prefix) switch (s.position) {
+                1 => 1,
+                2 => 0,
+                3 => 5,
+                else => 4,
+            } else 4;
+            s.logits[next] = 0x4080;
         }
     };
     const Lex = struct {
@@ -264,11 +274,12 @@ test "Qwen call gates feed corrected opener and multi-token names into the model
             return false;
         }
         fn text(_: *anyopaque, _: Allocator, token: u32) ![]const u8 {
-            return ([_][]const u8{ "<function=", "<tool_call>", "foo", ">", "wrong", "other" })[token];
+            return ([_][]const u8{ "<function=", "<tool_call>", "foo", ">", "wrong", "fo", "<think>", "</think>", "o" })[token];
         }
         fn encode(_: *anyopaque, _: Allocator, value: []const u8) ![]const u32 {
             if (std.mem.eql(u8, value, "<function=")) return &.{0};
             if (std.mem.eql(u8, value, "foo>")) return &.{ 2, 3 };
+            if (std.mem.eql(u8, value, "o>")) return &.{ 8, 3 };
             return error.UnexpectedText;
         }
     };
@@ -281,24 +292,41 @@ test "Qwen call gates feed corrected opener and multi-token names into the model
     var clock: lanes.fake.FixedClock = .{};
     var core = lanes.Engine.init(gpa, &cfg, adapter.backend(), clock.clock());
     defer core.deinit();
-    for ([_][]const []const u8{ &.{ "foo", "other" }, &.{"foo"} }) |names| {
+    const Case = struct {
+        names: []const []const u8 = &.{"foo"},
+        prompt: []const u32 = &.{0},
+        emitted: []const u32 = &.{ 1, 0, 2, 3, 4, 4 },
+        fed: []const u32 = &.{ 0, 1, 0, 2, 3, 4 },
+        end_thinking: bool = false,
+        suggest_prefix: bool = false,
+    };
+    for ([_]Case{
+        .{ .names = &.{ "foo", "other" } },
+        .{},
+        .{ .prompt = &.{6}, .end_thinking = true, .emitted = &.{ 7, 1, 0, 2, 3, 4 }, .fed = &.{ 6, 7, 1, 0, 2, 3 } },
+        .{ .suggest_prefix = true, .emitted = &.{ 1, 0, 5, 8, 3, 4 }, .fed = &.{ 0, 1, 0, 5, 8, 3 } },
+    }) |case| {
+        session.end_thinking = case.end_thinking;
+        session.suggest_prefix = case.suggest_prefix;
         var s = try lanes.Stream.init(gpa, .{
             .id = "call",
-            .prompt = &.{0},
+            .prompt = case.prompt,
             .max_new = 6,
             .call = .{
                 .opener = 1,
                 .lead = "<function=",
-                .names = names,
+                .names = case.names,
                 .tail = ">",
+                .think_open = 6,
+                .think_end = 7,
                 .lex = .{ .ctx = &session, .blank = Lex.blank, .text = Lex.text, .encode = Lex.encode },
             },
         });
         defer s.deinit(gpa);
         try core.addStream(&s);
         while (core.activeCount() > 0) try core.step();
-        try std.testing.expectEqualSlices(u32, &.{ 1, 0, 2, 3, 4, 4 }, s.emitted());
-        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 0, 2, 3, 4 }, session.fed[0..session.position]);
+        try std.testing.expectEqualSlices(u32, case.emitted, s.emitted());
+        try std.testing.expectEqualSlices(u32, case.fed, session.fed[0..session.position]);
         try std.testing.expect(adapter.active == null);
     }
 }
