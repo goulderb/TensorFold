@@ -1,7 +1,7 @@
 #requires -Version 7.0
 [CmdletBinding()]
 param(
-    [ValidateSet('test-qwen35-cuda-host', 'test-qwen35-sampler-turn', 'native', 'fatbins', 'qwen35-probe', 'qwen35-kernels-probe', 'qwen35-head-cost', 'qwen35-sampler-ab')]
+    [ValidateSet('test-qwen35-cuda-host', 'test-qwen35-sampler-turn', 'native', 'fatbins', 'qwen35-probe', 'qwen35-kernels-probe', 'qwen35-head-cost', 'qwen35-sampler-ab', 'qwen35-decode-profile')]
     [string]$Target = 'test-qwen35-cuda-host',
     [string]$Zig = 'C:/Users/developer/tools/zig-0.17.0/zig-x86_64-windows-0.17.0/zig.exe',
     [string]$CudaRoot = 'C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8',
@@ -10,6 +10,7 @@ param(
     [ValidateRange(1, 32)]
     [int]$Jobs = 2,
     [string]$SourceCommit = '',
+    [string]$PrebuiltFatbins = '',
     [switch]$WithoutKernels
 )
 
@@ -23,7 +24,17 @@ if ($SourceCommit -cnotmatch '^[0-9a-f]{40}$') { throw 'SourceCommit must be a f
 $vcvars = Join-Path $BuildTools 'VC/Auxiliary/Build/vcvars64.bat'
 $compiler = Join-Path $BuildTools "VC/Tools/MSVC/$MsvcVersion/bin/Hostx64/x64/cl.exe"
 $nvcc = Join-Path $CudaRoot 'bin/nvcc.exe'
-foreach ($path in @($Zig, $vcvars, $compiler, $nvcc)) {
+$requiredTools = @($Zig, $vcvars, $compiler)
+if ($PrebuiltFatbins) {
+    if ($WithoutKernels) { throw 'PrebuiltFatbins and WithoutKernels cannot be combined' }
+    $PrebuiltFatbins = (Resolve-Path -LiteralPath $PrebuiltFatbins).Path
+    if (-not (Test-Path -LiteralPath $PrebuiltFatbins -PathType Container)) {
+        throw 'PrebuiltFatbins must be a directory'
+    }
+} elseif (-not $WithoutKernels) {
+    $requiredTools += $nvcc
+}
+foreach ($path in $requiredTools) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Required build tool is missing: $path"
     }
@@ -63,7 +74,9 @@ foreach ($argument in @('build', $Target, "-j$Jobs", '--summary', 'all')) {
     $build.ArgumentList.Add($argument)
 }
 $build.ArgumentList.Add("-Dqwen35-probe-source=$SourceCommit")
-if (-not $WithoutKernels) {
+if ($PrebuiltFatbins) {
+    $build.ArgumentList.Add("-Dfatbins=$PrebuiltFatbins")
+} elseif (-not $WithoutKernels) {
     $build.ArgumentList.Add("-Dnvcc=$nvcc")
     $build.ArgumentList.Add('-Dsm=120')
 }

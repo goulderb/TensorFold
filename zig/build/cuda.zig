@@ -171,6 +171,15 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     }) });
     qwen_sampler_ab.root_module.addOptions("qwen_bench_options", qwen_bench_options);
     b.step("qwen35-sampler-ab", "Build only the paired Qwen35 sampler turn benchmark; never run it").dependOn(&b.addInstallArtifact(qwen_sampler_ab, .{}).step);
+    const qwen_decode_profile = b.addExecutable(.{ .name = "tf-qwen35-decode-profile", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/cuda/qwen35_decode_profile.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core) }, .{ .name = "cuda", .module = cuda } },
+    }) });
+    qwen_decode_profile.root_module.addOptions("qwen_bench_options", qwen_bench_options);
+    b.step("qwen35-decode-profile", "Build only the Qwen35 eager/graph diagnostic; never run it").dependOn(&b.addInstallArtifact(qwen_decode_profile, .{}).step);
     return server_exe;
 }
 

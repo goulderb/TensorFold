@@ -5,6 +5,9 @@ pub const engine = @import("cuda_engine.zig");
 pub const Config = checkpoint.Config;
 pub const Engine = engine.Engine;
 pub const Session = engine.Session;
+pub const floor_bytes = engine.floor_bytes;
+pub const DiagnosticPhase = engine.DiagnosticPhase;
+pub const DiagnosticNoTap = engine.DiagnosticNoTap;
 
 test {
     _ = @import("cuda_checkpoint_test.zig");

@@ -6,6 +6,30 @@ const Ops = @import("cuda_kernels.zig").Ops;
 const Allocator = std.mem.Allocator;
 pub const floor_bytes = 1536 << 20;
 
+pub const DiagnosticPhase = enum {
+    partition_begin,
+    input_norm,
+    mixer_inputs,
+    gdn_pre,
+    gdn_step,
+    gdn_out,
+    attention,
+    mixer_output,
+    residual_norm,
+    route,
+    expert_plan,
+    routed_up,
+    routed_down,
+    shared_expert,
+    combine_residual,
+    head,
+};
+
+pub const DiagnosticNoTap = struct {
+    pub fn mark(_: @This(), _: DiagnosticPhase) !void {}
+    pub fn layer(_: @This(), _: usize) void {}
+};
+
 pub const Options = struct {
     devices: []const c_int = &.{ 0, 1 },
     context: usize = 4096,
@@ -167,43 +191,62 @@ const Partition = struct {
     }
 
     fn block(p: *Partition, layer: weights.Layer, state: *LayerState, position: usize, capacity: usize) !void {
+        return p.blockTapped(layer, state, position, capacity, DiagnosticNoTap{});
+    }
+
+    fn blockTapped(p: *Partition, layer: weights.Layer, state: *LayerState, position: usize, capacity: usize, tap: anytype) !void {
         const b = p.b;
         const o = &p.ops;
         const s = p.stream;
         try o.rms(s, b.residual, layer.input_norm, b.x, 2048, 1e-6);
+        try tap.mark(.input_norm);
         switch (layer.mixer) {
             .gdn => |g| {
                 try p.projection(g.qkv, b.x, b.qkv);
                 try p.projection(g.z, b.x, b.z);
                 try p.projection(g.a, b.x, b.a);
                 try p.projection(g.b, b.x, b.b);
+                try tap.mark(.mixer_inputs);
                 try o.gdnPre(s, b.qkv, g.conv, state.gdn.history.ptr, b.a, b.b, g.a_log, g.dt_bias, b.q, b.k, b.v, b.decay, b.beta);
+                try tap.mark(.gdn_pre);
                 try o.gdnStep(s, b.q, b.k, b.v, b.decay, b.beta, state.gdn.recurrent.ptr, b.recurrent_out);
+                try tap.mark(.gdn_step);
                 try o.gdnOut(s, b.recurrent_out, b.z, g.norm, b.mixed, 1e-6);
+                try tap.mark(.gdn_out);
                 try p.projection(g.out, b.mixed, b.update);
             },
             .full => |f| {
                 try p.projection(f.q, b.x, b.mixed);
                 try p.projection(f.k, b.x, b.full_k);
                 try p.projection(f.v, b.x, b.full_v);
+                try tap.mark(.mixer_inputs);
                 try o.attention(s, b.mixed, b.full_k, b.full_v, f.q_norm, f.k_norm, state.full.keys.ptr, state.full.values.ptr, position, capacity, b.qkv, 1e-6);
+                try tap.mark(.attention);
                 try p.projection(f.out, b.qkv, b.update);
             },
         }
+        try tap.mark(.mixer_output);
         try o.add(s, b.residual, b.update, 2048);
         try o.rms(s, b.residual, layer.post_norm, b.x, 2048, 1e-6);
+        try tap.mark(.residual_norm);
         const m = layer.moe;
         try o.route(s, b.x, m.router, m.shared_gate, b.picks, b.route_weights);
+        try tap.mark(.route);
         const plan: cuda.grouped.Plan = .{ .members = b.members, .items = b.items, .counts = b.counts, .rank = 0, .hist = 0 };
         try o.router.route(s, b.picks, 8, 256, 16, plan);
+        try tap.mark(.expert_plan);
         try o.grouped().decode(s, .up, .{ .x = b.x, .stride = 2048, .slots = 8 }, m.experts, plan, b.expert_hidden, 8, -1);
+        try tap.mark(.routed_up);
         try o.grouped().decode(s, .down_f32, .{ .x = b.expert_hidden, .stride = 512 }, m.experts, plan, b.pairs, 8, -1);
+        try tap.mark(.routed_down);
         try p.projection(m.shared.gate, b.x, b.shared_gate);
         try p.projection(m.shared.up, b.x, b.shared_up);
         try o.swiglu(s, b.shared_gate, b.shared_up, b.shared_act, 512);
         try p.projection(m.shared.down, b.shared_act, b.shared_out);
+        try tap.mark(.shared_expert);
         try o.combine(s, b.pairs, b.route_weights, b.shared_out, b.update);
         try o.add(s, b.residual, b.update, 2048);
+        try tap.mark(.combine_residual);
     }
 };
 
@@ -356,6 +399,25 @@ pub const Session = struct {
     logits: []u16,
     position: usize = 0,
     poisoned: bool = true,
+
+    /// Diagnostic enqueue only. The probe owns context, transfers, completion and floor checks outside capture.
+    pub fn diagnosticPartition(session: *Session, rank: usize, token: u32, position: usize, tap: anytype) !void {
+        const e = session.engine;
+        if (session.poisoned or rank >= e.partitions.len or token >= 248320 or position >= e.capacity)
+            return error.InvalidDiagnosticStep;
+        const p = &e.partitions[rank];
+        try tap.mark(.partition_begin);
+        if (rank == 0) try p.ops.embed(p.stream, p.weights.embed.?, token, p.b.residual);
+        for (p.weights.layers, p.first..) |layer, i| {
+            tap.layer(i);
+            try p.blockTapped(layer, &session.layers[i], position, e.capacity, tap);
+        }
+        if (rank + 1 == e.partitions.len) {
+            try p.ops.rms(p.stream, p.b.residual, p.weights.norm.?, p.b.x, 2048, 1e-6);
+            try p.projection(p.weights.head.?, p.b.x, p.b.logits);
+            try tap.mark(.head);
+        }
+    }
 
     pub fn deinit(session: *Session) void {
         const e = session.engine;
