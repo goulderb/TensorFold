@@ -29,6 +29,8 @@ const g = contract.gates;
 const limits = contract.limits;
 const registry = contract.registry;
 const kk = cuda.kernels;
+const latent_available = @hasDecl(nemotron, "latent");
+const router_tiles_available = @hasDecl(nemotron.glue, "tiles_shared");
 
 const controls = struct {
     pub const bytes align(16) = @embedFile("fatbin_contract_controls").*;
@@ -41,7 +43,7 @@ const h3_image = struct {
 /// The embedded image a registration names (the controls' only when this binary was built with -Dnvcc).
 fn image(name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, "h3")) return &h3_image.bytes;
-    inline for (.{ "norms", "moe", "qwen36_mtp", "nemotron_attention", "nemotron_route", "nemotron_latent", "qmm_group", "lane_gemv", "prompt16", "qmmf", "ck_experts", "rank_sum", "prefill_attention", "vit", "embed_rows", "route_rows", "flashnext_gdn", "flashnext_batch", "flashnext_hc", "flashnext_attn", "flashnext_mtp", "qwen_vision", "exl3_linear", "exl3_experts", "exl3_candidate", "experts3", "experts3_prefill", "drama3", "drama3_fp8", "drama3_codec", "glm_mm", "glm_dflash", "nemotron_mamba", "sample", "qwen35", "qwen35_keep", "qwen35_kv8", "qwen35_draft", "ck_lane", "glm_glue", "nvfp4_experts", "exlr8_dense", "torch_pointwise", "dflash_qmm" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
+    inline for (.{ "norms", "moe", "qwen36_mtp", "nemotron_attention", "nemotron_route", "nemotron_latent", "qmm_group", "lane_gemv", "prompt16", "qmmf", "ck_experts", "rank_sum", "prefill_attention", "vit", "embed_rows", "route_rows", "flashnext_gdn", "flashnext_batch", "flashnext_hc", "flashnext_attn", "flashnext_mtp", "qwen_vision", "exl3_linear", "exl3_experts", "exl3_experts_glm", "exl3_candidate", "experts3", "experts3_prefill", "drama3", "drama3_fp8", "drama3_codec", "glm_mm", "glm_dflash", "nemotron_mamba", "sample", "qwen35", "qwen35_keep", "qwen35_kv8", "qwen35_draft", "ck_lane", "glm_glue", "nvfp4_experts", "exlr8_dense", "torch_pointwise", "dflash_qmm" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
     return if (options.controls) &controls.bytes else &.{};
 }
 
@@ -90,25 +92,36 @@ pub fn run(gpu: check.Gpu) !void {
     for (row_list[0..nrows]) |*r| try kernels.append(a, r.kernel());
     var logits = router_k.Logits{ .rig = .{ .gpu = gpu, .s = s }, .f = try mods[0].function("tf_nemo_router") };
     defer logits.deinit();
-    var logits_tiles = router_k.Logits{ .rig = .{ .gpu = gpu, .s = s }, .f = logits.f, .tiles = try mods[0].function("tf_nemo_router_tiles") };
-    defer logits_tiles.deinit();
+    var logits_tiles: ?router_k.Logits = if (router_tiles_available)
+        .{ .rig = .{ .gpu = gpu, .s = s }, .f = logits.f, .tiles = try mods[0].function("tf_nemo_router_tiles") }
+    else
+        null;
+    defer if (logits_tiles) |*x| x.deinit();
     var topk = router_k.TopK{ .rig = .{ .gpu = gpu, .s = s }, .f = try mods[0].function("tf_nemo_topk") };
     defer topk.deinit();
-    var latent = try nemotron.latent.Fns.load(gpu.d);
-    defer latent.unload();
-    var latent_topk = router_k.LatentTopK{ .rig = .{ .gpu = gpu, .s = s }, .fns = &latent };
-    defer latent_topk.deinit();
+    var latent: if (latent_available) nemotron.latent.Fns else void = if (latent_available) try nemotron.latent.Fns.load(gpu.d) else {};
+    defer if (latent_available) latent.unload();
+    var latent_topk: if (latent_available) router_k.LatentTopK else void = if (latent_available)
+        .{ .rig = .{ .gpu = gpu, .s = s }, .fns = &latent }
+    else {};
+    defer if (latent_available) latent_topk.deinit();
     try kernels.append(a, logits.kernel());
-    try kernels.append(a, logits_tiles.kernel());
+    if (logits_tiles) |*x| try kernels.append(a, x.kernel()) else std.debug.print("N/A  upstream tiled router: the retained Nemotron has no matching launcher\n", .{});
     try kernels.append(a, topk.kernel());
-    try kernels.append(a, latent_topk.kernel());
+    if (latent_available) try kernels.append(a, latent_topk.kernel()) else std.debug.print("N/A  upstream latent top-k and share-sum contracts: not implemented by the retained Nemotron\n", .{});
     var scan = scan_k.Scan{ .rig = .{ .gpu = gpu, .s = s }, .f = try mods[7].function("tf_nemo_scan"), .host = .init(a) };
     defer scan.deinit();
     try kernels.append(a, scan.kernel());
-    var latent_sums: [2]latent_k.Sums = undefined;
-    for (std.enums.values(latent_k.Kind), &latent_sums) |kind, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .fns = &latent };
-    defer for (&latent_sums) |*x| x.deinit();
-    for (&latent_sums) |*x| try kernels.append(a, x.kernel());
+    var latent_sums: [if (latent_available) 2 else 0]if (latent_available) latent_k.Sums else void = undefined;
+    if (latent_available) {
+        for (std.enums.values(latent_k.Kind), &latent_sums) |kind, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .fns = &latent };
+    }
+    defer if (latent_available) {
+        for (&latent_sums) |*x| x.deinit();
+    };
+    if (latent_available) {
+        for (&latent_sums) |*x| try kernels.append(a, x.kernel());
+    }
     const kinds = comptime std.enums.values(mm_k.Kind);
     var mm: [kinds.len]mm_k.Mm = undefined;
     for (kinds, &mm) |kind, *m| {
@@ -218,7 +231,11 @@ pub fn run(gpu: check.Gpu) !void {
     defer for (lanes[0..nlane]) |*x| x.deinit();
     if (ck) |*q| {
         for (ck_kinds) |kind| {
-            ck_experts[nck] = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .ck = q, .router = try cuda.grouped.Router.resolve(mods[6]), .latent = &latent };
+            if (kind == .prompt_sum and !latent_available) {
+                std.debug.print("N/A  checkpoint prompt share-sum contract: the retained Nemotron has no upstream latent launcher\n", .{});
+                continue;
+            }
+            ck_experts[nck] = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .ck = q, .router = try cuda.grouped.Router.resolve(mods[6]), .latent = if (latent_available) &latent else {} };
             try kernels.append(a, ck_experts[nck].kernel());
             nck += 1;
         }
@@ -265,6 +282,7 @@ fn live(gpu: check.Gpu) !usize {
     }
     var said: ?limits.Nvcc = null;
     for (registry.all_cuda ++ registry.cuda_controls) |r| {
+        if (!r.applies(sm)) continue;
         const control = std.mem.startsWith(u8, r.launch.name, "control");
         const bytes = image(r.launch.image);
         const rel = try built(gpu.gpa, bytes, sm);
@@ -290,4 +308,65 @@ fn live(gpu: check.Gpu) !usize {
     return n;
 }
 
+fn built(a: std.mem.Allocator, bytes: []const u8, sm: u32) !?limits.Nvcc {
+    return contract.cubin.releaseFor(a, bytes, sm);
+}
+
+/// Says which compiler's records an audit compares against, and why.
+fn records(what: []const u8, rel: ?limits.Nvcc, set: limits.Nvcc) void {
+    if (rel) |v| {
+        const own = std.meta.eql(v, set);
+        std.debug.print("INFO limits {s}: images built by nvcc {d}.{d}, checked against nvcc {d}.{d}'s records{s}\n", .{ what, v.major, v.minor, set.major, set.minor, if (own) "" else " (the newest set at or below it)" });
+    } else std.debug.print("INFO limits {s}: the images name no nvcc release; checked against nvcc {d}.{d}'s records\n", .{ what, set.major, set.minor });
+}
+
+/// tf-cuda-test kernel-contract-limits DIR: each record against the fatbins in DIR, every SM image they hold.
+pub fn fatbins(gpu: check.Gpu, dir: []const u8) !void {
+    const a = gpu.gpa;
+    var n: usize = 0;
+    var said: ?limits.Nvcc = null;
+    for (registry.all_cuda ++ registry.cuda_controls) |r| {
+        const control = std.mem.startsWith(u8, r.launch.name, "control");
+        const path = try std.fmt.allocPrint(a, "{s}/{s}.fatbin", .{ dir, r.launch.image });
+        defer a.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(gpu.io, path, a, .limited(1 << 28));
+        defer a.free(bytes);
+        const imgs = try contract.cubin.images(a, bytes);
+        defer a.free(imgs);
+        var red: usize = 0;
+        var line: std.ArrayList(u8) = .empty;
+        defer line.deinit(a);
+        for (limits.sms, 0..) |t, i| {
+            if (!r.applies(t.sm)) continue;
+            const img = for (imgs) |im| {
+                if (im.sm == t.sm) break im;
+            } else {
+                std.debug.print("FAIL limits {s}: {s} holds no sm_{d} image (build with -Dsm=80,86,89,120,121)\n", .{ r.launch.name, path, t.sm });
+                n += 1;
+                continue;
+            };
+            const ks = try contract.cubin.kernels(a, img.elf, t.sm);
+            defer a.free(ks);
+            const k = for (ks) |kv| {
+                if (std.mem.eql(u8, kv.name, r.launch.symbol)) break kv;
+            } else return error.SymbolNotInImage;
+            const rel = try contract.cubin.release(a, img.elf);
+            const set = registry.setFor(rel);
+            if (said == null or !std.meta.eql(said.?, set)) records("fatbins", rel, set);
+            said = set;
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(a);
+            red += try limits.cuda(r.launch, k.usage, t, &out, a);
+            const current = std.meta.eql(k.usage, registry.usageFor(r, rel)[i]);
+            if (!control and !current) n += 1;
+            std.debug.print("{s} limits sm_{d} {s}: {d} registers, {d} static shared bytes, bound {d} (record {s}){s}", .{ if (out.items.len > 0) (if (control) "RED " else "FAIL") else "PASS", t.sm, r.launch.name, k.usage.regs, k.usage.static, k.usage.bound, if (current) "current" else "stale", if (out.items.len > 0) ": " else "\n" });
+            if (out.items.len > 0) std.debug.print("{s}", .{out.items});
+            try line.print(a, ".{{ .regs = {d}, .static = {d}, .bound = {d} }}, ", .{ k.usage.regs, k.usage.static, k.usage.bound });
+        }
+        std.debug.print("RECORD {s}: .usage = .{{ {s}}}\n", .{ r.launch.name, line.items });
+        if (control and red == 0) n += 1;
+        if (!control) n += red;
+    }
+    try check.expect(n == 0, "kernel-contract-limits: {d} problems", .{n});
+    check.pass("kernel-contract-limits: every registered launch fits sm_80, sm_86, sm_89, sm_120 and sm_121, every control red", .{});
 }

@@ -162,8 +162,8 @@ fn moe(o: *Out, i: usize, bf: bool) !void {
     }
 }
 
-pub fn run(gpu: check.Gpu, out_dir: []const u8) !void {
-    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
+pub fn run(gpa: std.mem.Allocator, io: std.Io, out_dir: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
     var prng = std.Random.DefaultPrng.init(53);
@@ -185,13 +185,13 @@ pub fn run(gpu: check.Gpu, out_dir: []const u8) !void {
     for ([_][]const u8{ "enorm", "hnorm", "shared_head.norm" }) |m| try o.bf16Const(try tensor(a, "layers.{d}.{s}.weight", .{ layers, m }), &.{hidden}, 1.0);
     try o.linear(try tensor(a, "layers.{d}.eh_proj.weight", .{layers}), hidden, 2 * hidden);
 
-    try std.Io.Dir.cwd().createDirPath(gpu.io, out_dir);
+    try std.Io.Dir.cwd().createDirPath(io, out_dir);
     const text = try glm.config.textConfig(a, layers, 1, &.{1}, experts, vocab, hidden);
     const end = std.mem.lastIndexOfScalar(u8, text, '}') orelse return error.BadConfig;
     const cfg = try std.mem.concat(a, u8, &.{ text[0..end], modelopt_block, text[end..] }); // its linears are NVFP4
     _ = try glm.config.parse(a, cfg);
-    try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, "config.json" }), .data = cfg });
-    try core.shard_edit.create(gpu.gpa, try std.fs.path.join(a, &.{ out_dir, "model.safetensors" }), &.{.{ "format", "pt" }}, o.list.items);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, "config.json" }), .data = cfg });
+    try core.shard_edit.create(gpa, try std.fs.path.join(a, &.{ out_dir, "model.safetensors" }), &.{.{ "format", "pt" }}, o.list.items);
 
     // three prompts of the decode checks' lengths, ids under the eos at vocab - 2; want: 512 zeros (a length only)
     var dc: std.Io.Writer.Allocating = .init(a);
@@ -204,7 +204,7 @@ pub fn run(gpu: check.Gpu, out_dir: []const u8) !void {
         try dc.writer.writeAll("]}");
     }
     try dc.writer.writeAll("]}\n");
-    try std.Io.Dir.cwd().writeFile(gpu.io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, "dc.json" }), .data = dc.written() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ out_dir, "dc.json" }), .data = dc.written() });
     var bytes: usize = 0;
     for (o.list.items) |t| bytes += t.bytes.len;
     check.pass("glm-synth: {d} tensors, {d} MiB, config {d} layers {d} experts vocabulary {d}, dc.json in {s}", .{ o.list.items.len, bytes >> 20, layers, experts, vocab, out_dir });

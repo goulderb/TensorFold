@@ -12,13 +12,13 @@ const be = lanes.backend;
 /// First tokens a handle names.
 const ring = 1024;
 
-/// The widest verify window: the pending token and a full draft chain (glm-decode-check's, the AOT row variants).
-pub const max_rows = 1 + engine.max_drafts;
+/// Per-lane target storage: copied windows are wider than the seven-draft neural chain.
+pub const max_rows = @import("cuda_verify_plan.zig").target_rows;
 
 /// TF_GLM_LONE_COSTS=ONE,ROW: a lone stream's round modeled as ONE ms plus ROW ms a row past the first. Without a
 /// table lanes/depth.zig asks a lone stream for three drafts at most; with one it prices every depth the verify plan
-/// allows, and the stream's measured rounds replace the model depth by depth. Shared rounds keep their untimed fill:
-/// a constant cost leaves allocate.zig's rate rising with every likelier node, as an empty table does.
+/// allows, and the stream's measured rounds replace the model depth by depth. Shared rounds keep positive-probability
+/// nodes at a constant cost. Unlike untimed fill, a zero-probability tail does not improve that rate.
 pub const LoneCosts = struct {
     window: [max_rows]lanes.config.Cost,
     flat: [engine.shared_rows]lanes.config.Cost,
@@ -43,6 +43,7 @@ pub const LoneCosts = struct {
 /// A stream's place in the backend: its sequence's slot, the rows its last verify left uncommitted, its held drafts.
 const Lane = struct {
     slot: u32,
+    first_handle: ?u64 = null,
     pending_rows: ?usize = null,
     held: [engine.max_drafts]u32 = undefined,
     held_n: usize = 0,
@@ -55,6 +56,8 @@ pub const Lanes = struct {
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
     lone_costs: ?LoneCosts = null, // TF_GLM_LONE_COSTS
+    batch_prefill: bool = false,
+    prefill_batches: u64 = 0,
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
     drawn: [ring]u32 = undefined,
@@ -65,7 +68,7 @@ pub const Lanes = struct {
     }
 
     pub fn backend(self: *Lanes) be.Backend {
-        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else &steps_vt };
+        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else if (self.batch_prefill) &batch_vt else &steps_vt };
     }
 
     const whole_vt: be.Backend.VTable = .{
@@ -86,24 +89,32 @@ pub const Lanes = struct {
         v.prefill_step = prefillStepFn;
         break :vt v;
     };
+    const batch_vt: be.Backend.VTable = vt: {
+        var v = steps_vt;
+        v.prefill_batch = prefillBatchFn;
+        break :vt v;
+    };
 
     /// Round loop facts: windows up to max_rows, drafts with the head loaded, shared windows unless TF_GLM_SHARED=0.
     pub fn facts(self: *const Lanes) lanes.Model {
         const drafting = self.x.e.drafting();
         const sharing = drafting and !self.alone;
         const plan = self.x.e.verifyPlan();
+        const profile = self.x.e.settings.draft_profile;
         const costs: ?*const LoneCosts = if (drafting) if (self.lone_costs) |*c| c else null else null;
         return .{
+            .copy_drafts = if (profile.enabled) profile.copy.enabled else true,
             .window_costs = if (costs) |c| c.window[0 .. 1 + plan.drafts()] else &.{},
             .shared_costs = if (costs) |c| &c.flat else &.{},
-            .exact_width = if (drafting) @intCast(1 + plan.drafts()) else 1,
+            .exact_width = if (profile.enabled) @intCast(self.x.e.targetRows()) else if (drafting) @intCast(1 + plan.drafts()) else 1,
             .gpu_tokens = false,
             .mtp = drafting,
             .speculate = drafting,
             .speculate_early = false,
             .drafts = @intCast(plan.drafts()),
+            .fixed_drafts = profile.enabled,
             .hidden_rows = sharing,
-            .batch_rows = if (sharing) @intCast(plan.rows()) else 0,
+            .batch_rows = if (sharing) @intCast(self.x.e.sharedLimit()) else 0,
             .max_streams = if (sharing) engine.max_shared else 1,
             .draft_streams = sharing and self.x.e.dflash != null,
         };
@@ -157,7 +168,8 @@ pub const Lanes = struct {
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const self = of(ptr);
         const from = try self.opening(s);
-        _ = self.take(try self.x.prefill(s.prompt(), from, .{ .ptr = s, .check = cancelled }, marksOf(s)));
+        const handle = self.take(try self.x.prefill(s.prompt(), from, .{ .ptr = s, .check = cancelled }, marksOf(s)));
+        self.lanes.getPtr(s).?.first_handle = handle;
     }
 
     /// One chunk of the stream's prompt pass (fillOne runs other rounds between); true once the first token is drawn.
@@ -170,7 +182,7 @@ pub const Lanes = struct {
         const at = going orelse if (from) |r| r.at else 0;
         errdefer l.fill = null;
         if (try self.x.chunk(s.prompt(), at, from, .{ .ptr = s, .check = cancelled }, marksOf(s))) |first| {
-            _ = self.take(first);
+            l.first_handle = self.take(first);
             l.fill = null;
             return true;
         }
@@ -178,16 +190,80 @@ pub const Lanes = struct {
         return false;
     }
 
+    fn canBatch(self: *const Lanes, s: *const lanes.Stream) bool {
+        return !self.x.e.mtp and !self.lanes.contains(s) and s.prompt_len > 0 and s.prompt_len <= engine.prompt_batch_rows and
+            s.max_new > 0 and s.vision == null and s.images.len == 0 and s.grammar == null and s.gate == null and
+            s.logprobs == null and s.prompt_logprobs == null and s.decode_spans.len == 0 and
+            s.reuse.saved == null and s.reuse.at == 0 and s.reuse.marks.len == 0 and s.yield_check == null;
+    }
+
+    fn prefillBatchFn(ptr: *anyopaque, streams: []const *lanes.Stream, out: []be.PrefillOutcome) anyerror!void {
+        const self = of(ptr);
+        if (streams.len != out.len) return error.BadPromptBatch;
+        @memset(out, .skipped);
+        var eligible: usize = 0;
+        var rows: usize = 0;
+        for (streams) |s| {
+            if (eligible == engine.max_shared or !self.canBatch(s) or s.prompt_len > engine.prompt_rows - rows) break;
+            eligible += 1;
+            rows += s.prompt_len;
+        }
+        if (eligible < 2) return;
+        var parts: [engine.max_shared]engine.Engine.PromptPart = undefined;
+        var original: [engine.max_shared]usize = undefined;
+        var count: usize = 0;
+        for (streams[0..eligible], 0..) |s, i| {
+            if (s.isCancelled()) {
+                out[i] = .{ .failed = error.Cancelled };
+                continue;
+            }
+            _ = self.opening(s) catch |err| {
+                releaseFn(ptr, s);
+                out[i] = .{ .failed = err };
+                continue;
+            };
+            if (s.isCancelled()) {
+                releaseFn(ptr, s);
+                out[i] = .{ .failed = error.Cancelled };
+                continue;
+            }
+            parts[count] = .{ .slot = self.lanes.getPtr(s).?.slot, .ids = s.prompt() };
+            original[count] = i;
+            count += 1;
+        }
+        var first: [engine.max_shared]u32 = undefined;
+        if (count > 1) {
+            try self.x.prefillShared(parts[0..count], first[0..count]);
+            self.prefill_batches += 1;
+            var actual_rows: usize = 0;
+            for (parts[0..count]) |part| actual_rows += part.ids.len;
+            std.log.info("GLM cold prompt batch: {d} streams, {d} rows", .{ count, actual_rows });
+        } else if (count == 1) {
+            const s = streams[original[0]];
+            try self.x.bind(parts[0].slot);
+            first[0] = (self.x.chunk(s.prompt(), 0, null, .{ .ptr = s, .check = cancelled }, null) catch |err| {
+                releaseFn(ptr, s);
+                out[original[0]] = .{ .failed = err };
+                return;
+            }) orelse return error.BadPromptBatch;
+        }
+        for (original[0..count], first[0..count]) |i, token| {
+            self.lanes.getPtr(streams[i]).?.first_handle = self.take(token);
+            out[i] = .complete;
+        }
+    }
+
     /// A prompt pass begins: the stream's slot bound and its sequence fresh; where the pass resumes (a kept state).
     fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
         const ids = s.prompt();
-        if (ids.len + s.max_new + 1 + self.x.e.verifyPlan().drafts() >= self.x.e.capacity) return error.PromptTooLong;
+        if (ids.len + s.max_new + self.x.e.targetRows() >= self.x.e.capacity) return error.PromptTooLong;
         const free_slot = self.freeSlot();
         const gop = try self.lanes.getOrPut(self.x.e.gpa, s);
         if (!gop.found_existing) gop.value_ptr.* = .{ .slot = free_slot };
         gop.value_ptr.pending_rows = null;
         gop.value_ptr.held_n = 0;
         gop.value_ptr.fill = null;
+        gop.value_ptr.first_handle = null;
         try self.x.bind(gop.value_ptr.slot);
         if (self.x.e.pool != null) {
             const rows = try @import("cuda_kv_extent.zig").requestRows(ids.len, s.max_new, fw.window_rows, self.x.e.capacity);
@@ -227,7 +303,8 @@ pub const Lanes = struct {
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
         const self = of(ptr);
         if (position != s.prompt_len) return error.PositionMismatch;
-        return self.next - 1;
+        const lane = self.lanes.getPtr(s) orelse return error.UnknownStream;
+        return lane.first_handle orelse error.NoFirstToken;
     }
 
     fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, bits: []const u32) anyerror!u64 {
@@ -267,6 +344,13 @@ pub const Lanes = struct {
     /// Each window in its own forward on its stream's sequence (the core sends one when no forward is shared).
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const self = of(ptr);
+        if (windows.len != out.len) return error.BadVerifyBatch;
+        var total: usize = 0;
+        for (windows) |w| {
+            if (w.rows() > self.x.e.targetRows()) return error.WindowTooWide;
+            total += w.rows();
+        }
+        if (self.x.e.settings.draft_profile.enabled and total > self.x.e.sharedLimit()) return error.WindowTooWide;
         const constrained = for (windows) |w| {
             if (w.masks.len > 0) break true;
         } else false;
@@ -275,7 +359,7 @@ pub const Lanes = struct {
             if (w.parents != null) return error.TreesNotBuilt;
             const l = try self.bind(w.stream, null);
             const rows = w.rows();
-            if (rows > 1 + self.x.e.verifyPlan().drafts()) return error.WindowTooWide;
+            if (rows > self.x.e.targetRows()) return error.WindowTooWide;
             if (w.held > l.held_n) return error.NoHeldDrafts;
             const pos = self.x.e.pos();
             for (w.positions, 0..) |p, r| if (p != pos + 1 + r) return error.PositionMismatch;
@@ -302,7 +386,7 @@ pub const Lanes = struct {
             if (w.parents != null) return error.TreesNotBuilt;
             const l = try self.bind(w.stream, null);
             const rows = w.rows();
-            if (rows > 1 + self.x.e.verifyPlan().drafts()) return error.WindowTooWide;
+            if (rows > self.x.e.targetRows()) return error.WindowTooWide;
             if (w.held > l.held_n) return error.NoHeldDrafts;
             const pos = self.x.e.pos();
             for (w.positions, 0..) |p, r| if (p != pos + 1 + r) return error.PositionMismatch;
@@ -359,7 +443,7 @@ pub const Lanes = struct {
         var end = r.start;
         var keep: ?usize = null;
         const pending = if (r.rows) |rows| blk: {
-            if (rows.len == 0 or rows.len > 1 + self.x.e.verifyPlan().drafts() or r.follow.len < rows.len) return error.BadDraftRequest;
+            if (rows.len == 0 or rows.len > self.x.e.targetRows() or r.follow.len < rows.len) return error.BadDraftRequest;
             for (rows, 0..) |row, j| if (row != j) return error.TreesNotBuilt;
             end = std.math.add(u64, r.start, @as(u64, @intCast(rows.len))) catch return error.PositionMismatch;
             if (l.pending_rows) |available| {
@@ -435,6 +519,58 @@ pub const Lanes = struct {
 
 comptime {
     std.debug.assert(max_rows <= fw.window_rows);
+}
+
+test "prefilled lanes retain distinct first handles after another prompt completes" {
+    const a = std.testing.allocator;
+    var e: engine.Engine = undefined;
+    e.gpa = a;
+    var link: follow.Link = undefined;
+    var backend: Lanes = .{ .x = .{ .e = &e, .link = &link } };
+    defer backend.deinit();
+    var first = try lanes.Stream.init(a, .{ .id = "first", .prompt = &.{ 1, 2 }, .max_new = 4, .eos = &.{} });
+    defer first.deinit(a);
+    var second = try lanes.Stream.init(a, .{ .id = "second", .prompt = &.{3}, .max_new = 4, .eos = &.{} });
+    defer second.deinit(a);
+    const one = backend.take(101);
+    const two = backend.take(202);
+    try backend.lanes.put(a, &first, .{ .slot = 0, .first_handle = one });
+    try backend.lanes.put(a, &second, .{ .slot = 1, .first_handle = two });
+    const b = backend.backend();
+    try std.testing.expectEqual(one, try b.first(&first, 2));
+    try std.testing.expectEqual(two, try b.first(&second, 1));
+    try std.testing.expectEqual(@as(u32, 101), backend.drawn[one % ring]);
+}
+
+test "cold prompt batch eligibility preserves unsupported request state" {
+    const a = std.testing.allocator;
+    var e: engine.Engine = undefined;
+    e.gpa = a;
+    e.mtp = false;
+    var link: follow.Link = undefined;
+    var backend: Lanes = .{ .x = .{ .e = &e, .link = &link } };
+    defer backend.deinit();
+    var s = try lanes.Stream.init(a, .{ .id = "cold", .prompt = &.{ 1, 2 }, .max_new = 4, .eos = &.{} });
+    defer s.deinit(a);
+    try std.testing.expect(backend.canBatch(&s));
+    // The HTTP adapter gives ordinary chat a lesson decision row, even without a learner.
+    s.decide = 0;
+    try std.testing.expect(backend.canBatch(&s));
+    s.decide = null;
+    s.prompt_len = 128;
+    try std.testing.expect(!backend.canBatch(&s));
+    s.prompt_len = 2;
+    s.reuse.at = 2048;
+    try std.testing.expect(!backend.canBatch(&s));
+    s.reuse.at = 0;
+    s.reuse.marks = &.{1};
+    try std.testing.expect(!backend.canBatch(&s));
+    s.reuse.marks = &.{};
+    s.logprobs = 1;
+    try std.testing.expect(!backend.canBatch(&s));
+    s.logprobs = null;
+    e.mtp = true;
+    try std.testing.expect(!backend.canBatch(&s));
 }
 
 test "DFlash publishes the actual held count through the existing lane shape callback" {
@@ -515,7 +651,7 @@ test "lone costs let a lone DFlash stream price drafts past three, by acceptance
     try std.testing.expect(try loneDepth(&cfg, 0.6) <= 3); // prose-like acceptance: shallow stays cheaper a token
 }
 
-test "lone costs leave a shared round's draft allocation as the untimed fill made it" {
+test "lone costs preserve positive-probability shared draft allocation across row caps and overheads" {
     const gpa = std.testing.allocator;
     var e: engine.Engine = undefined;
     var link: follow.Link = undefined;
@@ -526,22 +662,46 @@ test "lone costs leave a shared round's draft allocation as the untimed fill mad
     var plain = try lanes.Config.init(gpa, untimed.facts(), max_rows, engine.max_drafts);
     defer plain.deinit(gpa);
     try std.testing.expect(plain.shared_costs.empty());
-    try std.testing.expectEqual(@as(?f64, 1.0), cfg.shared_costs.get(@intCast(engine.shared_rows)));
+    try std.testing.expectEqual(@as(?f64, 1.0), cfg.shared_costs.get(cfg.batch_rows));
     const sets = [_][]const []const f64{
         &.{ &.{ 0.9, 0.81, 0.73, 0.66, 0.59, 0.53 }, &.{ 0.6, 0.36, 0.22, 0.13, 0.08, 0.05 } },
         &.{ &.{ 0.5, 0.2, 0.05, 0.01, 0.001, 0.0001 }, &.{ 0.95, 0.9, 0.86, 0.81, 0.77, 0.74 }, &.{ 0.7, 0.49, 0.34, 0.24, 0.17, 0.12 } },
-        &.{ &.{ 0.3, 0.09, 0.03, 0.01, 0.0, 0.0 }, &.{ 0.3, 0.09, 0.03, 0.01, 0.0, 0.0 } },
     };
     for (sets) |probs| {
         const fixed: [3]u32 = @splat(1);
         for ([_]f64{ 0.0, 8.0, 120.0 }) |overhead| {
-            for ([_]u64{ 8, 32, engine.shared_rows }) |rows| {
+            for ([_]u64{ 8, 32, cfg.batch_rows }) |rows| {
                 const want = try lanes.allocate.allocateDrafts(gpa, fixed[0..probs.len], probs, &plain.shared_costs, overhead, rows, .{ .batched = true });
                 defer gpa.free(want);
                 const got = try lanes.allocate.allocateDrafts(gpa, fixed[0..probs.len], probs, &cfg.shared_costs, overhead, rows, .{ .batched = true });
                 defer gpa.free(got);
                 try std.testing.expectEqualSlices(u32, want, got);
             }
+        }
+    }
+}
+
+test "lone costs omit zero-probability shared tails while untimed fill spends the remaining rows" {
+    const gpa = std.testing.allocator;
+    var e: engine.Engine = undefined;
+    var link: follow.Link = undefined;
+    const timed = loneFixture(&e, &link, try LoneCosts.parse("38,7.9"));
+    var cfg = try lanes.Config.init(gpa, timed.facts(), max_rows, engine.max_drafts);
+    defer cfg.deinit(gpa);
+    const untimed = loneFixture(&e, &link, null);
+    var plain = try lanes.Config.init(gpa, untimed.facts(), max_rows, engine.max_drafts);
+    defer plain.deinit(gpa);
+    const probs = [_][]const f64{ &.{ 0.3, 0.09, 0.03, 0.01, 0.0, 0.0 }, &.{ 0.3, 0.09, 0.03, 0.01, 0.0, 0.0 } };
+    for ([_]f64{ 0.0, 8.0, 120.0 }) |overhead| {
+        const full = try lanes.allocate.allocateDrafts(gpa, &.{ 1, 1 }, &probs, &plain.shared_costs, overhead, cfg.batch_rows, .{ .batched = true });
+        defer gpa.free(full);
+        const priced = try lanes.allocate.allocateDrafts(gpa, &.{ 1, 1 }, &probs, &cfg.shared_costs, overhead, cfg.batch_rows, .{ .batched = true });
+        defer gpa.free(priced);
+        try std.testing.expectEqualSlices(u32, &.{ 6, 6 }, full);
+        try std.testing.expectEqualSlices(u32, &.{ 4, 4 }, priced);
+        for (probs, full, priced) |p, all, useful| {
+            for (p[0..useful]) |probability| try std.testing.expect(probability > 0);
+            for (p[useful..all]) |probability| try std.testing.expectEqual(@as(f64, 0), probability);
         }
     }
 }

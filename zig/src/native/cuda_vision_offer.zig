@@ -24,7 +24,7 @@ pub fn offer(v: anytype, open: ?api.VisionOpen) ?api.Vision {
     // a template that writes each image's begin and end itself: the server expands the image token alone
     const wrap: ?[2]u32 = if (@hasDecl(T, "template_wraps")) null else .{ x.marks.open, x.marks.close };
     var out: api.Vision = .{ .ctx = x, .prepare = prepare, .image_token = x.marks.image, .markers = &x.mark_ids, .wrap = wrap, .image_tokens = x.limits.image_tokens, .max_images = x.limits.max_images, .explain = T.explain };
-    if (comptime T == nemotron.native.vision.Vision) {
+    if (comptime T == nemotron.native.vision.Vision and @hasDecl(T, "prepareVideo")) {
         // video: the checkpoint's temporal projection, and a reserved token for the template's `<video>`
         if (x.cfg.video_temporal == 2 and x.marks.video != null) if (open) |o| {
             out.video = .{
@@ -151,48 +151,64 @@ test "a tower whose template writes its own markers gets no wrapper; other tower
     try std.testing.expectEqual(@as(u32, 2), offer(@as(?*Wraps, &own), null).?.image_token);
 }
 
+test "retained Omni image offer keeps its wrapper and does not advertise unsupported video" {
+    if (comptime !@hasDecl(nemotron.native.vision.Vision, "prepareVideo")) {
+        var v: nemotron.native.vision.Vision = undefined;
+        v.marks = .{ .image = 18, .open = 19, .close = 20 };
+        v.mark_ids = .{ 18, 19, 20 };
+        v.limits = .{ .image_tokens = 256, .max_images = 1 };
+        const offered = offer(@as(?*nemotron.native.vision.Vision, &v), .{ .video_tokens = 512 }).?;
+        try std.testing.expectEqual(@as(u32, 18), offered.image_token);
+        try std.testing.expectEqual([2]u32{ 19, 20 }, offered.wrap.?);
+        try std.testing.expectEqual(@as(u32, 256), offered.image_tokens);
+        try std.testing.expect(offered.video == null);
+    } else return error.SkipZigTest;
+}
+
 test "actual offer prepares bounded video and plans mixed rows through the shared Vision owner" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var v: nemotron.native.vision.Vision = undefined;
-    v.gpa = a;
-    v.spans = &.{};
-    defer v.end();
-    v.cfg = .{ .hidden = 1280, .layers = 32, .heads = 16, .ffn = 5120, .eps = 1e-6, .patch = 16, .prefix = 10, .side = 128, .projector_hidden = 20480, .text_hidden = 4096, .final_norm = false, .mean = .{ 0.5, 0.5, 0.5 }, .std = .{ 0.25, 0.25, 0.25 }, .min_patches = 1024, .max_patches = 13312, .max_model_len = 16384, .image_token = 18, .video_temporal = 2 };
-    v.marks = .{ .image = 18, .open = 19, .close = 20, .video = 30 };
-    v.mark_ids = v.marks.markers();
-    v.limits = .{ .image_tokens = 256, .video_tokens = 512, .max_images = 1 };
-    const held = offer(@as(?*nemotron.native.vision.Vision, &v), .{ .image_tokens = 256, .video_tokens = 512, .max_frames = 257, .max_videos = 17 }).?;
-    try std.testing.expectEqual(@as(u32, 256), held.video.?.max_frames);
-    try std.testing.expectEqual(@as(u32, 16), held.video.?.max_videos);
-    try std.testing.expectEqual(@as(u32, 512), held.video.?.video_tokens);
-    const Fake = struct {
-        fn decode(_: *anyopaque, indices: []const u32, sink: api.FrameSink) anyerror!void {
-            const pixels: [64 * 64 * 3]u8 = @splat(1);
-            for (indices, 0..) |_, i| try sink.take(sink.ctx, i, &pixels, 64, 64, 64 * 3);
-        }
-    };
-    var dummy: u8 = 0;
-    const prepared = try held.video.?.prepare(held.ctx, a, .{ .frames = 30, .rate_num = 30, .rate_den = 1, .width = 64, .height = 64, .ctx = &dummy, .decode = Fake.decode }, 512, 256);
-    try std.testing.expectEqual(@as(usize, 1), prepared.groups.len);
-    const group = prepared.groups[0];
-    try std.testing.expectEqual(@as(u32, 256), group.tokens);
-    try std.testing.expect(prepared.labels.len == 1 and prepared.times.len == 1);
-    v.rows = .{ .d = undefined, .buf = undefined, .hidden = 4096, .limit = try nemotron.native.vision.reservation(v.limits, true) };
-    v.tower.c.text_hidden = 1;
-    const images = [_]@import("engine_api").Image{
-        .{ .pixels = group.pixels, .gh = group.gh, .gw = group.gw, .tokens = group.tokens, .at = 10 },
-        .{ .pixels = group.pixels, .gh = group.gh, .gw = group.gw, .tokens = group.tokens, .at = 400 },
-    };
-    try std.testing.expectError(error.RowShape, v.begin(undefined, &images, 0));
-    try std.testing.expectEqual(@as(usize, 2), v.spans.len);
-    try std.testing.expectEqual(@as(u32, 256), v.spans[1].row);
-    try std.testing.expectError(error.RowShape, v.begin(undefined, &images, 300));
-    try std.testing.expectEqual(@as(usize, 1), v.spans.len);
-    try std.testing.expectEqual(@as(u32, 1), v.spans[0].image);
-    try std.testing.expectEqual(@as(u32, 0), v.spans[0].row);
-    try std.testing.expect(offer(@as(?*nemotron.native.vision.Vision, null), null) == null);
+    if (comptime @hasDecl(nemotron.native.vision.Vision, "prepareVideo")) {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var v: nemotron.native.vision.Vision = undefined;
+        v.gpa = a;
+        v.spans = &.{};
+        defer v.end();
+        v.cfg = .{ .hidden = 1280, .layers = 32, .heads = 16, .ffn = 5120, .eps = 1e-6, .patch = 16, .prefix = 10, .side = 128, .projector_hidden = 20480, .text_hidden = 4096, .final_norm = false, .mean = .{ 0.5, 0.5, 0.5 }, .std = .{ 0.25, 0.25, 0.25 }, .min_patches = 1024, .max_patches = 13312, .max_model_len = 16384, .image_token = 18, .video_temporal = 2 };
+        v.marks = .{ .image = 18, .open = 19, .close = 20, .video = 30 };
+        v.mark_ids = v.marks.markers();
+        v.limits = .{ .image_tokens = 256, .video_tokens = 512, .max_images = 1 };
+        const held = offer(@as(?*nemotron.native.vision.Vision, &v), .{ .image_tokens = 256, .video_tokens = 512, .max_frames = 257, .max_videos = 17 }).?;
+        try std.testing.expectEqual(@as(u32, 256), held.video.?.max_frames);
+        try std.testing.expectEqual(@as(u32, 16), held.video.?.max_videos);
+        try std.testing.expectEqual(@as(u32, 512), held.video.?.video_tokens);
+        const Fake = struct {
+            fn decode(_: *anyopaque, indices: []const u32, sink: api.FrameSink) anyerror!void {
+                const pixels: [64 * 64 * 3]u8 = @splat(1);
+                for (indices, 0..) |_, i| try sink.take(sink.ctx, i, &pixels, 64, 64, 64 * 3);
+            }
+        };
+        var dummy: u8 = 0;
+        const prepared = try held.video.?.prepare(held.ctx, a, .{ .frames = 30, .rate_num = 30, .rate_den = 1, .width = 64, .height = 64, .ctx = &dummy, .decode = Fake.decode }, 512, 256);
+        try std.testing.expectEqual(@as(usize, 1), prepared.groups.len);
+        const group = prepared.groups[0];
+        try std.testing.expectEqual(@as(u32, 256), group.tokens);
+        try std.testing.expect(prepared.labels.len == 1 and prepared.times.len == 1);
+        v.rows = .{ .d = undefined, .buf = undefined, .hidden = 4096, .limit = try nemotron.native.vision.reservation(v.limits, true) };
+        v.tower.c.text_hidden = 1;
+        const images = [_]@import("engine_api").Image{
+            .{ .pixels = group.pixels, .gh = group.gh, .gw = group.gw, .tokens = group.tokens, .at = 10 },
+            .{ .pixels = group.pixels, .gh = group.gh, .gw = group.gw, .tokens = group.tokens, .at = 400 },
+        };
+        try std.testing.expectError(error.RowShape, v.begin(undefined, &images, 0));
+        try std.testing.expectEqual(@as(usize, 2), v.spans.len);
+        try std.testing.expectEqual(@as(u32, 256), v.spans[1].row);
+        try std.testing.expectError(error.RowShape, v.begin(undefined, &images, 300));
+        try std.testing.expectEqual(@as(usize, 1), v.spans.len);
+        try std.testing.expectEqual(@as(u32, 1), v.spans[0].image);
+        try std.testing.expectEqual(@as(u32, 0), v.spans[0].row);
+        try std.testing.expect(offer(@as(?*nemotron.native.vision.Vision, null), null) == null);
+    } else return error.SkipZigTest; // the retained Omni family provides images, not upstream video
 }
 
 fn allocationVideo(a: Allocator) !void {
@@ -218,5 +234,7 @@ fn allocationVideo(a: Allocator) !void {
     try std.testing.expectEqual(@as(usize, 1), p.groups.len);
 }
 test "offer conversion unwinds every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationVideo, .{});
+    if (comptime @hasDecl(nemotron.native.vision.Vision, "prepareVideo")) {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationVideo, .{});
+    } else return error.SkipZigTest; // the retained Omni family provides images, not upstream video
 }

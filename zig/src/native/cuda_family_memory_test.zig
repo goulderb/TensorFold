@@ -7,6 +7,11 @@ const Fake = struct {
     var missing = false;
     var text: ?[]const u8 = null;
     var probes: usize = 0;
+    var bound: cuda.abi.Context = null;
+    fn bind(ctx: cuda.abi.Context) callconv(.c) cuda.abi.Result {
+        bound = ctx;
+        return 0;
+    }
     fn attribute(out: *c_int, _: cuda.abi.DeviceAttribute, _: c_int) callconv(.c) cuda.abi.Result {
         out.* = integrated;
         return 0;
@@ -29,7 +34,8 @@ test "Windows pool: real CUDA counts, OS selection, unified reserves and missing
     var driver: cuda.Driver = undefined;
     driver.api.cuDeviceGetAttribute = Fake.attribute;
     driver.api.cuMemGetInfo_v2 = Fake.memInfo;
-    const ctx: cuda.Context = .{ .d = &driver, .device = 0, .handle = null };
+    driver.api.cuCtxSetCurrent = Fake.bind;
+    const ctx: cuda.Context = .{ .d = &driver, .device = 0, .handle = @ptrFromInt(16) };
     var problem: []const u8 = "";
     Fake.missing = false;
     Fake.integrated = 1;
@@ -37,6 +43,7 @@ test "Windows pool: real CUDA counts, OS selection, unified reserves and missing
     Fake.text = null;
     const maybe_win = try poolFor(true, Fake, t.allocator, t.io, &ctx, &problem);
     try t.expect(maybe_win != null);
+    try t.expectEqual(ctx.handle, Fake.bound);
     const win = maybe_win.?;
     try t.expect(win.unified);
     try t.expectEqual(@as(u64, 64 << 30), win.total);

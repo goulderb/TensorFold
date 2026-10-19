@@ -49,6 +49,8 @@ pub const Loaded = struct {
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
     lone: ?LoneRun = null,
+    trim: ?lanes.Trim = null,
+    proposers: ?lanes.proposer.Factory = null,
     target: *engine.Engine, // the prompt cache keeps this engine's states (snap_*)
     admit: ?struct { ctx: *anyopaque, fits: *const fn (*anyopaque, u32, u32) bool } = null,
     peer_room: ?Peer = null, // rank 0: the server admits streams and kept states by this when it is smaller
@@ -194,11 +196,14 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         }
     }.get;
     own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .vision = own.vision, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .lone_costs = lone_costs };
+    own.lanes.batch_prefill = if (std.c.getenv("TF_GLM_MULTI_PREFILL")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
     if (lone_costs != null) std.log.info("GLM lone-stream round costs: {s} ms (one row, each further row)", .{std.mem.span(std.c.getenv("TF_GLM_LONE_COSTS").?)});
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
-        .rows = glm_lanes.max_rows,
+        .rows = if (set.draft_profile.enabled) glm_lanes.max_rows else 1 + engine.max_drafts,
+        .trim = if (set.draft_profile.enabled) own.e.settings.draft_profile.rowPolicy() else null,
+        .proposers = if (set.draft_profile.enabled) own.e.settings.draft_profile.proposers() else null,
         .stream_bytes = own.e.seqBytes(), // each stream past the first makes its own sequence on every rank
         .lane_limit = if (own.e.dflash != null) engine.max_shared else if (own.e.pool != null) @import("cuda_kv_extent.zig").max_slots else std.math.maxInt(u32),
         .free_streams = 1, // the first is the sequence the engine made

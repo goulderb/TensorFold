@@ -71,6 +71,7 @@ pub const Engine = struct {
                 .plain_guard = cfg.plain_guard,
                 .node_probabilities = cfg.node_probabilities,
                 .confidence_floor = cfg.draft_confidence,
+                .fixed_drafts = cfg.fixed_drafts,
                 .batch_rows = cfg.batch_rows,
                 .batched_heads = cfg.draft_streams,
             },
@@ -104,6 +105,8 @@ pub const Engine = struct {
     pub const fills = open.fills;
     pub const fillStream = open.fillStream;
     pub const fillStreamCommitted = open.fillStreamCommitted;
+    pub const fillBatch = open.fillBatch;
+    pub const fillBatchCommitted = open.fillBatchCommitted;
     pub const adopt = handover.adopt;
     pub const detach = handover.detach;
     pub const discard = handover.discard;
@@ -375,7 +378,7 @@ pub const Engine = struct {
             const chain = parents.len == 0 or accept.isChain(parents);
             try t.commit(.{ .stream = s, .drafted = p.kind == .head, .rows = @intCast(rows), .parents = if (chain) null else parents, .path = path, .bonus = sampled[path[path.len - 1]] });
         };
-        // the call gate's correction first, then the loop guard and the thinking budget (stream.cutRound)
+        // keep the earliest call correction, loop guard or thinking-budget cut (stream.cutRound)
         const cut = try s.cutRound(e.gpa, a, &committed);
         if (cut) |c| path = path[0 .. c + 1];
         s.rounds += 1;

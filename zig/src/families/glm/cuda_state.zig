@@ -19,8 +19,8 @@ const precision = @import("cuda_weight_precision.zig");
 
 /// A prompt chunk's rows (decode.PREFILL_ROWS).
 pub const prefill_rows = 2048;
-/// A decode window's rows (Engine's max_rows).
-pub const window_rows = 8;
+/// Target/replay storage, independent of the neural draft ceiling or advertised legacy lane width.
+pub const window_rows = @import("cuda_verify_plan.zig").target_rows;
 /// The context the buffers' dense attention partials reach (Buffers' min(capacity, 2560)).
 pub const dense_reach = 2560;
 
@@ -315,9 +315,10 @@ pub const Buffers = struct {
         const mia = @import("cuda_experts_mia.zig");
         const slots = w.config.topk + 1;
         const width = w.share.moe.len();
-        var storage = try cuda.DeviceBuffer.alloc(d, try mia.Scratch.bytes(b.rows, @min(b.rows, 32), slots, w.config.hidden, width));
+        const decode_rows = @min(b.rows, @import("cuda_verify_plan.zig").max_rows);
+        var storage = try cuda.DeviceBuffer.alloc(d, try mia.Scratch.bytes(b.rows, decode_rows, slots, w.config.hidden, width));
         errdefer storage.free();
-        b.moe.mia_scratch = try mia.Scratch.fromBase(storage.ptr, b.rows, @min(b.rows, 32), slots, w.config.hidden, width);
+        b.moe.mia_scratch = try mia.Scratch.fromBase(storage.ptr, b.rows, decode_rows, slots, w.config.hidden, width);
         b.mia_storage = storage;
     }
 

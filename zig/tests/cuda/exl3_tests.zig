@@ -1,400 +1,600 @@
-//! EXL3: the decode-row linear against float64 references, row invariance, the engine's fixture bytes, bandwidth.
+//! EXL3 projections on CUDA: codebooks and tiles bit for bit against core/exl3_format.zig, FP64 bounds, row windows.
 const std = @import("std");
 const cuda = @import("cuda");
+const core = @import("core");
 const check = @import("check.zig");
-const quant_ref_tests = @import("quant_ref_tests.zig");
-const exl3fmt = @import("core").exl3_format;
-const exl3 = cuda.exl3;
 const Gpu = check.Gpu;
-const Rig = quant_ref_tests.RigT;
-const bf = quant_ref_tests.helpers.bfOf;
+const fmt = core.exl3_format;
+const E = cuda.exl3_linear;
+const st = core.safetensors;
 
-const rows = [_]usize{ 1, 3, 8, 16, 17, 64, 128 }; // every row count in the f64 checks (128 covers the rest)
+const k_max = 16384; // GLM-5.3-Flash's widest input (o_proj: 64 heads of 256)
+const u = std.math.pow(f64, 2, -24);
 
-const Cfg = struct { id: []const u8, halves: u32, codebook: exl3fmt.Codebook, k: usize, n: usize };
+/// Device buffers for one test, freed together.
+pub const Rig = struct {
+    gpu: Gpu,
+    bufs: std.ArrayList(cuda.DeviceBuffer) = .empty,
 
-const f64_cfgs = [_]Cfg{
-    .{ .id = "exl3.linear.f64.mul1.4", .halves = 8, .codebook = .mul1, .k = 4096, .n = 1024 },
-    .{ .id = "exl3.linear.f64.mul1.4", .halves = 2, .codebook = .mul1, .k = 512, .n = 512 }, // 1 bit
-    .{ .id = "exl3.linear.f64.mul1.4", .halves = 4, .codebook = .mul1, .k = 512, .n = 512 }, // 2 bits
-    .{ .id = "exl3.linear.f64.mul1.5", .halves = 10, .codebook = .mul1, .k = 1024, .n = 4096 },
-    .{ .id = "exl3.linear.f64.mul1.5", .halves = 6, .codebook = .mul1, .k = 512, .n = 512 }, // 3 bits
-    .{ .id = "exl3.linear.f64.mul1.6", .halves = 12, .codebook = .mul1, .k = 2048, .n = 8192 }, // 8 warps a block
-    .{ .id = "exl3.linear.f64.mul1.7", .halves = 14, .codebook = .mul1, .k = 512, .n = 1024 },
-    .{ .id = "exl3.linear.f64.mul1.8", .halves = 16, .codebook = .mul1, .k = 2048, .n = 4096 },
-    .{ .id = "exl3.linear.f64.mcg", .halves = 8, .codebook = .mcg, .k = 1024, .n = 512 },
-    .{ .id = "exl3.linear.f64.mcg", .halves = 2, .codebook = .mcg, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.mcg", .halves = 4, .codebook = .mcg, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.mcg", .halves = 6, .codebook = .mcg, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.mcg", .halves = 10, .codebook = .mcg, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.mcg", .halves = 12, .codebook = .mcg, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.mcg", .halves = 14, .codebook = .mcg, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.mcg", .halves = 16, .codebook = .mcg, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.inst3", .halves = 8, .codebook = .inst3, .k = 1024, .n = 1024 },
-    .{ .id = "exl3.linear.f64.inst3", .halves = 2, .codebook = .inst3, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.inst3", .halves = 4, .codebook = .inst3, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.inst3", .halves = 6, .codebook = .inst3, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.inst3", .halves = 10, .codebook = .inst3, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.inst3", .halves = 12, .codebook = .inst3, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.inst3", .halves = 14, .codebook = .inst3, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.inst3", .halves = 16, .codebook = .inst3, .k = 512, .n = 512 },
-    // the mul1 half steps, 1.5 to 6.5 bits, under one check
-    .{ .id = "exl3.linear.f64.halfstep", .halves = 3, .codebook = .mul1, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.halfstep", .halves = 5, .codebook = .mul1, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.halfstep", .halves = 7, .codebook = .mul1, .k = 512, .n = 512 },
-    .{ .id = "exl3.linear.f64.halfstep", .halves = 9, .codebook = .mul1, .k = 1024, .n = 1024 },
-    .{ .id = "exl3.linear.f64.halfstep", .halves = 11, .codebook = .mul1, .k = 2048, .n = 1024 },
-    .{ .id = "exl3.linear.f64.halfstep", .halves = 13, .codebook = .mul1, .k = 512, .n = 512 },
-};
-
-/// One check's outcome: a failure prints its FAIL line (TestFailed ones already printed theirs) and fails the run.
-pub const Run = struct {
-    failed: bool = false,
-
-    pub fn fail(self: *Run, e: anyerror, id: []const u8) void {
-        if (e != error.TestFailed) std.debug.print("FAIL {s}: {t}\n", .{ id, e });
-        self.failed = true;
+    pub fn put(r: *Rig, items: anytype) !u64 {
+        const b = try cuda.DeviceBuffer.fromHost(r.gpu.d, std.mem.sliceAsBytes(items));
+        try r.bufs.append(r.gpu.gpa, b);
+        return b.ptr;
     }
-};
-
-pub fn run(gpu: Gpu, dir: []const u8) !void {
-    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
-    defer arena.deinit();
-    var s = try cuda.Stream.init(gpu.d, false);
-    defer s.deinit();
-    var prng = std.Random.DefaultPrng.init(11);
-    var r: Rig = .{ .gpu = gpu, .a = arena.allocator(), .s = s, .rng = prng.random() };
-    defer {
+    pub fn zeros(r: *Rig, len: usize) !u64 {
+        const b = try cuda.DeviceBuffer.alloc(r.gpu.d, @max(len, 16));
+        try b.fill8(0, null);
+        try r.gpu.d.check(r.gpu.d.api.cuStreamSynchronize(null), "cuStreamSynchronize");
+        try r.bufs.append(r.gpu.gpa, b);
+        return b.ptr;
+    }
+    pub fn get(r: *Rig, ptr: u64, out: []u8) !void {
+        const b: cuda.DeviceBuffer = .{ .d = r.gpu.d, .ptr = ptr, .len = out.len };
+        try b.download(0, out);
+    }
+    pub fn deinit(r: *Rig) void {
         for (r.bufs.items) |*b| b.free();
-        r.bufs.deinit(gpu.gpa);
+        r.bufs.deinit(r.gpu.gpa);
     }
-    var lin = try exl3.Linear.load(gpu.d);
-    defer lin.unload();
+};
 
-    var state = Run{};
-    var last: ?[]const u8 = null;
-    var ok = true;
-    for (f64_cfgs) |c| {
-        if (last) |prev| {
-            if (!std.mem.eql(u8, prev, c.id)) {
-                if (ok) check.pass("{s}", .{prev});
-                ok = true;
-            }
-        }
-        f64Linear(&r, &lin, c) catch |e| {
-            state.fail(e, c.id);
-            ok = false;
-        };
-        last = c.id;
-    }
-    if (last) |prev| {
-        if (ok) check.pass("{s}", .{prev});
-    }
-    {
-        var rows_ok = true;
-        rowsInvariant(&r, &lin) catch |e| {
-            state.fail(e, "exl3.linear.rows");
-            rows_ok = false;
-        };
-        if (rows_ok) check.pass("exl3.linear.rows", .{});
-    }
-    pythonChecks(&r, &lin, dir, &state) catch |e| {
-        state.fail(e, "exl3.linear.python");
-    };
-    try @import("exl3_dense_tests.zig").run(&r, &state, dir);
-    try @import("exl3_experts_tests.zig").run(&r, &state, dir);
-    try @import("exl3_layer_tests.zig").run(&r, &state, dir);
-    if (state.failed) return error.TestFailed;
-    try bench(&r, &lin);
-}
-
-/// A zeroed device buffer (counters must read zero, unlike zeros()'s 0xff canaries).
-pub fn zeroed(r: *Rig, bytes: usize) !u64 {
-    const b = try cuda.DeviceBuffer.alloc(r.gpu.d, @max(bytes, 16));
-    try r.bufs.append(r.gpu.gpa, b);
-    try b.fill8(0, r.s.handle);
-    return b.ptr;
-}
-
-/// One codebook and width at one shape: random trellis, scales and 128 rows of x, then every row count of `rows`.
-fn f64Linear(r: *Rig, lin: *const exl3.Linear, c: Cfg) !void {
-    const width = exl3fmt.Width{ .halves = @intCast(c.halves) };
-    const cb: exl3.Codebook = switch (c.codebook) {
+fn refBook(c: E.Codebook) fmt.Codebook {
+    return switch (c) {
         .inst3 => .inst3,
         .mcg => .mcg,
         .mul1 => .mul1,
     };
-    const k = c.k;
-    const n = c.n;
-    const trellis = try r.a.alloc(i16, (k / 16) * (n / 16) * width.tileWords());
-    for (trellis) |*v| v.* = r.rng.int(i16);
-    const suh = try r.a.alloc(u16, k);
-    const svh = try r.a.alloc(u16, n);
-    for (suh) |*v| v.* = @bitCast(@as(f16, @floatCast(r.rng.float(f32) * 2 - 1)));
-    for (svh) |*v| v.* = @bitCast(@as(f16, @floatCast(r.rng.float(f32) * 2 - 1)));
-    const x = try r.bfs(128 * k, 1.0);
-    const want = try reference(r, width, c.codebook, trellis, k, n, x, suh, svh);
-    const st = exl3.strides(k, n, c.halves, false);
-    const w: exl3.Weight = .{
-        .trellis = try r.dev(std.mem.sliceAsBytes(trellis)),
-        .suh = try r.dev(std.mem.sliceAsBytes(suh)),
-        .svh = try r.dev(std.mem.sliceAsBytes(svh)),
-        .bias = 0,
-        .k = @intCast(k),
-        .n = @intCast(n),
-        .halves = c.halves,
-        .codebook = cb,
-        .stride_k = st.k,
-        .stride_nb = st.nb,
-    };
-    const dx = try r.dev(std.mem.sliceAsBytes(x));
-    const counters = try zeroed(r, exl3.Linear.counterBytes(w));
-    for (rows) |m| {
-        const dy = try r.zeros(m * n * 2);
-        const xh = try r.zeros(m * k * 2);
-        const z: u64 = if (exl3.plan(k, n, 192, 8).sk > 1) try r.zeros(exl3.Linear.zBytes(w, m)) else 0;
-        try lin.matmul(r.s, w, dx, .bf16, m, dy, .bf16, xh, z, counters);
-        try closeOut(r, c.id, dy, m * n, want.want, want.tol);
-    }
 }
 
-/// The Python engine's f64 reference: Wq fp16 from the trellis, fp16 xh, the y sums, and each element's |t| sum.
-fn reference(r: *Rig, width: exl3fmt.Width, cb: exl3fmt.Codebook, trellis: []const i16, k: usize, n: usize, x: []const u16, suh: []const u16, svh: []const u16) !struct { want: []f64, tol: []f64 } {
-    const m = 128;
-    const wq = try r.a.alloc(f16, k * n);
-    exl3fmt.unpack(width, cb, trellis, k / 16, n / 16, wq);
-    const xs = try r.a.alloc(f64, m * k);
-    for (0..m) |row| {
-        for (0..k) |i| xs[row * k + i] = bf(x[row * k + i]) * @as(f64, @floatCast(@as(f16, @bitCast(suh[i]))));
+pub fn bf16(v: f32) u16 {
+    return @intCast(@as(u32, @bitCast(v)) >> 16);
+}
+
+fn ofBf16(b: u16) f64 {
+    return @as(f32, @bitCast(@as(u32, b) << 16));
+}
+
+fn gamma(n: usize) f64 {
+    return gammaU(n, u);
+}
+
+fn gammaU(n: usize, unit: f64) f64 {
+    const nu = @as(f64, @floatFromInt(n)) * unit;
+    return nu / (1 - nu);
+}
+
+/// `tf-cuda-test exl3 [DIR]`: codebooks, tiles, FP64 bounds and row windows; DIR adds a checkpoint's real matrices.
+pub fn run(gpu: Gpu, dir: ?[]const u8) !void {
+    var mod = try cuda.Module.load(gpu.d, cuda.kernels.exl3);
+    defer mod.unload();
+    var k = try E.Kernels.resolve(gpu.d, mod, k_max);
+    defer k.deinit();
+    var s = try cuda.Stream.init(gpu.d, true);
+    defer s.deinit();
+    try codebooks(gpu, &k, s);
+    try tiles(gpu, &k, s);
+    var b: Bound = .{};
+    const cases = [_]Case{
+        .{ .k = 256, .n = 256, .bits = 1, .book = .mul1 },   .{ .k = 256, .n = 384, .bits = 2, .book = .mcg },
+        .{ .k = 384, .n = 256, .bits = 3, .book = .inst3 },  .{ .k = 256, .n = 256, .bits = 4, .book = .mul1 },
+        .{ .k = 512, .n = 256, .bits = 5, .book = .mul1 },   .{ .k = 256, .n = 512, .bits = 6, .book = .mul1 },
+        .{ .k = 256, .n = 256, .bits = 7, .book = .mcg },    .{ .k = 256, .n = 256, .bits = 8, .book = .mul1 },
+        .{ .k = 1024, .n = 256, .bits = 4, .book = .inst3 }, .{ .k = 2048, .n = 128, .bits = 4, .book = .mul1 },
+        .{ .k = 1024, .n = 256, .bits = 6, .book = .mcg },
+    };
+    for (cases, 0..) |c, i| try synthetic(gpu, &k, s, c, 0xE3 + i, &b);
+    check.pass("{d} synthetic matrices, widths 1-8, three codebooks: {d} FP64 values, max error {e}, max {d:.4} of the bound, worst column {e} of the largest output", .{ cases.len, b.values, b.max_error, b.max_fraction, b.worst_column });
+    try windows(gpu, &k, s);
+    try fp32Out(gpu, &k, s);
+    if (dir) |d| try real(gpu, &k, s, d);
+}
+
+fn codebooks(gpu: Gpu, k: *const E.Kernels, s: cuda.Stream) !void {
+    var rig: Rig = .{ .gpu = gpu };
+    defer rig.deinit();
+    const out = try rig.zeros(65536 * 2);
+    const got = try gpu.gpa.alloc(u16, 65536);
+    defer gpu.gpa.free(got);
+    for ([_]E.Codebook{ .inst3, .mcg, .mul1 }) |c| {
+        try k.codebook(s, c, out);
+        try s.synchronize();
+        try rig.get(out, std.mem.sliceAsBytes(got));
+        for (got, 0..) |g, i| try check.expect(g == @as(u16, @bitCast(fmt.codebookValue(refBook(c), @intCast(i)))), "exl3 {t} state {d}", .{ c, i });
     }
-    exl3fmt.rotate(xs, m, k, 1);
-    const xh = try r.a.alloc(f16, m * k);
-    for (xh, xs) |*o, v| o.* = @floatCast(v);
-    const ypre = try r.a.alloc(f64, m * n); // [n][m], rotated along n
-    @memset(ypre, 0);
-    const s1 = try r.a.alloc(f64, m * n); // each output's sum of |xh * wq| over k
-    @memset(s1, 0);
-    var xv: [128]f64 = undefined;
-    var xa: [128]f64 = undefined;
-    for (0..k) |ki| {
-        for (0..m) |row| {
-            xv[row] = @floatCast(xh[row * k + ki]);
-            xa[row] = @abs(xv[row]);
+    check.pass("3 codebooks x 65536 states: the GPU's fp16 weights equal exl3_format.codebookValue bit for bit", .{});
+}
+
+fn tiles(gpu: Gpu, k: *const E.Kernels, s: cuda.Stream) !void {
+    var prng = std.Random.DefaultPrng.init(0x7E11);
+    const r = prng.random();
+    const tk = 2;
+    const tn = 3;
+    var count: usize = 0;
+    for (1..9) |bits| for ([_]E.Codebook{ .inst3, .mcg, .mul1 }) |c| {
+        var rig: Rig = .{ .gpu = gpu };
+        defer rig.deinit();
+        const words = try gpu.gpa.alloc(i16, tk * tn * 16 * bits);
+        defer gpu.gpa.free(words);
+        for (words) |*w| w.* = r.int(i16);
+        const m: E.Matrix = .{ .trellis = try rig.put(words), .suh = 0, .svh = 0, .k = tk * 16, .n = tn * 16, .bits = @intCast(bits), .codebook = c };
+        const out = try rig.zeros(m.k * m.n * 2);
+        try k.unpack(s, m, out);
+        try s.synchronize();
+        var got: [tk * tn * 256]f16 = undefined;
+        var want: [tk * tn * 256]f16 = undefined;
+        try rig.get(out, std.mem.sliceAsBytes(&got));
+        fmt.unpack(.{ .halves = @intCast(2 * bits) }, refBook(c), words, tk, tn, &want);
+        try check.sameBytes("exl3 unpack", std.mem.sliceAsBytes(&got), std.mem.sliceAsBytes(&want));
+        count += 1;
+    };
+    check.pass("{d} width/codebook pairs: random tiles unpack to exl3_format.unpack's W_q bit for bit", .{count});
+}
+
+pub const Case = struct { k: usize, n: usize, bits: u32, book: E.Codebook };
+
+/// Worst observed error, as a value and as a fraction of the fp32 bound, over every value checked.
+pub const Bound = struct {
+    values: usize = 0,
+    max_error: f64 = 0,
+    max_fraction: f64 = 0,
+    worst_column: f64 = 0,
+};
+
+/// One matrix's host copy (a column block of a real one, or a whole synthetic one) with its rows of input.
+pub const Host = struct {
+    k: usize,
+    n: usize,
+    bits: u32,
+    book: E.Codebook,
+    trellis: []const i16,
+    suh: []const f16,
+    svh: []const f16,
+};
+
+/// FP64 y = x W from exl3_format.dequantize, and per value the bound of exl3.cu's order (rotate, chain, transform).
+pub fn reference(a: std.mem.Allocator, h: Host, x: []const u16, rows: usize, y: []f64, bound: []f64, prompt: bool) !void {
+    const w = try a.alloc(f64, h.k * h.n);
+    defer a.free(w);
+    const scratch = try a.alloc(f64, 2 * h.k * h.n);
+    defer a.free(scratch);
+    fmt.dequantize(.{ .halves = @intCast(2 * h.bits) }, refBook(h.book), h.trellis, h.k / 16, h.n / 16, h.suh, h.svh, w, scratch);
+    const wq = try a.alloc(f16, h.k * h.n);
+    defer a.free(wq);
+    fmt.unpack(.{ .halves = @intCast(2 * h.bits) }, refBook(h.book), h.trellis, h.k / 16, h.n / 16, wq);
+    const rot = try a.alloc(f64, 2 * h.k);
+    defer a.free(rot);
+    const z = try a.alloc(f64, 2 * h.n);
+    defer a.free(z);
+    for (0..rows) |i| {
+        const xr = x[i * h.k ..][0..h.k];
+        for (0..h.n) |j| {
+            var acc: f64 = 0;
+            for (0..h.k) |l| acc += ofBf16(xr[l]) * w[l * h.n + j];
+            y[i * h.n + j] = acc;
         }
-        for (0..n) |col| {
-            const wv: f64 = @floatCast(wq[ki * n + col]);
-            const wa = @abs(wv);
-            const base = col * m;
-            for (0..m) |row| {
-                ypre[base + row] += xv[row] * wv;
-                s1[base + row] += xa[row] * wa;
+        // r = (x suh) H unnormalized, |r| and its error from one product and seven adds
+        const r = rot[0..h.k];
+        const re = rot[h.k..];
+        for (0..h.k) |l| r[l] = ofBf16(xr[l]) * @as(f64, @floatCast(h.suh[l]));
+        var blk: usize = 0;
+        while (blk < h.k) : (blk += 128) {
+            var sum: f64 = 0;
+            for (r[blk..][0..128]) |v| sum += @abs(v);
+            fwht(r[blk..][0..128]);
+            for (re[blk..][0..128], r[blk..][0..128]) |*e, v| {
+                e.* = gamma(8) * sum;
+                // prompt rows: r / 16 rounded to fp16 (relative 2^-11, 2^-25 absolute among subnormals)
+                if (prompt) e.* += std.math.pow(f64, 2, -11) * (@abs(v) + e.*) + std.math.pow(f64, 2, -21);
+            }
+        }
+        const za = z[0..h.n];
+        const ze = z[h.n..];
+        for (0..h.n) |j| {
+            var mag: f64 = 0;
+            var carried: f64 = 0;
+            for (0..h.k) |l| {
+                const q = @abs(@as(f64, @floatCast(wq[l * h.n + j])));
+                mag += (@abs(r[l]) + re[l]) * q;
+                carried += re[l] * q;
+            }
+            ze[j] = (if (prompt) gammaU(h.k + 3, std.math.pow(f64, 2, -22)) else gamma(h.k + 3)) * mag + carried;
+            za[j] = mag;
+        }
+        var ob: usize = 0;
+        while (ob < h.n) : (ob += 128) {
+            var zsum: f64 = 0;
+            var esum: f64 = 0;
+            for (ob..ob + 128) |j| {
+                zsum += za[j] + ze[j];
+                esum += ze[j];
+            }
+            for (ob..ob + 128) |j| {
+                const e = std.math.pow(f64, 2, -7) * @abs(@as(f64, @floatCast(h.svh[j]))) * (gamma(7) * zsum + esum);
+                bound[i * h.n + j] = e * (1 + u) + (if (prompt) std.math.pow(f64, 2, -8) else u) * (@abs(y[i * h.n + j]) + e);
             }
         }
     }
-    exl3fmt.rotate(ypre, n, m, 0);
-    const want = try r.a.alloc(f64, m * n);
-    const tol = try r.a.alloc(f64, m * n);
-    for (0..n) |col| {
-        const scale: f64 = @floatCast(@as(f16, @bitCast(svh[col])));
-        for (0..m) |row| {
-            want[row * n + col] = ypre[col * m + row] * scale;
-            // bf16 output ulp (2^-7 of the value) plus fp32 accumulation and fp16 xh cases, 2^-11 of the |t| sum
-            tol[row * n + col] = @abs(want[row * n + col]) / 128 + s1[row * n + col] / 2048 + 1e-30;
-        }
-    }
-    return .{ .want = want, .tol = tol };
 }
 
-/// bf16 outputs within the f64 reference's tolerance, with the exact FAIL line.
-pub fn closeOut(r: *Rig, id: []const u8, ptr: u64, len: usize, want: []const f64, tol: []const f64) !void {
-    const raw = try r.back(ptr, len * 2);
-    var most: f64 = 0;
-    var at: usize = 0;
-    for (want[0..len], tol[0..len], 0..) |wv, t, i| {
-        const g = bf(std.mem.bytesToValue(u16, raw[2 * i ..][0..2]));
-        const q = @abs(g - wv) / t;
-        if (q > most) {
-            most = q;
-            at = i;
+fn fwht(v: []f64) void {
+    var d: usize = 1;
+    while (d < v.len) : (d <<= 1) {
+        for (0..v.len) |i| {
+            if (i & d != 0) continue;
+            const a = v[i];
+            const b = v[i + d];
+            v[i] = a + b;
+            v[i + d] = a - b;
         }
-    }
-    std.debug.print("RESULT {s}: largest difference {d:.3} of its tolerance (element {d})\n", .{ id, most, at });
-    if (most > 1) {
-        std.debug.print("FAIL {s}: largest difference {d:.3} of its tolerance\n", .{ id, most });
-        return error.TestFailed;
     }
 }
 
-/// The first m rows of a 128-row call byte-equal every narrower call, at a split shape and a single-split one.
-fn rowsInvariant(r: *Rig, lin: *const exl3.Linear) !void {
-    const shapes = [_][2]usize{ .{ 4096, 1024 }, .{ 512, 4096 } };
-    for (shapes) |sh| {
-        const k = sh[0];
-        const n = sh[1];
-        const width: exl3fmt.Width = .{ .halves = 8 };
-        const trellis = try r.a.alloc(i16, (k / 16) * (n / 16) * width.tileWords());
-        for (trellis) |*v| v.* = r.rng.int(i16);
-        const suh = try r.a.alloc(u16, k);
-        const svh = try r.a.alloc(u16, n);
-        for (suh) |*v| v.* = @bitCast(@as(f16, @floatCast(r.rng.float(f32) * 2 - 1)));
-        for (svh) |*v| v.* = @bitCast(@as(f16, @floatCast(r.rng.float(f32) * 2 - 1)));
-        const st = exl3.strides(k, n, 8, false);
-        const w: exl3.Weight = .{
-            .trellis = try r.dev(std.mem.sliceAsBytes(trellis)),
-            .suh = try r.dev(std.mem.sliceAsBytes(suh)),
-            .svh = try r.dev(std.mem.sliceAsBytes(svh)),
-            .bias = 0,
-            .k = @intCast(k),
-            .n = @intCast(n),
-            .halves = 8,
-            .codebook = .mul1,
-            .stride_k = st.k,
-            .stride_nb = st.nb,
+/// Every value within its bound; the largest error by column against that column's largest output.
+pub fn compare(what: []const u8, got: []const f32, y: []const f64, bound: []const f64, rows: usize, n: usize, b: *Bound) !void {
+    var scale: f64 = 0;
+    for (y[0 .. rows * n]) |v| scale = @max(scale, @abs(v));
+    for (0..n) |j| {
+        var col_err: f64 = 0;
+        for (0..rows) |i| {
+            const at = i * n + j;
+            const err = @abs(@as(f64, got[at]) - y[at]);
+            try check.expect(err <= bound[at], "{s}: row {d} column {d} error {e} over its bound {e}", .{ what, i, j, err, bound[at] });
+            b.max_error = @max(b.max_error, err);
+            if (bound[at] > 0) b.max_fraction = @max(b.max_fraction, err / bound[at]);
+            col_err = @max(col_err, err);
+        }
+        if (scale > 0) b.worst_column = @max(b.worst_column, col_err / scale);
+    }
+    b.values += rows * n;
+}
+
+pub fn randomMatrix(a: std.mem.Allocator, r: std.Random, c: Case) !Host {
+    const trellis = try a.alloc(i16, E.Matrix.trellisBytes(c.k, c.n, c.bits) / 2);
+    for (trellis) |*w| w.* = r.int(i16);
+    const suh = try a.alloc(f16, c.k);
+    const svh = try a.alloc(f16, c.n);
+    for (suh) |*v| v.* = @floatCast((0.25 + 1.75 * r.float(f32)) * @as(f32, if (r.boolean()) -1 else 1));
+    for (svh) |*v| v.* = @floatCast((0.002 + 0.02 * r.float(f32)) * @as(f32, if (r.boolean()) -1 else 1));
+    return .{ .k = c.k, .n = c.n, .bits = c.bits, .book = c.book, .trellis = trellis, .suh = suh, .svh = svh };
+}
+
+pub fn freeHost(a: std.mem.Allocator, h: Host) void {
+    a.free(h.trellis);
+    a.free(h.suh);
+    a.free(h.svh);
+}
+
+pub fn randomRows(a: std.mem.Allocator, r: std.Random, rows: usize, k: usize) ![]u16 {
+    const x = try a.alloc(u16, rows * k);
+    for (x) |*v| v.* = bf16(r.floatNorm(f32) * 2);
+    return x;
+}
+
+fn upload(rig: *Rig, h: Host) !E.Matrix {
+    return .{ .trellis = try rig.put(h.trellis), .suh = try rig.put(h.suh), .svh = try rig.put(h.svh), .k = h.k, .n = h.n, .bits = h.bits, .codebook = h.book };
+}
+
+fn synthetic(gpu: Gpu, k: *const E.Kernels, s: cuda.Stream, c: Case, seed: u64, b: *Bound) !void {
+    const a = gpu.gpa;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const h = try randomMatrix(a, prng.random(), c);
+    defer freeHost(a, h);
+    const rows = 16;
+    const x = try randomRows(a, prng.random(), rows, c.k);
+    defer a.free(x);
+    var rig: Rig = .{ .gpu = gpu };
+    defer rig.deinit();
+    const m = try upload(&rig, h);
+    const out = try rig.zeros(rows * c.n * 4);
+    try k.rows(s, try rig.put(x), c.k, m, out, rows, true);
+    try s.synchronize();
+    const got = try a.alloc(f32, rows * c.n);
+    defer a.free(got);
+    try rig.get(out, std.mem.sliceAsBytes(got));
+    const y = try a.alloc(f64, rows * c.n);
+    defer a.free(y);
+    const bound = try a.alloc(f64, rows * c.n);
+    defer a.free(bound);
+    try reference(a, h, x, rows, y, bound, true);
+    try compare("exl3 synthetic", got, y, bound, rows, c.n, b);
+    // the same rows as a prompt: the tensor units' arithmetic, bf16 out
+    try k.prompt(s, try rig.put(x), c.k, m, out, rows, false);
+    try s.synchronize();
+    try getBf16(&rig, out, got);
+    try reference(a, h, x, rows, y, bound, true);
+    try compare("exl3 synthetic prompt", got, y, bound, rows, c.n, b);
+}
+
+fn getBf16(rig: *Rig, ptr: u64, out: []f32) !void {
+    const raw = try rig.gpu.gpa.alloc(u16, out.len);
+    defer rig.gpu.gpa.free(raw);
+    try rig.get(ptr, std.mem.sliceAsBytes(raw));
+    for (out, raw) |*o, v| o.* = @floatCast(ofBf16(v));
+}
+
+/// Each row alone, then every window 1-16 and a 40-row prompt through qlinear: each row's bf16 bytes as when alone.
+fn windows(gpu: Gpu, k: *const E.Kernels, s: cuda.Stream) !void {
+    const a = gpu.gpa;
+    var prng = std.Random.DefaultPrng.init(0x3D16);
+    const h = try randomMatrix(a, prng.random(), .{ .k = 2048, .n = 256, .bits = 4, .book = .mul1 });
+    defer freeHost(a, h);
+    const rows = 40;
+    const prompt_rows = 300; // past a 256-row chunk and a 64-row block
+    const x = try randomRows(a, prng.random(), prompt_rows, h.k);
+    defer a.free(x);
+    var rig: Rig = .{ .gpu = gpu };
+    defer rig.deinit();
+    const w: cuda.qlinear.Weight = .{ .exl3 = try upload(&rig, h) };
+    const l: cuda.qlinear.Linear = .{ .exl3 = k };
+    const xd = try rig.put(x);
+    const out = try rig.zeros(prompt_rows * h.n * 2);
+    const row_bytes = h.n * 2;
+    const alone = try a.alloc(u8, rows * row_bytes);
+    defer a.free(alone);
+    const got = try a.alloc(u8, rows * row_bytes);
+    defer a.free(got);
+    for (0..rows) |i| {
+        try l.decode(s, w, .{ .x = xd + i * h.k * 2 }, out, 1);
+        try s.synchronize();
+        try rig.get(out, alone[i * row_bytes ..][0..row_bytes]);
+    }
+    for (1..E.window + 1) |m| {
+        try l.decode(s, w, .{ .x = xd }, out, m);
+        try s.synchronize();
+        try rig.get(out, got[0 .. m * row_bytes]);
+        try check.sameBytes("exl3 decode window", got[0 .. m * row_bytes], alone[0 .. m * row_bytes]);
+    }
+    const p_alone = try a.alloc(u8, prompt_rows * row_bytes);
+    defer a.free(p_alone);
+    const p_got = try a.alloc(u8, prompt_rows * row_bytes);
+    defer a.free(p_got);
+    for (0..prompt_rows) |i| {
+        try l.prompt(s, w, .{ .x = xd + i * h.k * 2 }, out, 1);
+        try s.synchronize();
+        try rig.get(out, p_alone[i * row_bytes ..][0..row_bytes]);
+    }
+    for ([_]usize{ 2, 63, 64, 65, 255, 256, 257, prompt_rows }) |m| {
+        try l.prompt(s, w, .{ .x = xd }, out, m);
+        try s.synchronize();
+        try rig.get(out, p_got[0 .. m * row_bytes]);
+        try check.sameBytes("exl3 prompt rows", p_got[0 .. m * row_bytes], p_alone[0 .. m * row_bytes]);
+    }
+    check.pass("decode windows of 1-16 rows ({d} input parts) and prompts of 2-{d} rows through qlinear: every row's bf16 bytes equal the row alone on its path", .{ E.split(h.k, h.n), prompt_rows });
+}
+
+/// decodeF32 and promptF32 through qlinear: within FP64 bounds, the same bits at every row count, the bf16 out their rounding.
+fn fp32Out(gpu: Gpu, k: *const E.Kernels, s: cuda.Stream) !void {
+    const a = gpu.gpa;
+    var prng = std.Random.DefaultPrng.init(0xF32);
+    const h = try randomMatrix(a, prng.random(), .{ .k = 2048, .n = 256, .bits = 4, .book = .mcg });
+    defer freeHost(a, h);
+    const rows = 300;
+    const x = try randomRows(a, prng.random(), rows, h.k);
+    defer a.free(x);
+    var rig: Rig = .{ .gpu = gpu };
+    defer rig.deinit();
+    const w: cuda.qlinear.Weight = .{ .exl3 = try upload(&rig, h) };
+    const l: cuda.qlinear.Linear = .{ .exl3 = k };
+    const in: cuda.qlinear.Rows = .{ .x = try rig.put(x) };
+    const o32 = try rig.zeros(rows * h.n * 4);
+    const o16 = try rig.zeros(rows * h.n * 2);
+    const wide = try a.alloc(f32, rows * h.n);
+    defer a.free(wide);
+    const got = try a.alloc(f32, rows * h.n);
+    defer a.free(got);
+    const b16 = try a.alloc(u16, rows * h.n);
+    defer a.free(b16);
+    const y = try a.alloc(f64, rows * h.n);
+    defer a.free(y);
+    const bound = try a.alloc(f64, rows * h.n);
+    defer a.free(bound);
+    var b: Bound = .{};
+    for ([_]bool{ false, true }) |prompt| {
+        const what = if (prompt) "exl3 promptF32" else "exl3 decodeF32";
+        const top: usize = if (prompt) rows else E.window;
+        const counts: []const usize = if (prompt) &.{ 1, 63, 64, 65, 257 } else &.{ 1, 2, 3, 7, 8, 15 };
+        if (prompt) try l.promptF32(s, w, in, o32, top) else try l.decodeF32(s, w, in, o32, top);
+        if (prompt) try l.prompt(s, w, in, o16, top) else try l.decode(s, w, in, o16, top);
+        try s.synchronize();
+        try rig.get(o32, std.mem.sliceAsBytes(wide[0 .. top * h.n]));
+        try rig.get(o16, std.mem.sliceAsBytes(b16[0 .. top * h.n]));
+        try reference(a, h, x, top, y, bound, true);
+        try compare(what, wide, y, bound, top, h.n, &b);
+        var differ: usize = 0;
+        for (wide[0 .. top * h.n], b16[0 .. top * h.n]) |v, o| differ += @intFromBool(roundBf16(v) != o);
+        try check.expect(differ == 0, "{s}: the bf16 out is the fp32 out rounded ({d} of {d} differ)", .{ what, differ, top * h.n });
+        for (counts) |m| {
+            if (prompt) try l.promptF32(s, w, in, o32, m) else try l.decodeF32(s, w, in, o32, m);
+            try s.synchronize();
+            try rig.get(o32, std.mem.sliceAsBytes(got[0 .. m * h.n]));
+            try check.sameBytes(what, std.mem.sliceAsBytes(got[0 .. m * h.n]), std.mem.sliceAsBytes(wide[0 .. m * h.n]));
+        }
+    }
+    check.pass("decodeF32 (1-{d} rows) and promptF32 (1-{d} rows) through qlinear: {d} FP64 values within bounds (max {d:.4} of the bound), the same bits at every row count, the bf16 out their rounding", .{ E.window, rows, b.values, b.max_fraction });
+}
+
+fn roundBf16(v: f32) u16 {
+    const w: u32 = @bitCast(v);
+    return @intCast((w + 0x7FFF + ((w >> 16) & 1)) >> 16);
+}
+
+/// The checkpoint's real matrices: FP64 on three column blocks, then GB/s at 1 and 16 rows.
+fn real(gpu: Gpu, k: *const E.Kernels, s: cuda.Stream, dir: []const u8) !void {
+    const a = gpu.gpa;
+    const index_path = try std.fmt.allocPrint(a, "{s}/model.safetensors.index.json", .{dir});
+    defer a.free(index_path);
+    const index_bytes = try std.Io.Dir.cwd().readFileAlloc(gpu.io, index_path, a, .limited(64 << 20));
+    defer a.free(index_bytes);
+    const index = try std.json.parseFromSlice(std.json.Value, a, index_bytes, .{});
+    defer index.deinit();
+    const map = index.value.object.get("weight_map").?.object;
+    const P = "model.language_model.layers.";
+    const names = [_][]const u8{ P ++ "3.mlp.experts.0.gate_proj", P ++ "3.mlp.experts.0.down_proj", P ++ "0.mlp.down_proj", P ++ "3.mlp.shared_experts.up_proj", P ++ "3.self_attn.q_b_proj", P ++ "3.self_attn.o_proj", "lm_head" };
+    var b: Bound = .{};
+    var checked: usize = 0;
+    for (names) |name| {
+        const tname = try std.fmt.allocPrint(a, "{s}.trellis", .{name});
+        defer a.free(tname);
+        const wname = try std.fmt.allocPrint(a, "{s}.weight", .{name});
+        defer a.free(wname);
+        const shard = map.get(tname) orelse {
+            // a checkpoint may quantize only some matrices (experts-only EXL3): a plain .weight is skipped, a missing tensor fails
+            if (map.get(wname) == null) return error.TensorNotInIndex;
+            std.debug.print("SKIP exl3 {s}: not EXL3 in this checkpoint (.weight)\n", .{name});
+            continue;
         };
-        const x = try r.bfs(128 * k, 1.0);
-        const dx = try r.dev(std.mem.sliceAsBytes(x));
-        const counters = try zeroed(r, exl3.Linear.counterBytes(w));
-        const y128 = try r.zeros(128 * n * 2);
-        {
-            const xh = try r.zeros(128 * k * 2);
-            const z: u64 = if (exl3.plan(k, n, 192, 8).sk > 1) try r.zeros(exl3.Linear.zBytes(w, 128)) else 0;
-            try lin.matmul(r.s, w, dx, .bf16, 128, y128, .bf16, xh, z, counters);
-        }
-        const got128 = try r.back(y128, 128 * n * 2);
-        for ([_]usize{ 1, 2, 3, 16, 17, 64 }) |m| {
-            const ym = try r.zeros(m * n * 2);
-            const xh = try r.zeros(m * k * 2);
-            const z: u64 = if (exl3.plan(k, n, 192, 8).sk > 1) try r.zeros(exl3.Linear.zBytes(w, m)) else 0;
-            try lin.matmul(r.s, w, dx, .bf16, m, ym, .bf16, xh, z, counters);
-            const got = try r.back(ym, m * n * 2);
-            const id = try std.fmt.allocPrint(r.a, "exl3.linear.rows k={d} n={d} m={d}", .{ k, n, m });
-            try check.sameBytes(id, got, got128[0 .. m * n * 2]);
-        }
+        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ dir, shard.string });
+        defer a.free(path);
+        var f = try st.File.open(a, gpu.io, path);
+        defer f.close(gpu.io);
+        try realOne(gpu, k, s, &f, name, &b);
+        checked += 1;
     }
+    try check.expect(checked > 0, "exl3: none of the {d} selected matrices is EXL3 in this checkpoint", .{names.len});
+    check.pass("{d} real matrices: {d} FP64 values, max error {e}, max {d:.4} of the bound, worst column {e} of the largest output", .{ checked, b.values, b.max_error, b.max_fraction, b.worst_column });
 }
 
-/// The Python engine's recorded outputs, bit for bit (exl3_oracle.py's manifest and raw files).
-fn pythonChecks(r: *Rig, lin: *const exl3.Linear, dir: []const u8, state: *Run) !void {
-    if (std.mem.eql(u8, dir, "none")) {
-        for (4..9) |bits| std.debug.print("SKIP exl3.linear.python.{d}\n", .{bits});
-        return;
-    }
-    const manifest_path = try std.fs.path.join(r.a, &.{ dir, "manifest.json" });
-    const text = std.Io.Dir.cwd().readFileAlloc(r.gpu.io, manifest_path, r.a, .limited(1 << 24)) catch |e| {
-        for (4..9) |bits| {
-            std.debug.print("FAIL exl3.linear.python.{d}: {t}\n", .{ bits, e });
-            state.failed = true;
-        }
-        return;
-    };
-    var parsed = try std.json.parseFromSlice(std.json.Value, r.a, text, .{});
-    var seen = [_]bool{ false, false, false, false, false, false, false, false, false };
-    for (parsed.value.object.get("linears").?.array.items) |item| {
-        const o = item.object;
-        const bits: u32 = bitsOf(o.get("bits").?);
-        seen[bits] = true;
-        const id = try std.fmt.allocPrint(r.a, "exl3.linear.python.{d}", .{bits});
-        var ok = true;
-        pythonLinear(r, lin, dir, o, id) catch |e| {
-            state.fail(e, id);
-            ok = false;
+fn tensor(f: *const st.File, name: []const u8, part: []const u8) ?st.Tensor {
+    var buf: [256]u8 = undefined;
+    return f.get(std.fmt.bufPrint(&buf, "{s}.{s}", .{ name, part }) catch return null);
+}
+
+fn realOne(gpu: Gpu, k: *const E.Kernels, s: cuda.Stream, f: *const st.File, name: []const u8, b: *Bound) !void {
+    const a = gpu.gpa;
+    const t = tensor(f, name, "trellis") orelse return error.MissingTrellis;
+    const suh_t = tensor(f, name, "suh") orelse return error.MissingSuh;
+    const svh_t = tensor(f, name, "svh") orelse return error.MissingSvh;
+    const book: E.Codebook = if (tensor(f, name, "mul1") != null) .mul1 else if (tensor(f, name, "mcg") != null) .mcg else .inst3;
+    if (t.dtype != .i16 or t.rank != 3 or t.dim(2) % 16 != 0) return error.UnsupportedTrellis;
+    const kk = t.dim(0) * 16;
+    const n = t.dim(1) * 16;
+    const bits: u32 = @intCast(t.dim(2) / 16);
+    const words: []align(1) const i16 = std.mem.bytesAsSlice(i16, t.bytes);
+    const suh: []align(1) const f16 = std.mem.bytesAsSlice(f16, suh_t.bytes);
+    const svh: []align(1) const f16 = std.mem.bytesAsSlice(f16, svh_t.bytes);
+    var rig: Rig = .{ .gpu = gpu };
+    defer rig.deinit();
+    const m: E.Matrix = .{ .trellis = try rig.put(t.bytes), .suh = try rig.put(suh_t.bytes), .svh = try rig.put(svh_t.bytes), .k = kk, .n = n, .bits = bits, .codebook = book };
+    var prng = std.Random.DefaultPrng.init(0xF1A5);
+    const rows = 4;
+    const prompt_rows = 512;
+    const x = try randomRows(a, prng.random(), prompt_rows, kk);
+    defer a.free(x);
+    const xd = try rig.put(x);
+    const out = try rig.zeros(prompt_rows * n * 4);
+    try k.rows(s, xd, kk, m, out, rows, true);
+    try s.synchronize();
+    const got = try a.alloc(f32, rows * n);
+    defer a.free(got);
+    try rig.get(out, std.mem.sliceAsBytes(got));
+    // three 128-column blocks (first, middle, last), each a trellis of its own 8 tile columns
+    const tile_words = 16 * @as(usize, bits);
+    const sub = try a.alloc(i16, kk / 16 * 8 * tile_words);
+    defer a.free(sub);
+    const suh_c = try a.alloc(f16, kk);
+    defer a.free(suh_c);
+    for (suh_c, suh) |*d, v| d.* = v;
+    const svh_c = try a.alloc(f16, 128);
+    defer a.free(svh_c);
+    const y = try a.alloc(f64, rows * 128);
+    defer a.free(y);
+    const bound = try a.alloc(f64, rows * 128);
+    defer a.free(bound);
+    const g = try a.alloc(f32, rows * 128);
+    defer a.free(g);
+    const prompt_got = try a.alloc(f32, rows * n);
+    defer a.free(prompt_got);
+
+    try k.prompt(s, xd, kk, m, out, rows, false);
+    try s.synchronize();
+    try getBf16(&rig, out, prompt_got);
+    const blocks = n / 128;
+    for ([_]usize{ 0, blocks / 2, blocks - 1 }) |ob| {
+        for (0..kk / 16) |tk| for (0..8) |c| for (0..tile_words) |wi| {
+            sub[(tk * 8 + c) * tile_words + wi] = words[(tk * (n / 16) + 8 * ob + c) * tile_words + wi];
         };
-        if (ok) check.pass("{s}", .{id});
+        for (svh_c, 0..) |*v, j| v.* = svh[ob * 128 + j];
+        const sub_h: Host = .{ .k = kk, .n = 128, .bits = bits, .book = book, .trellis = sub, .suh = suh_c, .svh = svh_c };
+        try reference(a, sub_h, x, rows, y, bound, true);
+        for (0..rows) |i| @memcpy(g[i * 128 ..][0..128], got[i * n + ob * 128 ..][0..128]);
+        try compare(name, g, y, bound, rows, 128, b);
+        for (0..rows) |i| @memcpy(g[i * 128 ..][0..128], prompt_got[i * n + ob * 128 ..][0..128]);
+        try compare(name, g, y, bound, rows, 128, b);
     }
-    for (4..9) |bits| {
-        if (!seen[bits]) std.debug.print("SKIP exl3.linear.python.{d}\n", .{bits});
+    const one = try time(gpu, k, s, xd, m, out, 1);
+    const sixteen = try time(gpu, k, s, xd, m, out, E.window);
+    const many = try timePrompt(gpu, k, s, xd, m, out, prompt_rows);
+    const gb = @as(f64, @floatFromInt(t.bytes.len)) / 1e9;
+    check.pass("{s}: K={d} N={d} {d} bits {t}, 3 column blocks within FP64 bounds (decode and prompt); 1 row {d:.1} us ({d:.0} GB/s), 16 rows {d:.1} us, a {d}-row prompt {d:.0} rows/s", .{ name, kk, n, bits, book, one * 1e6, gb / one, sixteen * 1e6, prompt_rows, prompt_rows / many });
+}
+
+/// Seconds a call, the median of 7 runs of 20 after a warm-up, bf16 out.
+fn time(gpu: Gpu, k: *const E.Kernels, s: cuda.Stream, x: u64, m: E.Matrix, out: u64, rows: usize) !f64 {
+    try k.rows(s, x, m.k, m, out, rows, false);
+    try s.synchronize();
+    var runs: [7]f64 = undefined;
+    for (&runs) |*r| {
+        const t0 = check.now(gpu.io);
+        for (0..20) |_| try k.rows(s, x, m.k, m, out, rows, false);
+        try s.synchronize();
+        r.* = @as(f64, @floatFromInt(check.now(gpu.io) - t0)) / 20e9;
     }
+    return check.median(&runs);
 }
 
-fn bitsOf(v: std.json.Value) u32 {
-    return switch (v) {
-        .integer => |i| @intCast(i),
-        .float => |f| @intFromFloat(f),
-        else => unreachable,
-    };
-}
+/// A checkpoint's matrices by name, through its index: each read copies the trellis, suh and svh to the host.
+pub const Shards = struct {
+    gpu: Gpu,
+    dir: []const u8,
+    bytes: []u8,
+    index: std.json.Parsed(std.json.Value),
 
-fn pythonLinear(r: *Rig, lin: *const exl3.Linear, dir: []const u8, o: std.json.ObjectMap, id: []const u8) !void {
-    const k: usize = @intCast(o.get("k").?.integer);
-    const n: usize = @intCast(o.get("n").?.integer);
-    const bits: u32 = bitsOf(o.get("bits").?);
-    const cb: exl3.Codebook = if (std.mem.eql(u8, o.get("codebook").?.string, "mcg"))
-        .mcg
-    else if (std.mem.eql(u8, o.get("codebook").?.string, "inst3"))
-        .inst3
-    else
-        .mul1;
-    const bias = o.get("bias").?;
-    const st = exl3.strides(k, n, 2 * bits, false);
-    const w: exl3.Weight = .{
-        .trellis = try r.dev(try readFile(r, dir, o.get("trellis").?.string)),
-        .suh = try r.dev(try readFile(r, dir, o.get("suh").?.string)),
-        .svh = try r.dev(try readFile(r, dir, o.get("svh").?.string)),
-        .bias = if (std.meta.activeTag(bias) == .null) 0 else try r.dev(try readFile(r, dir, bias.string)),
-        .k = @intCast(k),
-        .n = @intCast(n),
-        .halves = 2 * bits,
-        .codebook = cb,
-        .stride_k = st.k,
-        .stride_nb = st.nb,
-    };
-    const xmap = o.get("x").?.object;
-    const ymap = o.get("y").?.object;
-    const counters = try zeroed(r, exl3.Linear.counterBytes(w));
-    for (o.get("rows").?.array.items) |rv| {
-        const m: usize = @intCast(rv.integer);
-        const key = try std.fmt.allocPrint(r.a, "{d}", .{m});
-        const x = try readFile(r, dir, xmap.get(key).?.string);
-        const want = try readFile(r, dir, ymap.get(key).?.string);
-        const dy = try r.zeros(m * n * 2);
-        const xh = try r.zeros(m * k * 2);
-        const z: u64 = if (exl3.plan(k, n, 192, 8).sk > 1) try r.zeros(exl3.Linear.zBytes(w, m)) else 0;
-        try lin.matmul(r.s, w, try r.dev(x), .bf16, m, dy, .bf16, xh, z, counters);
-        const got = try r.back(dy, want.len);
-        try check.sameBytes(id, got, want);
+    pub fn open(gpu: Gpu, dir: []const u8) !Shards {
+        const path = try std.fmt.allocPrint(gpu.gpa, "{s}/model.safetensors.index.json", .{dir});
+        defer gpu.gpa.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(gpu.io, path, gpu.gpa, .limited(64 << 20));
+        errdefer gpu.gpa.free(bytes);
+        return .{ .gpu = gpu, .dir = dir, .bytes = bytes, .index = try std.json.parseFromSlice(std.json.Value, gpu.gpa, bytes, .{}) };
     }
-}
 
-pub fn readFile(r: *Rig, dir: []const u8, name: []const u8) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(r.gpu.io, try std.fs.path.join(r.a, &.{ dir, name }), r.a, .limited(1 << 30));
-}
+    pub fn close(sh: *Shards) void {
+        sh.index.deinit();
+        sh.gpu.gpa.free(sh.bytes);
+    }
 
-/// Trellis bytes a second: one row of a 4-bit 4096x32768 layer (64 MiB, past L2), decode-dominated.
-fn bench(r: *Rig, lin: *const exl3.Linear) !void {
-    const k = 4096;
-    const n = 32768;
-    const bytes = k * n / 2;
-    const st = exl3.strides(k, n, 8, false);
-    const suh = try r.a.alloc(u16, k);
-    const svh = try r.a.alloc(u16, n);
-    @memset(suh, 0x3C00); // 1.0
-    @memset(svh, 0x3C00);
-    const x = try r.bfs(k, 1.0);
-    const w: exl3.Weight = .{
-        .trellis = try r.zeros(bytes),
-        .suh = try r.dev(std.mem.sliceAsBytes(suh)),
-        .svh = try r.dev(std.mem.sliceAsBytes(svh)),
-        .bias = 0,
-        .k = k,
-        .n = n,
-        .halves = 8,
-        .codebook = .mul1,
-        .stride_k = st.k,
-        .stride_nb = st.nb,
-    };
-    const dx = try r.dev(std.mem.sliceAsBytes(x));
-    const dy = try r.zeros(n * 2);
-    const xh = try r.zeros(k * 2);
-    const z = try r.zeros(exl3.Linear.zBytes(w, 1));
-    const counters = try zeroed(r, exl3.Linear.counterBytes(w));
-    for (0..3) |_| try lin.matmul(r.s, w, dx, .bf16, 1, dy, .bf16, xh, z, counters);
-    try r.s.synchronize();
-    const reps = 200;
-    const t0 = check.now(r.gpu.io);
-    for (0..reps) |_| try lin.matmul(r.s, w, dx, .bf16, 1, dy, .bf16, xh, z, counters);
-    try r.s.synchronize();
-    const t1 = check.now(r.gpu.io);
-    const sec = @as(f64, @floatFromInt(t1 - t0)) / 1e9;
-    const gb = @as(f64, @floatFromInt(bytes * reps)) / sec / 1e9;
-    std.debug.print("RESULT exl3.bench.decode {d:.1}\n", .{gb});
+    pub fn host(sh: *Shards, name: []const u8) !Host {
+        const a = sh.gpu.gpa;
+        var buf: [256]u8 = undefined;
+        const shard = sh.index.value.object.get("weight_map").?.object.get(try std.fmt.bufPrint(&buf, "{s}.trellis", .{name})) orelse return error.TensorNotInIndex;
+        const path = try std.fmt.allocPrint(a, "{s}/{s}", .{ sh.dir, shard.string });
+        defer a.free(path);
+        var f = try st.File.open(a, sh.gpu.io, path);
+        defer f.close(sh.gpu.io);
+        const t = tensor(&f, name, "trellis") orelse return error.MissingTrellis;
+        if (t.dtype != .i16 or t.rank != 3 or t.dim(2) % 16 != 0) return error.UnsupportedTrellis;
+        const suh_t = tensor(&f, name, "suh") orelse return error.MissingSuh;
+        const svh_t = tensor(&f, name, "svh") orelse return error.MissingSvh;
+        const trellis = try a.alloc(i16, t.bytes.len / 2);
+        @memcpy(std.mem.sliceAsBytes(trellis), t.bytes);
+        const suh = try a.alloc(f16, suh_t.bytes.len / 2);
+        @memcpy(std.mem.sliceAsBytes(suh), suh_t.bytes);
+        const svh = try a.alloc(f16, svh_t.bytes.len / 2);
+        @memcpy(std.mem.sliceAsBytes(svh), svh_t.bytes);
+        const book: E.Codebook = if (tensor(&f, name, "mul1") != null) .mul1 else if (tensor(&f, name, "mcg") != null) .mcg else .inst3;
+        return .{ .k = t.dim(0) * 16, .n = t.dim(1) * 16, .bits = @intCast(t.dim(2) / 16), .book = book, .trellis = trellis, .suh = suh, .svh = svh };
+    }
+};
+
+/// Seconds a prompt call, the median of 7 runs of 5 after a warm-up.
+fn timePrompt(gpu: Gpu, k: *const E.Kernels, s: cuda.Stream, x: u64, m: E.Matrix, out: u64, rows: usize) !f64 {
+    try k.prompt(s, x, m.k, m, out, rows, false);
+    try s.synchronize();
+    var runs: [7]f64 = undefined;
+    for (&runs) |*r| {
+        const t0 = check.now(gpu.io);
+        for (0..5) |_| try k.prompt(s, x, m.k, m, out, rows, false);
+        try s.synchronize();
+        r.* = @as(f64, @floatFromInt(check.now(gpu.io) - t0)) / 5e9;
+    }
+    return check.median(&runs);
 }

@@ -11,6 +11,119 @@ const win = @import("windows.zig");
 
 const gpa = std.testing.allocator;
 
+test "batched prefill opens independent histories and first tokens exactly once" {
+    const be = @import("backend.zig");
+    var cfg = try Config.init(gpa, .{ .exact_width = 1, .gpu_tokens = false }, 1, 0);
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var e = Engine.init(gpa, &cfg, target.coldBatched(), clock.clock());
+    defer e.deinit();
+    var a = try sm.Stream.init(gpa, .{ .id = "a", .prompt = &.{ 1, 2, 3 }, .max_new = 4, .drafts = false, .eos = &.{} });
+    defer a.deinit(gpa);
+    var b = try sm.Stream.init(gpa, .{ .id = "b", .prompt = &.{ 7, 11 }, .max_new = 4, .drafts = false, .eos = &.{} });
+    defer b.deinit(gpa);
+    var out: [2]be.PrefillOutcome = undefined;
+    try e.fillBatch(&.{ &a, &b }, &out);
+    try std.testing.expect(out[0] == .complete and out[1] == .complete);
+    try std.testing.expectEqual(@as(usize, 1), target.prefill_batches);
+    try std.testing.expectEqual(fake.next(&.{ 1, 2, 3 }, null, 3), a.emitted()[0]);
+    try std.testing.expectEqual(fake.next(&.{ 7, 11 }, null, 2), b.emitted()[0]);
+    while (e.activeCount() > 0) try e.step();
+    try std.testing.expectEqual(@as(usize, 4), a.emitted().len);
+    try std.testing.expectEqual(@as(usize, 4), b.emitted().len);
+    try std.testing.expectEqual(@as(usize, 2), target.prefill_count);
+}
+
+test "batched prefill preserves each upstream first-token commit hook" {
+    const be = @import("backend.zig");
+    const Hook = struct {
+        stream: *sm.Stream,
+        calls: usize = 0,
+        committed: bool = false,
+        fn run(ptr: *anyopaque) void {
+            const h: *@This() = @ptrCast(@alignCast(ptr));
+            h.calls += 1;
+            h.committed = h.stream.emitted().len == 1;
+        }
+    };
+    var cfg = try Config.init(gpa, .{ .exact_width = 8, .hidden_rows = true, .mtp = true, .speculate = true, .drafts = 7 }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var backend = target.coldBatched();
+    backend.first_before_draft = true;
+    var clock: fake.FixedClock = .{};
+    var e = Engine.init(gpa, &cfg, backend, clock.clock());
+    defer e.deinit();
+    var a = try sm.Stream.init(gpa, .{ .id = "a", .prompt = &.{ 1, 2, 3 }, .max_new = 1, .eos = &.{} });
+    defer a.deinit(gpa);
+    var b = try sm.Stream.init(gpa, .{ .id = "b", .prompt = &.{ 7, 11 }, .max_new = 1, .eos = &.{} });
+    defer b.deinit(gpa);
+    var hooks = [_]Hook{ .{ .stream = &a }, .{ .stream = &b } };
+    var out: [2]be.PrefillOutcome = undefined;
+    try e.fillBatchCommitted(&.{ &a, &b }, &out, &.{ .{ .ptr = &hooks[0], .call = Hook.run }, .{ .ptr = &hooks[1], .call = Hook.run } });
+    for (hooks, out) |hook, result| {
+        try std.testing.expect(result == .complete);
+        try std.testing.expectEqual(@as(usize, 1), hook.calls);
+        try std.testing.expect(hook.committed);
+    }
+    try std.testing.expect(a.finished and b.finished);
+    try std.testing.expectEqual(@as(usize, 0), e.activeCount());
+}
+
+test "batched prefill setup failure leaves the other stream usable" {
+    const be = @import("backend.zig");
+    var cfg = try Config.init(gpa, .{ .exact_width = 1, .gpu_tokens = false }, 1, 0);
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa, .refuse_sampled = true };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var e = Engine.init(gpa, &cfg, target.coldBatched(), clock.clock());
+    defer e.deinit();
+    var good = try sm.Stream.init(gpa, .{ .id = "good", .prompt = &.{ 1, 2 }, .max_new = 2, .drafts = false, .eos = &.{} });
+    defer good.deinit(gpa);
+    var refused = try sm.Stream.init(gpa, .{ .id = "refused", .prompt = &.{ 7, 8 }, .max_new = 2, .drafts = false, .sampling = .{ .seed = 1, .temperature = 1 }, .eos = &.{} });
+    defer refused.deinit(gpa);
+    var out: [2]be.PrefillOutcome = undefined;
+    try e.fillBatch(&.{ &good, &refused }, &out);
+    try std.testing.expect(out[0] == .complete and out[1] == .failed);
+    try std.testing.expect(out[1].failed == error.SamplingRefused);
+    try std.testing.expectEqual(@as(usize, 1), e.activeCount());
+    while (e.activeCount() > 0) try e.step();
+    try std.testing.expectEqual(@as(usize, 2), good.emitted().len);
+    try std.testing.expectEqual(@as(usize, 0), refused.emitted().len);
+}
+
+test "one cancelled batched prompt releases only its own cache" {
+    const be = @import("backend.zig");
+    const Cancel = struct {
+        fn check(ptr: *anyopaque) bool {
+            return @as(*bool, @ptrCast(@alignCast(ptr))).*;
+        }
+    };
+    var cfg = try Config.init(gpa, .{ .exact_width = 1, .gpu_tokens = false }, 1, 0);
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var e = Engine.init(gpa, &cfg, target.coldBatched(), clock.clock());
+    defer e.deinit();
+    var stop = true;
+    var good = try sm.Stream.init(gpa, .{ .id = "good", .prompt = &.{ 1, 2 }, .max_new = 2, .drafts = false, .eos = &.{} });
+    defer good.deinit(gpa);
+    var cancelled = try sm.Stream.init(gpa, .{ .id = "cancelled", .prompt = &.{ 7, 8 }, .max_new = 2, .drafts = false, .eos = &.{}, .cancel_check = .{ .ptr = &stop, .check = Cancel.check } });
+    defer cancelled.deinit(gpa);
+    var out: [2]be.PrefillOutcome = undefined;
+    try e.fillBatch(&.{ &good, &cancelled }, &out);
+    try std.testing.expect(out[0] == .complete and out[1] == .failed);
+    try std.testing.expect(out[1].failed == error.Cancelled);
+    try std.testing.expect(!target.lanes.contains(&cancelled) and target.lanes.contains(&good));
+    while (e.activeCount() > 0) try e.step();
+    try std.testing.expectEqual(@as(usize, 0), cancelled.emitted().len);
+}
+
 pub const Case = struct {
     prompt: []const u32,
     max_new: u32 = 40,
@@ -498,6 +611,7 @@ test "a required call stays pipelined beyond its corrected first token" {
     try engine.addStream(&s);
     while (engine.activeCount() > 0) try engine.step();
     try std.testing.expectEqualSlices(u32, &.{ 9, 20, 66 }, s.emitted());
+}
 
 /// The cases' prompts in pieces, case i opened before round 2 i, others decoding; `join`: Config.join_tail.
 fn runPieces(cases: []const Case, join: bool, joins: *usize) ![][]u32 {

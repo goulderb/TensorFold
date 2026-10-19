@@ -42,7 +42,7 @@ pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, th
         error.OutOfMemory => return error.OutOfMemory,
         error.Refused => "",
     };
-    const s = style(rendered) orelse .json; // unrecognized markup uses the canonical call form the parser accepts
+    const s = style(rendered) orelse return cx.refuse("tool_choice \"required\" or a named function needs a chat template that writes supported tool calls (Qwen XML, GLM argument tags, a JSON object or Gemma calls), and this one does not: send \"auto\"");
     const text = try build(cx.a, s, tools, parallel);
     const field = try std.fmt.allocPrint(cx.a, "tool_choice \"required\" or a named function on backend '{s}'", .{srv.backendName()});
     return srv.compiledStructure(cx, .structural_tag, text, field, thinking);

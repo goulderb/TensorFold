@@ -61,7 +61,6 @@ pub fn rowBits(bits: u8) u8 {
 
 /// One projection's weights in any format this module serves; every one but affine4 is a lane matmul mode.
 pub const Weight = union(enum) {
-    exl3: exl3.Weight,
     affine4: Affine4,
     fp8g: qmmf.Weight,
     mxfp8: qmmf.Weight, // e4m3 with UE8M0 scale bytes per 32 inputs
@@ -117,11 +116,10 @@ pub const Linear = struct {
     lane: ?*const qmmf.Lane = null, // decode rows of every lane format; fp8g and bf16 prompt rows too
     nvfp4_prompt: ?*const nvfp4.Prompt = null, // the prompt GEMM: nvfp4 and fp8 prompt rows (linear.py's prefill)
     exl3: ?*const exl3_linear.Kernels = null, // decode rows 16 a window; prompt rows on the tensor units
-    exl3_dense: ?*const exl3.Dense = null, // upstream's exl3/linear.cu weights (exl3_upload)
+    exl3_dense: ?*exl3.Dense = null, // upstream's exl3/linear.cu weights (exl3_upload)
     ck: ?*const ck.Ck = null, // the checkpoint's own math: an fp8 weight with an input scale takes e4m3 rows
     ck_rows: u64 = 0, // its e4m3 rows (at least rows * k bytes), and slice partials where no cluster meets them
     ck_part: u64 = 0,
-    exl3: ?*exl3.Dense = null, // the EXL3 kernels and the scratch the dense calls share
     ggml: ?*const ggml.Kernels = null, // q8_0 and iq2xxs rows of both kinds
 
     /// e4m3 rows of x times an fp8 weight under its input scale, bf16 out: decode and prompt rows alike (row-exact).
@@ -134,11 +132,6 @@ pub const Linear = struct {
     /// Decode rows: out (rows, n) bf16, each row's bits the same at every row count the format takes.
     pub fn decode(l: Linear, s: Stream, w: Weight, in: Rows, out: u64, rows: usize) !void {
         switch (w) {
-            .exl3 => |q| {
-                const e = l.exl3 orelse return error.FormatNotLoaded;
-                if (in.ldx != 0 and in.ldx != q.k) return error.RowStride;
-                return e.decode(s, q, in.x, .bf16, rows, out, .bf16);
-            },
             .affine4 => |q| {
                 const a = l.affine4 orelse return error.FormatNotLoaded;
                 if (rows > 16 or (in.ldx != 0 and in.ldx != q.k)) return a.clusterAs(s, in.x, in.ldx, in.sums, q, out, rows, splitK(q.n, q.k), false);
@@ -150,7 +143,11 @@ pub const Linear = struct {
             .fp8 => |q| return if (q.act != 0 and l.ck != null) l.checkpoint(s, l.ck.?, q, in, out, rows) else l.onLane(s, q, .fp8, in, out, rows),
             .bf16 => |q| return l.onLane(s, q, .bf16, in, out, rows),
             .exl3 => |q| return l.onExl3(s, q, in, out, rows),
-            .exl3_dense => |q| return (l.exl3_dense orelse return error.FormatNotLoaded).decode(s, q, in.x, .bf16, rows, out, .bf16),
+            .exl3_dense => |q| {
+                const e = l.exl3_dense orelse return error.FormatNotLoaded;
+                if (in.ldx != 0 and in.ldx != q.k) return error.RowStride;
+                return e.decode(s, q, in.x, .bf16, rows, out, .bf16);
+            },
             .ck8, .ck4 => return l.onNative(s, w, in, out, rows, .bf16),
             .q8_0, .iq2xxs => |q| return (l.ggml orelse return error.FormatNotLoaded).decode(s, q, in.x, in.ldx, rows, out, .bf16),
         }
@@ -159,11 +156,6 @@ pub const Linear = struct {
     /// Prompt rows: out (rows, n) bf16 by the format's prompt GEMM.
     pub fn prompt(l: Linear, s: Stream, w: Weight, in: Rows, out: u64, rows: usize) !void {
         switch (w) {
-            .exl3 => |q| {
-                const e = l.exl3 orelse return error.FormatNotLoaded;
-                if (in.ldx != 0 and in.ldx != q.k) return error.RowStride;
-                return e.prompt(s, q, in.x, .bf16, rows, out, .bf16);
-            },
             .affine4 => |q| {
                 const a = l.affine4 orelse return error.FormatNotLoaded;
                 return a.promptAs(s, in.x, in.ldx, q, out, rows, false);
@@ -174,7 +166,11 @@ pub const Linear = struct {
             .fp8 => |q| return if (q.act != 0 and l.ck != null) l.checkpoint(s, l.ck.?, q, in, out, rows) else l.onPrompt(s, q, .fp8, in, out, rows),
             .bf16 => |q| return l.onLane(s, q, .bf16, in, out, rows),
             .exl3 => |q| return (l.exl3 orelse return error.FormatNotLoaded).prompt(s, in.x, if (in.ldx == 0) q.k else in.ldx, q, out, rows, false),
-            .exl3_dense => |q| return (l.exl3_dense orelse return error.FormatNotLoaded).prompt(s, q, in.x, .bf16, rows, out, .bf16),
+            .exl3_dense => |q| {
+                const e = l.exl3_dense orelse return error.FormatNotLoaded;
+                if (in.ldx != 0 and in.ldx != q.k) return error.RowStride;
+                return e.prompt(s, q, in.x, .bf16, rows, out, .bf16);
+            },
             .ck8, .ck4 => return l.onNative(s, w, in, out, rows, .bf16),
             // prompt rows always take the prompt GEMM: a row's bits must not depend on where a prompt's chunks are cut
             .q8_0, .iq2xxs => |q| return (l.ggml orelse return error.FormatNotLoaded).promptRows(s, q, in.x, in.ldx, rows, out, .bf16),

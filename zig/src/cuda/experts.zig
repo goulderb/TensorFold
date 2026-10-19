@@ -16,7 +16,7 @@ const Stream = stream_.Stream;
 const Plan = grouped.Plan;
 const Affine3Experts = @import("experts3.zig").Affine3Experts;
 
-pub const Format = enum { affine4, affine3, fp8g, nvfp4, exl3, iq2xxs };
+pub const Format = enum { affine4, affine3, fp8g, nvfp4, exl3, exl3_common, iq2xxs };
 
 /// One layer's experts on the device as each format's make() lays them out; a family stacks its shared ones last.
 pub const Layer = struct {
@@ -35,7 +35,8 @@ pub const Layer = struct {
     shared: i32 = -1, // affine3: the expert whose tables are 4-bit (a SwiGLU pair at shared_up, down at shared_down)
     shared_up: u64 = 0,
     shared_down: u64 = 0,
-    exl3: exl3.Widths = .{}, // exl3: the layer's trellis widths and codebook
+    exl3: exl3.Widths = .{}, // retained GLM trellis widths and codebook
+    exl3_common: ?@import("exl3_experts_common.zig").Layer = null, // upstream per-expert pointer tables
 };
 
 /// A call's epilogue: up with its format's activation (affine4 relu^2, else SwiGLU), down to fp32 or to bf16 sums.
@@ -46,18 +47,17 @@ pub const Rows = struct { x: u64, stride: usize, slots: usize = 0 };
 
 /// The kernels of every format a family loaded; a layer whose format is not loaded is refused.
 pub const Grouped = struct {
-    exl3: ?*@import("exl3_grouped.zig").Grouped = null,
     affine4: ?*const Affine4Experts = null,
     affine3: ?*const Affine3Experts = null,
     fp8g: ?*const Fp8Experts = null,
     nvfp4: ?*const Nvfp4Experts = null,
     exl3: ?*const exl3.Experts = null,
+    exl3_common: ?*@import("exl3_grouped.zig").Grouped = null,
     iq2xxs: ?*const Iq2xxsExperts = null,
 
     /// Decode rows: `items` bounds the plan's items (grouped.maxItems at tile 16); `skip` an expert left out, or -1.
     pub fn decode(g: Grouped, s: Stream, epi: Epi, in: Rows, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
         switch (l.format) {
-            .exl3 => return (g.exl3 orelse return error.FormatNotLoaded).run(s, epi, in, l, p, out, items, skip, false),
             .affine4 => {
                 const a = g.affine4 orelse return error.FormatNotLoaded;
                 if (epi == .down_bf16) return error.EpilogueNotBuilt;
@@ -76,6 +76,7 @@ pub const Grouped = struct {
             .fp8g => return (g.fp8g orelse return error.FormatNotLoaded).run(s, epi, in, l, p, false, out, items, skip),
             .nvfp4 => return (g.nvfp4 orelse return error.FormatNotLoaded).run(s, epi, in, l, p, out, items, skip),
             .exl3 => return (g.exl3 orelse return error.FormatNotLoaded).run(s, epi, in, l, p, out, items, skip, false),
+            .exl3_common => return (g.exl3_common orelse return error.FormatNotLoaded).run(s, epi, in, l, p, out, items, skip, false),
             .iq2xxs => return iq2Run(g.iq2xxs orelse return error.FormatNotLoaded, s, false, epi, in, l, p, out, items, skip),
         }
     }
@@ -83,7 +84,6 @@ pub const Grouped = struct {
     /// Prompt rows: `items` bounds the plan's items at the format's prompt tile (prompt_tile).
     pub fn prompt(g: Grouped, s: Stream, epi: Epi, in: Rows, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
         switch (l.format) {
-            .exl3 => return (g.exl3 orelse return error.FormatNotLoaded).run(s, epi, in, l, p, out, items, skip, true),
             .affine4 => {
                 const a = g.affine4 orelse return error.FormatNotLoaded;
                 if (epi == .down_f32) return error.EpilogueNotBuilt;
@@ -102,6 +102,7 @@ pub const Grouped = struct {
             .fp8g => return (g.fp8g orelse return error.FormatNotLoaded).run(s, epi, in, l, p, true, out, items, skip),
             .nvfp4 => return (g.nvfp4 orelse return error.FormatNotLoaded).runPrompt(s, epi, in, l, p, out, items, skip),
             .exl3 => return (g.exl3 orelse return error.FormatNotLoaded).run(s, epi, in, l, p, out, items, skip, true),
+            .exl3_common => return (g.exl3_common orelse return error.FormatNotLoaded).run(s, epi, in, l, p, out, items, skip, true),
             .iq2xxs => return iq2Run(g.iq2xxs orelse return error.FormatNotLoaded, s, true, epi, in, l, p, out, items, skip),
         }
     }
@@ -110,7 +111,7 @@ pub const Grouped = struct {
 /// Pairs a prompt item holds, per format (the Python engines' prompt tiles).
 pub fn promptTile(f: Format) usize {
     return switch (f) {
-        .affine4, .affine3, .fp8g, .nvfp4, .exl3, .iq2xxs => 64,
+        .affine4, .affine3, .fp8g, .nvfp4, .exl3, .exl3_common, .iq2xxs => 64,
     };
 }
 
@@ -350,11 +351,15 @@ pub const Nvfp4Experts = struct {
     pub const Variant = enum { baseline, pipe4, n16, n16_pipe4 };
 
     pub fn decodeGrid(variant: Variant, items: usize, nb: usize, resident: usize) usize {
+        return decodeGridWarps(variant, items, nb, resident, 4);
+    }
+
+    pub fn decodeGridWarps(variant: Variant, items: usize, nb: usize, resident: usize, warps: usize) usize {
         const slices: usize = switch (variant) {
             .baseline, .pipe4 => 1,
             .n16, .n16_pipe4 => 2,
         };
-        return @min((items * nb * slices + 3) / 4, resident);
+        return @min((items * nb * slices + warps - 1) / warps, resident);
     }
 
     pub fn candidateSymbol(comptime variant: Variant, comptime epi: usize) [:0]const u8 {
@@ -422,6 +427,7 @@ pub const Nvfp4Experts = struct {
     }
 
     pub fn loadCandidates(e: *Nvfp4Experts, sms: usize) !void {
+        if (e.warps != 4) return error.BadExpertWarps;
         inline for (.{ Variant.pipe4, Variant.n16, Variant.n16_pipe4 }, 0..) |variant, vi| {
             inline for (0..4) |ei| {
                 e.candidate_fns[vi][ei] = try e.mod.function(candidateSymbol(variant, ei));
@@ -441,6 +447,7 @@ pub const Nvfp4Experts = struct {
     }
 
     pub fn runVariant(e: *const Nvfp4Experts, variant: Variant, s: Stream, epi: Epi, in: Rows, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
+        if (variant != .baseline and e.warps != 4) return error.BadExpertWarps;
         if (variant != .baseline and !e.candidates_loaded) return error.CandidateNotLoaded;
         const gate = epi == .up;
         const kg = (if (gate) l.dims else l.width) / 32;
@@ -449,7 +456,7 @@ pub const Nvfp4Experts = struct {
         const vi = @backingInt(variant);
         const f = if (variant == .baseline) e.fns[ei] else e.candidate_fns[vi - 1][ei];
         const resident = if (variant == .baseline) e.resident[ei] else e.candidate_resident[vi - 1][ei];
-        const grid = decodeGrid(variant, items, nb, resident);
+        const grid = decodeGridWarps(variant, items, nb, resident, e.warps);
         if (grid < 1) return;
         var a: launch_.Args = .{};
         a.add(in.x);
@@ -626,6 +633,16 @@ test "NVFP4 decode CTA geometry is explicit, bounded and defaults to four warps"
     try std.testing.expectEqual(@as(usize, 1), try Nvfp4Experts.decodeWarps("1"));
     try std.testing.expectEqual(@as(usize, 4), try Nvfp4Experts.decodeWarps("4"));
     for ([_][]const u8{ "0", "2", "8", "", "garbage" }) |v| try std.testing.expectError(error.BadExpertWarps, Nvfp4Experts.decodeWarps(v));
+}
+
+test "NVFP4 grid follows the selected warp count and candidates refuse single warp" {
+    try std.testing.expectEqual(@as(usize, 21), Nvfp4Experts.decodeGridWarps(.baseline, 3, 7, 128, 1));
+    try std.testing.expectEqual(@as(usize, 6), Nvfp4Experts.decodeGridWarps(.baseline, 3, 7, 128, 4));
+    try std.testing.expectEqual(@as(usize, 4), Nvfp4Experts.decodeGridWarps(.baseline, 3, 7, 4, 1));
+    var e: Nvfp4Experts = undefined;
+    e.warps = 1;
+    try std.testing.expectError(error.BadExpertWarps, e.loadCandidates(1));
+    try std.testing.expectError(error.BadExpertWarps, e.runVariant(.pipe4, undefined, .up, undefined, undefined, undefined, 0, 1, -1));
 }
 
 test {

@@ -54,7 +54,7 @@ pub const Experts = struct {
 
     pub fn load(d: *const Driver, sms: usize) !Experts {
         if (!kernels.available) return error.BuiltWithoutKernels;
-        var mod = try Module.load(d, kernels.exl3_experts);
+        var mod = try Module.load(d, kernels.exl3_experts_glm);
         errdefer mod.unload();
         const decode = try mod.function("tf_exl3_experts");
         const prompt = try mod.function("tf_exl3_experts_prompt");

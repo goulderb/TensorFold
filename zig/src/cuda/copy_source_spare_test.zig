@@ -77,6 +77,9 @@ const Fake = struct {
     fn release(_: abi.Device) callconv(.c) abi.Result {
         return 0;
     }
+    fn bind(_: abi.Context) callconv(.c) abi.Result {
+        return 0;
+    }
     fn init() Driver {
         allocs = 0;
         frees = 0;
@@ -96,6 +99,7 @@ const Fake = struct {
         d.api.cuStreamSynchronize = streamSync;
         d.api.cuCtxSynchronize = contextSync;
         d.api.cuDevicePrimaryCtxRelease_v2 = release;
+        d.api.cuCtxSetCurrent = bind;
         return d;
     }
     fn deinit() void {

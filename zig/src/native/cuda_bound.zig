@@ -18,6 +18,12 @@ pub fn vtable(comptime H: type, v: be.Backend.VTable) be.Backend.VTable {
                 return x.inner.vtable.prefill_step.?(x.inner.ptr, s);
             }
         }.f else null,
+        .prefill_batch = if (v.prefill_batch != null) struct {
+            fn f(p: *anyopaque, streams: []const *lanes.Stream, out: []be.PrefillOutcome) anyerror!void {
+                const x = H.bind(p);
+                return x.inner.vtable.prefill_batch.?(x.inner.ptr, streams, out);
+            }
+        }.f else null,
         .prefill_many = if (v.prefill_many != null) struct {
             fn f(p: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
                 const x = H.bind(p);
@@ -134,7 +140,7 @@ test "every entry the family's backend gives is forwarded, and none it leaves ou
     };
     var fake: lanes.fake.Fake = .{ .gpa = std.testing.allocator, .prefill_chunks = 3 };
     defer fake.deinit();
-    for ([_]be.Backend{ fake.backend(), fake.stepped() }) |b| {
+    for ([_]be.Backend{ fake.backend(), fake.stepped(), fake.batched(), fake.coldBatched() }) |b| {
         const w = vtable(H, b.vtable.*);
         const info = @typeInfo(be.Backend.VTable).@"struct";
         inline for (info.field_names, info.field_types) |name, T| {
@@ -171,6 +177,17 @@ test "each forwarded entry calls the family's entry of the same name, once" {
             fn f(p: *anyopaque, _: *S) anyerror!bool {
                 Rec.hit(p, "prefill_step");
                 return true;
+            }
+        }.f,
+        .prefill_many = struct {
+            fn f(p: *anyopaque, _: []const *S) anyerror!bool {
+                Rec.hit(p, "prefill_many");
+                return true;
+            }
+        }.f,
+        .prefill_batch = struct {
+            fn f(p: *anyopaque, _: []const *S, _: []be.PrefillOutcome) anyerror!void {
+                Rec.hit(p, "prefill_batch");
             }
         }.f,
         .first = struct {
@@ -283,6 +300,11 @@ test "each forwarded entry calls the family's entry of the same name, once" {
     try rec.once("prefill");
     _ = try w.prefill_step.?(p, &s);
     try rec.once("prefill_step");
+    _ = try w.prefill_many.?(p, &.{});
+    try rec.once("prefill_many");
+    var prefilled: [0]be.PrefillOutcome = .{};
+    try w.prefill_batch.?(p, &.{}, &prefilled);
+    try rec.once("prefill_batch");
     _ = try w.first(p, &s, 0);
     try rec.once("first");
     _ = try w.queue(p, &s, feed, 0);

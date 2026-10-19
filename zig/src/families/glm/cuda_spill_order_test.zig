@@ -34,6 +34,8 @@ test "spill flush precedes follower drops and a failed flush keeps their source 
         }
     };
     var d = Memory.driver();
+    const host_before = cuda.usage(false).host;
+    const retained_before = cuda.copy_source.retained();
     var lib: cuda.nccl.Library = .{ .lib = undefined, .api = undefined };
     lib.api.ncclBroadcast = Fixture.broadcast;
     var f: Fixture = .{};
@@ -57,4 +59,6 @@ test "spill flush precedes follower drops and a failed flush keeps their source 
     try leader.flush();
     try std.testing.expectEqual(@as(usize, 1), f.drops);
     try std.testing.expectEqual(@as(usize, 0), f.e.dropped.items.len);
+    try std.testing.expectEqual(host_before, cuda.usage(false).host);
+    try std.testing.expectEqual(retained_before, cuda.copy_source.retained());
 }

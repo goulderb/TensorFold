@@ -6,7 +6,10 @@ This fork includes native GLM integrations, MiaAI-Lab's DFlash2 and expert
 arithmetic, and a shared spill tier based on wojo's GLM work. Original donor
 notices, source revisions, transitive credits, and local changes are retained
 in [LICENSES/donors/README.md](LICENSES/donors/README.md). These supplement the
-upstream credits below. No model weights are included.
+upstream credits below. No model weights are included. The local GLM copy
+proposer and production row-policy adaptation follow pinned TensorFold Python
+production sources; their exact image/file provenance and local changes are
+recorded in that addendum. Existing notices and transitive credits still apply.
 
 TensorFold uses [MLX](https://github.com/ml-explore/mlx) and
 [mlx-lm](https://github.com/ml-explore/mlx-lm), MIT License, Copyright © 2023 Apple Inc.
@@ -162,13 +165,14 @@ checked bit for bit against ExLlamaV3's dequantization.
 
 The native `zig/src/core/exl3_format.zig` reference decoder, the `zig/src/core/exl3_projection*.zig` decoder and
 `zig/kernels/metal/core/exl3_projection.metal` separately implement the same format and codebooks
-under the Turboderp attribution above. No model weights are bundled. This local fork includes 24 captured
-DFlash2 kernel binaries under `zig/kernels/dflash2-aot/`; their `provenance.json` records the donor archive
-and file hashes. See the retained donor notices in `LICENSES/donors/`.
 under the Turboderp attribution above. So do the native checkpoint scan (`zig/src/core/exl3_load.zig`,
 `exl3_metal_load.zig`), the CUDA kernels (`zig/kernels/cuda/exl3_*.cu`, `exl3_decode.cuh`, `exl3_candidate.cuh`) and
-their Zig side (`zig/src/cuda/exl3*.zig`), and GLM's reader of its EXL3 experts (`zig/src/families/glm/cuda_exl3.zig`).
-No captured kernel binaries or model weights are bundled.
+their Zig side (`zig/src/cuda/exl3*.zig`). This fork retains GLM's checkpoint reader in
+`zig/src/families/glm/cuda_weights_exl3.zig` and its earlier expert kernel as `exl3_experts_glm.cu`;
+upstream v1.1.0's pointer-table experts remain in `exl3_experts.cu` with a separate host adapter.
+No model weights are bundled. Unlike upstream, this local fork includes 24 captured DFlash2 kernel
+binaries under `zig/kernels/dflash2-aot/`; their `provenance.json` records the donor archive and file
+hashes. See the retained donor notices in `LICENSES/donors/`.
 
 The EXLR8 reader, decoder, pull and kernels (`zig/src/core/exlr8*.zig`, `zig/src/cli/pull_exlr8*.zig`,
 `zig/src/cuda/exlr8.zig`, `zig/kernels/metal/core/exlr8*.metal`, `zig/kernels/cuda/exlr8*.cu`) read kindlingai's exlr8

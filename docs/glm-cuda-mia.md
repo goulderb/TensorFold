@@ -9,7 +9,14 @@ The prior GLM candidate is preserved at `archive/glm53-before-mia-20261016`.
 
 This imports numerical components into the existing `glm` family. The current
 Engine, rank link, target sampler, lane acceptance, vision and persistent store
-remain the execution path. The GLM branch now integrates the shared v1.0.12 base.
+remain the execution path. The current task integrates v1.1.0 shared layers while
+retaining this family; [the integration boundary](v110-shared-integration.md)
+records the still-unqualified port.
+
+The bounded cold-prompt and seven-draft/64-row work is ported from the nine local
+commits `0dbb813c1` through `d7ad99ece` on `task/glm53-dual-hotpath`. The historical
+GPU results below describe that earlier source, not new qualification of this
+v1.1.0 port. No serving pins change.
 
 ## Runtime controls
 
@@ -18,15 +25,54 @@ remain the execution path. The GLM branch now integrates the shared v1.0.12 base
 | `TF_GLM_DRAFTER` | `off`, `mtp`, `dflash2` | `mtp`, disabled when the existing drafts option is off |
 | `TF_GLM_DFLASH_DIR` | DFlash2 checkpoint directory | Required for `dflash2` |
 | `TF_GLM_DFLASH_KERNELS` | Pinned captured-kernel directory | Installed DFlash2 assets |
+| `TF_GLM_DFLASH_VERIFY_DRAFTS` | `3`, `6`, `7` | `3` |
 | `TF_GLM_EXL3_ROUTED` | `generic`, `mia-mcg4` | `generic` |
 
 DFlash2 requires the existing drafts option, TP2, sm121 and a dense-source
 `lm_head.weight` in the target checkpoint. The routed-only EXL3 production
 checkpoint has that head. A full-EXL3 head is refused. DFlash2 evaluates the
-donor's eight-position block and returns at most three proposals through the
-current lane interface. The returned count can be smaller. The target sampler
+donor's eight-position block and returns up to the selected proposal limit
+through the lane interface. The returned count can be smaller. The target sampler
 and acceptance loop decide which proposals to keep. Checkpoint configuration
 and weight contents enter paired startup and spill identity.
+
+The three-, six- and seven-draft plans permit 32, 56 and 64 shared target rows
+across eight lanes, including each lane's pending token. Mia decode scratch
+follows that geometry up to 64 rows. Existing three/six numerical identity
+markers are preserved; seven has a distinct marker. The captured DFlash
+block already produces seven candidate rows and is unchanged.
+
+`tf-cuda-test glm-verify-window-check MODEL` forces 32/56/63/64-row target
+windows against reset/replay references. Its explicit internal subset option
+allows cheap trained-prefix checks; ordinary serving still requires a complete
+DFlash target. Four- and eight-layer FP4 and EXL3/Mia prefixes passed all four
+widths on the Spark pair on 2026-10-19. These proofs use contiguous FP8 KV and
+compare logits, tokens, complete seven-row draft readbacks, adaptive proposals
+and the rank-zero committed state arena. Wider capacity alone is not evidence
+that the scheduler uses it or that a workload runs faster.
+
+## Bounded cold-prompt batches
+
+`TF_GLM_MULTI_PREFILL=1` opts the retained family into synchronous cohorts of cold,
+plain text prompts, each at most 127 rows and together at most one prompt chunk.
+Cache restores, snapshot marks, vision, grammar, logprobs, decoded spans and
+neural MTP-prefill paths stay on their existing individual path. Dense prompt
+projections retain per-sequence arithmetic at the proven boundary; the shared
+forward's segments retain separate sequence state.
+
+Upstream `prefill_many` and `addStreams` remain unchanged. That interface requires
+all-or-none success and retries individual prompts after a refusal or error. The
+optional `prefill_batch` extension instead reports each stream's setup outcome,
+leaves skipped streams untouched, and propagates shared-execution failures rather
+than retrying a possibly partially executed cohort. The host opens completed
+streams with upstream first-token commit hooks. The same bounded-aging priority
+selects chunks and cohorts: an aged long/background fill takes precedence over
+fresh short batches. A skipped preferred prompt gets its individual chunk in the
+same cycle, so attempting a batch cannot repeatedly reset its wait.
+
+`glm-prefill-shared-check` compares batched cold prompts with individual references;
+`glm-prefill-batch-bench` alternates batching in one loaded lane host. These tools
+are present for a new hardware trial; this source port has not run those trials.
 
 The lane backend submits active DFlash requests in one paired command. It packs
 arbitrary physical slots into the matching one-through-eight-lane captured

@@ -9,6 +9,141 @@ const Event = api.Event;
 const Request = api.Request;
 const Engine = api.Engine;
 
+test "batched host prefill preserves priority, delivery and per-job memory requeue" {
+    for ([_]?usize{ null, 1 }) |limit| {
+        const gpa = std.testing.allocator;
+        var cfg = try lanes.Config.init(gpa, .{ .exact_width = 1, .gpu_tokens = false }, 1, 0);
+        defer cfg.deinit(gpa);
+        var target: lanes.fake.Fake = .{ .gpa = gpa, .memory_lanes = limit };
+        defer target.deinit();
+        var clock: lanes.fake.FixedClock = .{};
+        var core = lanes.Engine.init(gpa, &cfg, target.coldBatched(), clock.clock());
+        defer core.deinit();
+        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+        const Results = struct {
+            mutex: std.Io.Mutex = .init,
+            finished: usize = 0,
+            tokens: usize = 0,
+            errors: usize = 0,
+            order: [2]Id = .{ 0, 0 },
+            filled: usize = 0,
+            fn event(ctx: *anyopaque, id: Id, ev: *const Event) void {
+                const r: *@This() = @ptrCast(@alignCast(ctx));
+                r.mutex.lockUncancelable(std.testing.io);
+                defer r.mutex.unlock(std.testing.io);
+                switch (ev.*) {
+                    .tokens => |ids| r.tokens += ids.len,
+                    .prefilled => {
+                        r.order[r.filled] = id;
+                        r.filled += 1;
+                    },
+                    .finished => |end| {
+                        r.finished += 1;
+                        r.errors += @intFromBool(end.reason != .length);
+                    },
+                    else => {},
+                }
+            }
+        };
+        var results: Results = .{};
+        const first: Request = .{ .prompt = &.{ 1, 2, 3, 4 }, .max_tokens = 4, .drafts = false };
+        const second: Request = .{ .prompt = &.{ 7, 8 }, .max_tokens = 4, .drafts = false };
+        const e = host.engine();
+        try e.submit(1, &first, .{ .ctx = &results, .event = Results.event });
+        try e.submit(2, &second, .{ .ctx = &results, .event = Results.event });
+        try host.start();
+        defer host.stop();
+        var waits: usize = 0;
+        while (true) {
+            results.mutex.lockUncancelable(std.testing.io);
+            const done = results.finished;
+            results.mutex.unlock(std.testing.io);
+            if (done == 2) break;
+            if (waits == 5000) return error.TestTimedOut;
+            waits += 1;
+            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+        }
+        try std.testing.expectEqual(@as(usize, 1), target.prefill_batches);
+        try std.testing.expectEqual(@as(usize, 8), results.tokens);
+        try std.testing.expectEqual(@as(usize, 0), results.errors);
+        try std.testing.expectEqualSlices(Id, &.{ 2, 1 }, &results.order);
+    }
+}
+
+test "fresh prompt cohorts cannot starve an aged long or background fill" {
+    const fill = @import("lane_host_fill.zig");
+    for ([_]bool{ false, true }) |background| {
+        const gpa = std.testing.allocator;
+        var cfg = try lanes.Config.init(gpa, .{ .exact_width = 1, .gpu_tokens = false }, 1, 0);
+        defer cfg.deinit(gpa);
+        var target: lanes.fake.Fake = .{ .gpa = gpa, .batch_max_prompt = 2 };
+        defer target.deinit();
+        var clock: lanes.fake.FixedClock = .{};
+        var core = lanes.Engine.init(gpa, &cfg, target.coldBatched(), clock.clock());
+        defer core.deinit();
+        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 3 });
+        const Results = struct {
+            const short_limit = 2 * (fill.preference_rounds + 2);
+            engine: Engine,
+            request: *const Request,
+            mutex: std.Io.Mutex = .init,
+            submitted: usize = 2,
+            short_done: usize = 0,
+            long_after: ?usize = null,
+            done: usize = 0,
+            errors: usize = 0,
+            fn event(ctx: *anyopaque, id: Id, ev: *const Event) void {
+                const r: *@This() = @ptrCast(@alignCast(ctx));
+                r.mutex.lockUncancelable(std.testing.io);
+                defer r.mutex.unlock(std.testing.io);
+                switch (ev.*) {
+                    .prefilled => if (id == 0) {
+                        r.long_after = r.short_done;
+                    },
+                    .finished => |end| {
+                        r.done += 1;
+                        r.errors += @intFromBool(end.reason != .length);
+                        if (id != 0) {
+                            r.short_done += 1;
+                            if (r.submitted < short_limit) {
+                                r.submitted += 1;
+                                r.engine.submit(@intCast(r.submitted), r.request, .{ .ctx = r, .event = event }) catch {
+                                    r.errors += 1;
+                                };
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        };
+        const short: Request = .{ .prompt = &.{ 1, 2 }, .max_tokens = 1, .drafts = false };
+        const long: Request = .{ .prompt = &@as([128]u32, @splat(3)), .max_tokens = 1, .drafts = false, .background = background };
+        const e = host.engine();
+        var results: Results = .{ .engine = e, .request = &short };
+        try e.submit(0, &long, .{ .ctx = &results, .event = Results.event });
+        try e.submit(1, &short, .{ .ctx = &results, .event = Results.event });
+        try e.submit(2, &short, .{ .ctx = &results, .event = Results.event });
+        try host.start();
+        defer host.stop();
+        var waits: usize = 0;
+        while (true) {
+            results.mutex.lockUncancelable(std.testing.io);
+            const done = results.done;
+            results.mutex.unlock(std.testing.io);
+            if (done == Results.short_limit + 1) break;
+            if (waits == 5000) return error.TestTimedOut;
+            waits += 1;
+            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+        }
+        try std.testing.expectEqual(@as(usize, 0), results.errors);
+        try std.testing.expect(target.prefill_batches >= fill.preference_rounds);
+        try std.testing.expect(results.long_after != null);
+        try std.testing.expect(results.long_after.? <= 2 * (fill.preference_rounds + 1));
+        try std.testing.expect(results.long_after.? < Results.short_limit);
+    }
+}
+
 test "a lane host fills the shortest waiting prompt first, so a short request waits on no long one" {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);

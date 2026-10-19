@@ -13,6 +13,7 @@ pub const Node = abi.GraphNode;
 /// A check for the graph calls a caller recovers from (capture end, instantiate, upload): a warning, not an error.
 fn soft(d: *const Driver, res: abi.Result, what: []const u8) Error!void {
     if (res == abi.success) return;
+    if (res == abi.error_not_ready) return error.NotReady;
     std.log.warn("{s}: {s} ({d}) {s}", .{ what, d.errorName(res), res, d.errorText(res) });
     return if (res == 2) error.OutOfDeviceMemory else error.CudaFailed;
 }
@@ -196,6 +197,14 @@ test "a capture, instantiate or upload failure: out of memory is OutOfDeviceMemo
     try std.testing.expectError(error.CudaFailed, e.upload(s));
 
     Fake.code = abi.success;
+    try beginCapture(s, .global);
+    _ = try endCapture(s);
+    try beginCapture(s, .global);
+    Fake.code = 1;
+    try std.testing.expectError(error.CudaFailed, endCapture(s));
+    try std.testing.expect(@import("copy_source_capture.zig").active(&d, @import("copy_source.zig").current()));
+    Fake.code = abi.success;
+    _ = try endCapture(s);
     try beginCapture(s, .global);
     _ = try endCapture(s);
     _ = try g.instantiate();

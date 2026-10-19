@@ -12,7 +12,7 @@ test {
     _ = @import("cuda_spill_order_test.zig");
 }
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve, spill_write, spill_read, spill_forget, vision, redraw_masked, verify_masked, draft_batch };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve, spill_write, spill_read, spill_forget, vision, redraw_masked, verify_masked, draft_batch, prefill_shared };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -276,7 +276,7 @@ pub const Leader = struct {
     }
 
     pub fn verifyMasked(x: Leader, ids: []const u32, out: []u32, bits: []const u32) !void {
-        if (ids.len > x.e.verifyPlan().drafts() + 1) return error.WindowTooWide;
+        if (ids.len > x.e.targetRows()) return error.WindowTooWide;
         try sampler.validateMasks(bits, ids.len, x.e.c.vocab);
         try x.flush();
         try x.e.smp.bits.uploadAsync(0, std.mem.sliceAsBytes(bits), x.e.stream.handle);
@@ -288,6 +288,11 @@ pub const Leader = struct {
     /// Several streams' windows in one forward on every rank (Engine.verifyShared): parts' slots and rows, then ids.
     pub fn verifyShared(x: Leader, parts: []const engine.Part) !void {
         if (parts.len == 0 or parts.len > engine.max_shared) return error.WindowTooWide;
+        var rows: usize = 0;
+        for (parts) |p| {
+            if (p.ids.len == 0 or p.ids.len > x.e.targetRows() or p.ids.len > x.e.sharedLimit() -| rows) return error.WindowTooWide;
+            rows += p.ids.len;
+        }
         try x.flush();
         var buf: [2 * engine.max_shared + engine.shared_rows]u32 = undefined;
         var n: usize = 2 * parts.len;
@@ -306,6 +311,22 @@ pub const Leader = struct {
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.keep), .a = n }, &.{});
         try x.complete(x.e.keep(n));
+    }
+
+    pub fn prefillShared(x: Leader, parts: []const engine.Engine.PromptPart, out: []u32) !void {
+        if (parts.len < 2 or parts.len > engine.max_shared or out.len != parts.len) return error.BadPromptBatch;
+        var words: [engine.prompt_rows + 2 * engine.max_shared]u32 = undefined;
+        var at = 2 * parts.len;
+        for (parts, 0..) |p, i| {
+            if (p.ids.len == 0 or p.ids.len > words.len - at) return error.BadPromptBatch;
+            words[2 * i] = p.slot;
+            words[2 * i + 1] = @intCast(p.ids.len);
+            @memcpy(words[at..][0..p.ids.len], p.ids);
+            at += p.ids.len;
+        }
+        try x.flush();
+        try x.send(.{ .kind = @backingInt(Kind.prefill_shared), .depth = @intCast(parts.len) }, words[0..at]);
+        try x.complete(x.e.prefillShared(parts, out));
     }
 
     pub fn draft(x: Leader, from_prompt: bool, follow_ids: []const u32, depth: usize, out: []u32) !usize {
@@ -428,7 +449,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
             try e.draftBatch(parts, results[0..parts.len]);
             continue;
         }
-        if (kind != .end and kind != .drop and kind != .shared and kind != .release) try e.bind(h.slot);
+        if (kind != .end and kind != .drop and kind != .shared and kind != .prefill_shared and kind != .release) try e.bind(h.slot);
         switch (kind) {
             .begin => try e.begin(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null),
             .prefill => {
@@ -474,6 +495,21 @@ pub fn follow(e: *Engine, link: *Link) !void {
                     row += n;
                 }
                 try e.verifyShared(parts[0..k]);
+            },
+            .prefill_shared => {
+                const k = h.depth;
+                if (k < 2 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadPromptBatch;
+                var parts: [engine.max_shared]engine.Engine.PromptPart = undefined;
+                var out: [engine.max_shared]u32 = undefined;
+                var at: usize = 2 * k;
+                for (parts[0..k], 0..) |*p, i| {
+                    const n = step.ids[2 * i + 1];
+                    if (n == 0 or n > step.ids.len - at) return error.BadPromptBatch;
+                    p.* = .{ .slot = step.ids[2 * i], .ids = step.ids[at..][0..n] };
+                    at += n;
+                }
+                if (at != step.ids.len) return error.BadPromptBatch;
+                try e.prefillShared(parts[0..k], out[0..k]);
             },
             .keep => try e.keep(@intCast(h.a)),
             .draft => {

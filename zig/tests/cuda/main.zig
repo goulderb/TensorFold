@@ -37,6 +37,8 @@ const split_load = @import("split_load.zig");
 const split_forward = @import("split_forward.zig");
 const ck_dense_tests = @import("ck_dense_tests.zig");
 const exl3_tests = @import("exl3_tests.zig");
+const exl3_experts_tests = @import("exl3_experts_tests.zig");
+const exl3_common_tests = @import("exl3_common_tests.zig");
 const exl3_tp2_tests = @import("exl3_tp2_tests.zig");
 const exl3_candidate_tests = @import("exl3_candidate_tests.zig");
 const experts3_tests = @import("experts3_tests.zig");
@@ -161,29 +163,25 @@ const usage =
     \\  exlr8-bench DIR [MANIFEST] [LAYER] [SETS]   a real EXLR8 layer: FP64, row windows, then GB/s by stage
     \\  exlr8-dense [DIR]         EXLR8 dense formats: decode bit-equal, FP64, row windows; DIR adds the real matrices
     \\  exl3 [DIR]                EXL3 projections: codebooks and tiles bit-equal, FP64, row windows; DIR adds real matrices
-    \\  exl3-experts [DIR]        EXL3 routed experts: FP64, SwiGLU, rows alone vs grouped, decode vs prompt; DIR a real layer
+    \\  exl3-experts [DIR]        retained EXL3 routed experts: FP64, rows alone vs grouped, decode vs prompt
+    \\  exl3-common DIR           upstream common EXL3 projections and pointer-table experts, synthetic and real tensors
     \\  pair                      two devices, two contexts, a host-staged handoff both ways (SKIP with one device)
     \\  split-load MODEL          each rank's half of a layer split loaded on its own device, with its bytes
     \\  split-forward MODEL       the two-rank chunk's logits against the unsplit chunk's
     \\  checkpoint                checkpoint prompt tiles, NVFP4 up rows and share sums byte-equal to the decode path (synthetic FP8 and NVFP4)
-    \\  exlr8                     EXLR8 projections: every codebook state, FP64, row windows, the Metal frozen digests
-    \\  exlr8-bench DIR [MANIFEST] [LAYER] [SETS]   a real EXLR8 layer: FP64, row windows, then GB/s by stage
-    \\  exlr8-dense [DIR]         EXLR8 dense formats: decode bit-equal, FP64, row windows; DIR adds the real matrices
     \\  tree                      tree attention (committed keys and paths) against float64 references (synthetic)
     \\  block                     DFlash block attention over windowed contexts against float64 (synthetic)
     \\  window                    sliding-window attention against float64 references (synthetic)
     \\  moe-glue                  sigmoid top-k routing and the weighted combine against float64 references (synthetic)
     \\  dense-rows                bf16 rows times weight rows (routers, heads) against float64 references (synthetic)
-    \\  exl3 [dir]                EXL3 decode-row linear: float64 checks, row invariance, the Python engine's fixture (dir none skips it)
     \\  exl3-tp2 <rank> <host:port> [dir]  EXL3 tensor parallel: rank shards vs the Python engine's, all-gathered (dir none skips them)
     \\  exl3-tiles [DIR]          EXL3's tile candidate: codebooks and tiles bit-equal, FP64, rows through qlinear and Dense
     \\  train-pack MODEL EXAMPLES [COUNT]   training passes holding several sequences against one a pass: differences, time
     \\  glm-precision             GLM Q4 MSE and FP8 row128 layout and projection references
     \\  glm-grammar               GLM first and multirow masked greedy and sampled draws
-    \\  kernel-contract           the registered kernels through the contract's gates, each planted control red (needs -Dnvcc)
+    \\  kernel-contract           available kernel probes through the contract's gates; unavailable family probes print N/A (needs -Dnvcc)
     \\  kernel-contract-limits DIR [--sm SM] [--only TEXT]   CPU-only ELF limits; scoped filters limit the claim
     \\  glm-attn-fp8load [rows]    FP8 attention byte parity and chunks-only timing (default 2048 rows, 32 heads)
-    \\  kernel-contract-limits DIR   each registered launch against sm_80/86/89/120/121 from the fatbins in DIR
     \\  glm-exl3                  GLM's EXL3 routed experts, decode and prompt, against float64 (synthetic)
     \\  glm-vision MODEL F32 BF16 IMG  GLM's image tower and preparation against vision_ref.py's torch runs
     \\  glm-mm-bench              GLM's bf16 linears: b16.matmul against glm_mm, by rows (one GPU)
@@ -194,6 +192,10 @@ const usage =
     \\  glm-lanes-concurrent <ckpt> <dc.json> <rank> <world> <idfile>  concurrent streams on one lanes.Engine, each against its solo run
     \\  glm-shared-check <ckpt> <dc.json> <rank> <world> <idfile>  shared verify windows against lone twins, logits and states byte for byte
     \\  glm-synth <dir>          a synthetic GLM-5.3-Flash checkpoint (2 layers, 16 experts) and its dc.json for the lane checks
+    \\  glm-prefill-shared-check MODEL RANK WORLD IDS_JSON  bounded batched cold prompts against separate references
+    \\  glm-prefill-batch-bench MODEL IDS_JSON OUT  alternating prompt batching in one loaded lane host
+    \\  glm-verify-window-check MODEL  exact 32/56/63/64-row shared verification against reset/replay references
+    \\  glm-verify-window-bench MODEL IDS_JSON OUT  alternating six/seven-draft c8 runs with prompt batching enabled
     \\
 ;
 
@@ -210,6 +212,10 @@ pub fn main(init: std.process.Init) !u8 {
         };
         return 0;
     }
+    if (std.mem.eql(u8, args[1], "glm-synth")) {
+        try glm_synth.run(init.gpa, init.io, try arg(args[2..], 0));
+        return 0;
+    }
     var driver = try cuda.Driver.open();
     defer driver.close();
     var ctx = try cuda.Context.init(&driver, 0);
@@ -219,10 +225,12 @@ pub fn main(init: std.process.Init) !u8 {
     const rest = args[2..];
 
     run(gpu, cmd, rest) catch |e| {
-        if (std.mem.eql(u8, cmd, "cached-plans-tp2")) cuda.tp_watch.fatal(@errorName(e));
+        if (std.mem.eql(u8, cmd, "cached-plans-tp2") and e != error.UnsupportedCommand) cuda.tp_watch.fatal(@errorName(e));
         std.debug.print("FAIL {s}: {t}\n", .{ cmd, e });
+        if (std.mem.eql(u8, cmd, "glm-prefill-batch-bench")) std.process.exit(1);
         return 1;
     };
+    if (std.mem.eql(u8, cmd, "glm-prefill-batch-bench")) std.process.exit(0);
     return 0;
 }
 
@@ -234,7 +242,13 @@ fn arg(rest: []const [:0]const u8, i: usize) ![]const u8 {
     return rest[i];
 }
 
+fn unavailable(cmd: []const u8, reason: []const u8) error{UnsupportedCommand} {
+    std.debug.print("N/A {s}: {s}\n", .{ cmd, reason });
+    return error.UnsupportedCommand;
+}
+
 fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+    if (std.mem.eql(u8, cmd, "glm-prefill-batch-bench")) return @import("glm_prefill_batch_bench.zig").run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "nvfp4-experts-bench")) return @import("nvfp4_experts_bench.zig").run(gpu, rest);
     if (std.mem.eql(u8, cmd, "glm-source-dense")) return @import("glm_source_dense_tests.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "ck-dense")) return ck_dense_tests.run(gpu);
@@ -291,9 +305,18 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-ref")) return glm_ref_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-vision-dump")) return @import("glm_vision_dump.zig").run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "affine8")) return affine8_tests.run(gpu);
-    if (std.mem.eql(u8, cmd, "glm-exl3")) return glm_exl3_tests.run_(gpu);
-    if (std.mem.eql(u8, cmd, "glm-mm-bench")) return glm_mm_bench.run(gpu);
-    if (std.mem.eql(u8, cmd, "glm-vision")) return glm_vision_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
+    if (std.mem.eql(u8, cmd, "glm-exl3")) {
+        if (comptime @hasDecl(@import("glm_cuda"), "exl3")) return glm_exl3_tests.run_(gpu);
+        return unavailable(cmd, "upstream GLM EXL3 is not the retained fork's expert implementation; use exl3-experts for the retained shared kernels");
+    }
+    if (std.mem.eql(u8, cmd, "glm-mm-bench")) {
+        if (comptime @hasDecl(@import("glm_cuda"), "mm")) return glm_mm_bench.run(gpu);
+        return unavailable(cmd, "the retained GLM has no upstream tiled glm.mm implementation");
+    }
+    if (std.mem.eql(u8, cmd, "glm-vision")) {
+        if (comptime @hasDecl(@import("glm_cuda"), "vision_config")) return glm_vision_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
+        return unavailable(cmd, "upstream GLM vision is not the retained fork's vision runtime; use glm-vision-dump with its independent oracle");
+    }
     if (std.mem.eql(u8, cmd, "modelopt")) return modelopt_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "moe")) return moe_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "experts3")) return experts3_tests.run(gpu);
@@ -303,6 +326,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "exlr8")) return exlr8_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "exl3-experts")) return exl3_experts_tests.run(gpu, if (rest.len > 0) rest[0] else null);
     if (std.mem.eql(u8, cmd, "exl3")) return exl3_tests.run(gpu, if (rest.len > 0) rest[0] else null);
+    if (std.mem.eql(u8, cmd, "exl3-common")) return exl3_common_tests.run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "exlr8-dense")) return exlr8_dense_tests.run(gpu, if (rest.len > 0) rest[0] else null);
     if (std.mem.eql(u8, cmd, "exlr8-bench")) return exlr8_tests.bench(gpu, try arg(rest, 0), if (rest.len > 1) rest[1] else "home", if (rest.len > 2) try std.fmt.parseInt(u16, rest[2], 10) else 40, if (rest.len > 3) try std.fmt.parseInt(usize, rest[3], 10) else 4);
     if (std.mem.eql(u8, cmd, "pair")) return pair_tests.pair(gpu);
@@ -334,17 +358,26 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "marks")) return resume_tests.insideChunks(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "prompt-cuts")) return prompt_cuts.run(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "prompt-segments")) return prompt_cuts.segments(gpu, try arg(rest, 0), try arg(rest, 1));
-    if (std.mem.eql(u8, cmd, "cached-plans-tp2")) return @import("shared_plans.zig").tp2(gpu, try arg(rest, 0), try arg(rest, 1));
-    if (std.mem.eql(u8, cmd, "shared-fork")) return shared_fork.run(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "cached-plans-tp2")) {
+        if (comptime @hasDecl(@import("nemotron"), "latent")) return @import("shared_plans.zig").tp2(gpu, try arg(rest, 0), try arg(rest, 1));
+        return unavailable(cmd, "the retained Nemotron does not expose upstream cached shared plans");
+    }
+    if (std.mem.eql(u8, cmd, "shared-fork")) {
+        if (comptime @hasDecl(@import("nemotron"), "latent")) return shared_fork.run(gpu, try arg(rest, 0));
+        return unavailable(cmd, "the retained Nemotron does not expose upstream side-stream shared experts");
+    }
     if (std.mem.eql(u8, cmd, "recapture")) return recapture_tests.run(gpu, try arg(rest, 0));
-    if (std.mem.eql(u8, cmd, "paged")) return paged_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
+    if (std.mem.eql(u8, cmd, "paged")) {
+        if (comptime @hasDecl(@import("nemotron"), "pages")) return paged_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
+        std.debug.print("N/A paged: the retained Nemotron uses its fork KV pool, not upstream's paged-sequence API\n", .{});
+        return error.UnsupportedCommand;
+    }
     if (std.mem.eql(u8, cmd, "grouped-plan")) return grouped_tests.plan(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "carveout")) {
         const mib = if (rest.len > 0) try std.fmt.parseInt(usize, rest[0], 10) else cuda.carveout.default_bytes >> 20;
         return carveout_tests.run(gpu, if (rest.len > 1) rest[1] else cuda.carveout.default_card, mib);
     }
     if (std.mem.eql(u8, cmd, "kernel-contract")) return contract_tests.run(gpu);
-    if (std.mem.eql(u8, cmd, "kernel-contract-limits")) return contract_tests.fatbins(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "tree")) return tree_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "block")) return block_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "window")) return window_tests.run(gpu);
@@ -353,7 +386,9 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "train-pack")) return train_pack.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) try std.fmt.parseInt(usize, rest[2], 10) else 24);
     if (std.mem.eql(u8, cmd, "glm-lanes-cover")) return glm_lanes_tests.coverCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
     if (std.mem.eql(u8, cmd, "glm-shared-check")) return glm_lanes_tests.sharedCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
-    if (std.mem.eql(u8, cmd, "glm-synth")) return glm_synth.run(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "glm-prefill-shared-check")) return glm_lanes_tests.prefillSharedCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
+    if (std.mem.eql(u8, cmd, "glm-verify-window-check")) return @import("glm_verify_window_check.zig").run(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "glm-verify-window-bench")) return @import("glm_prefill_batch_bench.zig").verifyRun(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2));
     if (std.mem.eql(u8, cmd, "glm-lanes-concurrent")) return glm_lanes_tests.concurrentCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
     std.debug.print("{s}", .{usage});
     return error.UnknownCommand;

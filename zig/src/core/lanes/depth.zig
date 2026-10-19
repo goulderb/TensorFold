@@ -59,6 +59,7 @@ pub const Rule = struct {
     plain_guard: bool,
     node_probabilities: bool,
     confidence_floor: ?f64 = null,
+    fixed_drafts: bool = false, // backend-controlled prefix, independent of measured acceptance/costs
     batch_rows: u32,
     batched_heads: bool = false, // one batch drafts every stream of a shared round (its steps: the deepest stream's)
     round_ms: Table = .{}, // a round's wall time by drafts, every stream's: what sampled streams price by
@@ -140,6 +141,7 @@ pub const Rule = struct {
 
     /// The most expected tokens a ms, probing one depth farther every `depth_probe_every` rounds.
     pub fn depth(r: *Rule, who: Who) !i64 {
+        if (r.fixed_drafts) return @min(@as(i64, r.most_drafts), @max(0, who.draft_room - 1));
         const most = @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1));
         if (most <= 0) return 0;
         if (r.confidence_floor != null) return most;
@@ -190,20 +192,20 @@ pub const Rule = struct {
         return true;
     }
 
-    /// Python `_head_depth`: the next round's head drafts for a stream (0 when forced, 1 with a copy ahead).
+    /// The next head request: forced or fixed-policy copies need none; adaptive copies retain their one-draft probe.
     pub fn headDepth(r: *Rule, who: *const Who, budget: ?i64, probe: Probe) !i64 {
-        const d: i64 = if (who.finished) 0 else if (budget) |b| b else if (r.node_probabilities)
+        const d: i64 = if (who.finished) 0 else if (budget) |b| b else if (r.node_probabilities and !r.fixed_drafts)
             @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1))
         else
             try r.depth(who.*);
         if (who.forced) return 0;
-        if (d != 0 and probe.copy(probe.ptr, who)) return 1;
+        if (d != 0 and probe.copy(probe.ptr, who)) return if (r.fixed_drafts) 0 else 1;
         return d;
     }
 
     /// Head drafts for the streams of a shared round, sized by allocation over their chain chances.
     pub fn budgets(r: *Rule, whos: []Who, probe: Probe, sampled: bool, out: []i64) !void {
-        if (r.confidence_floor != null) {
+        if (r.fixed_drafts or r.confidence_floor != null) {
             for (whos, out) |*w, *o| o.* = try r.headDepth(w, null, probe);
             return;
         }

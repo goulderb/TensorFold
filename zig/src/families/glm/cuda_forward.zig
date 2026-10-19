@@ -303,6 +303,19 @@ pub const Forward = struct {
     fn ffn(f: *const Forward, r: Rank, l: weights.Layer, rows: usize, out: ?u64) !void {
         const c = &r.w.config;
         const b = r.b;
+        if (b.prefill and r.segs.len > 0) {
+            switch (l.ffn) {
+                .dense => |m| for (r.segs) |g| {
+                    try mlp.body(f.mlpKernels(), f.stream, m, b.dense, b.normed + g.row0 * c.hidden * 2, c.hidden, g.rows, true);
+                    if (out) |o| try mlp.fill(f.mlpKernels(), f.stream, m, b.dense, 0, g.rows, true, o + g.row0 * c.hidden * 4);
+                },
+                .moe => |m| {
+                    try moe.body(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, rows, true);
+                    if (out) |o| for (r.segs) |g| try moe.fill(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, g.row0, g.row0 + g.rows, true, o + g.row0 * c.hidden * 4);
+                },
+            }
+            return;
+        }
         switch (l.ffn) {
             .dense => |m| {
                 try mlp.body(f.mlpKernels(), f.stream, m, b.dense, b.normed, c.hidden, rows, b.prefill);
@@ -545,7 +558,7 @@ pub const Forward = struct {
             .rank = @intCast(r.w.share.rank),
         }, ids);
         var cut: [max_pieces][2]usize = undefined;
-        const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
+        const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill and f.ranks[0].segs.len == 0) ranges(R, p.count, &cut) else 0) else 0;
         // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
         if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
         try f.finish(R);
@@ -600,6 +613,7 @@ pub const Forward = struct {
         for (f.ranks) |r| {
             const b = r.b;
             try glue.rmsnorm(f.set(), f.stream, b.hidden, c.hidden, r.w.norm, b.fnormed, c.hidden, b.fxs, c.eps, R, c.hidden);
+            if (b.prefill and r.segs.len > 0) continue; // the engine draws each prompt's last row separately
             const head_rows: usize = if (b.prefill) 1 else R;
             const first = if (b.prefill) R - 1 else 0;
             try b16.proj(f.set(), f.stream, b.fnormed + first * c.hidden * 2, c.hidden, r.w.head, b.logits, b.kda.mm_part, head_rows, r.w.share.vocab.len(), c.hidden, false);

@@ -99,14 +99,14 @@ test "verify plan settings are opt in and differ in rank and numerical identitie
             return if (std.mem.eql(u8, name, "TF_GLM_DFLASH_VERIFY_DRAFTS")) "6" else null;
         }
         fn invalid(name: [:0]const u8) ?[]const u8 {
-            return if (std.mem.eql(u8, name, "TF_GLM_DFLASH_VERIFY_DRAFTS")) "7" else null;
+            return if (std.mem.eql(u8, name, "TF_GLM_DFLASH_VERIFY_DRAFTS")) "8" else null;
         }
     };
     var problem: []const u8 = "";
     const selected = try ranks.Settings.read(Env.get, &problem);
     try std.testing.expectEqual(verify.Plan.dflash6, selected.dflash_verify);
     try std.testing.expectError(error.BadSetting, ranks.Settings.read(Env.invalid, &problem));
-    try std.testing.expectEqualStrings("TF_GLM_DFLASH_VERIFY_DRAFTS: 3 or 6", problem);
+    try std.testing.expectEqualStrings("TF_GLM_DFLASH_VERIFY_DRAFTS: 3, 6 or 7", problem);
     var base = selected;
     base.dflash_verify = .baseline;
     const zero: [32]u8 = @splat(0);
@@ -117,6 +117,52 @@ test "verify plan settings are opt in and differ in rank and numerical identitie
     base.hashNumerics(&a);
     selected.hashNumerics(&b);
     try std.testing.expect(!std.mem.eql(u8, &a.finalResult(), &b.finalResult()));
-    try std.testing.expectEqual(@as(usize, 72), 2 * engine.max_shared + engine.shared_rows);
+    try std.testing.expectEqual(@as(usize, 80), 2 * engine.max_shared + engine.shared_rows);
     try std.testing.expect(2 * engine.max_shared + engine.shared_rows <= @import("cuda_follow.zig").put_ids);
+}
+
+test "seven draft plan advertises and fills all 64 target rows" {
+    var e: engine.Engine = undefined;
+    e.mtp = false;
+    e.dflash = @ptrFromInt(256);
+    e.settings = .{ .draft = .dflash2, .dflash_verify = .dflash7 };
+    const b: backend.Lanes = .{ .x = .{ .e = &e, .link = undefined } };
+    var cfg = try lanes.Config.init(std.testing.allocator, b.facts(), backend.max_rows, engine.max_drafts);
+    defer cfg.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 8), cfg.family_width);
+    try std.testing.expectEqual(@as(u32, 7), cfg.most_drafts);
+    try std.testing.expectEqual(@as(u32, 64), cfg.batch_rows);
+    const probs: [8][]const f64 = @splat(&.{ 1, 1, 1, 1, 1, 1, 1 });
+    const counts = try lanes.allocate.allocate(std.testing.allocator, &.{ 1, 1, 1, 1, 1, 1, 1, 1 }, &probs, &cfg.shared_costs, 0, cfg.batch_rows);
+    defer std.testing.allocator.free(counts);
+    try std.testing.expectEqualSlices(u32, &.{ 7, 7, 7, 7, 7, 7, 7, 7 }, counts);
+    var ls: [8]state.Lane = @splat(.{});
+    var requests: [8]batch.Request = undefined;
+    for (&ls) |*l| l.end = 40;
+    for (&requests, 0..) |*r, i| r.* = .{ .slot = 7 - i, .end = 40, .pending = @intCast(i), .depth = 7, .sampling = null };
+    const plan = try batch.Plan.buildWithPlan(&ls, 1024, &requests, .dflash7);
+    try std.testing.expectEqual(@as(usize, 8), plan.count);
+    try std.testing.expectEqual(@as(i64, 47), plan.metadata(154856).positions[63]);
+    try std.testing.expectError(error.BadDraftRequest, batch.Plan.buildWithPlan(&ls, 1024, &requests, .dflash6));
+    requests[7].depth = 8;
+    try std.testing.expectError(error.BadDraftRequest, batch.Plan.buildWithPlan(&ls, 1024, &requests, .dflash7));
+    const ranks = @import("cuda_ranks.zig");
+    const six: ranks.Settings = .{ .dflash_verify = .dflash6 };
+    var seven = six;
+    seven.dflash_verify = .dflash7;
+    var a = std.crypto.hash.sha2.Sha256.init(.{});
+    var c = std.crypto.hash.sha2.Sha256.init(.{});
+    six.hashNumerics(&a);
+    seven.hashNumerics(&c);
+    try std.testing.expect(!std.mem.eql(u8, &a.finalResult(), &c.finalResult()));
+}
+
+test "Mia decode scratch fits all shared verification boundary shapes" {
+    const mia = @import("cuda_experts_mia.zig");
+    for ([_]usize{ 32, 56, 63, 64 }) |rows| {
+        const bytes = try mia.Scratch.bytes(rows, rows, 9, 4096, 1024);
+        const scratch = try mia.Scratch.fromBase(0x1000, rows, rows, 9, 4096, 1024);
+        try std.testing.expectEqual(rows, scratch.decode_capacity);
+        try std.testing.expect(scratch.work < 0x1000 + bytes);
+    }
 }

@@ -7,6 +7,10 @@ const Mock = struct {
     var frees: usize = 0;
     var copies: usize = 0;
     var syncs: usize = 0;
+    var context_syncs: usize = 0;
+    var retained_at_context: usize = 0;
+    const Pending = struct { source: []const u8, head: [8]u8 };
+    var pending: ?Pending = null;
     var live: usize = 0;
     var init_calls: usize = 0;
     var fail_alloc: bool = false;
@@ -21,11 +25,13 @@ const Mock = struct {
     const Copy = struct { dst: u64, len: usize, head: [8]u8 };
     var records: [1024]Copy = undefined;
     fn reset() void {
-        std.debug.assert(live == 0);
+        std.debug.assert(live == 0 and pending == null);
         allocs = 0;
         frees = 0;
         copies = 0;
         syncs = 0;
+        context_syncs = 0;
+        retained_at_context = 0;
         init_calls = 0;
         fail_alloc = false;
         null_alloc = false;
@@ -54,6 +60,7 @@ const Mock = struct {
         return 0;
     }
     fn free(p: u64) callconv(.c) m.cuda.abi.Result {
+        std.debug.assert(pending == null);
         for (0..8) |i| if (used[i] and ptrs[i] == p) {
             used[i] = false;
             live -= 1;
@@ -63,6 +70,7 @@ const Mock = struct {
         unreachable;
     }
     fn copy(dst: u64, src: ?*const anyopaque, n: usize) callconv(.c) m.cuda.abi.Result {
+        std.debug.assert(pending == null);
         copies += 1;
         if (copies == fail_copy) return m.cuda.abi.error_not_ready;
         var found = false;
@@ -74,11 +82,30 @@ const Mock = struct {
         const bytes: [*]const u8 = @ptrCast(src.?);
         @memcpy(head[0..@min(8, n)], bytes[0..@min(8, n)]);
         records[copies - 1] = .{ .dst = dst, .len = n, .head = head };
+        pending = .{ .source = bytes[0..n], .head = head };
         return 0;
     }
-    fn sync(_: m.cuda.abi.Stream) callconv(.c) m.cuda.abi.Result {
+    fn finishCopy() void {
+        if (pending) |p| {
+            std.debug.assert(live > 0);
+            const n = @min(p.source.len, p.head.len);
+            std.debug.assert(std.mem.eql(u8, p.head[0..n], p.source[0..n]));
+            pending = null;
+        }
+    }
+    fn sync(stream: m.cuda.abi.Stream) callconv(.c) m.cuda.abi.Result {
+        std.debug.assert(stream == null);
         syncs += 1;
-        return if (syncs == fail_sync) m.cuda.abi.error_not_ready else 0;
+        if (fail_sync != 0 and (syncs == fail_sync or syncs == fail_sync + 1)) return m.cuda.abi.error_not_ready;
+        finishCopy();
+        return 0;
+    }
+    fn contextSync() callconv(.c) m.cuda.abi.Result {
+        context_syncs += 1;
+        retained_at_context = m.cuda.copy_source.retained();
+        std.debug.assert(pending != null and retained_at_context > 0);
+        finishCopy();
+        return 0;
     }
     fn driver() m.cuda.Driver {
         var api: m.cuda.abi.Api = undefined;
@@ -87,6 +114,7 @@ const Mock = struct {
         api.cuMemFree_v2 = free;
         api.cuMemcpyHtoD_v2 = copy;
         api.cuStreamSynchronize = sync;
+        api.cuCtxSynchronize = contextSync;
         return .{ .lib = undefined, .api = api };
     }
 };
@@ -257,9 +285,13 @@ test "vision memory every upload or wait failure and malformed driver allocation
         try t.expectEqual(before, m.cuda.usage(false).device);
         Mock.reset();
         Mock.fail_sync = i;
+        const retained = m.cuda.copy_source.retained();
         try t.expectError(error.NotReady, m.DeviceWeights.init(t.allocator, &d, &f.w, 1 << 20));
         try t.expectEqual(@as(usize, 0), Mock.live);
         try t.expectEqual(before, m.cuda.usage(false).device);
+        try t.expectEqual(@as(usize, 1), Mock.context_syncs);
+        try t.expectEqual(retained + 1, Mock.retained_at_context);
+        try t.expectEqual(retained, m.cuda.copy_source.retained());
     }
     Mock.reset();
     Mock.fail_alloc = true;
@@ -327,6 +359,43 @@ test "vision memory activation owner uploads shared RoPE and stages independent 
     try t.expectEqual(before, m.cuda.usage(false).device);
     try t.expectEqual(@as(usize, 0), Mock.init_calls);
 }
+test "vision staging drains failed pixel and prepared uploads before destination reuse or release" {
+    const c = try tiny();
+    const pixels = try t.allocator.alloc(f32, 8 * 1176);
+    defer t.allocator.free(pixels);
+    @memset(pixels, 0.5);
+    const first: @import("cuda_vision_preprocess.zig").Prepared = .{ .canvas = .{ .height = 28, .width = 28 }, .content = .{ .height = 28, .width = 28 }, .grid = .{ 1, 2, 2 }, .patch_width = 1176, .pixels = pixels[0 .. 4 * 1176] };
+    var second = first;
+    second.pixels = pixels[4 * 1176 ..];
+    for (0..3) |case| for ([_]bool{ false, true }) |reuse| {
+        Mock.reset();
+        var d = Mock.driver();
+        const retained = m.cuda.copy_source.retained();
+        const before = m.cuda.usage(false).device;
+        var owned = try m.Activations.init(t.allocator, &d, c, .{ .groups = 2, .gh = 2, .gw = 2 }, .{}, 1 << 20);
+        Mock.fail_sync = Mock.syncs + (if (case == 2) @as(usize, 2) else 1);
+        if (case == 0) {
+            try t.expectError(error.NotReady, owned.stagePixels(pixels));
+        } else {
+            try t.expectError(error.NotReady, owned.stagePrepared(&.{ first, second }));
+        }
+        try t.expect(!owned.pixels_ready);
+        try t.expectEqual(@as(usize, 1), Mock.context_syncs);
+        try t.expectEqual(retained + 1, Mock.retained_at_context);
+        try t.expectEqual(retained, m.cuda.copy_source.retained());
+        try t.expectEqual(@as(usize, 1), Mock.live);
+        try t.expect(Mock.pending == null);
+        if (reuse) {
+            try owned.stagePrepared(&.{ first, second });
+            try t.expect(owned.pixels_ready);
+        }
+        owned.deinit();
+        try t.expectEqual(@as(usize, 0), Mock.live);
+        try t.expectEqual(@as(usize, 1), Mock.frees);
+        try t.expectEqual(before, m.cuda.usage(false).device);
+    };
+}
+
 test "vision memory allocation failure sweeps balance CPU and native ownership" {
     var fixture = try Fixture.init(t.allocator, try tiny());
     defer fixture.deinit();
@@ -364,7 +433,11 @@ test "vision memory allocation failure sweeps balance CPU and native ownership" 
         try t.expectEqual(@as(usize, 0), Mock.live);
         Mock.reset();
         Mock.fail_sync = i;
+        const retained = m.cuda.copy_source.retained();
         try t.expectError(error.NotReady, m.Activations.init(t.allocator, &d, fixture.w.c, .{ .groups = 2, .gh = 2, .gw = 2 }, .{}, 1 << 20));
         try t.expectEqual(@as(usize, 0), Mock.live);
+        try t.expectEqual(@as(usize, 1), Mock.context_syncs);
+        try t.expectEqual(retained + 1, Mock.retained_at_context);
+        try t.expectEqual(retained, m.cuda.copy_source.retained());
     }
 }

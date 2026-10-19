@@ -1,7 +1,14 @@
 # Local fork credits and changes
 
-This addendum describes the local TensorFold fork based on upstream v1.0.12,
-including the source at `114beb79335d4b33833bc842ed37f1bf4723541d`.
+This addendum describes the local TensorFold fork, including the v1.0.12-based
+source at `114beb79335d4b33833bc842ed37f1bf4723541d` and the in-progress
+v1.1.0 shared-layer integration at upstream `76aafcf27` (2026-10-19).
+The latter retains the fork's GLM and Nemotron families, adapts their shared
+APIs, and keeps their incompatible EXL3/FP8-KV kernel ABIs explicit. The GLM
+expert kernel is renamed `exl3_experts_glm.cu`, not attributed as new work;
+upstream's newer pointer-table implementation keeps its original source and
+credits. Retained checkpoint-math dense operators remain extensions of the
+upstream shared CUDA layers. Integration is not fresh GPU qualification.
 It supplements the upstream `NOTICE`, `THIRD_PARTY_NOTICES.md`, and
 `docs/credits.md`. It does not replace their copyright or license terms.
 
@@ -96,6 +103,10 @@ and spill paths. They add the prompt-slot FP32-to-BF16 conversion and adapt
 the import to the v1.0.12 APIs. `docs/glm-cuda-mia.md` describes the integration
 and its qualification limits. The importer is not the original author.
 
+The local seven-draft extension sizes Mia decode scratch for up to 64 shared
+rows and adds boundary replay checks. It preserves the donor's expert
+arithmetic and captured DFlash kernels.
+
 The source tree includes 24 captured DFlash2 cubins under
 `zig/kernels/dflash2-aot/`. Its `provenance.json` identifies the donor archive
 and file hashes. These are software artifacts, not checkpoint weights.
@@ -107,6 +118,30 @@ code. They credit local-inference-lab's b12x/RoCEnante transport, Jay Leaton's
 GLM work, and specified design contributions from drowzeys and BertholomusAI
 (Albert Lee, GitHub `bertholomus`). Do not reduce these to a single Mia credit
 or label design-only references as copied code.
+
+## Production GLM copy and row-policy adaptation (2026-10-19)
+
+`zig/src/families/glm/cuda_copy_drafts.zig` adapts TensorFold's Python
+`families/glm5_next/cuda/copy_drafts.py` from the pinned Mia/TensorFold
+production image
+`sha256:d7e14f8799ad21f7e93ba95ea78826426c98ab27d5fbfdf81bed876a2e09ce6e`.
+The exact donor file SHA256 is
+`a8ab7c52f7ba5d7466f27aaef1dba6120930f9fee7e579a0fa32ea74fc591161`.
+The shared longest-tail row policy follows that image's `multi.py`, SHA256
+`1386e5275e6c6b0578a698a639e0d578f8d1bfbb69207624829cc2d58576bda2`.
+The workstation evidence is
+`C:/Development/prep/glm53-expert-tuning/production-source-receipt.json`.
+These image/file pins identify the adapted content; they do not invent an
+individual author or Git revision for an image snapshot.
+
+Credit remains with Ash Hart and the TensorFold contributors and the
+production recipe's retained Mia and transitive donor notices above. The local
+changes use the native upstream proposer factory, borrow committed context
+instead of owning a second history, preserve original-copy miss accounting,
+and separate the unpadded multi-lane path from optional standalone padding.
+The opt-in shared-policy extension preserves existing head-only callers.
+No Python donor code executes in the native engine. This adaptation is not a
+new authorship claim, graph-execution equivalence, or GPU qualification.
 
 ## The shared spill tier and Nemotron adapters
 

@@ -35,6 +35,13 @@ pub const Proposer = struct {
     }
 };
 
+/// Makes and frees request-local proposers without depending on the server's lane-host module.
+pub const Factory = struct {
+    ctx: *anyopaque,
+    make: *const fn (ctx: *anyopaque, gpa: Allocator, prompt: []const u32, eos: []const u32) anyerror!Proposer,
+    free: *const fn (ctx: *anyopaque, p: Proposer) void,
+};
+
 pub const max_ngram = 8;
 const Key = [max_ngram]u32;
 

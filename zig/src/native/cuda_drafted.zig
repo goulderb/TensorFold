@@ -62,12 +62,15 @@ pub fn wrap(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, loaded: 
     return s;
 }
 
-test "--drafter: a family that loads its own drafter (GLM's DFlash2) serves as it loaded, and one with neither refuses" {
-    const F = @import("glm_cuda").native;
-    try std.testing.expect(@hasField(F.Options, "drafter") and !@hasDecl(F, "openDrafter"));
+test "--drafter: a family owning the option serves its loaded drafter; a retained environment-only GLM refuses" {
+    const F = struct {
+        pub const model_type = "own_drafter";
+        pub const Options = struct { drafter: ?[]const u8 = null };
+    };
     const Loaded = struct { backend: lanes.backend.Backend, facts: lanes.Model, stream_bytes: usize };
-    var loaded: Loaded = undefined;
-    loaded.stream_bytes = 7;
+    var target: lanes.fake.Fake = .{ .gpa = std.testing.allocator };
+    defer target.deinit();
+    const loaded: Loaded = .{ .backend = target.backend(), .facts = .{}, .stream_bytes = 7 };
     const o: api.Open = .{ .dir = "glm", .model_type = F.model_type, .drafter = "dflash2" };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -80,4 +83,6 @@ test "--drafter: a family that loads its own drafter (GLM's DFlash2) serves as i
     };
     try std.testing.expect((try wrap(Plain, arena.allocator(), std.testing.allocator, std.testing.io, loaded, o, &problem)) == null);
     try std.testing.expectEqualStrings("--drafter: plain checkpoints load no draft model on CUDA", problem);
+    try std.testing.expect((try wrap(@import("glm_cuda").native, arena.allocator(), std.testing.allocator, std.testing.io, loaded, o, &problem)) == null);
+    try std.testing.expectEqualStrings("--drafter: glm5_next checkpoints load no draft model on CUDA", problem);
 }

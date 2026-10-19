@@ -1,6 +1,5 @@
 //! Nemotron-H multi-row windows: 1..16 tokens in one pass, rows bit-identical to the one-token path; else commit(c).
 const std = @import("std");
-const platform = @import("sys");
 const rt = @import("xpu").rt;
 const model = @import("xpu_model.zig");
 
@@ -31,8 +30,8 @@ pub var prof_on: bool = false;
 var prof: [48]struct { h: ?*const anyopaque = null, ns: u64 = 0, calls: u64 = 0 } = @splat(.{});
 
 fn nowNs() u64 {
-    var ts: platform.c.timespec = undefined;
-    _ = platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 

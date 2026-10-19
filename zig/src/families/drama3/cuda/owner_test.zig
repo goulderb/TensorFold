@@ -45,7 +45,7 @@ const Mock = struct {
     }
     fn wait(s: cuda.abi.Stream) callconv(.c) c_int {
         waits += 1;
-        if (s == fail_stream) return cuda.abi.error_not_ready;
+        if (fail_stream != null and s == fail_stream) return cuda.abi.error_not_ready;
         if (@intFromPtr(s) == 3 or @intFromPtr(s) == 0x40) pending = false;
         return 0;
     }

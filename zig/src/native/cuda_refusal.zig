@@ -5,13 +5,8 @@ const nemotron = @import("nemotron");
 
 /// Flags refused whatever the family; null when `o` may open.
 pub fn backend(o: api.Open) ?[]const u8 {
-    if (o.mtp_drafts) |n| if (n > nemotron.native.max_drafts) return std.fmt.comptimePrint("--mtp-drafts: the CUDA engine drafts at most {d}", .{nemotron.native.max_drafts});
-    if (o.mtp_confidence) |c| if (!(c >= 0 and c <= 1)) return "--mtp-confidence must be from 0 to 1";
-    if (o.mtp_drafts != null or o.mtp_confidence != null) {
-        if (!std.mem.eql(u8, o.model_type, nemotron.native.model_type) and
-            !std.mem.eql(u8, o.model_type, nemotron.omni.model_type))
-            return "--mtp-drafts: this CUDA family's drafts are not tunable; serve it without --mtp-drafts or --mtp-confidence";
-    }
+    if (o.mtp_drafts != null or o.mtp_confidence != null)
+        return "--mtp-drafts: the retained CUDA families do not take MTP controls; serve without --mtp-drafts or --mtp-confidence";
     if (o.learn != null and !o.learn_conversations) return "--learn learns shared prompt prefixes on Macs only; CUDA keeps conversation states on disk with --learn-conversations: serve with it, or without --learn, --learn-dir or --learn-gib";
     if (o.speed_up != null) return "--speed-up links two Macs: serve without --speed-up on CUDA";
     if (o.prompt_cache_over_cap) return "--prompt-cache-over-cap lifts a Mac's 70% cap: on CUDA the prompt cache takes at most the memory the weights and streams leave, so serve without it";
@@ -108,16 +103,15 @@ test "--learn-conversations opens Nemotron only, the one CUDA family whose state
     try std.testing.expect(family(nemotron.native, .{ .dir = "d", .model_type = "nemotron_h", .learn_conversations = true }) == null);
 }
 
-test "CUDA MTP controls respect window and probability bounds" {
-    for ([_]u32{ 0, 8, 15, 23, 31 }) |n| {
-        try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h_omni", .mtp_drafts = n }) == null);
-    }
-    try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h_omni", .mtp_drafts = 32 }) != null);
-    for ([_]f64{ 0, 0.5, 1 }) |c| {
-        try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h", .mtp_confidence = c }) == null);
-    }
-    for ([_]f64{ -0.1, 1.1, std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) }) |c| {
-        try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h", .mtp_confidence = c }) != null);
+test "retained Nemotron refuses upstream MTP controls instead of ignoring them" {
+    for ([_][]const u8{ "nemotron_h", "nemotron_h_omni" }) |model_type| {
+        try std.testing.expect(backend(.{ .dir = "d", .model_type = model_type }) == null);
+        for ([_]u32{ 0, 8, 15, 23, 31, 32 }) |n| {
+            try std.testing.expectStringStartsWith(backend(.{ .dir = "d", .model_type = model_type, .mtp_drafts = n }) orelse "", "--mtp-drafts");
+        }
+        for ([_]f64{ 0, 0.5, 1, -0.1, 1.1, std.math.nan(f64), std.math.inf(f64) }) |c| {
+            try std.testing.expectStringStartsWith(backend(.{ .dir = "d", .model_type = model_type, .mtp_confidence = c }) orelse "", "--mtp-drafts");
+        }
     }
 }
 

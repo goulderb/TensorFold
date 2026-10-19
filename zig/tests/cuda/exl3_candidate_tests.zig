@@ -326,8 +326,8 @@ fn windows(gpu: Gpu, s: cuda.Stream) !void {
     defer rig.deinit();
     var dense = try tilesDense(gpu);
     defer dense.unload();
-    const w: cuda.qlinear.Weight = .{ .exl3 = weightOf(try upload(&rig, h)) };
-    const l: cuda.qlinear.Linear = .{ .exl3 = &dense };
+    const w: cuda.qlinear.Weight = .{ .exl3_dense = weightOf(try upload(&rig, h)) };
+    const l: cuda.qlinear.Linear = .{ .exl3_dense = &dense };
     const xd = try rig.put(x);
     const out = try rig.zeros(prompt_rows * h.n * 2);
     const row_bytes = h.n * 2;
@@ -377,8 +377,8 @@ fn fp32Out(gpu: Gpu, s: cuda.Stream) !void {
     defer rig.deinit();
     var dense = try tilesDense(gpu);
     defer dense.unload();
-    const w: cuda.qlinear.Weight = .{ .exl3 = weightOf(try upload(&rig, h)) };
-    const l: cuda.qlinear.Linear = .{ .exl3 = &dense };
+    const w: cuda.qlinear.Weight = .{ .exl3_dense = weightOf(try upload(&rig, h)) };
+    const l: cuda.qlinear.Linear = .{ .exl3_dense = &dense };
     const in: cuda.qlinear.Rows = .{ .x = try rig.put(x) };
     const o32 = try rig.zeros(rows * h.n * 4);
     const o16 = try rig.zeros(rows * h.n * 2);

@@ -6,7 +6,8 @@ const Stream = @import("stream.zig").Stream;
 /// One planned window as the policy sees it.
 pub const Window = struct {
     stream: *Stream,
-    drafted: bool, // head drafts the policy may trim; every other window runs whole
+    drafted: bool, // head drafts the policy may trim
+    copied: bool = false, // copied drafts, trimmable only with VTable.copy_windows
     rows: u32, // rows as planned, the pending row included
     parents: ?[]const i32, // the drafts' parents for a tree (null: a chain)
 };
@@ -29,6 +30,8 @@ pub const Trim = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Opt in to prefix cuts of copied windows too; existing head-only policies are unchanged.
+        copy_windows: bool = false,
         /// Each window's drafts for this round; `alone`: the round's only window. Slices in `out` live in `arena`.
         choose: *const fn (ptr: *anyopaque, windows: []const Window, alone: bool, arena: Allocator, out: []Choice) anyerror!void,
         /// Every window's commit, in plan order (a shared round's windows one after the other).

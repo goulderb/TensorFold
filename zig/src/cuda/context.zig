@@ -37,11 +37,12 @@ pub const Context = struct {
             return error.Invalid;
         }
         @import("copy_source.zig").setCurrent(ctx); // the host made it current: copy sources are tagged with it
-        return .{ .d = d, .device = dev, .handle = ctx };
+        return .{ .d = d, .device = dev, .handle = ctx, .device_ordinal = dev };
     }
 
     /// Waits for all work, then drops this retain; resources made in it must be released first.
     pub fn deinit(self: *Context) void {
+        self.makeCurrent() catch {};
         self.d.synchronize() catch {};
         @import("copy_source.zig").dropSpares(self.d, self.handle); // their pinned bytes go with the context
         _ = self.d.api.cuDevicePrimaryCtxRelease_v2(self.device);
@@ -88,3 +89,36 @@ pub const Context = struct {
         return m;
     }
 };
+
+test "context teardown binds its own device before synchronization and release" {
+    const Fake = struct {
+        var current: abi.Context = null;
+        var synced: abi.Context = null;
+        var released: abi.Device = -1;
+        fn bind(ctx: abi.Context) callconv(.c) abi.Result {
+            current = ctx;
+            return abi.success;
+        }
+        fn sync() callconv(.c) abi.Result {
+            synced = current;
+            return abi.success;
+        }
+        fn release(dev: abi.Device) callconv(.c) abi.Result {
+            released = dev;
+            return abi.success;
+        }
+    };
+    var d: Driver = .{ .lib = undefined, .api = undefined };
+    d.api.cuCtxSetCurrent = Fake.bind;
+    d.api.cuCtxSynchronize = Fake.sync;
+    d.api.cuDevicePrimaryCtxRelease_v2 = Fake.release;
+    const source = @import("copy_source.zig");
+    defer source.setCurrent(null);
+    Fake.current = @ptrFromInt(1);
+    Fake.synced = null;
+    Fake.released = -1;
+    var ctx: Context = .{ .d = &d, .device = 3, .handle = @ptrFromInt(2), .device_ordinal = 3 };
+    ctx.deinit();
+    try std.testing.expectEqual(@as(abi.Context, @ptrFromInt(2)), Fake.synced);
+    try std.testing.expectEqual(@as(abi.Device, 3), Fake.released);
+}

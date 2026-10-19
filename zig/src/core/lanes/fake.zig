@@ -60,6 +60,8 @@ pub const Fake = struct {
     answer_cycles: bool = false,
     prefill_chunks: usize = 0,
     prefill_count: usize = 0,
+    prefill_batches: usize = 0,
+    batch_max_prompt: ?usize = null, // partial cohorts skip longer prompts, as a bounded GPU batch does
     fail_pieces: usize = 0, // the next this many `piece` calls fail with error.Unbound
     many_passes: usize = 0, // prefill_many calls that took their streams (batched())
     many_streams: usize = 0, // streams those calls prefilled
@@ -116,6 +118,26 @@ pub const Fake = struct {
         x.many_passes += 1;
         x.many_streams += ss.len;
         return true;
+    }
+
+    /// A stepped target with partial-outcome prompt cohorts, separate from all-or-none `batched`.
+    pub fn coldBatched(x: *Fake) be.Backend {
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .prefill_batch = prefillBatch, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
+    }
+
+    fn prefillBatch(ptr: *anyopaque, streams: []const *Stream, out: []be.PrefillOutcome) anyerror!void {
+        const x = self(ptr);
+        @memset(out, .skipped);
+        if (streams.len < 2) return;
+        x.prefill_batches += 1;
+        for (streams, out) |s, *result| {
+            if (x.batch_max_prompt) |n| if (s.prompt_len > n) continue;
+            prefill(ptr, s) catch |err| {
+                result.* = .{ .failed = err };
+                continue;
+            };
+            result.* = .complete;
+        }
     }
 
     /// The same target filling its prompt a chunk a call (`prefill_chunks`), as a backend with `prefill_step`.

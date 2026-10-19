@@ -21,7 +21,7 @@ const wants = [_]Want{
 };
 
 fn record(symbol: []const u8) ?registry.CudaRecord {
-    for (registry.cuda) |r| if (std.mem.eql(u8, r.launch.symbol, symbol)) return r;
+    for (registry.all_cuda) |r| if (std.mem.eql(u8, r.launch.symbol, symbol)) return r;
     return null;
 }
 

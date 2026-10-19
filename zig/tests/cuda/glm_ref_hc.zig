@@ -62,7 +62,7 @@ pub fn mixing(r: *Rig, set: glue.Set) !void {
     const full = [5]u64{ all.out, all.xs, all.post, all.comb, all.part };
     const per = [5]usize{ d * 2, (d / 64) * 4, s * 4, s * s * 4, glue.hcPartBytes(1) };
     const what = [5][]const u8{ "normed rows", "group sums", "post", "comb", "partials" };
-    for ([_]usize{ 1, 5, 63 }) |m| {
+    for ([_]usize{ 1, 5, 32, 56, 63, 64 }) |m| {
         const o = try pre(r, set, dx, w, m);
         for ([5]u64{ o.out, o.xs, o.post, o.comb, o.part }, full, per, what) |got, want, n, label|
             try ref.sameRows(r, try std.fmt.bufPrint(&name, "hc pre: {d} rows' {s} equal the {d}-row call's", .{ m, label, rows }), want, got, m * n);

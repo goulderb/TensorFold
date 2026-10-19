@@ -12,7 +12,17 @@ pub const Memory = struct {
         d.api.cuMemcpyDtoDAsync_v2 = copy;
         d.api.cuMemcpy2DAsync_v2 = copy2D;
         d.api.cuMemcpyDtoH_v2 = download;
+        d.api.cuMemcpyHtoD_v2 = uploadSync;
         d.api.cuMemcpyHtoDAsync_v2 = upload;
+        d.api.cuMemHostAlloc = hostAlloc;
+        d.api.cuMemFreeHost = hostFree;
+        d.api.cuEventCreate = eventCreate;
+        d.api.cuEventDestroy_v2 = eventDone;
+        d.api.cuEventRecord = eventRecord;
+        d.api.cuEventQuery = eventDone;
+        d.api.cuEventSynchronize = eventDone;
+        d.api.cuCtxSynchronize = contextSync;
+        d.api.cuCtxSetCurrent = setCurrent;
         d.api.cuMemsetD8_v2 = fill8;
         d.api.cuMemsetD8Async = fill8Async;
         d.api.cuMemsetD32Async = fill32;
@@ -60,9 +70,37 @@ pub const Memory = struct {
         @memcpy(slice(dst, n), slice(src, n));
         return 0;
     }
-    fn upload(dst: u64, src: ?*const anyopaque, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+    fn uploadSync(dst: u64, src: ?*const anyopaque, n: usize) callconv(.c) cuda.abi.Result {
         const from: [*]const u8 = @ptrCast(src.?);
         @memcpy(slice(dst, n), from[0..n]);
+        return 0;
+    }
+    fn upload(dst: u64, src: ?*const anyopaque, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        return uploadSync(dst, src, n);
+    }
+    fn hostAlloc(ptr: *?*anyopaque, n: usize, _: c_uint) callconv(.c) cuda.abi.Result {
+        var address: u64 = 0;
+        const result = alloc(&address, n);
+        if (result == 0) ptr.* = @ptrFromInt(address);
+        return result;
+    }
+    fn hostFree(ptr: ?*anyopaque) callconv(.c) cuda.abi.Result {
+        return free(@intFromPtr(ptr.?));
+    }
+    fn eventCreate(event: *cuda.abi.Event, _: c_uint) callconv(.c) cuda.abi.Result {
+        event.* = @ptrFromInt(1);
+        return 0;
+    }
+    fn eventDone(_: cuda.abi.Event) callconv(.c) cuda.abi.Result {
+        return 0;
+    }
+    fn eventRecord(_: cuda.abi.Event, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        return 0;
+    }
+    fn contextSync() callconv(.c) cuda.abi.Result {
+        return 0;
+    }
+    fn setCurrent(_: cuda.abi.Context) callconv(.c) cuda.abi.Result {
         return 0;
     }
     fn download(dst: ?*anyopaque, src: u64, n: usize) callconv(.c) cuda.abi.Result {

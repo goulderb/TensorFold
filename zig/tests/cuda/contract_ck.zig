@@ -52,7 +52,7 @@ pub const Experts = struct {
     kind: Kind,
     ck: *const Ck,
     router: grouped.Router,
-    latent: *const nemotron.latent.Fns,
+    latent: if (@hasDecl(nemotron, "latent")) *const nemotron.latent.Fns else void,
     shape: c.Shape = undefined,
     x: []u8 = &.{}, // NVFP4 rows: codes, then block scales
     w: []u8 = &.{}, // [experts][n][k/2] codes
@@ -287,7 +287,9 @@ pub const Experts = struct {
                 a.add(@as(c_int, 1));
                 a.add(self.base);
                 a.add(@as(c_int, @intCast(n)));
-                try cuda.launch.launch(self.latent.combine, .{ .grid = .{ .x = @intCast(self.outRows()), .y = @intCast((n + 255) / 256) }, .block = .{ .x = 256 } }, self.rig.s, &a);
+                if (comptime @hasDecl(nemotron, "latent")) {
+                    try cuda.launch.launch(self.latent.combine, .{ .grid = .{ .x = @intCast(self.outRows()), .y = @intCast((n + 255) / 256) }, .block = .{ .x = 256 } }, self.rig.s, &a);
+                } else return error.UnsupportedKernel;
             },
         }
         return self.rig.bytes(self.base, self.outBytes());

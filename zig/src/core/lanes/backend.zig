@@ -30,6 +30,9 @@ pub const Alternative = struct { tokens: [4]u32, probs: [4]f64 };
 /// A window's results: each row's drawn token, the held drafts the forward verified, and logprob rows when asked.
 pub const Verified = struct { sampled: []u32, drafts: []u32, rows: []Row = &.{} };
 
+/// Skipped streams are untouched; complete streams have their own first draw ready.
+pub const PrefillOutcome = union(enum) { skipped, complete, failed: anyerror };
+
 /// Tapped cache rows for a drafter: the prompt's until the first verify, then each verify's kept rows until the next.
 pub const Features = struct {
     pub const Space = enum { host, device };
@@ -79,6 +82,9 @@ pub const Backend = struct {
         prefill_step: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!bool = null,
         /// Several prompts in one pass, each as after `prefill`; false or an error leaves none prefilled.
         prefill_many: ?*const fn (ptr: *anyopaque, ss: []const *Stream) anyerror!bool = null,
+        /// Partial prompt cohort: setup errors are per-stream outcomes; a shared execution error fails the cohort.
+        /// Unlike prefill_many, skipped streams stay untouched and an execution error must not retry them alone.
+        prefill_batch: ?*const fn (ptr: *anyopaque, streams: []const *Stream, out: []PrefillOutcome) anyerror!void = null,
         /// Draw the first token from the prompt's last row at `position`; a handle to it.
         first: *const fn (ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64,
         /// Feed one token and queue the draw of the next at `position` (a one-token round); a handle to it.

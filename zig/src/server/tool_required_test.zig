@@ -14,7 +14,7 @@ const a = std.testing.allocator;
 const specs = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}},\"required\":[\"q\"]}}},{\"type\":\"function\",\"function\":{\"name\":\"now\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]";
 
 const Text = struct {
-    form: enum { xml, json, gemma, unknown } = .json,
+    form: enum { xml, json, glm, gemma, unknown } = .json,
     fn text(t: *Text) mt.Text {
         return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocab, .eos_ids = eos, .render = render, .template_source = source } };
     }
@@ -48,6 +48,7 @@ const Text = struct {
         return g.dupe(u8, switch (t.form) {
             .xml => "<tool_call><function=tfprobe_fn><parameter=tfprobe_k>v</parameter></function></tool_call>",
             .json => "<tool_call>{\"name\":\"tfprobe_fn\",\"arguments\":{\"tfprobe_k\":\"v\"}}</tool_call>",
+            .glm => "<tool_call>tfprobe_fn<arg_key>tfprobe_k</arg_key><arg_value>v</arg_value></tool_call>",
             .gemma => "<|tool_call>call:tfprobe_fn{tfprobe_k:<|\"|>v<|\"|>}<tool_call|>",
             .unknown => "prompt",
         });
@@ -74,6 +75,8 @@ const Stub = struct {
 
 // The compiler boundary records the production grammar; no xgrammar library or GPU is loaded in this fixture.
 const Compile = struct {
+    calls: usize = 0,
+
     fn compiler(c: *Compile) api.grammar.Compiler {
         var out: api.grammar.Compiler = undefined;
         out.h = c;
@@ -86,6 +89,8 @@ const Compile = struct {
     }
     fn compile(ptr: *anyopaque, kind: c_int, _: [*]const u8, _: usize, _: [*]u8, _: usize) callconv(.c) ?*anyopaque {
         std.debug.assert(kind == 5);
+        const c: *Compile = @ptrCast(@alignCast(ptr));
+        c.calls += 1;
         return ptr;
     }
     fn free(_: *anyopaque) callconv(.c) void {}
@@ -116,14 +121,14 @@ test "required tools: unsupported required tools name the actual backend before 
     try std.testing.expect(std.mem.indexOf(u8, cx.message, "cuda") != null);
 }
 
-test "required tools: Gemma and unknown templates can constrain required calls on a grammar backend" {
+test "required tools: supported markup compiles and unknown templates refuse before compilation" {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const g = arena.allocator();
     var stub: Stub = .{};
     var compile: Compile = .{};
     var compiler = compile.compiler();
-    for ([_]@FieldType(Text, "form"){ .xml, .json, .gemma, .unknown }) |form| {
+    for ([_]@FieldType(Text, "form"){ .xml, .json, .glm, .gemma, .unknown }) |form| {
         var text: Text = .{ .form = form };
         const srv = try Server.init(a, std.testing.io, stub.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
         defer srv.deinit();
@@ -131,8 +136,19 @@ test "required tools: Gemma and unknown templates can constrain required calls o
         srv.grammars = &compiler;
         var cx: errors.Cx = .{ .a = g };
         var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 200 };
-        try srv.checkFeatures(&cx, try value(g, "{\"tool_call_required\":true}"), true, false, &.{1}, (try value(g, specs)).array, &request);
-        try std.testing.expect(request.structure != null);
+        const required = try value(g, "{\"tool_call_required\":true}");
+        const offered = (try value(g, specs)).array;
+        if (form == .unknown) {
+            const before = compile.calls;
+            try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, required, true, false, &.{1}, offered, &request));
+            try std.testing.expectEqual(@as(u16, 400), cx.status());
+            try std.testing.expectEqual(before, compile.calls);
+            try std.testing.expect(request.structure == null and request.call == null);
+            try std.testing.expect(std.mem.indexOf(u8, cx.message, "chat template") != null);
+        } else {
+            try srv.checkFeatures(&cx, required, true, false, &.{1}, offered, &request);
+            try std.testing.expect(request.structure != null);
+        }
     }
 }
 
@@ -170,7 +186,7 @@ test "required tools: both routes parse required and named calls and enforce a c
     var stub: Stub = .{};
     var compile: Compile = .{};
     var compiler = compile.compiler();
-    for ([_]bool{ false, true }) |response| for ([_]bool{ false, true }) |named| for ([_]@FieldType(Text, "form"){ .xml, .json, .gemma, .unknown }) |form| {
+    for ([_]bool{ false, true }) |response| for ([_]bool{ false, true }) |named| for ([_]@FieldType(Text, "form"){ .xml, .json, .glm, .gemma, .unknown }) |form| {
         var text: Text = .{ .form = form };
         const srv = try Server.init(a, std.testing.io, stub.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
         defer srv.deinit();
@@ -182,6 +198,13 @@ test "required tools: both routes parse required and named calls and enforce a c
         try std.testing.expect(input.fields.get("tool_call_required").?.truthy());
         try std.testing.expectEqual(@as(usize, if (named) 1 else 2), input.tools.len);
         var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 512 };
+        if (form == .unknown) {
+            const before = compile.calls;
+            try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, input.fields, true, false, &.{1}, input.tools, &request));
+            try std.testing.expectEqual(before, compile.calls);
+            try std.testing.expect(request.structure == null and request.call == null);
+            continue;
+        }
         try srv.checkFeatures(&cx, input.fields, true, false, &.{1}, input.tools, &request);
         const structure = request.structure.?;
         const root = try value(g, structure.text);
@@ -256,7 +279,7 @@ test "qwen27 tool calls: required and named calls use the masked lane fake throu
     var stub: Stub = .{};
     var compile: Compile = .{};
     var compiler = compile.compiler();
-    for ([_]bool{ false, true }) |response| for ([_]bool{ false, true }) |named| for ([_]@FieldType(Text, "form"){ .xml, .json, .gemma, .unknown }) |form| {
+    for ([_]bool{ false, true }) |response| for ([_]bool{ false, true }) |named| for ([_]@FieldType(Text, "form"){ .xml, .json, .glm, .gemma, .unknown }) |form| {
         var text: Text = .{ .form = form };
         const srv = try Server.init(a, std.testing.io, stub.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"} }, null);
         defer srv.deinit();
@@ -268,6 +291,13 @@ test "qwen27 tool calls: required and named calls use the masked lane fake throu
         try std.testing.expect(input.fields.get("tool_call_required").?.truthy());
         try std.testing.expectEqual(@as(usize, if (named) 1 else 2), input.tools.len);
         var request: api.Request = .{ .prompt = &.{1}, .max_tokens = 512 };
+        if (form == .unknown) {
+            const before = compile.calls;
+            try std.testing.expectError(error.Refused, srv.checkFeatures(&cx, input.fields, true, false, &.{1}, input.tools, &request));
+            try std.testing.expectEqual(before, compile.calls);
+            try std.testing.expect(request.structure == null and request.call == null);
+            continue;
+        }
         try srv.checkFeatures(&cx, input.fields, true, false, &.{1}, input.tools, &request);
         const structure = request.structure.?;
         const root = try value(g, structure.text);

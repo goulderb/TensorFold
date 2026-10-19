@@ -417,6 +417,7 @@ test "a blocking download synchronizes no stream: a reader of a non-blocking str
     var out: [16]u8 = undefined;
     try b.download(0, &out);
     try Recorder.expect(&.{.dtoh}); // the copy alone: no stream waited for (native/nemotron_spill.zig fences before it)
+}
 
 test "allocation cap includes pinned and in-flight bytes and refunds failed driver calls" {
     const before = usage(true);

@@ -40,6 +40,9 @@ pub const Fake = struct {
     fail_write: bool = false,
     writes: usize = 0,
     fail_restore: bool = false,
+    fail_spill_read: bool = false,
+    spill_forgets: usize = 0, // names the store asked every rank to drop (a pass from 0 resets it)
+    peer_tier: ?*pc.spill.Tier = null, // a toy rank 1: a read needs its copy stored, else error.NotStored
     live: usize = 0,
     spare_bytes: u64 = 0,
     peer: ?*Peer = null, // speed-up mode's rank 1: it keeps the same states and drops them only when a request names them
@@ -124,6 +127,46 @@ pub const Fake = struct {
         f.live += 1;
         return st;
     }
+    /// With a spill tier: a state's position and sum as one payload (one rank; spill_resume.zig pairs ranks).
+    pub fn spilling(f: *Fake) Snapshots {
+        return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .spill_write = spillWriteFn, .spill_read = spillReadFn, .spill_forget = spillForgetFn } };
+    }
+    fn spillForgetFn(ptr: *anyopaque, _: pc.spill.Name) void {
+        of(ptr).spill_forgets += 1;
+    }
+    fn stateBytes(p: *anyopaque) []u8 {
+        return std.mem.asBytes(@as(*State, @ptrCast(@alignCast(p))));
+    }
+    fn spillWriteFn(_: *anyopaque, saved: Saved, tier: *pc.spill.Tier, name: pc.spill.Name, tokens: []const u32) anyerror!void {
+        var copy: State = @as(*State, @ptrCast(@alignCast(saved))).*;
+        const Src = struct {
+            fn read(p: *anyopaque, offset: u64, out: []u8) anyerror!void {
+                @memcpy(out, stateBytes(p)[@intCast(offset)..][0..out.len]);
+            }
+        };
+        const j = try tier.write(name, tokens, "", @sizeOf(State), .{ .ptr = &copy, .read = Src.read });
+        defer j.release();
+        j.waitCopied(); // `copy` lives on this stack
+    }
+    fn spillReadFn(ptr: *anyopaque, tier: *pc.spill.Tier, name: pc.spill.Name) anyerror!Saved {
+        const f = of(ptr);
+        if (f.fail_spill_read) return error.ToySpillReadFailed;
+        if (f.peer_tier) |p| if (!p.has(name) or p.pending(name)) return error.NotStored; // rank 1 first: no rank changed
+        var r = try tier.read(name);
+        defer r.close();
+        if (r.payloadLen() != @sizeOf(State)) return error.ReadFailed;
+        const st = try f.gpa.create(State);
+        errdefer f.gpa.destroy(st);
+        const Dst = struct {
+            fn write(p: *anyopaque, offset: u64, bytes: []const u8) anyerror!void {
+                @memcpy(stateBytes(p)[@intCast(offset)..][0..bytes.len], bytes);
+            }
+        };
+        try r.pump(.{ .ptr = st, .write = Dst.write });
+        if (st.at != name.at) return error.ReadFailed;
+        f.live += 1;
+        return st;
+    }
     /// A pool-like family: a kept state holds 10 bytes under `bytes`, and a dropped one's storage stays spare.
     pub fn pooled(f: *Fake) Snapshots {
         return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = savePooledFn, .restore = restoreFn, .drop = dropSpareFn, .charged = chargedFn, .spare = spareFn, .trim = trimFn, .reuses = reusesFn } };
@@ -190,7 +233,7 @@ pub const Fake = struct {
 
     /// A prompt pass from `plan.from`, keeping at each mark; returns the sum a fresh pass would give.
     pub fn pass(f: *Fake, s: *Store, prompt: []const u32, plan: Plan) u64 {
-        if (plan.from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .fail_write = f.fail_write, .writes = f.writes, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer };
+        if (plan.from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .fail_write = f.fail_write, .writes = f.writes, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer, .peer_tier = f.peer_tier };
         if (f.peer) |p| p.in_pass = true;
         defer if (f.peer) |p| {
             p.in_pass = false;

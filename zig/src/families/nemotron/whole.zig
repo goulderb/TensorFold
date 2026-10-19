@@ -1,6 +1,5 @@
 //! Whole-mode lessons: pocket neurons (default), a weight edit (TF_SLIDE_EDIT) or a probe (TF_SLIDE_PROBE).
 const std = @import("std");
-const platform = @import("sys");
 const examples = @import("lesson_examples.zig");
 const adapters = @import("learn_shape.zig");
 const forgetting = @import("pocket_forget.zig");
@@ -12,8 +11,8 @@ pub const Method = enum { pocket, edit, probe };
 
 /// The method the environment picks for whole lessons.
 pub fn method() Method {
-    if (platform.c.getenv("TF_SLIDE_PROBE") != null) return .probe;
-    if (platform.c.getenv("TF_SLIDE_EDIT") != null) return .edit;
+    if (std.c.getenv("TF_SLIDE_PROBE") != null) return .probe;
+    if (std.c.getenv("TF_SLIDE_EDIT") != null) return .edit;
     return .pocket;
 }
 

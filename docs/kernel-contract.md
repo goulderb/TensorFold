@@ -1,5 +1,18 @@
 # Kernel contract
 
+## Local v1.1.0 integration boundary (2026-10-19)
+
+This task integrates upstream v1.1.0 shared layers while retaining the fork's GLM and
+Nemotron families. The imported registry records describe their original upstream
+kernels, not fresh measurements of this hybrid source. In particular, retained
+Nemotron attention uses the fork's FP8-KV ABI rather than upstream page tables;
+retained GLM EXL3 experts use `exl3_experts_glm`, distinct from upstream's pointer-table
+`exl3_experts` image. New or changed images require their own measured records and
+qualification before serving. Historical receipts below apply only to the exact
+source and image hashes they identify, not this integration merely because host
+tests compile. No model, GPU, Windows, or production-parity result is established by
+this source update.
+
 Every GPU kernel, ours or a contributor's, registers with the kernel contract before it lands. One harness
 (`zig/src/core/contract/`) runs five gates on Metal and on CUDA, and each gate has a planted control: a kernel built to
 break that gate, which the gate must report as failing. A run where a control passes is a failed run, because then the
@@ -112,7 +125,10 @@ Metal: softmax, RMS norm, bf16 top-k, the row projection (3, 4, 6 and 8 bits), a
 formats on the M5's tensor units, where its reg kernel must equal the cooperative one bit for bit), and tile_qmm's
 prompt tiles and their decode twin (4, 6 and 8 bits; the twin bit-equal to the tiles). Gate 5 also holds the rest of
 tile_qmm's pipelines and GLM-5.3-Flash's hc_expand_10.
-CUDA: the RMS norm rows (16-byte form and the fp32-out tree), Nemotron's router logits and top-k, qmm_group's cluster
+
+### Retained fork CUDA inventory and historical receipt
+
+The retained harness includes the RMS norm rows (16-byte form and the fp32-out tree), Nemotron's router logits and top-k, qmm_group's cluster
 tile, lane_gemv and its split-K form (both bit-equal to it), prompt16's FP4 tile with bf16 and fp32 out, qmmf's FP4
 tiles with fp32 out (K slices met in a cluster, fused, or by `reduce_kernel<true>`), and the reduce-scatter's
 `tf_rank_sum`. On sm_121 only, GLM-5.3-Flash FP4-Local: the latent attention chunks (bf16 and FP8 caches, 16- and
@@ -125,7 +141,13 @@ The [2026-10-18 sm_121 receipt](receipts/glm53-contract-sm121-20261018.json) rec
 `4424dbd45b1b3835cfe31f73baa396cf678ec0ca`: 88 kernels pass gates 1-4, all five planted controls are red,
 and live gate 5 has zero limit problems. The receipt includes the full log and the measured image hashes.
 This run qualifies the registered kernel contracts on sm_121, not full model serving or another GPU target.
-CUDA: the RMS norm rows (16-byte form and the fp32-out tree), Nemotron's router logits (and their 128-row tiles,
+
+### Imported upstream v1.1.0 CUDA inventory
+
+Upstream's inventory below is retained as documentation of its source, not a fresh
+qualification of the retained families or modified shared kernels:
+
+the RMS norm rows (16-byte form and the fp32-out tree), Nemotron's router logits (and their 128-row tiles,
 bit-equal to them) and top-k, the latent top-k's decode form (bit-equal to `tf_super_topk`), the latent combine and
 shared add over bf16 share sums (bit-equal to `tf_super_combine` and `tf_super_moe_out` over the fp32 shares), the
 Mamba scan of a verify window (its host twin's bytes), qmm_group's cluster tile, lane_gemv and its split-K form (both

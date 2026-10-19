@@ -26,6 +26,104 @@ pub fn openComm(gpu: Gpu, lib: *const cuda.nccl.Library, rank: c_int, world: c_i
 
 const DcKind = struct { kind: []const u8, prompt: []const i32, want: []const i32 };
 
+/// Small real-forward proof: packed prompt states and subsequent logits equal their serial twins.
+pub fn prefillSharedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
+    const glm = @import("glm_cuda");
+    var arena = std.heap.ArenaAllocator.init(gpu.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var lib = try cuda.nccl.Library.open();
+    defer lib.close();
+    const comm = try openComm(gpu, &lib, rank, world, id_path);
+    defer _ = lib.api.ncclCommDestroy(comm);
+    var problem: []const u8 = "";
+    var settings = try glm.ranks.Settings.read(&glm.ranks.environment, &problem);
+    settings.draft = .off;
+    const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = 4096, .mtp = false, .settings = settings });
+    defer e.deinit();
+    var link = try glm.follow.Link.init(gpu.gpa, gpu.d, &lib, comm, e.stream, 4096);
+    defer link.deinit();
+    if (rank != 0) return glm.follow.follow(e, &link);
+    const x: glm.follow.Leader = .{ .e = e, .link = &link };
+    defer x.end() catch {};
+    var lengths = [_]usize{ 1, 3, 31, 58, 64, 65, 126, 127 };
+    if (std.c.getenv("TF_GLM_PROOF_ROWS")) |raw| {
+        const rows = try std.fmt.parseInt(usize, std.mem.span(raw), 10);
+        if (rows == 0 or rows > glm.engine.prompt_batch_rows) return error.BadProofRows;
+        @memset(&lengths, rows);
+    }
+    var parts: [lengths.len]glm.engine.Engine.PromptPart = undefined;
+    var first: [lengths.len]u32 = undefined;
+    var want: [lengths.len]u32 = undefined;
+    for (lengths, 0..) |n, i| {
+        const ids = try a.alloc(u32, n);
+        for (ids, 0..) |*id, r| id.* = @intCast(10 + (i * 23 + r * 7) % 1000);
+        parts[i] = .{ .slot = @intCast(i), .ids = ids };
+        for ([_]u32{ @intCast(i), @intCast(i + lengths.len) }) |slot| {
+            try x.bind(slot);
+            try x.begin(null);
+        }
+    }
+    const oversized: [128]u32 = @splat(10);
+    try std.testing.expectError(error.BadPromptBatch, e.prefillShared(&.{ .{ .slot = 0, .ids = &oversized }, parts[1] }, first[0..2]));
+    try x.prefillShared(&parts, &first);
+    try e.stream.synchronize();
+    var total_rows: usize = 0;
+    for (lengths) |n| total_rows += n;
+    const hidden = try a.alloc(u16, total_rows * e.c.hidden);
+    try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(hidden.ptr, e.bp.fnormed, hidden.len * 2), "cuMemcpyDtoH");
+    var row0: usize = 0;
+    for (parts, 0..) |p, i| {
+        try x.bind(@intCast(i + lengths.len));
+        want[i] = try x.prefill(p.ids, null, null, null);
+        try check.expect(first[i] == want[i], "batch prompt {d}: first {d} equals serial {d}", .{ i, first[i], want[i] });
+        try e.stream.synchronize();
+        const serial_hidden = try a.alloc(u16, p.ids.len * e.c.hidden);
+        try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(serial_hidden.ptr, e.bp.fnormed, serial_hidden.len * 2), "cuMemcpyDtoH");
+        const batched_hidden = hidden[row0 * e.c.hidden ..][0..serial_hidden.len];
+        try check.expect(std.mem.eql(u16, serial_hidden, batched_hidden), "batch prompt {d}: all final prompt hidden rows equal serial (first element diff {?d})", .{ i, std.mem.indexOfDiff(u16, serial_hidden, batched_hidden) });
+        row0 += p.ids.len;
+    }
+    try e.stream.synchronize();
+    var mismatches: usize = 0;
+    for (0..lengths.len) |i| {
+        const got = &e.seqs.items[i].?.st;
+        const twin = &e.seqs.items[i + lengths.len].?.st;
+        const left = try a.alloc(u8, got.arena.buf.len);
+        const right = try a.alloc(u8, twin.arena.buf.len);
+        try got.arena.buf.download(0, left);
+        try twin.arena.buf.download(0, right);
+        try check.expect(got.pos == twin.pos and got.pending == 0 and twin.pending == 0 and std.mem.eql(u1, got.cur, twin.cur), "batch prompt {d}: position and KDA parity equal serial", .{i});
+        if (std.mem.indexOfDiff(u8, left, right)) |at| {
+            mismatches += 1;
+            std.debug.print("state mismatch: prompt={d} rows={d} first_byte={d} batch={d} serial={d}\n", .{ i, lengths[i], at, left[at], right[at] });
+        }
+    }
+    try check.expect(mismatches == 0, "{d} of eight prompt states differ from serial", .{mismatches});
+    const V = e.share.vocab.len();
+    const left_logits = try a.alloc(u16, V);
+    const right_logits = try a.alloc(u16, V);
+    for (0..lengths.len) |i| {
+        for (0..3) |round| {
+            const token: u32 = @intCast(700 + i * 11 + round);
+            var got: [1]u32 = undefined;
+            var twin: [1]u32 = undefined;
+            try x.bind(@intCast(i));
+            try x.verify(&.{token}, &got);
+            try e.stream.synchronize();
+            try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(left_logits.ptr, e.bd.logits, V * 2), "cuMemcpyDtoH");
+            try x.keep(1);
+            try x.bind(@intCast(i + lengths.len));
+            try x.verify(&.{token}, &twin);
+            try e.stream.synchronize();
+            try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(right_logits.ptr, e.bd.logits, V * 2), "cuMemcpyDtoH");
+            try x.keep(1);
+            try check.expect(got[0] == twin[0] and std.mem.eql(u16, left_logits, right_logits), "batch prompt {d}: round {d} logits and token equal serial", .{ i, round });
+        }
+    }
+    check.pass("TP={d}: eight cold prompts ({d}..{d} rows), every state byte, first token and three following decode logits equal serial twins", .{ world, lengths[0], lengths[lengths.len - 1] });
+}
+
 /// `glm-lanes-cover`: CONTRIBUTING's single-stream contracts on one Engine: drafts, cancel, discard, eos, prompt cache.
 pub fn coverCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
     const glm = @import("glm_cuda");

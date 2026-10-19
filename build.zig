@@ -148,8 +148,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&cost_run.step);
     merge_build.targets(b, target, optimize); // tensorfold merge's tests and tf-merge-check, host only on every OS
     switch (target.result.os.tag) {
-        .macos => metalTargets(b, target, optimize, draft_ids, build_options, test_step),
-        .linux, .windows => cuda_build.targets(b, target, optimize, draft_ids, build_options),
+        .macos => _ = metalTargets(b, target, optimize, draft_ids, build_options, test_step),
+        .linux, .windows => _ = cuda_build.targets(b, target, optimize, draft_ids, build_options),
         else => {},
     }
     const gemma4_host_sources = b.createModule(.{ .root_source_file = b.path("zig/kernels/metal/sources.zig"), .target = b.graph.host });

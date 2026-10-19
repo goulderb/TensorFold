@@ -23,6 +23,8 @@ pub const persistence = @import("cuda_persistence.zig");
 pub const spill_payload = @import("cuda_spill_payload.zig");
 
 pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
+// The mixed-precision equivalence proof currently covers short prompts only.
+pub const prompt_batch_rows = 127;
 
 pub const Options = struct {
     room: ?Room = null,
@@ -30,6 +32,8 @@ pub const Options = struct {
     mtp: bool, // load the MTP head (drafts)
     settings: ranks.Settings,
     draft_kernels: ?[]const u8 = null,
+    /// GPU proof tools may omit target layers; serving always requires the complete DFlash target.
+    partial_dflash_check: bool = false,
 };
 
 fn validateKdaProjection(c: *const config.Config, world: usize, converted: bool) !void {
@@ -124,6 +128,7 @@ pub const Engine = struct {
     bd: fw.Buffers, // verify windows
     bm: fw.Buffers, // the MTP head's rows
     bs: ?fw.Buffers = null, // shared verify windows (with the MTP head, as the lane core shares only then)
+    verify_widths: [shared_rows + 1]u64 = @splat(0),
     route_trace: ?route_trace.Trace = null,
     pairs: cuda.DeviceBuffer, // every rank's (value, id) of a greedy draw
     smp: sampler.Sampler,
@@ -168,8 +173,14 @@ pub const Engine = struct {
             startup_problem = err;
             break :blk settings.draft;
         };
+        if (settings.draft_profile.enabled and startup_problem == null) {
+            if (settings.draft != .dflash2 or settings.dflash_verify != .dflash7) startup_problem = error.BadDraftProfile;
+            settings.draft_profile.copy.validate() catch |err| {
+                startup_problem = err;
+            };
+        }
         if (settings.draft == .dflash2 and startup_problem == null) {
-            if (world != 2 or c.hidden != 4096 or c.hc != 4 or c.vocab != 154880 or (settings.layers != 0 and settings.layers != c.layers)) startup_problem = error.UnsupportedDFlashTarget;
+            if (world != 2 or c.hidden != 4096 or c.hc != 4 or c.vocab != 154880 or (!o.partial_dflash_check and settings.layers != 0 and settings.layers != c.layers)) startup_problem = error.UnsupportedDFlashTarget;
             if (startup_problem == null) {
                 if (settings.draft_dir) |draft_dir| {
                     settings.draft_checkpoint = ranks.hashDraftCheckpoint(gpa, io, draft_dir) catch |err| blk: {
@@ -265,7 +276,7 @@ pub const Engine = struct {
         e.bm = if (o.settings.kv_shard) try fw.Buffers.initOwned(d, &e.w, fw.window_rows, false, o.capacity) else try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bm.deinit();
         const verify_rows = settings.dflash_verify.active(settings.draft == .dflash2).rows();
-        if (rank == 0 and settings.draft == .dflash2 and settings.dflash_verify == .dflash6) std.log.info("GLM DFlash verify plan: drafts=6 lane_rows=7 shared_rows=56", .{});
+        if (rank == 0 and settings.draft == .dflash2) std.log.info("GLM DFlash verify plan: drafts={d} lane_rows={d} shared_rows={d}", .{ settings.dflash_verify.drafts(), 1 + settings.dflash_verify.drafts(), verify_rows });
         if (with_mtp or settings.draft == .dflash2) e.bs = if (o.settings.kv_shard) try fw.Buffers.initSharedOwned(d, &e.w, verify_rows, o.capacity) else try fw.Buffers.initShared(d, &e.w, verify_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
         const route_samples = try route_trace.samples(ranks.environment("TF_GLM_ROUTE_SAMPLES"));
@@ -569,6 +580,42 @@ pub const Engine = struct {
         if (try e.shared(if (cancel) |c| @floatFromInt(@intFromBool(c.check(c.ptr))) else 0) > 0) return error.Cancelled;
     }
 
+    pub const PromptPart = struct { slot: u32, ids: []const u32 };
+
+    /// Complete cold prompts share row work; every sequence keeps its own recurrence, attention, head and taps.
+    pub fn prefillShared(e: *Engine, parts: []const PromptPart, out: []u32) !void {
+        if (parts.len < 2 or parts.len > max_shared or out.len != parts.len or e.mtp) return error.BadPromptBatch;
+        var segs: [max_shared]fw.Seg = undefined;
+        var ids: [prompt_rows]u32 = undefined;
+        var rows: usize = 0;
+        for (parts, 0..) |p, i| {
+            if (p.ids.len == 0 or p.ids.len > prompt_batch_rows or p.ids.len > prompt_rows - rows) return error.BadPromptBatch;
+            for (parts[0..i]) |prior| if (p.slot == prior.slot) return error.SlotTwice;
+            try e.bind(p.slot);
+            if (e.cur.st.pos != 0 or e.cur.st.pending != 0 or e.cur.vision != null) return error.BadPromptBatch;
+            if (p.ids.len + fw.window_rows >= e.cur.st.capacity) return error.PromptTooLong;
+            segs[i] = .{ .st = &e.cur.st, .row0 = rows, .rows = p.ids.len };
+            @memcpy(ids[rows..][0..p.ids.len], p.ids);
+            rows += p.ids.len;
+        }
+        try e.gate(null);
+        var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = &e.bp, .segs = segs[0..parts.len] }};
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load };
+        try f.run(@ptrCast(ids[0..rows]));
+        for (parts, segs[0..parts.len], 0..) |p, g, i| {
+            try e.bind(p.slot);
+            const last = g.row0 + g.rows - 1;
+            try @import("cuda_b16.zig").proj(f.set(), e.stream, e.bp.fnormed + last * e.c.hidden * 2, e.c.hidden, e.w.head, e.bp.logits, e.bp.kda.mm_part, 1, e.share.vocab.len(), e.c.hidden, false);
+            try e.draw(e.bp.logits, 1, p.ids.len, out[i..][0..1]);
+            if (e.dflash) |drafter| {
+                errdefer e.pair_failure(error.DFlashCommitFailed);
+                try drafter.acceptPrompt(p.slot, e.bp.taps.?.ptr + g.row0 * e.c.hidden * 2, e.bp.rows, g.rows, 0);
+            }
+            const own = e.view(&e.bp, &one);
+            try own.commit(g.rows);
+        }
+    }
+
     /// Device bytes retained at a prompt mark; MTP has absorbed the same prefix at these marks.
     pub fn snapshotBytes(e: *const Engine, at: usize) u64 {
         const plan = e.cur.st.layout.snapshot(.{ .main = at, .mtp = if (e.mtp) at else 0 }) catch return std.math.maxInt(u64);
@@ -833,7 +880,7 @@ pub const Engine = struct {
         var ids: [shared_rows]u32 = undefined;
         var rows: usize = 0;
         for (parts, 0..) |p, i| {
-            if (p.ids.len == 0 or p.ids.len > 1 + e.verifyPlan().drafts() or rows + p.ids.len > b.rows) return error.WindowTooWide;
+            if (p.ids.len == 0 or p.ids.len > e.targetRows() or rows + p.ids.len > @min(b.rows, e.sharedLimit())) return error.WindowTooWide;
             for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
             try e.bind(p.slot);
             segs[i] = .{ .st = &e.cur.st, .row0 = rows, .rows = p.ids.len };
@@ -852,6 +899,7 @@ pub const Engine = struct {
             if (e.dflash) |drafter| try drafter.stageWindow(p.slot, b.taps.?.ptr, b.rows, g.row0, g.rows, g.st.pos);
             try e.draw(b.logits + g.row0 * e.share.vocab.len() * 2, g.rows, g.st.pos + 1, p.out);
         }
+        e.verify_widths[rows] += 1;
     }
 
     /// forward.commit of the last window's first `n` rows (the KDA replay when fewer than it ran).
@@ -884,6 +932,14 @@ pub const Engine = struct {
 
     pub fn verifyPlan(e: *const Engine) verify_plan.Plan {
         return e.settings.dflash_verify.active(e.dflash != null);
+    }
+
+    pub fn targetRows(e: *const Engine) usize {
+        return if (e.settings.draft_profile.enabled) verify_plan.target_rows else 1 + e.verifyPlan().drafts();
+    }
+
+    pub fn sharedLimit(e: *const Engine) usize {
+        return if (e.settings.draft_profile.enabled) @import("cuda_draft_profile.zig").shared_rows else e.verifyPlan().rows();
     }
 
     fn resolveDraftBatch(e: *const Engine, parts: []const DraftPart, out: *[max_shared]dflash_mod.BatchRequest) !void {

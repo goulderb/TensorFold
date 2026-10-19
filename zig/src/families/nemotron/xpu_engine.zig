@@ -1,7 +1,6 @@
 //! Nemotron-H serial decode on an Intel GPU as one engine value: device checkpoint, one sequence.
 
 const std = @import("std");
-const platform = @import("sys");
 const xpu = @import("xpu");
 const cfgm = @import("xpu_config.zig");
 const widths = @import("config.zig");
@@ -22,8 +21,8 @@ pub const Options = struct {
 };
 
 fn nowNs() u64 {
-    var ts: platform.c.timespec = undefined;
-    _ = platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts);
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 

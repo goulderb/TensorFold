@@ -418,25 +418,79 @@ pub const LaneHost = struct {
     /// The next filling job's next prompt chunk: the other streams' rounds run between chunks, not after the prompt.
     fn fillOne(h: *LaneHost) void {
         if (h.filling.items.len == 0) return;
+        if (h.fillBatch()) return;
         const at = fill.next(h);
         const job = h.filling.items[at];
         const first = !job.fill_began;
         job.fill_began = true;
         const done = h.core.fillStreamCommitted(&job.stream, first, .{ .ptr = job, .call = firstCommitted }) catch |e| {
-            _ = switch (e) {
-                error.Cancelled => h.cancel(job),
-                error.LaneMemory => blk: {
-                    fill.unfill(h, job);
-                    break :blk h.requeue(job);
-                },
-                else => h.drop(job, h.words(e)),
-            };
+            h.fillFailed(job, e);
             return;
         };
         if (!done) return;
         _ = h.filling.orderedRemove(at);
         h.prefilled(job, job.began);
         _ = h.deliver(job);
+    }
+
+    fn fillFailed(h: *LaneHost, job: *Job, err: anyerror) void {
+        _ = switch (err) {
+            error.Cancelled => h.cancel(job),
+            error.LaneMemory => blk: {
+                fill.unfill(h, job);
+                break :blk h.requeue(job);
+            },
+            else => h.drop(job, h.words(err)),
+        };
+    }
+
+    fn fillBatch(h: *LaneHost) bool {
+        if (h.core.backend.vtable.prefill_batch == null or h.filling.items.len < 2) return false;
+        const jobs = h.gpa.dupe(*Job, h.filling.items) catch return false;
+        defer h.gpa.free(jobs);
+        std.mem.sort(*Job, jobs, @as(*const LaneHost, h), fill.before);
+        var count: usize = 0;
+        for (jobs) |job| {
+            if (job.fill_began or job.request.background) break;
+            count += 1;
+        }
+        if (count < 2) return false;
+        const streams = h.gpa.alloc(*lanes.Stream, count) catch return false;
+        defer h.gpa.free(streams);
+        const hooks = h.gpa.alloc(lanes.backend.Committed, count) catch return false;
+        defer h.gpa.free(hooks);
+        const out = h.gpa.alloc(lanes.backend.PrefillOutcome, count) catch return false;
+        defer h.gpa.free(out);
+        for (jobs[0..count], streams, hooks) |job, *stream, *hook| {
+            stream.* = &job.stream;
+            hook.* = .{ .ptr = job, .call = firstCommitted };
+        }
+        h.core.fillBatchCommitted(streams, out, hooks) catch |err| {
+            ends.failAll(h, h.words(err));
+            return true;
+        };
+        const preferred = out[0] != .skipped;
+        if (preferred) {
+            for (h.filling.items) |job| job.fill_wait +|= 1;
+            for (jobs[0..count], out) |job, result| {
+                if (result != .skipped) job.fill_wait = 0;
+            }
+        }
+        for (jobs[0..count], out) |job, result| {
+            if (result == .skipped) continue;
+            job.fill_began = true;
+            switch (result) {
+                .complete => {
+                    fill.unfill(h, job);
+                    h.prefilled(job, job.began);
+                    _ = h.deliver(job);
+                },
+                .failed => |err| h.fillFailed(job, err),
+                .skipped => unreachable,
+            }
+        }
+        // A bounded cohort may skip its preferred (long) prompt. Give it its chunk now, not another aging reset.
+        return preferred;
     }
 
     /// A reply's grammar from the server's compiler (Info.structures engines get requests that carry one).
@@ -630,4 +684,5 @@ test {
     _ = @import("lane_host_end_test.zig");
     _ = @import("lane_review_test.zig");
     _ = @import("lane_host_first_test.zig");
+    _ = @import("lane_proposers_test.zig");
 }

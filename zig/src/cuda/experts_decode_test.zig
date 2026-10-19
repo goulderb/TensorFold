@@ -46,6 +46,7 @@ test "nvfp4 A/B dispatch preserves packed weight and plan ABI and baseline defau
     var d: Driver = undefined;
     d.api.cuLaunchKernel = Mock.launch;
     var ex: Nvfp4Experts = undefined;
+    ex.warps = 4;
     ex.candidates_loaded = true;
     for (&ex.fns, 0..) |*f, i| f.* = .{ .d = &d, .handle = @ptrFromInt(1 + i) };
     ex.resident = @splat(192);

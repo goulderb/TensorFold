@@ -14,13 +14,26 @@ export fn exl3Compile(d: *const cuda.Driver, dense: *cuda.exl3.Dense, group: *cu
         _ = upload.dense(parts, g) catch return;
     }
     _ = cuda.exl3_upload.layer(&upload, arena.allocator(), 128, 128, .mul1, 0, 0, &.{}, &.{}, &.{}) catch {};
-    const linear: cuda.qlinear.Linear = .{ .exl3 = dense };
+    const linear: cuda.qlinear.Linear = .{ .exl3_dense = dense };
+    const weight: cuda.qlinear.Weight = .{ .exl3_dense = w.* };
+    linear.decode(s.*, weight, .{ .x = 0 }, 0, 1) catch {};
+    linear.prompt(s.*, weight, .{ .x = 0 }, 0, 1) catch {};
+    linear.decodeF32(s.*, weight, .{ .x = 0 }, 0, 1) catch {};
+    linear.promptF32(s.*, weight, .{ .x = 0 }, 0, 1) catch {};
+    const grouped: cuda.experts.Grouped = .{ .exl3_common = group };
+    grouped.decode(s.*, .up, .{ .x = 0, .stride = l.dims }, l.*, p.*, 0, 1, -1) catch {};
+    grouped.prompt(s.*, .down_f32, .{ .x = 0, .stride = l.width }, l.*, p.*, 0, 1, -1) catch {};
+    grouped.prompt(s.*, .down_bf16, .{ .x = 0, .stride = l.width }, l.*, p.*, 0, 1, -1) catch {};
+}
+
+export fn retainedExl3Compile(k: *const cuda.exl3_linear.Kernels, e: *const cuda.exl3_experts.Experts, w: *const cuda.exl3_linear.Matrix, l: *const cuda.experts.Layer, s: *const cuda.Stream, p: *const cuda.grouped.Plan) void {
+    const linear: cuda.qlinear.Linear = .{ .exl3 = k };
     const weight: cuda.qlinear.Weight = .{ .exl3 = w.* };
     linear.decode(s.*, weight, .{ .x = 0 }, 0, 1) catch {};
     linear.prompt(s.*, weight, .{ .x = 0 }, 0, 1) catch {};
     linear.decodeF32(s.*, weight, .{ .x = 0 }, 0, 1) catch {};
     linear.promptF32(s.*, weight, .{ .x = 0 }, 0, 1) catch {};
-    const grouped: cuda.experts.Grouped = .{ .exl3 = group };
+    const grouped: cuda.experts.Grouped = .{ .exl3 = e };
     grouped.decode(s.*, .up, .{ .x = 0, .stride = l.dims }, l.*, p.*, 0, 1, -1) catch {};
     grouped.prompt(s.*, .down_f32, .{ .x = 0, .stride = l.width }, l.*, p.*, 0, 1, -1) catch {};
     grouped.prompt(s.*, .down_bf16, .{ .x = 0, .stride = l.width }, l.*, p.*, 0, 1, -1) catch {};

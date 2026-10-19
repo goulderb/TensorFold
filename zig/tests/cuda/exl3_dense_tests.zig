@@ -7,7 +7,7 @@ const exl3fmt = @import("core").exl3_format;
 const exl3_load = @import("core").exl3_load;
 const exl3 = cuda.exl3;
 const qlinear = cuda.qlinear;
-const exl3_tests = @import("exl3_tests.zig");
+const exl3_tests = @import("exl3_common_tests.zig");
 const Run = exl3_tests.Run;
 const Rig = quant_ref_tests.RigT;
 const bf = quant_ref_tests.helpers.bfOf;
@@ -15,7 +15,7 @@ const bf = quant_ref_tests.helpers.bfOf;
 pub fn run(r: *Rig, state: *Run, dir: []const u8) !void {
     var dense = try exl3.Dense.load(r.gpu.d);
     defer dense.unload();
-    const ql: qlinear.Linear = .{ .exl3 = &dense };
+    const ql: qlinear.Linear = .{ .exl3_dense = &dense };
     {
         var ok = true;
         qlinearCheck(r, &ql, &dense.lin) catch |e| {
@@ -72,8 +72,8 @@ fn qlinearCheck(r: *Rig, ql: *const qlinear.Linear, lin: *const exl3.Linear) !vo
         for ([_]Kind{ .decode, .prompt }) |kind| {
             const got = try r.zeros(m * n * 2);
             switch (kind) {
-                .decode => try ql.decode(r.s, .{ .exl3 = w }, .{ .x = dx }, got, m),
-                .prompt => try ql.prompt(r.s, .{ .exl3 = w }, .{ .x = dx }, got, m),
+                .decode => try ql.decode(r.s, .{ .exl3_dense = w }, .{ .x = dx }, got, m),
+                .prompt => try ql.prompt(r.s, .{ .exl3_dense = w }, .{ .x = dx }, got, m),
             }
             const raw = try r.back(got, m * n * 2);
             const id = try std.fmt.allocPrint(r.a, "exl3.qlinear.{s} m={d}", .{ @tagName(kind), m });

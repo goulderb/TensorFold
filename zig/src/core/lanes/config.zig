@@ -24,6 +24,7 @@ pub const Model = struct {
     plain_guard: bool = false, // plain rounds compete with drafted depths
     draft_confidence: ?f64 = null,
     drafts: u32 = 1, // head drafts a round at most
+    fixed_drafts: bool = false, // request that ceiling; the backend's own policy selects its prefix
     window_costs: []const Cost = &.{}, // forward ms by exact window width (timed at load)
     mtp_step_ms: f64 = 0.0, // one chained head step (timed at load)
     draft_step_ms: f64 = 0.0, // a shared round's draft past a stream's first, as the backend's head runs it (0: priced free)
@@ -53,6 +54,7 @@ pub const Config = struct {
     pipelined: bool,
     plain_guard: bool,
     most_drafts: u32,
+    fixed_drafts: bool = false,
     draft_confidence: ?f64 = null,
     family_streams: bool,
     batch_rows: u32,
@@ -129,6 +131,7 @@ pub const Config = struct {
             .pipelined = m.gpu_tokens,
             .plain_guard = m.plain_guard,
             .most_drafts = @min(m.drafts, @min(width - 1, max_draft)),
+            .fixed_drafts = m.fixed_drafts,
             .draft_confidence = m.draft_confidence,
             .family_streams = streams,
             .batch_rows = batch_rows,

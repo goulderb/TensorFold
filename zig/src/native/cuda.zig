@@ -24,7 +24,6 @@ const cuda_disk = @import("cuda_disk.zig");
 const vision_offer = @import("cuda_vision_offer.zig");
 const nspill = @import("nemotron_spill.zig");
 const spill_facts = @import("nemotron_spill_facts.zig");
-const Pool = budget.Pool;
 const drafted = @import("cuda_drafted.zig");
 const kv_pages = @import("cuda_kv_pool.zig");
 
@@ -32,7 +31,6 @@ const kv_pages = @import("cuda_kv_pool.zig");
 const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native };
 /// --record opens here (engines.zig refuses it for a backend without this).
 pub const records = true;
-
 
 /// The same copies with a spill tier (TENSORFOLD_SPILL_*): evicted states go to local disk through an owned host slot.
 const nemotron_spill_snaps: api.prompt_cache.Snapshots.VTable = .{
@@ -48,7 +46,7 @@ const nemotron_spill_snaps: api.prompt_cache.Snapshots.VTable = .{
 };
 
 pub const backends: []const []const u8 = &.{"cuda"};
-pub const serves: []const []const u8 = &.{ "--mtp-drafts", "--mtp-confidence" };
+pub const serves: []const []const u8 = &.{};
 pub const families: []const api.Family = blk: {
     var out: [registry.len + 2]api.Family = undefined;
     for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
@@ -64,12 +62,11 @@ pub const deviceName = cuda_device.deviceName;
 const getenv = cuda_device.getenv;
 const setting = cuda_device.setting;
 
-
 /// TENSORFOLD_SPLIT=1 asks for the two-GPU layer split. Unset or 0: one device, the existing path.
 /// TENSORFOLD_TP=2: two-GPU tensor parallel in one process (cuda_tp2.zig).
 fn tpRequested() bool {
-    const v = std.c.getenv("TENSORFOLD_TP") orelse return false;
-    return std.mem.eql(u8, std.mem.span(v), "2");
+    const v = getenv("TENSORFOLD_TP") orelse return false;
+    return std.mem.eql(u8, v, "2");
 }
 
 /// A layer split or two-GPU TP: either one runs one stream over two devices, with the host's per-device admission.
@@ -102,37 +99,6 @@ fn contextWindow(requested: ?i64, native: i64, default: i64) error{ Negative, No
     return r;
 }
 
-/// The pool now, read on the thread whose context is current; `problem` names a bad variable.
-fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8) !?budget.Pool {
-    const unified = (try ctx.attribute(.integrated)) != 0;
-    const card = try ctx.memInfo();
-    const text = if (unified) budget.procText(a, io, "/proc/meminfo") else null;
-    const available = budget.counts(unified, .{ .total = card.total, .available = card.free }, text) catch {
-        problem.* = "cannot read or parse /proc/meminfo's MemTotal and MemAvailable; refusing CUDA unified-memory admission";
-        return null;
-    };
-    const free = available.available;
-    const total = available.total;
-    const reserve = budget.reserveBytes(getenv("TENSORFOLD_MEMORY_RESERVE_GIB"), total, unified) catch {
-        problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_MEMORY_RESERVE_GIB={s}: a number of GiB from {d} to the memory's size", .{ getenv("TENSORFOLD_MEMORY_RESERVE_GIB").?, budget.floor(unified).least });
-        return null;
-    };
-    const limit = budget.limitBytes(getenv("TENSORFOLD_CUDA_MEMORY_LIMIT_GB")) catch {
-        problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_CUDA_MEMORY_LIMIT_GB={s}: a positive number of GiB whose byte count fits in a 64-bit size", .{getenv("TENSORFOLD_CUDA_MEMORY_LIMIT_GB").?});
-        return null;
-    };
-    return .{ .free = free, .total = total, .reserve = reserve, .limit = limit, .unified = unified };
-}
-
-fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
-    const u = cuda.usage(reset_peak);
-    return .{ .active = u.device, .cache = 0, .peak = u.peak, .pinned = u.host };
-}
-
-const windows = @import("cuda_window.zig");
-const modelContext = windows.modelContext;
-const contextWindow = windows.contextWindow;
-
 /// A lone driver returns false at completion or true when yield hands it to the lane core.
 const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool, resumed: bool) anyerror!bool;
 
@@ -156,6 +122,8 @@ pub const Host = struct {
     host: api.LaneHost,
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
+    trim: ?lanes.Trim = null, // optional family row policy, installed before the lane thread starts
+    proposers: @FieldType(api.LaneHost, "proposers") = null, // request-local copies through the upstream factory
     store: ?*api.prompt_cache.Store = null, // kept Nemotron states; null when the budget is 0
     spill_owner: ?*glm_spill.Adapter = null,
     disk: ?*nspill.Disk = null, // the store's spill tier (TENSORFOLD_SPILL_*); null when none is configured
@@ -245,6 +213,12 @@ pub const Host = struct {
         return h;
     }
 
+    fn familyPolicies(h: *Host, loaded: anytype) void {
+        const L = @TypeOf(loaded);
+        h.trim = if (@hasField(L, "trim")) loaded.trim else null;
+        h.proposers = if (@hasField(L, "proposers")) loaded.proposers else null;
+    }
+
     /// The round loop and the lane host over the family's backend, its thread started.
     pub fn serve(h: *Host, io: std.Io, facts: lanes.Model, rows: u32, info: api.Info, explain: ?api.Explain) !void {
         h.cfg = try lanes.Config.init(h.gpa, facts, rows, rows - 1);
@@ -255,7 +229,9 @@ pub const Host = struct {
         h.clock = .{ .io = io };
         h.core = lanes.Engine.init(h.gpa, &h.cfg, h.backend(), h.clock.clock());
         errdefer h.core.deinit();
+        h.core.trim = h.trim;
         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
+        h.host.proposers = h.proposers;
         h.host.memory = if (h.gpu != null) .{ .read = family_memory.read } else null;
         h.host.explain = explain;
         h.host.health = h.health;
@@ -468,8 +444,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         }
     };
     var probe: Probe = .{ .a = a, .io = io, .ctx = &g.ctx, .held = held0, .problem = problem };
-    const split = pairRequested();
-    const tp = tpRequested();
+    const split = if (comptime @hasField(F.Options, "split")) pairRequested() else false;
+    const tp = if (comptime @hasField(F.Options, "split")) tpRequested() else false;
     if (split and !tp and (o.drafts or o.slide or o.learn != null or segments != 1 or disk_config != null or (o.prompt_cache_gib orelse 0) != 0 or (o.lanes_fixed and o.lanes != 1))) {
         problem.* = "TENSORFOLD_SPLIT is a single-stream layer-split trial, not TP: use --no-drafts --parallel 1 --prompt-cache-gib 0 without learning, spill or segments";
         return null;
@@ -481,7 +457,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     var opts: F.Options = .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments, .slide = o.slide };
     if (!family_options.set(F, o, &opts, problem)) return null;
     if (@hasField(F.Options, "split")) opts.split = splitOnly();
-    if (@hasField(F.Options, "tp") and o.tp == 0) opts.tp = tpRequested();
+    if (comptime @hasField(F.Options, "tp")) {
+        if (comptime @FieldType(F.Options, "tp") == bool) opts.tp = tp;
+    }
     if (@hasField(F.Options, "room")) opts.room = .{ .ctx = &probe, .read = Probe.read };
     var spill_owner: ?*glm_spill.Adapter = null;
     defer if (!opened) if (spill_owner) |owner| owner.deinit();
@@ -586,8 +564,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         };
         return null;
     };
-    const cache = if (split and !tp) 0 else budget.cacheBytes(o.prompt_cache_gib, room, served.stream_bytes * (streams -| free));
-    const store_cache = if (@hasDecl(F, "snap_save")) try snaps.cacheBudget(F, loaded.target, cache) else 0;
+    const held = served.stream_bytes * (streams -| free);
+    const kept = if (split and !tp) kv_pages.Kept{ .snaps = 0, .copied = 0, .snap_bytes = 0 } else kv_pages.kept(F, loaded, paged, o, room, held, host_budget, host_cache);
+    const store_cache = if (@hasDecl(F, "snap_save")) try snaps.cacheBudget(F, loaded.target, kept.copied) else 0;
     // Mamba spares are prepaid; the tier reservation is charged once inside the remaining Store budget.
     const disk: ?*nspill.Disk = if (F != nemotron.native) null else if (disk_config) |*c| (try openDisk(F, a, gpa, io, g, loaded, c, &model_files.?, &exe_files.?, kernels, segments, store_cache, after.unified, problem)) orelse return null else null;
     defer if (!opened) if (disk) |d| d.abandon(null); // after the store's own unwind, which detaches it
@@ -601,16 +580,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = served.backend, .served = served, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = if (@hasField(L, "lone")) loaded.lone else null };
     h.spill_owner = spill_owner;
+    h.familyPolicies(loaded);
     h.readiness(F);
-    const held = served.stream_bytes * (streams -| free);
-    const kept = kv_pages.kept(F, loaded, paged, o, room, held, host_budget, host_cache);
     const shown = try kv_pages.text(F, a, served.stream_bytes, layout, paged, @intCast(window), kept, o.kv8);
     h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB{s}; {d} stream{s} at once, {s}, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in passes of up to {d} rows{s}{s}; {s}", .{
         capability, device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(learn_bytes)}) else "", streams, if (streams == 1) "" else "s", shown[0], toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
         shown[1],   if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
     errdefer gpa.free(h.startup);
-    if (@hasDecl(F, "snap_save") and cache > 0) {
+    if (@hasDecl(F, "snap_save") and (kept.copied > 0 or kept.snaps > 0)) {
         const pc = api.prompt_cache;
         const store = try gpa.create(pc.Store);
         errdefer gpa.destroy(store);
@@ -672,7 +650,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
     h.disk = disk;
     h.target = if (F == nemotron.native) loaded.target else null;
-    const admit: ?api.Admit = if (comptime !@hasDecl(F, "fits")) null else if (paged != null) .{ .ctx = loaded.ctx, .fits = F.fits } else null;
+    const admit = admission(F, loaded, paged);
     try h.serve(io, served.facts, loaded.rows, .{
         .lanes = streams,
         .max_queued = o.max_queued,
@@ -699,8 +677,74 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
 
 const toGib = family_memory.toGib;
 
+/// A retained family's pool owns its admission; paged families expose it through the common plan.
+fn admission(comptime F: type, loaded: anytype, paged: ?kv_pages.Plan) ?api.Admit {
+    if (comptime @hasField(@TypeOf(loaded), "admit")) {
+        if (loaded.admit) |ad| return .{ .ctx = ad.ctx, .fits = ad.fits };
+    }
+    if (comptime @hasDecl(F, "fits")) {
+        if (paged != null) return .{ .ctx = loaded.ctx, .fits = F.fits };
+    }
+    return null;
+}
+
+test "optional family trim and proposer factories reach the served lane host without changing other families" {
+    const Hooks = struct {
+        fn release(_: *anyopaque) void {}
+        fn choose(_: *anyopaque, _: []const lanes.trim.Window, _: bool, _: Allocator, _: []lanes.trim.Choice) !void {}
+        fn commit(_: *anyopaque, _: lanes.trim.Commit) !void {}
+        fn make(_: *anyopaque, _: Allocator, _: []const u32, _: []const u32) !lanes.proposer.Proposer {
+            return error.TestUnexpectedResult;
+        }
+        fn free(_: *anyopaque, _: lanes.proposer.Proposer) void {}
+    };
+    var target: lanes.fake.Fake = .{ .gpa = std.testing.allocator };
+    defer target.deinit();
+    var h: Host = .{ .gpa = std.testing.allocator, .gpu = null, .family = &target, .release = Hooks.release, .inner = target.backend(), .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined };
+    h.familyPolicies(.{
+        .trim = @as(?lanes.Trim, .{ .ptr = &target, .vtable = &.{ .choose = Hooks.choose, .commit = Hooks.commit } }),
+        .proposers = @as(@FieldType(api.LaneHost, "proposers"), .{ .ctx = &target, .make = Hooks.make, .free = Hooks.free }),
+    });
+    try h.serve(std.testing.io, .{ .exact_width = 16, .hidden_rows = true }, 16, .{ .lanes = 2 }, null);
+    defer {
+        h.host.stop();
+        h.core.deinit();
+        h.cfg.deinit(h.gpa);
+    }
+    try std.testing.expectEqual(@as(*anyopaque, &target), h.core.trim.?.ptr);
+    try std.testing.expectEqual(@as(*anyopaque, &target), h.host.proposers.?.ctx);
+    h.familyPolicies(.{});
+    try std.testing.expect(h.trim == null and h.proposers == null);
+}
+
+test "retained family pool admission survives the common page-plan adapter" {
+    const F = struct {};
+    const Gate = struct {
+        fn fits(p: *anyopaque, prompt: u32, output: u32) bool {
+            const limit: *const u32 = @ptrCast(@alignCast(p));
+            return @as(u64, prompt) + output <= limit.*;
+        }
+    };
+    var limit: u32 = 64;
+    const loaded = .{ .admit = @as(?api.Admit, .{ .ctx = &limit, .fits = Gate.fits }) };
+    const ad = admission(F, loaded, null) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(ad.fits(ad.ctx, 32, 32));
+    try std.testing.expect(!ad.fits(ad.ctx, 32, 33));
+    try std.testing.expect(admission(F, .{}, null) == null);
+}
+
+test "context windows: the family default inside the model's, 0 for the model's, never past it" {
+    try std.testing.expectEqual(@as(i64, 16384), try contextWindow(null, 262144, 16384));
+    try std.testing.expectEqual(@as(i64, 4096), try contextWindow(null, 4096, 16384));
+    try std.testing.expectEqual(@as(i64, 262144), try contextWindow(0, 262144, 16384));
+    try std.testing.expectEqual(@as(i64, 65536), try contextWindow(65536, 262144, 16384));
+    try std.testing.expectError(error.PastNative, contextWindow(300000, 262144, 16384));
+    try std.testing.expectError(error.Negative, contextWindow(-5, 262144, 16384));
+    try std.testing.expectError(error.NoNative, contextWindow(0, 0, 16384));
+}
+
 test {
-    _ = windows;
+    _ = family_memory;
     _ = budget; // cuda_memory.zig's own tests, which no other test binary reaches
     _ = refusals;
     _ = lane_backend;
@@ -708,7 +752,6 @@ test {
     _ = cuda_device; // the device and variable tests
     _ = nspill;
     _ = spill_facts;
-    _ = windows;
 }
 
 test "the lane core sees a family's prefill_step through the lane backend, so a served prompt can step" {

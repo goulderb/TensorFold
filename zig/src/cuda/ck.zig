@@ -122,6 +122,7 @@ pub const Ck = struct {
     dense8: [2][8]Function,
     dense8_reduce: Function,
     dense4: [2]Function,
+    dense4_resident: [2]usize,
     row_scales_fn: Function,
     quant8_rows_fn: Function,
     quant8_weight_fn: Function,
@@ -159,6 +160,7 @@ pub const Ck = struct {
                 try c.dense8[j][i].allowDynamicShared(32768);
             }
             c.dense4[j] = try experts_mod.function("tf_ck4_dense_" ++ ep);
+            c.dense4_resident[j] = @max(1, try c.dense4[j].occupancy(128, 0)) * sms;
         }
         c.dense8_reduce = try lane_mod.function("tf_ck8_dense_reduce");
         c.row_scales_fn = try lane_mod.function("tf_ck_row_scales_or_nan");
@@ -270,7 +272,8 @@ pub const Ck = struct {
         for ([_]usize{ rows, w.k, w.n }) |v| a.add(@as(i32, @intCast(v)));
         a.add(out);
         const units = ((rows + 15) / 16) * ((w.n + 63) / 64);
-        try go(c.dense4[@intFromBool(kind == .f32)], s, .{ @max(1, @min((units + 3) / 4, c.resident[1])), 1, 1 }, 128, 0, &a);
+        const ep = @intFromBool(kind == .f32);
+        try go(c.dense4[ep], s, .{ @max(1, @min((units + 3) / 4, c.dense4_resident[ep])), 1, 1 }, 128, 0, &a);
     }
 
     /// bf16 rows [m, k] (`ldx` apart) to e4m3(x / act) at `out` [m, k], in the FP8 weights' fragment order.
@@ -506,4 +509,36 @@ test "native dense refuses invalid buffers before launching and preserves the st
     try std.testing.expectEqualSlices(usize, &.{ 1, 2, 3 }, &Fake.seen);
     try std.testing.expectEqual(@as(i32, 136), Fake.stride);
     try std.testing.expectEqual([3]i32{ 3, 160, 128 }, Fake.dims);
+}
+
+test "dense NVFP4 uses its own epilogue occupancy rather than expert residency" {
+    const abi = @import("abi.zig");
+    const Fake = struct {
+        var calls: usize = 0;
+        var grid: u32 = 0;
+        var block: u32 = 0;
+        fn launch(f: abi.Function, gx: c_uint, _: c_uint, _: c_uint, bx: c_uint, _: c_uint, _: c_uint, _: c_uint, _: abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) abi.Result {
+            calls += 1;
+            if (@intFromPtr(f.?) == 3) {
+                grid = gx;
+                block = bx;
+            }
+            return 0;
+        }
+    };
+    var d: Driver = .{ .lib = undefined, .api = undefined };
+    d.api.cuLaunchKernel = Fake.launch;
+    const s: Stream = .{ .d = &d, .handle = null };
+    var c: Ck = undefined;
+    c.row_scales_fn = .{ .d = &d, .handle = @ptrFromInt(1) };
+    c.quant4_rows_fn = .{ .d = &d, .handle = @ptrFromInt(2) };
+    c.dense4[1] = .{ .d = &d, .handle = @ptrFromInt(3) };
+    c.dense4_resident[1] = 2;
+    const w: Fp4Matrix = .{ .words = 256, .scales = 512, .scale = 0.5, .n = 160, .k = 128, .npad = 256 };
+    const bytes = try workspaceBytes(.nvfp4, 33, 160, 128);
+    Fake.calls = 0;
+    try c.matmul4(s, w, 4096, 136, 33, .{ .ptr = 12288, .bytes = bytes }, 8192, .f32);
+    try std.testing.expectEqual(@as(usize, 3), Fake.calls);
+    try std.testing.expectEqual(@as(u32, 2), Fake.grid);
+    try std.testing.expectEqual(@as(u32, 128), Fake.block);
 }

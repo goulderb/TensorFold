@@ -75,11 +75,14 @@ pub const Library = struct {
     pub fn openPath(path: []const u8) Error!Library {
         var lib = platform.DynLib.open(path) catch return error.LibraryUnavailable;
         errdefer lib.close();
-        var missing: []const u8 = "";
-        const api = lib.resolve(Api, &missing) catch {
-            std.log.err("{s} has no {s}", .{ path, missing });
-            return error.MissingSymbol;
-        };
+        var api: Api = undefined;
+        const info = @typeInfo(Api).@"struct";
+        inline for (info.field_names, info.field_types) |name, T| {
+            @field(api, name) = lib.lookup(T, name) orelse {
+                std.log.err("{s} has no {s}", .{ path, name });
+                return error.MissingSymbol;
+            };
+        }
         return .{ .lib = lib, .api = api };
     }
 

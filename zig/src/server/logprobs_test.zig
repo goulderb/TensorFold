@@ -250,7 +250,7 @@ test "issue 969: a first EOS counts in usage but sends no text and classifies as
     }
 }
 
-fn tokensOf(comptime s: []const u8) [s.len]u32 {
+pub fn tokensOf(comptime s: []const u8) [s.len]u32 {
     var out: [s.len]u32 = undefined;
     for (s, &out) |c, *o| o.* = c;
     return out;

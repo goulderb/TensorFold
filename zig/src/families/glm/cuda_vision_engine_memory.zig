@@ -56,6 +56,12 @@ fn allocate(d: *const cuda.Driver, len: usize) !cuda.DeviceBuffer {
     _ = std.math.add(u64, b.ptr, len) catch return error.InvalidVisionDeviceAllocation;
     return b;
 }
+fn upload(pool: cuda.DeviceBuffer, offset: usize, bytes: []const u8) !void {
+    pool.upload(offset, bytes) catch |err| {
+        cuda.completion.drain(pool.d, .{ .d = pool.d, .handle = null }, "a vision upload's default stream and context did not drain");
+        return err;
+    };
+}
 fn view(pool: cuda.DeviceBuffer, r: Region) !cuda.DeviceBuffer {
     if (r.offset > pool.len or r.len > pool.len - r.offset) return error.InvalidVisionMemoryRegion;
     const ptr = std.math.add(u64, pool.ptr, r.offset) catch return error.InvalidVisionMemoryRegion;
@@ -118,7 +124,7 @@ pub const DeviceWeights = struct {
         for (layout.regions, 0..) |r, i| {
             const converted = try w.converted(a, i);
             defer a.free(converted);
-            try pool.upload(r.offset, std.mem.sliceAsBytes(converted));
+            try upload(pool, r.offset, std.mem.sliceAsBytes(converted));
         }
         return .{ .layout = layout, .pool = pool };
     }
@@ -267,8 +273,8 @@ pub const Activations = struct {
         defer table.deinit(a);
         var pool = try allocate(d, layout.bytes);
         errdefer pool.free();
-        try pool.upload(layout.region(.cosine).offset, std.mem.sliceAsBytes(table.cos));
-        try pool.upload(layout.region(.sine).offset, std.mem.sliceAsBytes(table.sin));
+        try upload(pool, layout.region(.cosine).offset, std.mem.sliceAsBytes(table.cos));
+        try upload(pool, layout.region(.sine).offset, std.mem.sliceAsBytes(table.sin));
         return .{ .layout = layout, .pool = pool };
     }
     pub fn buffer(self: *const Activations, slot: Slot) !cuda.DeviceBuffer {
@@ -281,7 +287,7 @@ pub const Activations = struct {
         const r = self.layout.region(.pixels);
         if (pixels.len != r.len / 4) return error.InvalidVisionGrid;
         for (pixels) |x| if (!std.math.isFinite(x)) return error.NonFiniteVisionPixels;
-        try self.pool.upload(r.offset, std.mem.sliceAsBytes(pixels));
+        try upload(self.pool, r.offset, std.mem.sliceAsBytes(pixels));
         self.pixels_ready = true;
     }
     /// Still-picture groups must share one canvas grid. Validate the whole batch
@@ -299,7 +305,7 @@ pub const Activations = struct {
         var at = self.layout.region(.pixels).offset;
         for (images) |image| {
             const bytes = std.mem.sliceAsBytes(image.pixels);
-            try self.pool.upload(at, bytes);
+            try upload(self.pool, at, bytes);
             at += bytes.len;
         }
         self.pixels_ready = true;

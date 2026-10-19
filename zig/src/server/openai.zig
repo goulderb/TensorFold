@@ -436,15 +436,14 @@ const Run = struct {
     const StreamSink = struct {
         run: *Run,
         tools: bool,
-        prompt_len: usize,
         opened: bool = false,
         pending: std.ArrayList(Value) = .empty, // research progress waits for actual engine admission
 
-        fn begin(ctx: *anyopaque, _: usize) error{Closed}!void {
+        fn begin(ctx: *anyopaque, prompt_len: usize) error{Closed}!void {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
             if (s.opened) return;
             const r = s.run;
-            try r.out.vt.open(r.out.ctx, s.prompt_len);
+            try r.out.vt.open(r.out.ctx, prompt_len);
             s.opened = true;
             if (!s.tools and r.is_chat) try r.emit(r.chunk(roleDelta(r.a) catch return error.Closed, null) catch return error.Closed);
             for (s.pending.items) |delta| try call(ctx, delta);
@@ -519,7 +518,7 @@ const Run = struct {
         };
         var handed = false; // generate gives the preparing count back from here on
         defer if (!handed) chat.release(r.srv, prepared.preparing);
-        var sink_state: StreamSink = .{ .run = r, .tools = tools, .prompt_len = prepared.prompt_len };
+        var sink_state: StreamSink = .{ .run = r, .tools = tools };
         defer sink_state.pending.deinit(a);
         handed = true;
         const sink: chat.Sink = .{ .ctx = &sink_state, .call = StreamSink.call, .begin = StreamSink.begin };
@@ -585,7 +584,7 @@ fn roleDelta(a: Allocator) Allocator.Error!Value {
     return chat.deltaOf(a, "role", "assistant");
 }
 
-test "acceptance opens one public stream and carries the prepared prompt count" {
+test "admission opens one public stream with the admitted prompt count" {
     const Capture = struct {
         opens: usize = 0,
         prompt_len: usize = 0,
@@ -600,9 +599,47 @@ test "acceptance opens one public stream and carries the prepared prompt count" 
     run_.out = .{ .ctx = &capture, .vt = &.{ .open = Capture.open, .event = undefined, .reply = undefined } };
     run_.is_chat = false;
     run_.a = std.testing.allocator;
-    var sink: Run.StreamSink = .{ .run = &run_, .tools = false, .prompt_len = 17 };
-    try Run.StreamSink.accepted(&sink);
-    try Run.StreamSink.accepted(&sink);
+    var sink: Run.StreamSink = .{ .run = &run_, .tools = false };
+    try Run.StreamSink.begin(&sink, 17);
+    try Run.StreamSink.begin(&sink, 19);
     try std.testing.expectEqual(@as(usize, 1), capture.opens);
     try std.testing.expectEqual(@as(usize, 17), capture.prompt_len);
+}
+
+test "progress stays buffered until admission and is flushed once" {
+    const Capture = struct {
+        opens: usize = 0,
+        events: usize = 0,
+        early: bool = false,
+        fn open(ptr: *anyopaque, _: usize) error{Closed}!void {
+            const c: *@This() = @ptrCast(@alignCast(ptr));
+            c.opens += 1;
+        }
+        fn event(ptr: *anyopaque, _: ?Value) error{Closed}!void {
+            const c: *@This() = @ptrCast(@alignCast(ptr));
+            c.early = c.early or c.opens == 0;
+            c.events += 1;
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var capture: Capture = .{};
+    var run_: Run = undefined;
+    run_.out = .{ .ctx = &capture, .vt = &.{ .open = Capture.open, .event = Capture.event, .reply = undefined } };
+    run_.is_chat = false;
+    run_.a = arena.allocator();
+    run_.id = "progress";
+    run_.created = 0;
+    run_.plan.named = "test";
+    var sink: Run.StreamSink = .{ .run = &run_, .tools = false };
+    defer sink.pending.deinit(run_.a);
+    try Run.StreamSink.call(&sink, .{ .string = "research" });
+    try std.testing.expectEqual(@as(usize, 0), capture.events);
+    try std.testing.expectEqual(@as(usize, 1), sink.pending.items.len);
+    try Run.StreamSink.begin(&sink, 17);
+    try Run.StreamSink.begin(&sink, 19);
+    try std.testing.expectEqual(@as(usize, 1), capture.opens);
+    try std.testing.expectEqual(@as(usize, 1), capture.events);
+    try std.testing.expectEqual(@as(usize, 0), sink.pending.items.len);
+    try std.testing.expect(!capture.early);
 }

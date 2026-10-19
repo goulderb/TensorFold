@@ -7,7 +7,7 @@ pub const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[
 const torch_ops = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false" };
 
 /// IEEE division and square root, no contraction or flush: host glue references match bit for bit.
-const glue = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false", "--prec-div=true", "--prec-sqrt=true" };
+pub const glue = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false", "--prec-div=true", "--prec-sqrt=true" };
 
 pub const kernels = [_]Kernel{
     .{ .name = "flashnext_gdn", .flags = &.{ "-O3", "--fmad=false" } }, // qwen4_exp/cuda/gdn.cu chain, one row
@@ -79,6 +79,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "glm_quant", .flags = torch_ops }, // ours: GLM's draft-only weight quantizers, torch at load in the Python family
     .{ .name = "exl3_linear", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/linear.cu's device code, tensorfold_exl3_linear_v5
     .{ .name = "exl3_experts", .flags = &.{ "-O3", "--expt-relaxed-constexpr" } }, // exl3/experts.cu's device code, tensorfold_exl3_experts
+    .{ .name = "exl3_experts_glm", .flags = &.{ "-O3", "--fmad=false" } }, // retained GLM stack/Widths ABI from the fork's exl3.cu path
     .{ .name = "exl3_candidate", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // #806's EXL3 tiles: Dense's candidate
     .{ .name = "glm_vision", .flags = &.{"-O3"} }, // ours: GLM's image tower steps around cuBLASLt (norms, rotary, softmax, merger)
     .{ .name = "glm_vision_ops", .flags = &.{ "-O3", "--fmad=false" } }, // ours: the tower's remaining ops, torch's order

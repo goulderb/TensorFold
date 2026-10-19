@@ -245,15 +245,20 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
     try trail.event(e, &.{ f("ev", trail.str("alloc")), f("plans", .{ .list = rows }) });
 }
 
-/// A family's row policy decides each head window's drafts (lanes/trim.zig); other windows run whole.
+/// A family's row policy decides head drafts and, when opted in, copy prefixes; forced windows run whole.
 fn trimmed(e: *Engine, plans: []Plan, t: trim.Trim) !void {
     const a = e.arena.allocator();
     const asks = try a.alloc(trim.Window, plans.len);
-    for (asks, plans) |*w, p| w.* = .{ .stream = p.stream, .drafted = p.kind == .head, .rows = @intCast(1 + p.count()), .parents = p.parents };
+    for (asks, plans) |*w, p| w.* = .{ .stream = p.stream, .drafted = p.kind == .head, .copied = p.kind == .copy, .rows = @intCast(1 + p.count()), .parents = p.parents };
     const out = try a.alloc(trim.Choice, plans.len);
     for (out, plans) |*o, p| o.* = .{ .count = @intCast(p.count()) };
     try t.choose(asks, e.alone and plans.len == 1, a, out);
     for (plans, out) |*p, c| {
+        if (p.kind == .copy and t.vtable.copy_windows) {
+            if (c.nodes != null) return error.CopyTrimNeedsPrefix;
+            try cut.prefix(a, p, c.count);
+            continue;
+        }
         if (p.kind != .head) continue;
         if (c.nodes) |nodes| {
             if (p.parents == null or p.held > 0) return error.TrimNodesNeedTree;

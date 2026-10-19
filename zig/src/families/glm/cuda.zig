@@ -22,6 +22,8 @@ pub const config = @import("config.zig");
 pub const quant = @import("cuda_quant.zig");
 pub const q4 = @import("cuda_q4.zig");
 pub const ranks = @import("cuda_ranks.zig");
+pub const draft_profile = @import("cuda_draft_profile.zig");
+pub const copy_drafts = @import("cuda_copy_drafts.zig");
 pub const sampler = @import("cuda_sampler.zig");
 pub const engine = @import("cuda_engine.zig");
 pub const follow = @import("cuda_follow.zig");
@@ -63,6 +65,8 @@ test {
     _ = quant;
     _ = q4;
     _ = ranks;
+    _ = draft_profile;
+    _ = copy_drafts;
     _ = sampler;
     _ = engine;
     _ = follow;

@@ -57,7 +57,7 @@ pub const Grouped = struct {
 
     pub fn run(g: *Grouped, s: Stream, epi: experts.Epi, in: experts.Rows, l: experts.Layer, p: grouped.Plan, out: u64, items: usize, skip: i32, _: bool) !void {
         if (epi == .up and g.up_contract != .bf16) return error.UnsupportedEpilogue;
-        const w = l.exl3 orelse return error.BadExperts;
+        const w = l.exl3_common orelse return error.BadExperts;
         if (w.dims != l.dims or w.width != l.width or w.experts != l.experts or l.relu2 or
             in.stride > std.math.maxInt(i32) or in.slots > std.math.maxInt(i32)) return error.BadExperts;
         const up = epi == .up;
@@ -105,7 +105,7 @@ test "Grouped scratch includes every pair and rejects overflowing geometry" {
 
 test "Grouped's bf16 up refuses a call that asks for the combined fp32 activation pipeline" {
     var g: Grouped = .{ .d = undefined, .kernels = undefined, .up_contract = .combined_fp32 };
-    const layer: experts.Layer = .{ .format = .exl3, .up = 0, .down = 0, .dims = 128, .width = 128, .experts = 1 };
+    const layer: experts.Layer = .{ .format = .exl3_common, .up = 0, .down = 0, .dims = 128, .width = 128, .experts = 1 };
     try std.testing.expectError(error.UnsupportedEpilogue, g.run(undefined, .up, undefined, layer, undefined, 0, 0, -1, false));
     g.up_contract = .bf16;
     try std.testing.expectError(error.BadExperts, g.run(undefined, .up, undefined, layer, undefined, 0, 0, -1, false));

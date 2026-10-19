@@ -141,3 +141,27 @@ pub fn fillStreamCommitted(e: *Engine, s: *Stream, first: bool, hook: ?be.Commit
     try openedCommitted(e, s, .rule, hook);
     return true;
 }
+
+pub fn fillBatch(e: *Engine, streams: []const *Stream, out: []be.PrefillOutcome) !void {
+    return fillBatchCommitted(e, streams, out, &.{});
+}
+
+/// A partial-outcome prompt pass, preserving each stream's first-token commit hook.
+pub fn fillBatchCommitted(e: *Engine, streams: []const *Stream, out: []be.PrefillOutcome, hooks: []const be.Committed) !void {
+    if (streams.len != out.len or (hooks.len != 0 and streams.len != hooks.len)) return error.BadPrefillBatch;
+    @memset(out, .skipped);
+    const batch = e.backend.vtable.prefill_batch orelse return;
+    _ = e.arena.reset(.retain_capacity);
+    try batch(e.backend.ptr, streams, out);
+    for (streams, out, 0..) |s, *result, i| {
+        if (result.* == .skipped) continue;
+        try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+        switch (result.*) {
+            .complete => openedCommitted(e, s, .rule, if (hooks.len == 0) null else hooks[i]) catch |err| {
+                result.* = .{ .failed = err };
+            },
+            .failed => |err| if (err == error.Cancelled) e.backend.release(s),
+            .skipped => unreachable,
+        }
+    }
+}

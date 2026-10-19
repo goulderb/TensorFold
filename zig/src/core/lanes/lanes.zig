@@ -55,6 +55,9 @@ test {
     _ = @import("pricing_test.zig");
     _ = @import("fill_test.zig");
     _ = @import("fill_trim_test.zig");
+    _ = @import("copy_trim_test.zig");
+    _ = @import("copy_replay_test.zig");
+    _ = @import("fixed_depth_test.zig");
 }
 
 pub const learned_disk = @import("learned_disk.zig");

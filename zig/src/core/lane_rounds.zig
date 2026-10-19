@@ -41,11 +41,7 @@ pub const Rounds = struct {
 };
 
 /// Makes and frees a request's copy proposer (`prompt` and `eos` outlive it).
-pub const Proposers = struct {
-    ctx: *anyopaque,
-    make: *const fn (ctx: *anyopaque, gpa: Allocator, prompt: []const u32, eos: []const u32) anyerror!lanes.proposer.Proposer,
-    free: *const fn (ctx: *anyopaque, p: lanes.proposer.Proposer) void,
-};
+pub const Proposers = lanes.proposer.Factory;
 
 /// One round under the family's planner; false when it did nothing (nothing to admit, prefill or decode).
 fn round(h: *LaneHost, rd: Rounds) bool {

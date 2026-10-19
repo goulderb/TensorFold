@@ -14,7 +14,10 @@ const glue = nemotron.glue;
 
 /// The K slices the engine cuts a router into: Super's latent router (4,096 inputs) its own, Nano's the glue's.
 fn slices(k: usize) usize {
-    return if (k == 4096) nemotron.latent.routerSlices(k) else glue.routerShape(k).sk;
+    if (comptime @hasDecl(nemotron, "latent")) {
+        if (k == 4096) return nemotron.latent.routerSlices(k);
+    }
+    return glue.routerShape(k).sk;
 }
 
 /// One fma chain a K slice (two a bf16 word pair).
@@ -96,7 +99,13 @@ pub const Logits = struct {
         const t: usize = if (tiles) 128 else 16;
         const grid: cuda.Dim3 = .{ .x = @intCast((d.shape.rows + t - 1) / t), .y = @intCast((d.shape.n + t - 1) / t), .z = @intCast(sk) };
         const f = if (tiles) self.tiles.? else self.f;
-        try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = 256 }, .shared = if (tiles) glue.tiles_shared else glue.routerShared(d.shape.k / sk) }, self.rig.s, &a);
+        const shared = if (comptime @hasDecl(glue, "tiles_shared"))
+            (if (tiles) glue.tiles_shared else glue.routerShared(d.shape.k / sk))
+        else blk: {
+            if (tiles) return error.UnsupportedKernel;
+            break :blk glue.routerShape(d.shape.k).shared;
+        };
+        try cuda.launch.launch(f, .{ .grid = grid, .block = .{ .x = 256 }, .shared = shared }, self.rig.s, &a);
     }
 
     pub fn replaced(self: *Logits) ![]const u8 {
