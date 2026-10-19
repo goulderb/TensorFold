@@ -1,5 +1,10 @@
 # Quantization and transport screens
 
+The user subsequently requested retaining compatible sub-5% gains for a
+combined trial after larger changes. Quantization reuse is now retained in
+the [small-candidate ledger](small-candidate-ledger-20261019.md); the original
+individual-trial decision and measurements below remain historical evidence.
+
 FP8 input-quantization reuse is rejected for integration at the current 5%
 complete-turn materiality gate. All outputs and encoded activations matched,
 but the rotating-eight-bank projection saves only 9.9724 ms per 191-append
