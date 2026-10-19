@@ -105,7 +105,7 @@ fn run(io: std.Io, s: *qwen.Session, input: Input, tokens: []u32, rows: []u16) !
     for (tokens, 0..) |*token, i| {
         @memcpy(rows[i * s.logits.len ..][0..s.logits.len], s.logits);
         const greedy = try argmax(s.logits);
-        token.* = if (i < input.forced.len) input.forced[i] else if (i == 0) input.token else greedy;
+        token.* = if (i < input.forced.len) input.forced[i] else greedy;
         if (i + 1 < tokens.len) try s.append(&.{token.*});
     }
     const end = now(io);
