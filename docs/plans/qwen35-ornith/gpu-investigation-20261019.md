@@ -102,3 +102,18 @@ Five alternating measured pairs then time both real complete turns and fixed
 steps; warmup and correctness capture are excluded. Fixed-step graph timings
 remain distinct from generation throughput. Independent reference-model
 numerical qualification remains open regardless of self-parity or speed.
+
+R3 (`c22bdf7f`) passed: five alternating real greedy pairs give 30.709 to
+44.315 tok/s, with complete-turn medians 6.145 to 4.233 seconds. Every consumed
+BF16 row and generated token matched. Its fixed-step graph median is 18.229 ms
+for the candidate versus 28.336 ms baseline. This is material but short of the
+80 tok/s objective. Nemotron restored at 14:09:03 UTC as PID 2148, fresh READY
+request b0cdfaae-99ca-4421-ade4-051e53cd0867; floor 5356/6103 MiB.
+
+The next isolated kernel change keeps selected IDs locally and unrolls its
+eight slots, instead of consulting global output picks inside every candidate
+scan. Traversal, strict comparison, chosen values and FP32 math stay unchanged.
+Astra's source review identifies the 7168 prior-pick comparisons and repeated
+pointer reads as credible cost, but source alone cannot prove generated load
+counts or their runtime share. Candidate phase profiling now repeats the same
+separate event/control graph protocol to expose the residual route cost.

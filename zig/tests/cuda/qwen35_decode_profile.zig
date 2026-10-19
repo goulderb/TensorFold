@@ -229,6 +229,44 @@ fn generation(init: std.process.Init, s: *qwen.Session, input: Input, j: Journal
     };
 }
 
+fn profilePhases(init: std.process.Init, s: *qwen.Session, baseline: Snapshot, input: Input, position: usize, graphs: []const Captured, hash_buffer: []u8, j: Journal, comptime candidate: bool) !void {
+    const a = init.arena.allocator();
+    const e = s.engine;
+    var taps: [2]Tap = undefined;
+    var phased: [2]Captured = undefined;
+    for (&taps, &phased, 0..) |*tap, *graph, rank| {
+        try e.partitions[rank].context.makeCurrent();
+        tap.* = try Tap.init(a, &e.driver, e.partitions[rank].stream);
+        graph.* = try capture(s, rank, input.token, position, tap);
+    }
+    defer for (&taps, &phased, 0..) |*tap, *g, rank| {
+        e.partitions[rank].context.makeCurrent() catch {};
+        g.exec.deinit();
+        tap.deinit();
+    };
+    for (0..5) |sample| {
+        try baseline.restore(s);
+        const phased_began = now(init.io);
+        for (0..input.repetitions) |_| try step(s, input.token, position, &phased);
+        const phased_elapsed = now(init.io) - phased_began;
+        const digest = try stateHash(s, hash_buffer);
+        try baseline.restore(s);
+        const control_began = now(init.io);
+        for (0..input.repetitions) |_| try step(s, input.token, position, graphs);
+        const control_elapsed = now(init.io) - control_began;
+        const control = try stateHash(s, hash_buffer);
+        if (!std.mem.eql(u8, &digest, &control)) return error.ProfileStateMismatch;
+        try j.write(.{ .kind = if (candidate) "router_profile_turn" else "profile_turn", .sample = sample, .phased_elapsed_ns = phased_elapsed, .control_elapsed_ns = control_elapsed, .steps = input.repetitions });
+        for (taps, 0..) |tap, rank| {
+            try e.partitions[rank].context.makeCurrent();
+            for (1..tap.used) |i| {
+                const stamp = tap.stamps[i];
+                try j.write(.{ .kind = if (candidate) "router_phase" else "phase", .sample = sample, .rank = rank, .layer = stamp.layer, .phase = @tagName(stamp.phase), .ms = try cuda.Event.elapsedMs(tap.stamps[i - 1].event, stamp.event) });
+            }
+        }
+    }
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
@@ -313,39 +351,7 @@ fn execute(init: std.process.Init, model_dir: []const u8, input: Input, j: Journ
         if (!std.mem.eql(u8, &hashes[0], &hashes[1])) return error.GraphStateMismatch;
         try j.write(.{ .kind = "pair_verified", .pair = pair, .exact_state_and_logits = true });
     }
-    var taps: [2]Tap = undefined;
-    var phased: [2]Captured = undefined;
-    for (&taps, &phased, 0..) |*tap, *graph, rank| {
-        try e.partitions[rank].context.makeCurrent();
-        tap.* = try Tap.init(a, &e.driver, e.partitions[rank].stream);
-        graph.* = try capture(&s, rank, input.token, position, tap);
-    }
-    defer for (&taps, &phased, 0..) |*tap, *g, rank| {
-        e.partitions[rank].context.makeCurrent() catch {};
-        g.exec.deinit();
-        tap.deinit();
-    };
-    for (0..5) |sample| {
-        try baseline.restore(&s);
-        const phased_began = now(init.io);
-        for (0..input.repetitions) |_| try step(&s, input.token, position, &phased);
-        const phased_elapsed = now(init.io) - phased_began;
-        const digest = try stateHash(&s, hash_buffer);
-        try baseline.restore(&s);
-        const control_began = now(init.io);
-        for (0..input.repetitions) |_| try step(&s, input.token, position, &graphs);
-        const control_elapsed = now(init.io) - control_began;
-        const control = try stateHash(&s, hash_buffer);
-        if (!std.mem.eql(u8, &digest, &control)) return error.ProfileStateMismatch;
-        try j.write(.{ .kind = "profile_turn", .sample = sample, .phased_elapsed_ns = phased_elapsed, .control_elapsed_ns = control_elapsed, .steps = input.repetitions });
-        for (taps, 0..) |tap, rank| {
-            try e.partitions[rank].context.makeCurrent();
-            for (1..tap.used) |i| {
-                const stamp = tap.stamps[i];
-                try j.write(.{ .kind = "phase", .sample = sample, .rank = rank, .layer = stamp.layer, .phase = @tagName(stamp.phase), .ms = try cuda.Event.elapsedMs(tap.stamps[i - 1].event, stamp.event) });
-            }
-        }
-    }
+    try profilePhases(init, &s, baseline, input, position, &graphs, hash_buffer, j, false);
     try baseline.restore(&s);
     try routeParity(&s, j);
     try baseline.restore(&s);
@@ -376,6 +382,8 @@ fn execute(init: std.process.Init, model_dir: []const u8, input: Input, j: Journ
         if (!std.mem.eql(u8, &digest, &references[15])) return error.CooperativeFinalMismatch;
         try j.write(.{ .kind = "router_turn", .graph = graph_mode == 1, .pair = pair, .order = order, .warmup = pair == 0, .cooperative = candidate, .elapsed_ns = elapsed, .steps = input.repetitions, .exact_state_and_logits = true });
     };
+    routeMode(&s, true);
+    try profilePhases(init, &s, baseline, input, position, &cooperative, hash_buffer, j, true);
     try generation(init, &s, input, j);
     try floor(e);
     try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "fixed-step and synthetic 64/128 greedy router self-parity; independent numerical gate remains open", .production_qualification = false });

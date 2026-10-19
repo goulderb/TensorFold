@@ -152,6 +152,24 @@ if any(row["kind"] == "router_graph_nodes" for row in rows):
         "generation_measured_pairs": 5,
         "production_qualified": False,
     }
+    candidate_phases = [row for row in rows if row["kind"] == "router_phase"]
+    if candidate_phases:
+        assert len(candidate_phases) == len(phase_keys)
+        assert {(r["sample"], r["rank"], r["layer"], r["phase"]) for r in candidate_phases} == phase_keys
+        assert all(math.isfinite(r["ms"]) and r["ms"] >= 0 for r in candidate_phases)
+        candidate_totals = defaultdict(float)
+        for row in candidate_phases:
+            candidate_totals[row["sample"], row["phase"]] += row["ms"]
+        result["router_candidate"]["phases"] = {
+            name: {"median_ms": statistics.median([candidate_totals[s, name] for s in range(5)]),
+                   "range_ms": [min(candidate_totals[s, name] for s in range(5)), max(candidate_totals[s, name] for s in range(5))]}
+            for name in categories
+        }
+        candidate_profile = [row for row in rows if row["kind"] == "router_profile_turn"]
+        assert [r["sample"] for r in candidate_profile] == list(range(5))
+        extra = [r["phased_elapsed_ns"] / r["control_elapsed_ns"] - 1 for r in candidate_profile]
+        result["router_candidate"]["event_instrumentation_overhead_fraction"] = {
+            "median": statistics.median(extra), "range": [min(extra), max(extra)]}
 serialized = json.dumps(result, indent=2) + "\n"
 if args.output:
     args.output.write_text(serialized, encoding="utf-8", newline="\n")

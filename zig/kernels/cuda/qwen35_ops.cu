@@ -234,16 +234,21 @@ extern "C" __global__ void tf_qwen35_route_select(
     __syncthreads();
     if (threadIdx.x != 0) return;
     float chosen[8];
+    int selected[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    #pragma unroll
     for (int slot = 0; slot < 8; ++slot) {
         int best = -1;
         for (int candidate = 0; candidate < 256; ++candidate) {
             bool used = false;
-            for (int prior = 0; prior < slot; ++prior) used |= picks[prior] == candidate;
+            #pragma unroll
+            for (int prior = 0; prior < 8; ++prior) used |= selected[prior] == candidate;
             if (!used && (best < 0 || logits[candidate] > logits[best])) best = candidate;
         }
-        picks[slot] = best;
+        selected[slot] = best;
         chosen[slot] = logits[best];
     }
+    #pragma unroll
+    for (int slot = 0; slot < 8; ++slot) picks[slot] = selected[slot];
     float denominator = 0.0f;
     for (int slot = 0; slot < 8; ++slot) {
         weights[slot] = expf(chosen[slot] - chosen[0]);
