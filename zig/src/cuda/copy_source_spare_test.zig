@@ -15,6 +15,10 @@ const Fake = struct {
     var copies: usize = 0;
     var query_result: abi.Result = 0;
     var sync_result: abi.Result = 0;
+    var bind_result: abi.Result = 0;
+    var syncs: usize = 0;
+    var releases: usize = 0;
+    var destroys: usize = 0;
     var next_event: usize = 1;
     var pending: std.ArrayList(usize) = .empty;
     var flight: std.ArrayList(usize) = .empty;
@@ -65,20 +69,23 @@ const Fake = struct {
         return if (has(&pending, @intFromPtr(e))) abi.error_not_ready else 0;
     }
     fn eventDestroy(_: abi.Event) callconv(.c) abi.Result {
+        destroys += 1;
         return 0;
     }
     fn streamSync(_: abi.Stream) callconv(.c) abi.Result {
         return contextSync();
     }
     fn contextSync() callconv(.c) abi.Result {
+        syncs += 1;
         if (sync_result == 0) complete();
         return sync_result;
     }
     fn release(_: abi.Device) callconv(.c) abi.Result {
+        releases += 1;
         return 0;
     }
     fn bind(_: abi.Context) callconv(.c) abi.Result {
-        return 0;
+        return bind_result;
     }
     fn init() Driver {
         allocs = 0;
@@ -87,6 +94,10 @@ const Fake = struct {
         copies = 0;
         query_result = 0;
         sync_result = 0;
+        bind_result = 0;
+        syncs = 0;
+        releases = 0;
+        destroys = 0;
         complete();
         var d: Driver = undefined;
         d.api.cuMemHostAlloc = hostAlloc;
@@ -202,6 +213,40 @@ test "a context's end and the driver's close free the spares" {
     try t.expect(!source.keepDriver(&d));
     try t.expectEqual(@as(usize, 0), source.spareCount());
     try t.expectEqual(Fake.allocs, Fake.frees);
+}
+
+test "failed context binding retains its spare buffers and context until teardown can retry" {
+    var d = Fake.init();
+    spares();
+    defer settle(&d);
+    defer source.setCurrent(null);
+    const owner: abi.Context = @ptrFromInt(10);
+    const other: abi.Context = @ptrFromInt(9);
+    source.setCurrent(owner);
+    const stream: streams.Stream = .{ .d = &d, .handle = @ptrFromInt(2) };
+    try source.enqueue(&d, 256, &@as([16]u8, @splat(3)), stream);
+    try source.synchronizeStream(&d, stream.handle);
+    try t.expectEqual(@as(usize, 1), source.spareCount());
+    const syncs = Fake.syncs;
+    source.setCurrent(other);
+    Fake.bind_result = abi.error_not_ready;
+    var ctx: Context = .{ .d = &d, .device = 3, .handle = owner, .device_ordinal = 3 };
+    ctx.deinit();
+    try t.expectEqual(syncs, Fake.syncs);
+    try t.expectEqual(@as(usize, 0), Fake.releases);
+    try t.expectEqual(@as(usize, 0), Fake.destroys);
+    try t.expectEqual(@as(usize, 0), Fake.frees);
+    try t.expectEqual(@as(usize, 1), source.spareCount());
+    try t.expectEqual(other, source.current());
+    try t.expectEqual(owner, ctx.handle);
+    try t.expectEqual(@as(abi.Device, 3), ctx.device);
+    Fake.bind_result = 0;
+    ctx.deinit();
+    try t.expectEqual(syncs + 1, Fake.syncs);
+    try t.expectEqual(@as(usize, 1), Fake.releases);
+    try t.expectEqual(@as(usize, 1), Fake.destroys);
+    try t.expectEqual(Fake.allocs, Fake.frees);
+    try t.expectEqual(@as(usize, 0), source.spareCount());
 }
 
 test "spares count against the copy-source bound and give way to a new stage" {
