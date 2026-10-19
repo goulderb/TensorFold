@@ -22,11 +22,12 @@ class AnalyzerTests(unittest.TestCase):
                    "plan": {"source_commit": source}, "restoration": {"passed": True, "clef_unchanged": True}}
         (self.window / "window.json").write_text(json.dumps(receipt))
         p, n = 64, 128
-        input_bytes = json.dumps({"prompt": list(range(p)), "output_tokens": n, "context": 4096, "cut": 20, "forced": []}).encode()
+        input_bytes = json.dumps({"prompt": list(range(p)), "output_tokens": n, "context": 4096, "cut": 20, "forced": [], "verify_default_policy": True}).encode()
         (self.window / "profile-input.json").write_bytes(input_bytes)
         (self.window / "plan.json").write_text(json.dumps({"source_commit": source, "experiments": [{"name": "profile", "input_sha256": hashlib.sha256(input_bytes).hexdigest()}]}))
         start = {"kind": "start", "source_commit": source, "implementation": "shared-qwen-engine", "identities": identity,
-                 "context": 4096, "cut": 20, "prompt_tokens": p, "output_tokens": n}
+                 "context": 4096, "cut": 20, "prompt_tokens": p, "output_tokens": n,
+                 "default_policies": {"enabled": True, "expert_up_n8": True, "gdn_layout": "key_value", "verify_expert_graphs": True, "verify_gdn_graphs": True}}
         data = bytearray()
         for i in range(n):
             row = bytearray(analyzer.VOCAB * 2)
@@ -46,11 +47,15 @@ class AnalyzerTests(unittest.TestCase):
                 rows.append({"kind": "turn", "pair": pair, "order": order, "warmup": pair == 0, "arm": arm, "graph": graph,
                              "times": times, "elapsed_ns": 12800, "steps": appends, "graph_launches": 2 * appends if graph else 0,
                              "graph_nodes": 983, "position": appends, "exact_rows_tokens_and_final_state": True,
-                             "consumed_logits_sha256": sha, "persistent_state_sha256": state, "tokens": list(range(n))})
+                             "consumed_logits_sha256": sha, "persistent_state_sha256": state, "tokens": list(range(n)),
+                             "default_policies": {"expert_up_n8": True, "gdn_layout": "key_value", "verify_expert_graphs": True, "verify_gdn_graphs": True,
+                                                  "graph_verifiers": [{"rank": rank, "expert_baseline_nodes": 0, "expert_n8_nodes": 40 if graph else 0,
+                                                                       "gdn_baseline_nodes": 0, "gdn_candidate_nodes": 30 if graph else 0} for rank in range(2)]}})
         rows.extend([{"kind": "controls", "all_consumed_rows_equal": True, "changing_tokens_and_positions": True,
                       "interleaved_session_isolation": True, "reset": True, "partial_stage_failure_poison": True, "uncommitted_lengths": True},
                      {"kind": "phase", "rank": 0, "layer": 0, "phase": "gemm", "elapsed_ms": 1.0, "captured": False, "instrumented": True},
-                     {"kind": "complete", "correctness_pass": True, "production_qualification": False}])
+                     {"kind": "complete", "correctness_pass": True, "production_qualification": False,
+                      "default_policies": {"graph_verifiers": [{"rank": rank, "expert_baseline_nodes": 0, "expert_n8_nodes": 40, "gdn_baseline_nodes": 0, "gdn_candidate_nodes": 30} for rank in range(2)]}}])
         self.rows = rows
         self.save()
 
@@ -133,6 +138,17 @@ class AnalyzerTests(unittest.TestCase):
 
     def test_rejects_greedy_token_not_argmax(self):
         self.reject(lambda: next(r for r in self.rows if r.get("kind") == "turn").update(tokens=[127] + list(range(1, 128))))
+
+    def test_rejects_default_policy_not_initialized(self):
+        self.reject(lambda: next(r for r in self.rows if r.get("kind") == "start")["default_policies"].update(expert_up_n8=False))
+
+    def test_rejects_missing_default_capture_counter(self):
+        entry = next(r for r in self.rows if r.get("kind") == "turn" and r.get("arm") == "graph")["default_policies"]["graph_verifiers"][0]
+        self.reject(lambda: entry.pop("expert_n8_nodes"))
+
+    def test_rejects_wrong_default_function_arm(self):
+        entry = next(r for r in self.rows if r.get("kind") == "turn" and r.get("arm") == "graph")["default_policies"]["graph_verifiers"][0]
+        self.reject(lambda: entry.update(expert_baseline_nodes=20))
 
 
 if __name__ == "__main__":

@@ -20,6 +20,32 @@ def read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def verify_default_policies(profile_input, start, turns, complete):
+    if profile_input.get("verify_default_policy", False) is not True:
+        return
+    initial = start.get("default_policies")
+    require(isinstance(initial, dict) and all(initial.get(k) is True for k in ("enabled", "expert_up_n8", "verify_expert_graphs", "verify_gdn_graphs")) and initial.get("gdn_layout") == "key_value", "default HF policy was not initialized before session profiling")
+    final_counts = None
+    for turn in turns:
+        policy = turn.get("default_policies")
+        require(isinstance(policy, dict) and all(policy.get(k) is True for k in ("expert_up_n8", "verify_expert_graphs", "verify_gdn_graphs")) and policy.get("gdn_layout") == "key_value", "default policy binding missing from profile turn")
+        ranks = policy.get("graph_verifiers")
+        require(isinstance(ranks, list) and [entry.get("rank") for entry in ranks if isinstance(entry, dict)] == [0, 1], "default graph verifier rank bindings missing")
+        for entry in ranks:
+            counts = [entry.get(k) for k in ("expert_baseline_nodes", "expert_n8_nodes", "gdn_baseline_nodes", "gdn_candidate_nodes")]
+            require(all(type(v) is int and v >= 0 for v in counts), "default graph verifier counts missing or invalid")
+            expert_base, expert_n8, gdn_base, gdn_candidate = counts
+            require(expert_base == 0 and expert_n8 % 20 == 0, "captured expert graph did not bind N8 for every 20-layer graph")
+            require(gdn_base == 0 and gdn_candidate % 15 == 0, "captured GDN graph did not bind key/value for every 15-node graph")
+            require(expert_n8 // 20 == gdn_candidate // 15, "expert and GDN verifier graph multiplicities differ")
+            if turn["arm"] == "graph":
+                require(expert_n8 > 0 and gdn_candidate > 0, "captured graph turn verified no default-policy nodes")
+        if turn["arm"] == "graph":
+            final_counts = ranks
+    completion = complete.get("default_policies")
+    require(isinstance(completion, dict) and completion.get("graph_verifiers") == final_counts, "completion default graph counters missing or stale")
+
+
 def analyze(window, require_greedy=False):
     receipt = read_json(window / "window.json")
     plan = read_json(window / "plan.json")
@@ -67,6 +93,7 @@ def analyze(window, require_greedy=False):
     turns = [r for r in rows if r.get("kind") == "turn"]
     require(len(turns) == 12, "expected 6 eager/captured pairs")
     turns.sort(key=lambda r: (r["pair"], r["order"]))
+    verify_default_policies(profile_input, start, turns, complete)
     expected_state = None
     logits_path = window / "profile-results" / "consumed-logits.bf16"
     raw_size = logits_path.stat().st_size

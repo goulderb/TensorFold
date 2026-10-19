@@ -33,6 +33,7 @@ const Input = struct {
     expert_n8_ab: bool = false,
     quant_reuse_screen: bool = false,
     transport_screen: bool = false,
+    verify_default_policy: bool = false,
 };
 const Journal = struct {
     a: std.mem.Allocator,
@@ -67,6 +68,7 @@ fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     if (input.gdn_layout_ab and input.expert_n8_ab) return error.InvalidInput;
     if ((input.gdn_layout_ab or input.expert_n8_ab) and (input.expert_fixture != null or input.gdn_layout_screen or input.quant_reuse_screen or input.transport_screen or input.forced.len != 0)) return error.InvalidInput;
     if (input.expert_n8_screen and (input.expert_fixture == null or input.gdn_layout_screen)) return error.InvalidInput;
+    if (input.verify_default_policy and (input.gdn_layout_ab or input.expert_n8_ab or input.expert_fixture != null or input.gdn_layout_screen or input.quant_reuse_screen or input.transport_screen or input.forced.len != 0)) return error.InvalidInput;
     if ((input.expert_fixture == null) != (input.expert_fixture_sha256 == null)) return error.InvalidExpertFixture;
     if (input.expert_fixture_sha256) |sha| {
         if (sha.len != 64) return error.InvalidExpertFixture;
@@ -410,8 +412,8 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
     };
     const single_gpu_micro = input.expert_fixture != null or input.gdn_layout_screen or input.quant_reuse_screen;
     const micro = single_gpu_micro or input.transport_screen;
-    try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = if (micro) "isolated Qwen operator screens; no model load or model throughput claim" else "changing-token changing-position eager and captured shared Qwen forwards", .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
     if (micro) {
+        try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = "isolated Qwen operator screens; no model load or model throughput claim", .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
         if (input.transport_screen) try transport_screen.run(init.gpa, init.io, .{ identities[0].ordinal, identities[1].ordinal }, j);
         if (single_gpu_micro) for (identities) |identity| {
             var driver = try cuda.Driver.open();
@@ -430,9 +432,22 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
     }
     const c = try qwen.Engine.open(init.gpa, init.io, dir, .{ .context = input.context, .cut = input.cut, .captured = !input.gdn_layout_ab and !input.expert_n8_ab });
     defer c.deinit();
-    if (input.gdn_layout_ab or input.expert_n8_ab) return trialAB(init, c, input, output, j, if (input.expert_n8_ab) .expert_n8 else .gdn_layout);
+    if (input.gdn_layout_ab or input.expert_n8_ab) {
+        try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = "changing-token changing-position eager and captured shared Qwen forwards", .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
+        return trialAB(init, c, input, output, j, if (input.expert_n8_ab) .expert_n8 else .gdn_layout);
+    }
+    if (input.verify_default_policy) for (c.partitions) |*p| {
+        if (!p.engine.expert_up_n8) return error.DefaultExpertN8PolicyMismatch;
+        p.engine.verify_expert_graphs = true;
+        p.engine.verify_gdn_graphs = true;
+    };
     var s = try c.createSession();
     defer s.deinit();
+    if (input.verify_default_policy) for (s.caches) |cache| {
+        if (cache.gdn_layout != .key_value) return error.DefaultGdnLayoutPolicyMismatch;
+    };
+    try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = "changing-token changing-position eager and captured shared Qwen forwards", .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut,
+        .default_policies = if (input.verify_default_policy) .{ .enabled = true, .expert_up_n8 = c.partitions[0].engine.expert_up_n8, .gdn_layout = @tagName(s.caches[0].gdn_layout), .verify_expert_graphs = c.partitions[0].engine.verify_expert_graphs, .verify_gdn_graphs = c.partitions[0].engine.verify_gdn_graphs } else null });
     const tokens = try a.alloc(u32, input.output_tokens);
     const expected_tokens = try a.alloc(u32, input.output_tokens);
     const rows = try a.alloc(u16, input.output_tokens * s.logits.len);
@@ -456,7 +471,8 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
             try j.write(.{ .kind = "memory", .pair = pair, .order = order, .rank = rank, .free_bytes = (try p.context.memInfo()).free, .floor_bytes = qwen.floor_bytes });
         }
         if (graph and launches != 2 * timing.appends) return error.GraphWorkCountMismatch;
-        try j.write(.{ .kind = "turn", .pair = pair, .order = order, .warmup = pair == 0, .arm = if (graph) "graph" else "eager", .graph = graph, .times = timing, .elapsed_ns = timing.elapsed_ns, .steps = timing.appends, .graph_launches = launches, .graph_nodes = nodes, .position = s.position, .exact_rows_tokens_and_final_state = true, .consumed_logits_sha256 = &expected_hash, .persistent_state_sha256 = &state, .tokens = tokens });
+        try j.write(.{ .kind = "turn", .pair = pair, .order = order, .warmup = pair == 0, .arm = if (graph) "graph" else "eager", .graph = graph, .times = timing, .elapsed_ns = timing.elapsed_ns, .steps = timing.appends, .graph_launches = launches, .graph_nodes = nodes, .position = s.position, .exact_rows_tokens_and_final_state = true, .consumed_logits_sha256 = &expected_hash, .persistent_state_sha256 = &state, .tokens = tokens,
+            .default_policies = if (input.verify_default_policy) .{ .expert_up_n8 = c.partitions[0].engine.expert_up_n8, .gdn_layout = @tagName(s.caches[0].gdn_layout), .verify_expert_graphs = c.partitions[0].engine.verify_expert_graphs, .verify_gdn_graphs = c.partitions[0].engine.verify_gdn_graphs, .graph_verifiers = .{ .{ .rank = 0, .expert_baseline_nodes = c.partitions[0].engine.expert_graph_nodes_baseline, .expert_n8_nodes = c.partitions[0].engine.expert_graph_nodes_n8, .gdn_baseline_nodes = c.partitions[0].engine.gdn_graph_nodes_baseline, .gdn_candidate_nodes = c.partitions[0].engine.gdn_graph_nodes_candidate }, .{ .rank = 1, .expert_baseline_nodes = c.partitions[1].engine.expert_graph_nodes_baseline, .expert_n8_nodes = c.partitions[1].engine.expert_graph_nodes_n8, .gdn_baseline_nodes = c.partitions[1].engine.gdn_graph_nodes_baseline, .gdn_candidate_nodes = c.partitions[1].engine.gdn_graph_nodes_candidate } } } else null });
     };
     var peer = try c.createSession();
     defer peer.deinit();
@@ -478,5 +494,6 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
     if (!std.mem.eql(u16, rows, expected_rows)) return error.PoisonResetMismatch;
     try j.write(.{ .kind = "controls", .all_consumed_rows_equal = true, .changing_tokens_and_positions = true, .interleaved_session_isolation = true, .reset = true, .partial_stage_failure_poison = true, .uncommitted_lengths = true });
     try trace(init, &s, input, j);
-    try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "shared engine eager/captured parity and session controls", .production_qualification = false, .independent_reference_parity = "not checked by this executable" });
+    try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "shared engine eager/captured parity and session controls", .production_qualification = false, .independent_reference_parity = "not checked by this executable",
+        .default_policies = if (input.verify_default_policy) .{ .expert_up_n8 = c.partitions[0].engine.expert_up_n8, .gdn_layout = @tagName(s.caches[0].gdn_layout), .verify_expert_graphs = c.partitions[0].engine.verify_expert_graphs, .verify_gdn_graphs = c.partitions[0].engine.verify_gdn_graphs, .graph_verifiers = .{ .{ .rank = 0, .expert_baseline_nodes = c.partitions[0].engine.expert_graph_nodes_baseline, .expert_n8_nodes = c.partitions[0].engine.expert_graph_nodes_n8, .gdn_baseline_nodes = c.partitions[0].engine.gdn_graph_nodes_baseline, .gdn_candidate_nodes = c.partitions[0].engine.gdn_graph_nodes_candidate }, .{ .rank = 1, .expert_baseline_nodes = c.partitions[1].engine.expert_graph_nodes_baseline, .expert_n8_nodes = c.partitions[1].engine.expert_graph_nodes_n8, .gdn_baseline_nodes = c.partitions[1].engine.gdn_graph_nodes_baseline, .gdn_candidate_nodes = c.partitions[1].engine.gdn_graph_nodes_candidate } } } else null });
 }
