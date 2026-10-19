@@ -143,6 +143,52 @@ The opt-in shared-policy extension preserves existing head-only callers.
 No Python donor code executes in the native engine. This adaptation is not a
 new authorship claim, graph-execution equivalence, or GPU qualification.
 
+## Partial GLM target graphs (2026-10-19)
+
+The opt-in native FFN-site graph bank uses upstream TensorFold's `cuda.graph`
+wrapper and the retained GLM HC/router/expert/collective path credited above.
+Local changes extract that stable site, manage graph lifetime by engine-owned
+scratch/layer/exact rows, and add paired failure handling and replay proofs.
+The partial predecessor used pinned production `verify.py`, `segments.py` and
+`forward.py` as design references only. The full target port below subsequently
+adapts segmented kernels and metadata. Existing Ash Hart/TensorFold, Mia, wojo
+and transitive credits remain; neither path is a new authorship claim for their
+arithmetic or a GPU qualification.
+
+## Complete GLM target-forward graph port (2026-10-19)
+
+The native full-target port follows the production image pinned above and adapts
+its segmented KDA prep/recurrence orchestration in `zig/kernels/cuda/glm_kda.cu`.
+The exact donor `families/glm5_next/cuda/kda.cu` SHA256 is
+`f74056a38e6f18a5d1995cf994e0f3e0231b24a530da827a350f221aedfbdafc`.
+Local changes load absolute per-sequence state/replay pointers from staged device
+tables and preserve the retained native FP32 convolution weights and update4
+arithmetic, rather than imposing the production contiguous-arena layout.
+
+`glm_target_dsa.cu` and the native target adapters extend the retained GLM latent,
+index, selection and attention arithmetic with per-row device metadata. The
+production segmented math and sharded query/owner protocol are references from
+`latent.py` (SHA256
+`73edd5297525ee5fc457c04e4e622e0413b17666c194427d9ddb993e0ce000e6`),
+`sparse.py` (`80b8de2c2aaccc3c128fdaf65d83b25f66973bb76b58693f2d95b399b723d1cd`)
+and `shard.py` (`204577f02fb60dd8a9fb724ed5818dc256415c8c79aa4091daa44ada0386fdd1`).
+The native port uses fixed NCCL collectives and byte-preserving device owner
+selection; it does not import RoCEnante/b12x transport or the TP3-only
+`seg_chunks.cu` specialization as a TP2 implementation.
+
+Original production-lineage legal documents are retained unmodified at
+[mia-b5808ac6](mia-b5808ac6/NOTICE) and [wojo-7fac72b3](wojo-7fac72b3/NOTICE),
+including each revision's LICENSE, CREDITS.md and exact source/hash manifest.
+These identify legal lineage, not a claim that an image file equals an entire
+Git revision. Keep the upstream TensorFold/Ash Hart, MiaAI-Lab, Robert
+Wojciechowski and all retained transitive credits. No model weights, model
+licenses or permission to publish are supplied by this source adaptation.
+
+The engine-owned tables, stable aggregate-row scratch, full-forward graph
+lifecycle, paired failure handling and eager/segmented/replay probes are local
+integration changes. Arithmetic, output parity, graph memory, cache/spill/vision
+and full-model performance require their own device qualification.
+
 ## The shared spill tier and Nemotron adapters
 
 `zig/src/core/spill.zig` and `docs/spill-tier.md` identify the GLM spill tier

@@ -22,6 +22,8 @@ const vision_binding = @import("cuda_vision_binding.zig");
 const taps = @import("cuda_taps.zig");
 const mia = @import("cuda_experts_mia.zig");
 const route_trace = @import("cuda_route_trace.zig");
+const target_graph = @import("cuda_target_graph.zig");
+const target_forward = @import("cuda_target_forward.zig");
 
 test {
     _ = taps;
@@ -216,6 +218,10 @@ pub const Forward = struct {
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
     vision: ?@import("cuda_vision_binding.zig").Binding = null,
     route_trace: ?*route_trace.Trace = null,
+    target_graphs: ?*target_graph.Bank = null,
+    full_target: ?*target_forward.Runtime = null,
+    target_buffer: target_graph.Buffer = .lone,
+    target_failure: *const fn (anyerror) void = @import("cuda_kv_owner.zig").failPair,
 
     pub fn set(f: *const Forward) glue.Set {
         return .{ .glue = &f.m.glue, .linear = f.linear(), .copy_rows = f.m.copy_rows, .exlr8_dense = if (f.m.source_dense) |*d| d else null, .source_upcast = f.m.source_upcast, .attn_fp8load = f.attn_fp8load };
@@ -532,18 +538,79 @@ pub const Forward = struct {
         }
     }
 
+    fn beginRows(f: *const Forward, rows: usize) !void {
+        for (f.ranks) |r| {
+            if (rows == 0 or rows > r.b.rows) return error.BadWindow;
+            if (r.segs.len == 0) {
+                if (r.st.pos > r.st.capacity or rows > r.st.capacity - r.st.pos) return error.PastCapacity;
+                r.st.pending = rows;
+                r.st.prompt = r.b.prefill;
+            } else try shared.begin(r, rows);
+        }
+    }
+
+    /// All request-dependent host work stays outside the complete target graph.
+    pub fn prepareTarget(f: *const Forward, ids: []const i32) !void {
+        try f.beginRows(ids.len);
+        for (f.ranks) |r| {
+            try cuda.copy_source.enqueue(f.d, r.b.ids, std.mem.sliceAsBytes(ids), f.stream);
+            if (f.vision) |binding| {
+                const target: vision_binding.Target = .{
+                    .stream = f.stream,
+                    .context = binding.owner.context,
+                    .embedding = .{ .d = f.d, .ptr = r.b.x, .len = r.b.rows * 4 * r.w.config.hidden * 2, .borrowed = true },
+                    .start = r.st.pos,
+                    .capacity = vision_binding.logicalCapacity(r.st.capacity),
+                    .window = r.b.rows,
+                    .vocab = r.w.config.vocab,
+                    .world = @intCast(r.w.share.world),
+                    .rank = @intCast(r.w.share.rank),
+                };
+                const plan = try vision_binding.plan(binding, target, ids);
+                try vision_binding.checkContext(f.stream, target.context);
+                // Feature injection belongs to eager prompt admission, not a target verification window.
+                if (plan.count != 0) return error.TargetGraphContainsVisionPrompt;
+            }
+        }
+    }
+
+    /// Embedding, every target layer and the head, with no sequence-dependent host selection.
+    pub fn computeTarget(f: *const Forward, runtime: *target_forward.Runtime, rows: usize) !void {
+        const c = &f.ranks[0].w.config;
+        for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, rows, c.hidden, c.hc);
+        var ki: usize = 0;
+        var di: usize = 0;
+        for (f.ranks[0].w.layers, 0..) |layer, index| {
+            for (f.ranks) |r| {
+                try f.pre(r, layer.attn_hc, layer.in_norm, rows);
+                switch (layer.mixer) {
+                    .kda => |k| try runtime.kda(f.set(), f.stream, r.b, k, ki, rows, slot(r, rows), f.kda_wide),
+                    .mla => |a| try runtime.dsa(f.set(), f.stream, f.exchange, r.b, a, di, rows, slot(r, rows)),
+                }
+            }
+            try f.gather(rows);
+            try f.ffnSite(index, rows);
+            switch (layer.mixer) {
+                .kda => ki += 1,
+                .mla => di += 1,
+            }
+        }
+        for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, rows, c.hidden, c.hc);
+        try f.finish(rows);
+    }
+
     /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.
     pub fn run(f: *const Forward, ids: []const i32) !void {
-        const R = ids.len;
-        for (f.ranks) |r| {
-            if (R == 0 or R > r.b.rows) return error.BadWindow;
-            if (r.segs.len == 0) {
-                if (r.st.pos + R > r.st.capacity) return error.PastCapacity;
-                r.st.pending = R;
-                r.st.prompt = r.b.prefill;
-            } else try shared.begin(r, R);
-            try f.d.check(f.d.api.cuMemcpyHtoDAsync_v2(r.b.ids, ids.ptr, R * 4, f.stream.handle), "cuMemcpyHtoDAsync");
+        if (f.full_target) |runtime| {
+            runtime.run(f, ids) catch |err| {
+                f.target_failure(err);
+                return err;
+            };
+            return;
         }
+        const R = ids.len;
+        try f.beginRows(R);
+        for (f.ranks) |r| try f.d.check(f.d.api.cuMemcpyHtoDAsync_v2(r.b.ids, ids.ptr, R * 4, f.stream.handle), "cuMemcpyHtoDAsync");
         const c = &f.ranks[0].w.config;
         for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
         if (f.vision) |binding| for (f.ranks) |r| try vision_binding.inject(binding, .{
@@ -576,27 +643,46 @@ pub const Forward = struct {
                 if (r.segs.len > 0) try shared.mixer(f, r, l, li, di, R, slot(r, R)) else try f.mixer(r, l, li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
             }
             try f.gather(R);
-            for (f.ranks) |r| {
-                const l = r.w.layers[j];
-                try f.post(r, R);
-                try f.pre(r, l.ffn_hc, l.post_norm, R);
-                try f.ffn(r, l, R, slot(r, R));
-                if (f.route_trace) |trace| switch (l.ffn) {
-                    .moe => |m| try trace.capture(f.stream, j, m.count, m.top_k, r.b.moe.plan),
-                    .dense => {},
-                };
-            }
-            try f.gather(R);
-            for (f.ranks) |r| {
-                try f.post(r, R);
-                try f.captureTap(r, j, 0, R);
-            }
+            try f.ffnLayer(j, R);
             switch (f.ranks[0].w.layers[j].mixer) {
                 .kda => li += 1,
                 .mla => di += 1,
             }
         }
         for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, R, c.hidden, c.hc);
+    }
+
+    fn ffnLayer(f: *const Forward, layer: usize, rows: usize) !void {
+        if (f.target_graphs) |bank| {
+            if (!f.ranks[0].b.prefill and f.route_trace == null and rows <= target_graph.max_rows) {
+                bank.run(f.stream, .{ .buffer = f.target_buffer, .layer = layer, .rows = rows }, f, ffnSite) catch |err| {
+                    // A peer may already be capturing or replaying NCCL. Never fall back on just this rank.
+                    f.target_failure(err);
+                    return err;
+                };
+                return;
+            }
+        }
+        try f.ffnSite(layer, rows);
+    }
+
+    /// Only engine-owned scratch and fixed weights: no sequence pointers, positions, parities or KV extents.
+    fn ffnSite(f: *const Forward, layer: usize, rows: usize) !void {
+        for (f.ranks) |r| {
+            const l = r.w.layers[layer];
+            try f.post(r, rows);
+            try f.pre(r, l.ffn_hc, l.post_norm, rows);
+            try f.ffn(r, l, rows, slot(r, rows));
+            if (f.route_trace) |trace| switch (l.ffn) {
+                .moe => |m| try trace.capture(f.stream, layer, m.count, m.top_k, r.b.moe.plan),
+                .dense => {},
+            };
+        }
+        try f.gather(rows);
+        for (f.ranks) |r| {
+            try f.post(r, rows);
+            try f.captureTap(r, layer, 0, rows);
+        }
     }
 
     fn captureTap(f: *const Forward, r: Rank, layer: usize, lo: usize, hi: usize) !void {

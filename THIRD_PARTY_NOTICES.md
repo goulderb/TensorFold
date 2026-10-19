@@ -9,7 +9,12 @@ in [LICENSES/donors/README.md](LICENSES/donors/README.md). These supplement the
 upstream credits below. No model weights are included. The local GLM copy
 proposer and production row-policy adaptation follow pinned TensorFold Python
 production sources; their exact image/file provenance and local changes are
-recorded in that addendum. Existing notices and transitive credits still apply.
+recorded in that addendum. The target-graph paths reuse upstream CUDA graph
+ownership and retained native arithmetic. The full-forward port additionally
+adapts production segmented KDA orchestration and extends native DSA arithmetic
+with staged metadata and fixed owner communication. Exact donor image/file pins,
+local changes and original production-lineage legal documents are retained in
+LICENSES/donors/. Existing notices and transitive credits still apply.
 
 TensorFold uses [MLX](https://github.com/ml-explore/mlx) and
 [mlx-lm](https://github.com/ml-explore/mlx-lm), MIT License, Copyright © 2023 Apple Inc.
