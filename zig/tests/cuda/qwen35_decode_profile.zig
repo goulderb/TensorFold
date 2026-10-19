@@ -14,6 +14,8 @@ const prefill_screen = @import("qwen35_prefill_screen.zig");
 const operator_suite = @import("qwen35_operator_suite.zig");
 const mma_capture_screen = @import("qwen35_mma_capture_screen.zig");
 const ck_stage_screen = @import("qwen35_ck_stage_screen.zig");
+const slice_major_input = @import("qwen35_slice_major_input.zig");
+const slice_major_screen = @import("qwen35_slice_major_screen.zig");
 
 comptime {
     if (options.engine_optimization != .fast) @compileError("diagnostics require ReleaseFast engine");
@@ -45,6 +47,7 @@ const Input = struct {
     prefill_ab: bool = false,
     combined_ab: bool = false,
     operator_suite: ?operator_suite.Suite = null,
+    slice_major_screen: ?slice_major_input.Screen = null,
 };
 const Journal = struct {
     a: std.mem.Allocator,
@@ -90,6 +93,7 @@ fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     try expert_latency_screen.validateInput(input);
     try prefill_screen.validateInput(input);
     try operator_suite.validateInput(input);
+    try slice_major_input.validateInput(input);
     if ((input.prefill_ab or input.combined_ab) and (input.prompt.len != 64 or input.output_tokens != 128 or input.context != 4096 or input.cut != 20)) return error.InvalidInput;
     if (input.router_screen or input.router_candidate) return error.ArchivedDiagnosticMode;
     if (input.gdn_layout_ab and input.expert_n8_ab) return error.InvalidInput;
@@ -669,10 +673,10 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
         defer driver.close();
         break :blk try admitted.verify(a, &driver);
     };
-    const single_gpu_micro = input.expert_fixture != null or input.gdn_layout_screen or input.quant_reuse_screen or input.prefill_operator_screen or input.operator_suite != null;
+    const single_gpu_micro = input.expert_fixture != null or input.gdn_layout_screen or input.quant_reuse_screen or input.prefill_operator_screen or input.operator_suite != null or input.slice_major_screen != null;
     const micro = single_gpu_micro or input.transport_screen;
     if (micro) {
-        try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = if (input.operator_suite != null) "isolated CK pipeline and FP8 intermediate screens; no complete model load or model throughput claim" else if (input.prefill_operator_screen) "isolated partial-checkpoint prefill operators; no complete model load or model throughput claim" else "isolated Qwen operator screens; no model load or model throughput claim", .driver_kind = "qwen35-decode-profile", .expert_shard_screen = input.expert_shard_screen, .expert_latency_screen = input.expert_latency_screen, .prefill_operator_screen = input.prefill_operator_screen, .operator_suite = input.operator_suite, .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
+        try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = if (input.slice_major_screen != null) "isolated slice-major expert-up screen; no model throughput claim" else if (input.operator_suite != null) "isolated CK pipeline and FP8 intermediate screens; no complete model load or model throughput claim" else if (input.prefill_operator_screen) "isolated partial-checkpoint prefill operators; no complete model load or model throughput claim" else "isolated Qwen operator screens; no model load or model throughput claim", .driver_kind = "qwen35-decode-profile", .expert_shard_screen = input.expert_shard_screen, .expert_latency_screen = input.expert_latency_screen, .prefill_operator_screen = input.prefill_operator_screen, .operator_suite = input.operator_suite, .slice_major_screen = input.slice_major_screen, .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
         if (input.transport_screen) try transport_screen.run(init.gpa, init.io, .{ identities[0].ordinal, identities[1].ordinal }, j);
         if (single_gpu_micro) for (identities) |identity| {
             var driver = try cuda.Driver.open();
@@ -690,6 +694,7 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
                 try ck_stage_screen.run(gpu, dir, suite.stage3.path, suite.stage3.sha256, j);
                 try mma_capture_screen.run(gpu, suite.mma.fixture, suite.mma.fixture_sha256, suite.mma.image, suite.mma.image_sha256, j);
             }
+            if (input.slice_major_screen) |screen| try slice_major_screen.run(gpu, screen.fixture, screen.fixture_sha256, screen.image, screen.image_sha256, j);
         };
         try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "isolated operator parity and timing screens", .production_qualification = false });
         return;

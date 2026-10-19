@@ -262,6 +262,21 @@ and notices remain unchanged.
 
 ## Retain notices in future changes and releases
 
+The October 19 Qwen operator evidence adapts TensorFold contributors'
+`zig/kernels/cuda/ck_lane.cu`, `mma4.cuh`, `qmm_frag.cuh`,
+`nvfp4_experts.cu` and `experts.cuh`, preserved at fork revision
+`62a2a679878e5d57e6949d0fd6ce009d408fc211`. The diagnostic source snapshots
+retain their original headers. The stage-depth clone changes the pipeline
+depth and entry names; the MMA clone adds FP32 trace stores and separate
+entry names. The slice-major experiment permutes complete packed words and
+changes the corresponding scalar address in a renamed split-M consumer.
+These are local diagnostic adaptations, not original authorship of the
+operators or their mathematical references. TensorFold's copyright,
+Apache-2.0 license, earlier MIT notices where applicable, NVIDIA runtime
+dependency terms and all existing transitive credits continue to apply.
+The archives pin actual source/header/compiler bytes and state the local
+changes; they do not package or relicense the checkpoint or CUDA runtime.
+
 The next tuning probes retain the entire original shared sampler at local
 revision `ad247b3daf045015d59bd106a88591bff961e488` as
 `zig/tests/fixtures/qwen35/sampler_before.zig`. It is a byte-identical

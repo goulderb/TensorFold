@@ -31,6 +31,9 @@ the semantic fields; unused union bytes remain opaque. Launch configuration,
 kernel arithmetic, images and numerical checks did not change. The original
 analyzers and first-attempt artifacts are retained. Fable's earlier inference
 that a default request implied zero readback was disproven by this probe.
+Dimensions are independently read back; policy one is a request-independent
+fingerprint of this driver. A driver update may trip this fail-closed screen.
+The omitted-default request itself is a source-level fact.
 
 The repaired build passed 40 host tests, all 27 CLI admission cases and the
 fleet fast gate. Component tests passed separately: six union tests, fifteen
@@ -47,7 +50,8 @@ changes only pipeline depth four to three and associated dynamic shared
 storage (20,480 to 15,360 bytes), with matching source/compiler provenance.
 
 Every graph attests 104 serial kernel nodes, exact function, geometry, ten
-argument spans and actual cluster attributes. All saved active outputs match
+argument spans, readback cluster dimensions and that driver policy fingerprint.
+All saved active outputs match
 the serial references, and guards and encoded inputs remain intact for rows
 1/2/16. Every timed sample also checks outputs outside timing. One warmup pair
 precedes five alternating measured pairs per shape/GPU. The table reports
@@ -80,7 +84,9 @@ attest launch requests, not independent graph/cluster readback for this screen.
 
 For Q coordinates 3950, 4766 and 3245 and V coordinate 77, the independent
 integer/Fraction predictor compares four predefined accumulation models.
-Both GPUs fit only `mma32_exact_rz_fused_acc` across every captured FP32 bit.
+The intersection across all four coordinates on both GPUs contains only
+`mma32_exact_rz_fused_acc`. Q3950 and Q4766 each admit two models and V77
+admits all four; Q3245 carries the discrimination.
 At Q3245 both observe partial bits `[3305180512,3316962952]`, joined bits
 `3321191736`, post-alpha bits `3205985419` and BF16 bits `48919`. This separates
 the former two surviving RZ models despite their equal BF16 output.
@@ -119,6 +125,9 @@ The ZIP contains 1,008 members, 27,661,056 bytes, SHA256
 `c0cd88b8c64f5bc48922bb9a800b3c72058bf8eaebf506bab3c9692091235413`.
 The archive verifier passes, all fifteen external files (97,730,693 bytes)
 rehash unchanged, and the post-archive historical audit passes again.
+The separately retained [Fable follow-up](evidence/upstream-ck-operator-suite-20261019/fable-r2.json)
+reproduced the audit byte-for-byte and found no blocker. Its two wording
+qualifications are incorporated above. The original ZIP remains unchanged.
 
 No production configuration changed. The next exact tuning candidate is
 slice-major code-word packing in an isolated split-M consumer. Device greedy
