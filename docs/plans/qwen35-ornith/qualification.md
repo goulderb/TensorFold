@@ -6,6 +6,12 @@ passed. Full-logit comparison against the corrected Hugging Face reference
 fails the unchanged diagnostic limits. This is an experimental testing path;
 numerical parity and production qualification remain open.
 
+The [2026-10-19 performance investigation](gpu-investigation-20261019.md)
+reaches 81.668 decode tok/s on a synthetic 64/128 greedy c1 turn with exact
+eager/graph self-parity. Its graph path remains diagnostic, and its router is
+off by default. These results do not change the independent reference gate or
+qualify the server, long context, concurrent occupancy, sizing or promotion.
+
 The user approved stopping workstation Nemotron for this trial. It stopped
 at 2026-10-18 01:52:49 UTC. The trial was stopped and the existing production
 task restarted at 02:22:22 UTC. At 02:23:22 UTC the production proxy returned
