@@ -50,3 +50,24 @@ raw/packed weight copies are separately pinned by size and SHA256; live
 reanalysis also requires the original checkpoint ranges, saved traces,
 executable and images listed in the inventory. This archive is not a model
 package or promotion receipt.
+
+## Q/V accumulation investigation
+
+The subsequent CPU investigation reproduces every saved HF Q/V output with
+fresh Torch `F.linear`, across 8192 Q and 512 V elements and three input
+shapes. Integer FP8 products and independent Fraction controls place all
+three disputed coordinates close to BF16 midpoints. Exact-real rounding
+favors HF at the two Q coordinates and native at V77; neither implementation
+uniformly equals exact-real rounding at these coordinates.
+
+Two models with source-matched split-K partitions and rounding toward zero
+within each modeled K32 MMA fit all 8704 native BF16 outputs. This is a
+fitting hypothesis, not proof of the device's internal rounding. NVIDIA's
+[PTX reference](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma)
+leaves FP8 MMA accumulation order and rounding unspecified. A bounded capture
+of actual FP32 slice partials and pre-scale sums would distinguish the models.
+The investigation retains 42 input/source pins, seven reduction alternatives,
+three exact Fraction controls and three bit-flip product/dot controls.
+CUDA was never initialized. The [additional archive](evidence/upstream-qv-rounding-20261019/archive.json)
+preserves the script, report and results. The reference, thresholds and failing
+full-model quality status remain unchanged.
