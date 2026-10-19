@@ -9,6 +9,7 @@ from pathlib import Path
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("window", type=Path)
 parser.add_argument("--output", type=Path)
+parser.add_argument("--require-generation-graph", action="store_true", help="Reject missing changing-position generation evidence")
 args = parser.parse_args()
 receipt = json.loads((args.window / "window.json").read_text())
 assert receipt["passed"] and receipt["restored"] and receipt["clef_unchanged"], "window failed or is not restored"
@@ -171,6 +172,8 @@ if any(row["kind"] == "router_graph_nodes" for row in rows):
         result["router_candidate"]["event_instrumentation_overhead_fraction"] = {
             "median": statistics.median(extra), "range": [min(extra), max(extra)]}
 graph_setup = [r for r in rows if r["kind"] == "generation_graph_setup"]
+if args.require_generation_graph:
+    assert graph_setup, "missing changing-position generation evidence"
 if graph_setup:
     assert len(graph_setup) == 1 and graph_setup[0]["nodes"] == 993 and graph_setup[0]["dynamic_nodes"] == 21
     assert graph_setup[0]["elapsed_ns"] > 0
@@ -190,7 +193,7 @@ if graph_setup:
         assert [r["graph"] for r in both] == ([False, True] if pair % 2 == 0 else [True, False])
         for row in both:
             assert row["warmup"] == (pair == 0) and row["tokens"] == graph_tokens and row["position"] == 191
-            assert row["exact_rows_tokens_and_final_state"]
+            assert row.get("exact_tokens_and_final_state", row.get("exact_rows_tokens_and_final_state", False))
             assert [row[k] for k in ("observed_graph_appends", "observed_graph_launches", "observed_parameter_updates")] == ([191, 382, 4011] if row["graph"] else [0, 0, 0])
             t = row["times"]
             assert t["decode_tokens"] == 127 and t["appends"] == 191 and t["draws"] == 128
@@ -211,6 +214,7 @@ if graph_setup:
         "paired_complete_turn_latency_reductions": pair_gains,
         "graph_construction_seconds": graph_setup[0]["elapsed_ns"] / 1e9,
         "exact_consumed_bf16_rows": 128,
+        "row_parity_scope": "untimed captured turn; timed turns verify output tokens and final persistent state",
         "exact_final_persistent_state": True,
         "stale_position_negative_control_passed": True,
         "production_qualified": False,

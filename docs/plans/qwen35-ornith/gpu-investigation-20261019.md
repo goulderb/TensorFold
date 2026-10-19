@@ -155,3 +155,49 @@ queries and full logits download; its graphs include only partition compute.
 Its statement that these costs are absent from graph timing is incorrect.
 `cuGraphKernelNodeGetParams_v2` already exists in the ABI. Keep floor queries
 in both arms to isolate graph replay. A fresh judge reviews these corrections.
+
+## Completed changing-position generation result
+
+R5 source `8b6d03bd3aaf94b21e467b6c18a1c936521ff233`, executable SHA256
+`70b5d4a0e1bd03ef26de8a60ac5b73ca327825f3442bc5b5009086c1d07b8892`,
+passed the entire window. Five alternating measured graph/eager pairs with
+the cooperative router gave decode medians 81.668 versus 63.828 tok/s;
+ranges 81.315–81.897 and 63.105–64.015. Complete turn is 2.264 versus
+2.917 seconds; graph prefill is 0.709 seconds. Graph construction, excluded
+from warmed turns, took 2.592 ms. Decode throughput counts 127 generated
+tokens after the first draw, excluding prefill.
+
+All 128 consumed BF16 rows, output tokens and final persistent-state digests
+match exactly. Every graph turn executes 191 appends, 382 graph launches and
+4011 parameter updates, ends at position191, and repeats from reset. The
+stale-position negative control changes state, and invalid-token/capacity
+admission rejects before launch. These are real changing-token and position
+turns, not the earlier fixed-step estimate. Sampler, full logits download,
+physical GPU floor queries, completion, contexts and host seam remain timed.
+
+Nemotron restored at 14:25:33 UTC as PID18996 with fresh canonical READY
+request 7dfa63e2-8c08-482a-9a32-ef242bc945e3, paid fallback disabled.
+Clef remains PID21392. Minimum physical free memory during R5 is 5356/6103
+MiB, above the required1536 MiB on each internal GPU. The controller exited.
+
+Raw R1–R5 receipts, plans, inputs, outputs, memory samples, build evidence,
+PTX and source pins are retained under `evidence/gpu-investigation-20261019`.
+The analyzer accepts R5 with `--require-generation-graph`, rejects failed R1,
+and rejects both corrupted router parity and absent required graph evidence.
+Its two negative checks are retained in `analyzer-negative/`.
+
+The 80tok/s bounded target is met for this synthetic 64/128 one-lane 4096
+context Ornith checkpoint using warmed graphs. This is not a server throughput,
+Qwen-checkpoint, long-context, concurrent-load or model-quality qualification.
+Original routing/eager defaults and all serving pins remain unchanged. The
+checkpoint is NVFP4; existing projection/expert arithmetic is W4A16, without
+a new native FP4 MMA implementation. The independent full-logit reference
+gate still fails, so there is no promotion or production sizing claim.
+
+R5's raw timed-turn boolean was named `exact_rows_tokens_and_final_state`.
+The actual timed check verifies output tokens and final state; all consumed
+rows are compared in the separate untimed parity pass. The next probe source
+renames that timed field to `exact_tokens_and_final_state`, and the analyzer
+accepts the retained legacy label while stating its bounded meaning. No raw
+artifact or measured number is rewritten. This is a reporting correction,
+without a CUDA arithmetic or timed-work change.

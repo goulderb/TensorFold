@@ -311,7 +311,7 @@ fn graphGeneration(init: std.process.Init, s: *qwen.Session, input: Input, hash_
         const state = try stateHash(s, hash_buffer);
         if (!std.mem.eql(u32, &reference, &output) or !std.mem.eql(u8, &reference_state, &state) or s.position != 191) return error.GraphGenerationRepeatMismatch;
         if (graph and (replay.appends != 191 or replay.launches != 382 or replay.updates != 4011)) return error.GraphWorkCountMismatch;
-        try j.write(.{ .kind = "generation_graph_turn", .pair = pair, .order = order, .warmup = pair == 0, .graph = graph, .times = timing, .observed_graph_appends = replay.appends, .observed_graph_launches = replay.launches, .observed_parameter_updates = replay.updates, .position = s.position, .exact_rows_tokens_and_final_state = true, .tokens = output });
+        try j.write(.{ .kind = "generation_graph_turn", .pair = pair, .order = order, .warmup = pair == 0, .graph = graph, .times = timing, .observed_graph_appends = replay.appends, .observed_graph_launches = replay.launches, .observed_parameter_updates = replay.updates, .position = s.position, .exact_tokens_and_final_state = true, .tokens = output });
     };
 }
 
