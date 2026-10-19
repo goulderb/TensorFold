@@ -102,6 +102,12 @@ CPU checks also reject eight corruptions of record counts, work, token output,
 pair order, parity, driver median, head sample count and reference errors.
 There was no additional device run to generate these negative cases.
 
+Fable's [independent result review](evidence/device-window-20261019T1230/review-fable-r3.md)
+recomputed the medians, paired reductions and head scenario from raw rows and
+accepted handoff with no blocker. The
+[parent response](evidence/device-window-20261019T1230/review-response-r3.md)
+closes its durability finding and clarifies hash, telemetry and scope limits.
+
 No model was promoted, no new production capacity was sized and no full fleet
 promotion gate ran. Optimized HTTP behavior, concurrency, cache, long context,
 soak/restart and quality remain unqualified. The original full-model numerical
