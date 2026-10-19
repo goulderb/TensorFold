@@ -276,6 +276,12 @@ Apache-2.0 license, earlier MIT notices where applicable, NVIDIA runtime
 dependency terms and all existing transitive credits continue to apply.
 The archives pin actual source/header/compiler bytes and state the local
 changes; they do not package or relicense the checkpoint or CUDA runtime.
+The terminal-greedy screen reuses TensorFold's existing tree-round BF16
+argmax and retains the diagnostic host comparator as a source-pinned control.
+The shared-activation screen extracts the existing Qwen HF activation,
+renames its control and adds a diagnostic BF16 intermediate round plus a
+separate recorder. It retains the original mathematical-reference credits
+above; the diagnostic candidate is not a newly authored model equation.
 
 The next tuning probes retain the entire original shared sampler at local
 revision `ad247b3daf045015d59bd106a88591bff961e488` as

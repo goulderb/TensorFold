@@ -13,4 +13,7 @@ test {
     _ = @import("qwen35_ck_stage_screen.zig");
     _ = @import("qwen35_slice_major_input.zig");
     _ = @import("qwen35_slice_major_screen.zig");
+    _ = @import("qwen35_boundary_input.zig");
+    _ = @import("qwen35_terminal_greedy_screen.zig");
+    _ = @import("qwen35_shared_activation_screen.zig");
 }
