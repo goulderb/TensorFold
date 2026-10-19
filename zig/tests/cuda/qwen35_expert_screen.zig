@@ -6,18 +6,17 @@ const Arm = enum {
     wn4_baseline,
     wn4_n16_pipe4,
     wn1_baseline,
-    wn2_n16_pipe4,
+    wn4_n8_pipe4,
 
     fn warps(self: Arm) usize {
         return switch (self) {
             .wn1_baseline => 1,
-            .wn2_n16_pipe4 => 2,
             else => 4,
         };
     }
 
     fn variant(self: Arm) X.Variant {
-        std.debug.assert(self != .wn2_n16_pipe4);
+        std.debug.assert(self != .wn4_n8_pipe4);
         return if (self == .wn4_n16_pipe4) .n16_pipe4 else .baseline;
     }
 
@@ -26,7 +25,7 @@ const Arm = enum {
     }
 };
 const arms = [_]Arm{ .wn4_baseline, .wn4_n16_pipe4, .wn1_baseline };
-const wn2_arms = [_]Arm{ .wn4_baseline, .wn4_n16_pipe4, .wn2_n16_pipe4 };
+const n8_arms = [_]Arm{ .wn4_baseline, .wn4_n16_pipe4, .wn4_n8_pipe4 };
 const experts = 256;
 const dims = 2048;
 const width = 512;
@@ -38,12 +37,12 @@ const floor_bytes = 1536 * 1024 * 1024;
 const FilePin = struct { bytes: usize, sha256: []const u8 };
 const Manifest = struct { scope: []const u8, expert_order: []const usize, files: std.json.ArrayHashMap(FilePin) };
 
-const Wn2Up = struct {
+const N8Up = struct {
     f: cuda.Function,
     resident: usize,
 
     fn grid(resident: usize) usize {
-        return @min((bound * (width / X.cols) * 2 + 1) / 2, resident);
+        return @min((bound * (width / X.cols) * 4 + 3) / 4, resident);
     }
 
     fn args(rows: cuda.experts.Rows, layer: cuda.experts.Layer, plan: cuda.grouped.Plan, out: u64) cuda.launch.Args {
@@ -62,16 +61,16 @@ const Wn2Up = struct {
         return a;
     }
 
-    fn run(self: Wn2Up, s: cuda.Stream, rows: cuda.experts.Rows, layer: cuda.experts.Layer, plan: cuda.grouped.Plan, out: u64) !void {
+    fn run(self: N8Up, s: cuda.Stream, rows: cuda.experts.Rows, layer: cuda.experts.Layer, plan: cuda.grouped.Plan, out: u64) !void {
         var a = args(rows, layer, plan, out);
-        try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(grid(self.resident)), .y = 1, .z = 1 }, .block = .{ .x = 64, .y = 1, .z = 1 } }, s, &a);
+        try cuda.launch.launch(self.f, .{ .grid = .{ .x = @intCast(grid(self.resident)), .y = 1, .z = 1 }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &a);
     }
 };
 
-fn runArm(arm: Arm, wn2: ?Wn2Up, engines: *const [2]X, s: cuda.Stream, epi: cuda.experts.Epi, rows: cuda.experts.Rows, layer: cuda.experts.Layer, plan: cuda.grouped.Plan, out: u64) !void {
-    if (arm == .wn2_n16_pipe4) {
+fn runArm(arm: Arm, n8: ?N8Up, engines: *const [2]X, s: cuda.Stream, epi: cuda.experts.Epi, rows: cuda.experts.Rows, layer: cuda.experts.Layer, plan: cuda.grouped.Plan, out: u64) !void {
+    if (arm == .wn4_n8_pipe4) {
         std.debug.assert(epi == .up);
-        return (wn2 orelse return error.Wn2KernelNotLoaded).run(s, rows, layer, plan, out);
+        return (n8 orelse return error.N8KernelNotLoaded).run(s, rows, layer, plan, out);
     }
     return arm.engine(engines).runVariant(arm.variant(), s, epi, rows, layer, plan, out, bound, -1);
 }
@@ -150,11 +149,11 @@ pub fn run(gpu: check.Gpu, fixture_dir: []const u8, expected_manifest_sha256: []
     return runMode(false, gpu, fixture_dir, expected_manifest_sha256, journal);
 }
 
-pub fn runWn2(gpu: check.Gpu, fixture_dir: []const u8, expected_manifest_sha256: []const u8, journal: anytype) !void {
+pub fn runN8(gpu: check.Gpu, fixture_dir: []const u8, expected_manifest_sha256: []const u8, journal: anytype) !void {
     return runMode(true, gpu, fixture_dir, expected_manifest_sha256, journal);
 }
 
-fn runMode(comptime wn2_mode: bool, gpu: check.Gpu, fixture_dir: []const u8, expected_manifest_sha256: []const u8, journal: anytype) !void {
+fn runMode(comptime n8_mode: bool, gpu: check.Gpu, fixture_dir: []const u8, expected_manifest_sha256: []const u8, journal: anytype) !void {
     try floor(gpu);
     const manifest_path = try std.fs.path.join(gpu.gpa, &.{ fixture_dir, "manifest.json" });
     defer gpu.gpa.free(manifest_path);
@@ -164,19 +163,19 @@ fn runMode(comptime wn2_mode: bool, gpu: check.Gpu, fixture_dir: []const u8, exp
     const manifest = try std.json.parseFromSlice(Manifest, gpu.gpa, manifest_bytes, .{ .ignore_unknown_fields = true });
     defer manifest.deinit();
     try validateOrder(manifest.value.expert_order);
-    try journal.write(.{ .kind = if (wn2_mode) "expert_wn2_fixture" else "expert_fixture", .ordinal = gpu.ctx.device_ordinal, .manifest_sha256 = &manifest_sha256, .scope = manifest.value.scope, .expert_order = manifest.value.expert_order, .bank0_original_ids = manifest.value.expert_order[0..slots], .bank0_remapped_ids = [8]usize{ 0, 1, 2, 3, 4, 5, 6, 7 } });
+    try journal.write(.{ .kind = if (n8_mode) "expert_n8_fixture" else "expert_fixture", .ordinal = gpu.ctx.device_ordinal, .manifest_sha256 = &manifest_sha256, .scope = manifest.value.scope, .expert_order = manifest.value.expert_order, .bank0_original_ids = manifest.value.expert_order[0..slots], .bank0_remapped_ids = [8]usize{ 0, 1, 2, 3, 4, 5, 6, 7 } });
     const sms: usize = @intCast(try gpu.ctx.attribute(.multiprocessor_count));
     var engines: [2]X = undefined;
     engines[0] = try X.loadWarps(gpu.d, sms, 4);
     defer engines[0].unload();
     try engines[0].loadCandidates(sms);
-    if (!wn2_mode) engines[1] = try X.loadWarps(gpu.d, sms, 1);
-    defer if (!wn2_mode) engines[1].unload();
-    const wn2: ?Wn2Up = if (wn2_mode) blk: {
-        const f = try engines[0].mod.function("tf_nvfp4_wn2_n16_pipe4_swiglu");
-        if (try f.attribute(.local_size_bytes) != 0) return error.Wn2KernelSpill;
-        const resident = @as(usize, @intCast(try f.occupancy(64, 0))) * sms;
-        if (Wn2Up.grid(resident) != 128) return error.Wn2GridMismatch;
+    if (!n8_mode) engines[1] = try X.loadWarps(gpu.d, sms, 1);
+    defer if (!n8_mode) engines[1].unload();
+    const n8: ?N8Up = if (n8_mode) blk: {
+        const f = try engines[0].mod.function("tf_nvfp4_n8_pipe4_swiglu");
+        if (try f.attribute(.local_size_bytes) != 0) return error.N8KernelSpill;
+        const resident = @as(usize, @intCast(try f.occupancy(128, 0))) * sms;
+        if (N8Up.grid(resident) != 128) return error.N8GridMismatch;
         break :blk .{ .f = f, .resident = resident };
     } else null;
     var mod = try cuda.Module.load(gpu.d, cuda.kernels.experts);
@@ -184,13 +183,13 @@ fn runMode(comptime wn2_mode: bool, gpu: check.Gpu, fixture_dir: []const u8, exp
     const router = try cuda.grouped.Router.resolve(mod);
     var stream = try cuda.Stream.init(gpu.d, false);
     defer stream.deinit();
-    const epis = if (wn2_mode) &[_]cuda.experts.Epi{.up} else &[_]cuda.experts.Epi{ .up, .down_f32 };
-    for (epis) |epi| try projection(wn2_mode, wn2, gpu, fixture_dir, &manifest.value, journal, &engines, router, stream, epi);
+    const epis = if (n8_mode) &[_]cuda.experts.Epi{.up} else &[_]cuda.experts.Epi{ .up, .down_f32 };
+    for (epis) |epi| try projection(n8_mode, n8, gpu, fixture_dir, &manifest.value, journal, &engines, router, stream, epi);
     try floor(gpu);
 }
 
-fn projection(comptime wn2_mode: bool, wn2: ?Wn2Up, gpu: check.Gpu, dir: []const u8, manifest: *const Manifest, journal: anytype, engines: *const [2]X, router: cuda.grouped.Router, s: cuda.Stream, epi: cuda.experts.Epi) !void {
-    const selected_arms = if (wn2_mode) wn2_arms else arms;
+fn projection(comptime n8_mode: bool, n8: ?N8Up, gpu: check.Gpu, dir: []const u8, manifest: *const Manifest, journal: anytype, engines: *const [2]X, router: cuda.grouped.Router, s: cuda.Stream, epi: cuda.experts.Epi) !void {
+    const selected_arms = if (n8_mode) n8_arms else arms;
     const up = epi == .up;
     const n: usize = if (up) width else dims;
     const k: usize = if (up) dims else width;
@@ -231,7 +230,7 @@ fn projection(comptime wn2_mode: bool, wn2: ?Wn2Up, gpu: check.Gpu, dir: []const
     var actual: [2]i32 = undefined;
     try counts.download(0, std.mem.asBytes(&actual));
     if (actual[0] != slots or bound != slots) return error.ExpertPlanCountMismatch;
-    try journal.write(.{ .kind = if (wn2_mode) "expert_wn2_plan" else "expert_plan", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .actual_items = actual[0], .bound = bound, .picks = picks, .banks = banks, .limit = layer.limit, .relu2 = layer.relu2 });
+    try journal.write(.{ .kind = if (n8_mode) "expert_n8_plan" else "expert_plan", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .actual_items = actual[0], .bound = bound, .picks = picks, .banks = banks, .limit = layer.limit, .relu2 = layer.relu2 });
     var reference = try cuda.DeviceBuffer.alloc(gpu.d, saved.len);
     defer reference.free();
     var output = try cuda.DeviceBuffer.alloc(gpu.d, saved.len);
@@ -251,12 +250,12 @@ fn projection(comptime wn2_mode: bool, wn2: ?Wn2Up, gpu: check.Gpu, dir: []const
         if (bank == 0) try check.sameBytes("bank0 saved real expert output", want, saved);
         for (selected_arms[1..]) |arm| {
             try output.fill8(0xff, s.handle);
-            try runArm(arm, wn2, engines, s, epi, rows, bl, plan, output.ptr);
+            try runArm(arm, n8, engines, s, epi, rows, bl, plan, output.ptr);
             try s.synchronize();
             try output.download(0, got);
             try finite(got, !up);
             try check.sameBytes(@tagName(arm), got, want);
-            try journal.write(.{ .kind = if (wn2_mode) "expert_wn2_bank_parity" else "expert_bank_parity", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .bank = bank, .variant = @tagName(arm), .warps = arm.warps(), .finite = true, .bit_exact = true, .saved_real_output = bank == 0 });
+            try journal.write(.{ .kind = if (n8_mode) "expert_n8_bank_parity" else "expert_bank_parity", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .bank = bank, .variant = @tagName(arm), .warps = arm.warps(), .finite = true, .bit_exact = true, .saved_real_output = bank == 0 });
         }
     }
     var graphs: [selected_arms.len]cuda.graph.Exec = undefined;
@@ -264,9 +263,9 @@ fn projection(comptime wn2_mode: bool, wn2: ?Wn2Up, gpu: check.Gpu, dir: []const
     defer for (graphs[0..made]) |*graph| graph.deinit();
     for (selected_arms, 0..) |arm, vi| {
         const ex = arm.engine(engines);
-        const variant = if (arm == .wn2_n16_pipe4) X.Variant.baseline else arm.variant();
+        const variant = if (arm == .wn4_n8_pipe4) X.Variant.baseline else arm.variant();
         try cuda.graph.beginCapture(s, .thread_local);
-        for (0..launches) |i| runArm(arm, wn2, engines, s, epi, rows, bankLayer(layer, i % banks), plan, output.ptr) catch |err| {
+        for (0..launches) |i| runArm(arm, n8, engines, s, epi, rows, bankLayer(layer, i % banks), plan, output.ptr) catch |err| {
             if (cuda.graph.endCapture(s)) |graph| {
                 var dead = graph;
                 dead.deinit();
@@ -282,9 +281,9 @@ fn projection(comptime wn2_mode: bool, wn2: ?Wn2Up, gpu: check.Gpu, dir: []const
         try s.synchronize();
         const ei: usize = @backingInt(epi);
         const variant_index = @backingInt(variant);
-        const resident = if (arm == .wn2_n16_pipe4) wn2.?.resident else if (variant == .baseline) ex.resident[ei] else ex.candidate_resident[variant_index - 1][ei];
-        const f = if (arm == .wn2_n16_pipe4) wn2.?.f else if (variant == .baseline) ex.fns[ei] else ex.candidate_fns[variant_index - 1][ei];
-        const grid = if (arm == .wn2_n16_pipe4) Wn2Up.grid(resident) else X.decodeGridWarps(variant, bound, n / X.cols, resident, arm.warps());
+        const resident = if (arm == .wn4_n8_pipe4) n8.?.resident else if (variant == .baseline) ex.resident[ei] else ex.candidate_resident[variant_index - 1][ei];
+        const f = if (arm == .wn4_n8_pipe4) n8.?.f else if (variant == .baseline) ex.fns[ei] else ex.candidate_fns[variant_index - 1][ei];
+        const grid = if (arm == .wn4_n8_pipe4) N8Up.grid(resident) else X.decodeGridWarps(variant, bound, n / X.cols, resident, arm.warps());
         const block = arm.warps() * 32;
         var nodes: [launches]cuda.graph.Node = undefined;
         const captured = try graph.nodes(&nodes);
@@ -294,7 +293,7 @@ fn projection(comptime wn2_mode: bool, wn2: ?Wn2Up, gpu: check.Gpu, dir: []const
             try gpu.d.check(gpu.d.api.cuGraphKernelNodeGetParams_v2(node, &params), "cuGraphKernelNodeGetParams");
             try checkNode(params, f.handle, grid, block);
         }
-        try journal.write(.{ .kind = if (wn2_mode) "expert_wn2_kernel" else "expert_kernel", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .variant = @tagName(arm), .warps = arm.warps(), .symbol = try kernelName(f), .grid = params.grid_x, .block = params.block_x, .regs = try f.attribute(.num_regs), .local_bytes = try f.attribute(.local_size_bytes), .resident_blocks = resident, .resident_blocks_per_sm = try f.occupancy(@intCast(block), 0), .kernel_launches = launches, .verified_kernel_nodes = captured.len, .banks = banks, .logical_weight_and_scale_bytes_per_launch = slots * (one + parts * 4), .logical_unique_weight_and_scale_bytes = experts * (one + parts * 4) });
+        try journal.write(.{ .kind = if (n8_mode) "expert_n8_kernel" else "expert_kernel", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .variant = @tagName(arm), .warps = arm.warps(), .symbol = try kernelName(f), .grid = params.grid_x, .block = params.block_x, .regs = try f.attribute(.num_regs), .local_bytes = try f.attribute(.local_size_bytes), .resident_blocks = resident, .resident_blocks_per_sm = try f.occupancy(@intCast(block), 0), .kernel_launches = launches, .verified_kernel_nodes = captured.len, .banks = banks, .logical_weight_and_scale_bytes_per_launch = slots * (one + parts * 4), .logical_unique_weight_and_scale_bytes = experts * (one + parts * 4) });
     }
     var start = try cuda.Event.init(gpu.d, true);
     defer start.deinit();
@@ -314,18 +313,77 @@ fn projection(comptime wn2_mode: bool, wn2: ?Wn2Up, gpu: check.Gpu, dir: []const
             try finite(got, !up);
             try check.sameBytes("timed graph final bank output", got, want);
             try floor(gpu);
-            try journal.write(.{ .kind = if (wn2_mode) "expert_wn2_sample" else "expert_sample", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .comparison = @tagName(arm), .pair = pair, .warmup = pair == 0, .order = order, .arm = @tagName(selected_arms[vi]), .elapsed_ms = elapsed_ms, .kernel_launches = launches, .banks = banks, .final_bank = (launches - 1) % banks, .finite = true, .bit_exact_final = true });
+            try journal.write(.{ .kind = if (n8_mode) "expert_n8_sample" else "expert_sample", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .comparison = @tagName(arm), .pair = pair, .warmup = pair == 0, .order = order, .arm = @tagName(selected_arms[vi]), .elapsed_ms = elapsed_ms, .kernel_launches = launches, .banks = banks, .final_bank = (launches - 1) % banks, .finite = true, .bit_exact_final = true });
         };
     }
-    try journal.write(.{ .kind = if (wn2_mode) "expert_wn2_projection_complete" else "expert_projection_complete", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .all_bank_prechecks = true, .saved_bank0_exact = true, .graph_finals_exact = true, .timed_pairs_per_candidate = 5 });
+    try journal.write(.{ .kind = if (n8_mode) "expert_n8_projection_complete" else "expert_projection_complete", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .all_bank_prechecks = true, .saved_bank0_exact = true, .graph_finals_exact = true, .timed_pairs_per_candidate = 5 });
 }
 
-test "Qwen WN2 up screen keeps the direct decode ABI and bank offsets" {
+test "Qwen N8 scalar slices recover every packed source column and scale" {
+    const n = 64;
+    const k = 64;
+    var codes: [2][n * k / 2]u8 = undefined;
+    var scales: [2][n * k / 16]u8 = undefined;
+    for (0..2) |part| {
+        for (&codes[part], 0..) |*code, i| code.* = @truncate(i * 29 + i / 17 + part * 101);
+        for (&scales[part], 0..) |*scale, i| scale.* = @truncate(i * 7 + part * 13);
+    }
+    var words: [n / X.cols * (k / 32) * 2 * X.words]u32 = undefined;
+    const shifts = [2][4]u5{ .{ 0, 16, 4, 20 }, .{ 8, 24, 12, 28 } };
+    X.packGateUp(&words, .{ &codes[0], &scales[0] }, .{ &codes[1], &scales[1] }, n, k);
+    for (0..n / X.cols) |cb| for (0..k / 32) |group| for (0..2) |part| {
+        const block = words[((cb * (k / 32) + group) * 2 + part) * X.words ..][0..X.words];
+        for (0..32) |lane| for (0..4) |slice| {
+            const word = block[lane * 4 + slice];
+            const row = cb * X.cols + slice * 8 + lane / 4;
+            for (0..2) |half| for (0..4) |q| {
+                const input = group * 32 + half * 16 + (lane % 4) * 4 + q;
+                const source = codes[part][row * (k / 2) + input / 2];
+                const expected: u32 = if (input % 2 == 0) source & 0xf else source >> 4;
+                try std.testing.expectEqual(expected, (word >> shifts[half][q]) & 0xf);
+            };
+        };
+        for (0..4) |t| for (0..4) |slice| for (0..2) |half| {
+            const word = block[128 + t * 4 + 2 * half + (slice >> 1)];
+            const shift: u5 = @intCast(16 * (slice & 1));
+            for (0..2) |column| {
+                const byte_shift: u5 = shift + @as(u5, @intCast(column * 8));
+                const row = cb * X.cols + slice * 8 + t * 2 + column;
+                const expected = scales[part][row * (k / 16) + group * 2 + half];
+                try std.testing.expectEqual(@as(u32, expected), (word >> byte_shift) & 0xff);
+            }
+        };
+    };
+}
+
+test "Qwen N8 warp units cover every output exactly once across four slices" {
+    var seen: [slots][width]bool = @splat(@splat(false));
+    const slices = 4;
+    const nb = width / X.cols;
+    const grid = N8Up.grid(10000);
+    try std.testing.expectEqual(@as(usize, 512), grid * Arm.wn4_n8_pipe4.warps());
+    for (0..grid) |block| for (0..Arm.wn4_n8_pipe4.warps()) |warp| {
+        const unit = block * Arm.wn4_n8_pipe4.warps() + warp;
+        const tile = unit / slices;
+        const slice = unit % slices;
+        const item = tile / nb;
+        const cb = tile - item * nb;
+        for (0..4) |t| for (0..2) |column| {
+            const col = cb * X.cols + 2 * t + 8 * slice + column;
+            try std.testing.expect(item < slots and col < width);
+            try std.testing.expect(!seen[item][col]);
+            seen[item][col] = true;
+        };
+    };
+    for (seen) |row| for (row) |covered| try std.testing.expect(covered);
+}
+
+test "Qwen N8 up screen keeps the direct decode ABI and bank offsets" {
     const layer: cuda.experts.Layer = .{ .format = .nvfp4, .up = 4096, .down = 0, .up_scale = 8192, .down_scale = 0, .width = width, .dims = dims, .experts = experts };
     const rows: cuda.experts.Rows = .{ .x = 1024, .stride = dims, .slots = slots };
     const plan: cuda.grouped.Plan = .{ .items = 100, .counts = 200, .members = 300, .rank = 0, .hist = 0 };
     const last = bankLayer(layer, banks - 1);
-    const a = Wn2Up.args(rows, last, plan, 400);
+    const a = N8Up.args(rows, last, plan, 400);
     try std.testing.expectEqual(@as(usize, 14), a.count);
     const values = [_]u64{ rows.x, dims, slots, last.up, last.up_scale, 64, 16, plan.items, plan.counts, plan.members, 400, width, 0, 0xffffffff };
     const sizes = [_]u16{ 8, 4, 4, 8, 8, 4, 4, 8, 8, 8, 8, 4, 4, 4 };
@@ -333,11 +391,11 @@ test "Qwen WN2 up screen keeps the direct decode ABI and bank offsets" {
         try std.testing.expectEqual(@as(?u64, value), a.integer(i));
         try std.testing.expectEqual(size, a.sizes[i]);
     }
-    try std.testing.expectEqual(@as(usize, 128), Wn2Up.grid(10000));
-    try std.testing.expectEqual(@as(usize, 7), Wn2Up.grid(7));
-    try std.testing.expectEqual(@as(usize, 64), Arm.wn2_n16_pipe4.warps() * 32);
+    try std.testing.expectEqual(@as(usize, 128), N8Up.grid(10000));
+    try std.testing.expectEqual(@as(usize, 7), N8Up.grid(7));
+    try std.testing.expectEqual(@as(usize, 128), Arm.wn4_n8_pipe4.warps() * 32);
     try std.testing.expectEqual(Arm.wn1_baseline, arms[2]);
-    try std.testing.expectEqual(Arm.wn2_n16_pipe4, wn2_arms[2]);
+    try std.testing.expectEqual(Arm.wn4_n8_pipe4, n8_arms[2]);
 }
 
 test "Qwen expert screen uses eight items and covers all real expert banks" {

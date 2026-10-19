@@ -45,9 +45,13 @@ __device__ __forceinline__ void load_stage(Stage<M>& st, const uint4* blk, int g
   for (int m = 0; m < M; ++m) {
     if constexpr (NC == NTW) {
       st.w[m] = ld_nc(b + m * BLOCK4 + lane);
-    } else {
+    } else if constexpr (NC == 2) {
       const uint2 w = __ldg(reinterpret_cast<const uint2*>(b + m * BLOCK4 + lane) + slice);
       st.w[m] = make_uint4(w.x, w.y, 0u, 0u);
+    } else {
+      static_assert(NC == 1);
+      const uint32_t w = __ldg(reinterpret_cast<const uint32_t*>(b + m * BLOCK4 + lane) + slice);
+      st.w[m] = make_uint4(w, 0u, 0u, 0u);
     }
     st.s[m] = ld_nc(b + m * BLOCK4 + 32 + t);
   }
@@ -394,6 +398,6 @@ TF_NVFP4_PROMPT(tf_nvfp4_prompt_down, 1, 3, 8)
 TF_NVFP4_DECODE_SET(pipe4, 4, 4, 4)
 TF_NVFP4_DECODE_SET(n16, 4, 2, 2)
 TF_NVFP4_DECODE_SET(n16_pipe4, 4, 4, 2)
-TF_NVFP4_DECODE(tf_nvfp4_wn2_n16_pipe4_swiglu, 2, 2, 2, 4, 2)
+TF_NVFP4_DECODE(tf_nvfp4_n8_pipe4_swiglu, 2, 2, 4, 4, 1)
 #undef TF_NVFP4_DECODE_SET
 #undef TF_NVFP4_DECODE
