@@ -422,3 +422,51 @@ Historical instrumented prose traces had about a 2.5% native non-kernel
 complement, but those unmatched periods included following draft proposal work.
 They do not bound collective/kernel/scheduling effects or explain a whole-turn
 gap. The assistant's former 5% partial-benefit screen is not an acceptance gate.
+
+## Completed full-model comparison, 2026-10-19
+
+The graph and teardown changes are integrated at `b5fac6aee`. The continuation
+kept all 18 code-input hashes and the retained native/proof executables unchanged.
+It exercised both full target graphs and HTTP prompt batching with production's
+seven neural drafts, fifteen copy drafts and aggregate 32-row verification budget.
+Native's admitted geometry was eight 262,144-token contexts, a 2,113,536-token
+live-only pool, and a separate 12.5 GiB saved-state budget.
+
+The combined configuration passed 28 functional cases. Eight requests each
+completed 253,840 input plus 8,192 output tokens, with at least 1,012.5 seconds
+of actual eight-stream overlap. A 1,806.6-second soak completed 1,528 requests
+with zero serving errors. Distinct saved states and an evicted reference restored
+correctly within the running process. These checks do not imply restart parity.
+
+Five measured groups after a discarded warmup, through the private HTTP path,
+gave full/eager median c8 rates of 154.99/144.48 tokens/s for code cap128,
+97.38/88.81 for prose cap128 and 93.05/84.91 for prose cap512. The measured
+7.3–9.6% graph benefit has disjoint c8 ranges. All 130 measured native response
+pairs match exactly. Single-client differences were within variation; no material
+prefill benefit was measured. Loads were sequential rather than alternating
+process pairs, and rates include admission/prefill and count actual output tokens.
+
+The pinned production EXL3 comparator reached 217.45 and 126.47 tokens/s on
+the same fixed cap128 c8 code/prose work. Native full remains 28.7% and 23.0%
+behind. Native FP4 and production EXL3 are different checkpoints: this is a
+serving comparison, not an isolated weight-format experiment. The production
+benchmark disabled snapshot retention with a SHA-pinned, CPU-tested module-load
+overlay while retaining its 12.5 GiB pool-sizing budget and full 256K context;
+all timing responses had zero cached tokens. An earlier reduced-pool control is
+retained separately and excluded from the primary comparison.
+
+First near-full disk restores after both clean restart and active-request SIGKILL
+returned wrong marker answers with `TF_GLM_PREFILL_ATTN_LOCAL=1`. A fresh cold
+prefill masked the failure, so only first restores before that prefill count.
+Changing only the flag to `0`, with the same binary and saved files, restored
+both failing near-full fixtures correctly at 260,096 cached tokens, followed by
+three matching replays. This supports the missing-prefix hypothesis in the
+non-owner per-layer attention replicas; no replica repair is claimed here.
+
+The candidate is rejected for production on measured performance and the enabled
+local-attention path's restart failure. Supervised native public-path and reboot
+promotion gates were not run after failed acceptance. The complete fleet record
+is `docs/plans/glm53-native/full-model-parity-20261019.md` and
+`fleet/trials/glm53-full-model-parity-20261019.json` in local-ai-server, with
+raw receipts retained under
+`C:/Development/prep/glm53-fullgraph-complete-20261019/`.
