@@ -61,9 +61,13 @@ pub fn Adapter(comptime Session: type) type {
 
         fn draw(self: *Self, s: *lanes.Stream, position: u64) !u64 {
             if (self.active != s or self.session.position != position) return error.PositionMismatch;
+            const sampling: lanes.Sampling = s.sampling orelse .{ .seed = 0, .temperature = 0 };
+            if (sampling.temperature <= 0) {
+                if (try self.session.cachedGreedy(position)) |token| return token;
+            }
             for (self.values, self.session.logits) |*value, bits|
                 value.* = @as(f32, @bitCast(@as(u32, bits) << 16));
-            return lanes.sampling.choose(self.gpa, self.values, self.ids, position, s.sampling orelse .{ .seed = 0, .temperature = 0 });
+            return lanes.sampling.choose(self.gpa, self.values, self.ids, position, sampling);
         }
 
         fn begin(self: *Self, s: *lanes.Stream) !void {
@@ -148,11 +152,21 @@ const FakeSession = struct {
     logits: [4]u16 = .{ 0x3f80, 0x4000, 0x4040, 0x4080 },
     resets: usize = 0,
     fail: bool = false,
+    greedy: ?u32 = null,
+    greedy_reads: usize = 0,
+
+    fn cachedGreedy(s: *FakeSession, position: u64) !?u32 {
+        if (s.fail) return error.GpuFailed;
+        if (position != s.position) return error.PositionMismatch;
+        s.greedy_reads += 1;
+        return s.greedy;
+    }
 
     fn reset(s: *FakeSession) !void {
         s.position = 0;
         s.resets += 1;
         s.fail = false;
+        s.greedy = null;
     }
 
     fn append(s: *FakeSession, tokens: []const u32) !void {
@@ -160,6 +174,40 @@ const FakeSession = struct {
         s.position += tokens.len;
     }
 };
+
+test "Qwen terminal greedy bypasses host conversion only for an eligible committed pick" {
+    const gpa = std.testing.allocator;
+    var session: FakeSession = .{ .position = 2, .greedy = 3 };
+    var adapter = try Adapter(FakeSession).init(gpa, &session, 32);
+    defer adapter.deinit();
+    var s = try lanes.Stream.init(gpa, .{ .id = "greedy", .prompt = &.{ 1, 2 }, .max_new = 4 });
+    defer s.deinit(gpa);
+    adapter.active = &s;
+    @memset(adapter.values, -123);
+    try std.testing.expectEqual(@as(u64, 3), try adapter.backend().first(&s, 2));
+    for (adapter.values) |value| try std.testing.expectEqual(@as(f64, -123), value);
+    try std.testing.expectEqual(@as(usize, 1), session.greedy_reads);
+    try std.testing.expectError(error.PositionMismatch, adapter.backend().first(&s, 3));
+    try std.testing.expectEqual(@as(usize, 1), session.greedy_reads);
+    session.greedy = null;
+    try std.testing.expectEqual(@as(u64, 3), try adapter.backend().first(&s, 2));
+    try std.testing.expectEqualSlices(f64, &.{ 1, 2, 3, 4 }, adapter.values);
+    session.logits[0] = 0x7f80;
+    const nonfinite = [_]f64{ std.math.inf(f64), 2, 3, 4 };
+    const expected = try lanes.sampling.choose(gpa, &nonfinite, adapter.ids, 2, .{ .seed = 0, .temperature = 0 });
+    try std.testing.expectEqual(expected, try adapter.backend().first(&s, 2));
+    session.logits[0] = 0x3f80;
+    session.greedy = 0;
+    s.sampling = .{ .seed = 17, .temperature = 1, .top_k = 0, .top_p = 1 };
+    const reads = session.greedy_reads;
+    try std.testing.expectEqual(try lanes.sampling.choose(gpa, &.{ 1, 2, 3, 4 }, adapter.ids, 2, s.sampling.?), try adapter.backend().first(&s, 2));
+    try std.testing.expectEqual(reads, session.greedy_reads);
+    s.sampling = null;
+    session.fail = true;
+    try std.testing.expectError(error.GpuFailed, adapter.backend().first(&s, 2));
+    adapter.active = null;
+    try std.testing.expectError(error.PositionMismatch, adapter.backend().first(&s, 2));
+}
 
 test "Qwen lane adapter uses keyed positions, validates windows and resets between streams" {
     const gpa = std.testing.allocator;
@@ -253,6 +301,9 @@ test "Qwen call gates feed corrected opener and multi-token names into the model
         fed: [32]u32 = undefined,
         end_thinking: bool = false,
         suggest_prefix: bool = false,
+        fn cachedGreedy(_: *const @This(), _: u64) !?u32 {
+            return null;
+        }
         fn reset(s: *@This()) !void {
             s.position = 0;
         }

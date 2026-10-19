@@ -13,6 +13,7 @@ pub const Options = struct {
     captured: bool = true,
     prefill_rows: usize = 1,
     expert_up_layout: cuda.experts.Nvfp4UpLayout = .lane_major,
+    terminal_greedy: bool = false,
 };
 
 fn validatePrefillRows(rows: usize) !void {
@@ -101,7 +102,7 @@ pub const Chain = struct {
         };
         for (c.partitions, placements[0..c.partitions.len]) |*p, placement| {
             try p.context.makeCurrent();
-            p.engine = try engine.Engine.initPlacedWithOptions(gpa, io, &p.context, dir, admitted, placement, false, .{ .expert_up_layout = options.expert_up_layout });
+            p.engine = try engine.Engine.initPlacedWithOptions(gpa, io, &p.context, dir, admitted, placement, false, .{ .expert_up_layout = options.expert_up_layout, .terminal_greedy = options.terminal_greedy });
             engines += 1;
             p.engine.captured = options.captured;
             p.engine.bounded_hf_prefill = options.prefill_rows > 1;
@@ -170,6 +171,7 @@ pub const Session = struct {
 
     pub fn reset(s: *Session) !void {
         s.poisoned = true;
+        s.invalidateGreedy();
         for (s.chain.partitions, 0..) |*p, i| {
             try p.context.makeCurrent();
             try s.caches[i].reset(p.engine);
@@ -213,7 +215,11 @@ pub const Session = struct {
     }
 
     fn stepRows(s: *Session, tokens: []const u32, keep: engine.Keep) !void {
-        errdefer s.poisoned = true;
+        s.invalidateGreedy();
+        errdefer {
+            s.invalidateGreedy();
+            s.poisoned = true;
+        }
         const c = s.chain;
         const bytes = tokens.len * c.config.geometry.hidden * 2;
         // The residual payload starts at the fixed maximum-row stride for every chunk.
@@ -248,6 +254,20 @@ pub const Session = struct {
         if (out.len != s.logits.len) return error.InvalidLogits;
         for (out, s.logits) |*value, bits| value.* = @bitCast(@as(u32, bits) << 16);
     }
+
+    fn invalidateGreedy(s: *Session) void {
+        for (s.caches[0..s.chain.partitions.len]) |*cache| cache.terminal_greedy = null;
+    }
+
+    pub fn cachedGreedy(s: *const Session, position: u64) !?u32 {
+        if (s.poisoned) return error.PoisonedSession;
+        if (position != s.position) return error.PositionMismatch;
+        if (position == 0) return null;
+        const cache = &s.caches[s.chain.partitions.len - 1];
+        if (cache.len != position) return null;
+        const pick = cache.terminal_greedy orelse return null;
+        return if (pick.position == position) pick.token else null;
+    }
 };
 
 test "prefill bounds reject before checkpoint or CUDA access" {
@@ -256,6 +276,7 @@ test "prefill bounds reject before checkpoint or CUDA access" {
     for (1..17) |rows| try validatePrefillRows(rows);
     const defaults: Options = .{};
     try std.testing.expectEqual(@as(usize, 1), defaults.prefill_rows);
+    try std.testing.expect(!defaults.terminal_greedy);
 }
 
 test "prefill seam keeps residual payload disjoint for every admitted chunk" {
@@ -290,7 +311,10 @@ test "diagnostic validates output shape and every token without mutation" {
 
 test "a stage bind failure poisons the chunk without committing host state" {
     const Fake = struct {
+        var pending: *engine.Cache = undefined;
+        var inject: bool = false;
         fn bind(_: cuda.abi.Context) callconv(.c) cuda.abi.Result {
+            if (inject) pending.terminal_greedy = .{ .position = 5, .token = 1 };
             return cuda.abi.error_not_ready;
         }
     };
@@ -310,7 +334,10 @@ test "a stage bind failure poisons the chunk without committing host state" {
         cache.len = 3;
         cache.written = 3;
         cache.last = null;
+        cache.terminal_greedy = .{ .position = 3, .token = 1 };
     }
+    Fake.pending = &s.caches[1];
+    Fake.inject = true;
     try std.testing.expectError(error.NotReady, s.appendLogitRows(&.{ 1, 2 }, &out));
     try std.testing.expect(s.poisoned);
     try std.testing.expectEqual(@as(usize, 3), s.position);
@@ -318,10 +345,67 @@ test "a stage bind failure poisons the chunk without committing host state" {
         try std.testing.expectEqual(@as(usize, 3), cache.len);
         try std.testing.expectEqual(@as(usize, 3), cache.written);
         try std.testing.expect(cache.last == null);
+        try std.testing.expect(cache.terminal_greedy == null);
     }
     for (logits) |value| try std.testing.expectEqual(@as(u16, 0x3f80), value);
     for (out) |value| try std.testing.expectEqual(@as(u16, 0xa5a5), value);
     try std.testing.expectError(error.PoisonedSession, s.append(&.{1}));
+    try std.testing.expectError(error.PoisonedSession, s.cachedGreedy(3));
+    for (&s.caches) |*cache| cache.terminal_greedy = .{ .position = 3, .token = 1 };
+    Fake.inject = false;
     try std.testing.expectError(error.NotReady, s.reset());
     try std.testing.expect(s.poisoned);
+    for (s.caches) |cache| try std.testing.expect(cache.terminal_greedy == null);
+}
+
+test "terminal picks require committed session positions and stay isolated between sessions" {
+    var stages: [2]Stage = undefined;
+    var chain: Chain = undefined;
+    chain.partitions = &stages;
+    chain.context = 64;
+    var logits_a = [_]u16{ 0x3f80, 0x4000 };
+    var logits_b = [_]u16{ 0x4000, 0x3f80 };
+    var a: Session = .{ .chain = &chain, .caches = undefined, .logits = &logits_a, .position = 7 };
+    var b: Session = .{ .chain = &chain, .caches = undefined, .logits = &logits_b, .position = 7 };
+    for ([_]*Session{ &a, &b }, 0..) |s, i| {
+        for (&s.caches) |*cache| {
+            cache.len = 7;
+            cache.terminal_greedy = null;
+        }
+        s.caches[1].terminal_greedy = .{ .position = 8, .token = @intCast(1 - i) };
+        try std.testing.expect(try s.cachedGreedy(7) == null);
+        for (&s.caches) |*cache| {
+            const parts = [_]engine.Part{.{ .cache = cache, .rows = 1 }};
+            engine.Engine.commit(&parts, false);
+        }
+        try std.testing.expect(try s.cachedGreedy(7) == null);
+        s.position = 8;
+    }
+    try std.testing.expectEqual(@as(?u32, 1), try a.cachedGreedy(8));
+    try std.testing.expectEqual(@as(?u32, 0), try b.cachedGreedy(8));
+    try a.append(&.{});
+    try std.testing.expectEqual(@as(?u32, 1), try a.cachedGreedy(8));
+    try std.testing.expectError(error.PositionMismatch, a.cachedGreedy(7));
+    try std.testing.expectError(error.InvalidToken, a.append(&.{2}));
+    try std.testing.expectEqual(@as(?u32, 1), try a.cachedGreedy(8));
+    b.invalidateGreedy();
+    try std.testing.expect(try b.cachedGreedy(8) == null);
+    try std.testing.expectEqual(@as(?u32, 1), try a.cachedGreedy(8));
+    var out: [2]f32 = undefined;
+    try a.copyLogits(&out);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2 }, &out);
+    a.poisoned = true;
+    try std.testing.expectError(error.PoisonedSession, a.cachedGreedy(8));
+}
+
+test "partial and recorded commits discard terminal picks" {
+    var cache: engine.Cache = undefined;
+    cache.len = 7;
+    cache.terminal_greedy = .{ .position = 23, .token = 1 };
+    const parts = [_]engine.Part{.{ .cache = &cache, .rows = 1 }};
+    engine.Engine.commit(&parts, false);
+    try std.testing.expect(cache.terminal_greedy == null);
+    cache.terminal_greedy = .{ .position = 9, .token = 1 };
+    engine.Engine.commit(&parts, true);
+    try std.testing.expect(cache.terminal_greedy == null);
 }

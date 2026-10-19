@@ -51,6 +51,205 @@ pub fn aligned(n: usize) usize {
     return std.mem.alignForward(usize, n, 256);
 }
 
+const TerminalOutput = struct {
+    logits_bytes: usize,
+    pick_at: usize,
+    bytes: usize,
+
+    fn init(heads: usize, vocab: usize) TerminalOutput {
+        const bytes = heads * vocab * 2;
+        const pick_at = std.mem.alignForward(usize, bytes, @alignOf(cuda.tree_round.Pick));
+        return .{ .logits_bytes = bytes, .pick_at = pick_at, .bytes = pick_at + @sizeOf(cuda.tree_round.Pick) };
+    }
+
+    fn token(output: TerminalOutput, host: []const u8, vocab: usize) !?u32 {
+        const pick = std.mem.bytesToValue(cuda.tree_round.Pick, host[output.pick_at..][0..@sizeOf(cuda.tree_round.Pick)]);
+        if (pick.nonfinite & ~@as(u32, 7) != 0) return error.InvalidTerminalPick;
+        if (pick.nonfinite != 0) {
+            if (pick.token != std.math.maxInt(u32)) return error.InvalidTerminalPick;
+            return null;
+        }
+        if (pick.token >= vocab) return error.InvalidTerminalPick;
+        return pick.token;
+    }
+};
+
+test "terminal output layout preserves row stride and aligns a contiguous Pick suffix" {
+    for ([_]usize{ 1, 3, 257, 248320 }) |vocab| {
+        const capacity = TerminalOutput.init(most_verify, vocab).bytes;
+        for (1..most_verify + 1) |heads| {
+            const output = TerminalOutput.init(heads, vocab);
+            try std.testing.expectEqual(heads * vocab * 2, output.logits_bytes);
+            try std.testing.expectEqual(@as(usize, 0), output.pick_at % @alignOf(cuda.tree_round.Pick));
+            try std.testing.expect(output.pick_at >= output.logits_bytes);
+            try std.testing.expect(output.pick_at - output.logits_bytes <= 2);
+            try std.testing.expect(output.bytes <= capacity);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 496648), TerminalOutput.init(1, 248320).bytes);
+    try std.testing.expectEqual(@as(usize, 7946248), TerminalOutput.init(16, 248320).bytes);
+}
+
+test "terminal Pick validation preserves nonfinite fallback and rejects malformed results" {
+    var bytes: [16]u8 = @splat(0);
+    const output = TerminalOutput.init(1, 3);
+    for ([_]cuda.tree_round.Pick{ .{ .token = 2, .nonfinite = 0 }, .{ .token = 0xffffffff, .nonfinite = 1 }, .{ .token = 0xffffffff, .nonfinite = 7 } }) |pick| {
+        @memcpy(bytes[output.pick_at..][0..8], std.mem.asBytes(&pick));
+        const token = try output.token(&bytes, 3);
+        if (pick.nonfinite == 0) try std.testing.expectEqual(@as(?u32, 2), token) else try std.testing.expect(token == null);
+    }
+    for ([_]cuda.tree_round.Pick{ .{ .token = 3, .nonfinite = 0 }, .{ .token = 0xffffffff, .nonfinite = 0 }, .{ .token = 1, .nonfinite = 1 }, .{ .token = 0xffffffff, .nonfinite = 8 } }) |pick| {
+        @memcpy(bytes[output.pick_at..][0..8], std.mem.asBytes(&pick));
+        try std.testing.expectError(error.InvalidTerminalPick, output.token(&bytes, 3));
+    }
+}
+
+test "terminal graph key occupies bit 25 without changing prior shape dimensions" {
+    for (1..17) |rows| for ([_]bool{ false, true }) |heads_all| {
+        var shape: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .heads_all = heads_all, .expert_up_layout = .slice_major_v1, .expert_up_split_m = true, .reuse_fp8_quant = true, .expert_up_n8 = true, .gdn_layout = .key_value };
+        const before = shape.key();
+        shape.terminal_greedy = true;
+        try std.testing.expectEqual(@as(u32, 1 << 25), before ^ shape.key());
+    };
+    try std.testing.expect(!(Engine.InitOptions{}).terminal_greedy);
+}
+
+test "terminal finish uses one extended copy and publishes finite picks only at commit" {
+    const Fake = struct {
+        var copies: usize = 0;
+        var syncs: usize = 0;
+        var size: usize = 0;
+        var fail_sync: bool = false;
+        var fail_copy: bool = false;
+        fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            syncs += 1;
+            return if (fail_sync) cuda.abi.error_not_ready else cuda.abi.success;
+        }
+        fn copy(out: ?*anyopaque, source: cuda.abi.DevicePtr, bytes: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            copies += 1;
+            size = bytes;
+            if (fail_copy) return cuda.abi.error_not_ready;
+            const dst: [*]u8 = @ptrCast(out.?);
+            const src: [*]const u8 = @ptrFromInt(source);
+            @memcpy(dst[0..bytes], src[0..bytes]);
+            return cuda.abi.success;
+        }
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuStreamSynchronize = Fake.sync;
+    d.api.cuMemcpyDtoHAsync_v2 = Fake.copy;
+    var device: [112]u8 align(16) = @splat(0xa5);
+    var host: [112]u8 align(16) = @splat(0x5a);
+    var terminal: [3]u16 = @splat(99);
+    var cache: Cache = undefined;
+    cache.logits = &terminal;
+    var e: Engine = undefined;
+    e.d = &d;
+    e.stream = .{ .d = &d, .handle = null };
+    e.placement = .{ .first = 0, .end = 1, .total = 1 };
+    e.g.vocab = 3;
+    e.logits = @intFromPtr(&device);
+    e.host_logits = .{ .d = &d, .bytes = &host };
+    for ([_]usize{ 1, 16 }) |rows| for ([_]bool{ false, true }) |all| {
+        const heads = if (all) rows else 1;
+        const output = TerminalOutput.init(heads, 3);
+        @memset(&device, 0xa5);
+        @memset(&host, 0x5a);
+        for (std.mem.bytesAsSlice(u16, device[0..output.logits_bytes]), 0..) |*word, i| word.* = @intCast(i + 1);
+        const pick: cuda.tree_round.Pick = .{ .token = 2, .nonfinite = 0 };
+        @memcpy(device[output.pick_at..][0..8], std.mem.asBytes(&pick));
+        cache.len = 7;
+        cache.terminal_greedy = .{ .position = 7, .token = 0 };
+        Fake.copies = 0;
+        Fake.syncs = 0;
+        Fake.fail_sync = false;
+        Fake.fail_copy = false;
+        const parts = [_]Part{.{ .cache = &cache, .rows = rows }};
+        const shape: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .heads_all = all, .terminal_greedy = true };
+        const keep: Keep = if (all) .prompt_logits else .last;
+        try e.finish(&parts, keep, shape);
+        try std.testing.expectEqual(@as(usize, 1), Fake.copies);
+        try std.testing.expectEqual(@as(usize, 1), Fake.syncs);
+        try std.testing.expectEqual(output.bytes, Fake.size);
+        try std.testing.expectEqualSlices(u8, device[0..output.logits_bytes], host[0..output.logits_bytes]);
+        for (host[output.bytes..]) |byte| try std.testing.expectEqual(@as(u8, 0x5a), byte);
+        try std.testing.expectEqualSlices(u16, e.rowLogits(heads - 1), &terminal);
+        try std.testing.expectEqual(@as(usize, 7), cache.len);
+        try std.testing.expectEqual(7 + rows, cache.terminal_greedy.?.position);
+        Engine.commit(&parts, false);
+        try std.testing.expectEqual(cache.len, cache.terminal_greedy.?.position);
+
+        const bad: cuda.tree_round.Pick = .{ .token = 0, .nonfinite = 1 };
+        @memcpy(device[output.pick_at..][0..8], std.mem.asBytes(&bad));
+        terminal = @splat(99);
+        try std.testing.expectError(error.InvalidTerminalPick, e.finish(&parts, keep, shape));
+        try std.testing.expect(cache.terminal_greedy == null);
+        try std.testing.expectEqualSlices(u16, &.{ 99, 99, 99 }, &terminal);
+
+        const nonfinite: cuda.tree_round.Pick = .{ .token = 0xffffffff, .nonfinite = 7 };
+        @memcpy(device[output.pick_at..][0..8], std.mem.asBytes(&nonfinite));
+        try e.finish(&parts, keep, shape);
+        try std.testing.expect(cache.terminal_greedy == null);
+        try std.testing.expectEqualSlices(u16, e.rowLogits(heads - 1), &terminal);
+
+        var disabled = shape;
+        disabled.terminal_greedy = false;
+        cache.terminal_greedy = .{ .position = cache.len, .token = 1 };
+        try e.finish(&parts, keep, disabled);
+        try std.testing.expectEqual(output.logits_bytes, Fake.size);
+        try std.testing.expect(cache.terminal_greedy == null);
+        try std.testing.expectEqualSlices(u16, e.rowLogits(heads - 1), &terminal);
+
+        cache.terminal_greedy = .{ .position = cache.len, .token = 1 };
+        Fake.fail_copy = true;
+        Fake.syncs = 0;
+        try std.testing.expectError(error.NotReady, e.finish(&parts, keep, shape));
+        try std.testing.expect(cache.terminal_greedy == null);
+        try std.testing.expectEqual(@as(usize, 0), Fake.syncs);
+        Fake.fail_copy = false;
+
+        cache.terminal_greedy = .{ .position = cache.len, .token = 1 };
+        Fake.fail_sync = true;
+        try std.testing.expectError(error.NotReady, e.finish(&parts, keep, shape));
+        try std.testing.expect(cache.terminal_greedy == null);
+    };
+    Fake.fail_sync = false;
+}
+
+test "terminal argmax launch uses the shared function and terminal row with exact ABI" {
+    const Fake = struct {
+        var calls: usize = 0;
+        var row: u64 = 0;
+        var pick: u64 = 0;
+        fn launch(f: cuda.abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint, shared: c_uint, _: cuda.abi.Stream, params: ?[*]?*anyopaque, extra: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            if (f != @as(cuda.abi.Function, @ptrFromInt(123)) or gx != 1 or gy != 1 or gz != 1 or bx != 256 or by != 1 or bz != 1 or shared != 0 or extra != null) return 1;
+            const args = params orelse return 1;
+            const input: *const u64 = @ptrCast(@alignCast(args[0].?));
+            const output: *const u64 = @ptrCast(@alignCast(args[1].?));
+            const vocab: *const u32 = @ptrCast(@alignCast(args[2].?));
+            const stride: *const u32 = @ptrCast(@alignCast(args[3].?));
+            if (input.* != row or output.* != pick or vocab.* != 3 or stride.* != 3) return 1;
+            calls += 1;
+            return cuda.abi.success;
+        }
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Fake.launch;
+    var e: Engine = undefined;
+    e.g.vocab = 3;
+    e.logits = 4096;
+    e.stream = .{ .d = &d, .handle = null };
+    e.terminal = .{ .module = undefined, .kernels = undefined };
+    e.terminal.?.kernels.argmax_fn = .{ .d = &d, .handle = @ptrFromInt(123) };
+    Fake.calls = 0;
+    for ([_]usize{ 1, 16 }) |heads| {
+        Fake.row = 4096 + (heads - 1) * 6;
+        Fake.pick = 4096 + TerminalOutput.init(heads, 3).pick_at;
+        try e.pickTerminal(heads);
+    }
+    try std.testing.expectEqual(@as(usize, 2), Fake.calls);
+}
+
 /// qwen35.cuh's Geo.
 pub const Geo = extern struct { hid: c_int, nk: c_int, nv: c_int, qh: c_int, kvh: c_int, nl: c_int };
 
@@ -190,6 +389,7 @@ pub const Engine = struct {
     expert_up_split_m: bool = false,
     reuse_fp8_quant: bool = false,
     bounded_hf_prefill: bool = false,
+    terminal: ?struct { module: cuda.Module, kernels: cuda.tree_round.Kernels } = null,
     verify_expert_graphs: bool = false,
     expert_graph_nodes_baseline: usize = 0,
     expert_graph_nodes_n8: usize = 0,
@@ -293,7 +493,7 @@ pub const Engine = struct {
         return initPlaced(gpa, io, ctx, dir, .{ .geometry = g, .encoding = .mlx }, .{ .first = 0, .end = g.layers, .total = g.layers }, kv8);
     }
 
-    pub const InitOptions = struct { expert_up_layout: cuda.experts.Nvfp4UpLayout = .lane_major };
+    pub const InitOptions = struct { expert_up_layout: cuda.experts.Nvfp4UpLayout = .lane_major, terminal_greedy: bool = false };
 
     pub fn initPlaced(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, admitted: checkpoint.Admitted, placement: checkpoint.Placement, kv8: bool) !*Engine {
         return initPlacedWithOptions(gpa, io, ctx, dir, admitted, placement, kv8, .{});
@@ -301,6 +501,7 @@ pub const Engine = struct {
 
     pub fn initPlacedWithOptions(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, admitted: checkpoint.Admitted, placement: checkpoint.Placement, kv8: bool, options: InitOptions) !*Engine {
         const g = try placement.localGeometry(admitted.geometry);
+        if (options.terminal_greedy and admitted.numerics() != .hf_modelopt) return error.UnsupportedQwenTerminalGreedy;
         if (options.expert_up_layout == .slice_major_v1 and (admitted.numerics() != .hf_modelopt or g.hidden != 2048 or g.intermediate != 512 or g.experts != 256)) return error.UnsupportedQwenExpertUpLayout;
         if (admitted.numerics() == .hf_modelopt and kv8) return error.UnsupportedQwenKv;
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -325,6 +526,7 @@ pub const Engine = struct {
         e.expert_up_split_m = options.expert_up_layout == .slice_major_v1;
         e.reuse_fp8_quant = false;
         e.bounded_hf_prefill = false;
+        e.terminal = null;
         e.verify_expert_graphs = false;
         e.expert_graph_nodes_baseline = 0;
         e.expert_graph_nodes_n8 = 0;
@@ -359,6 +561,12 @@ pub const Engine = struct {
             e.mods[i] = try cuda.Module.load(d, img);
             loaded += 1;
         }
+        if (options.terminal_greedy and placement.ownsHead()) {
+            var module = try cuda.Module.load(d, kk.tree_round);
+            errdefer module.unload();
+            e.terminal = .{ .module = module, .kernels = try cuda.tree_round.Kernels.resolve(module) };
+        }
+        errdefer if (e.terminal) |*t| t.module.unload();
         const sms: usize = @intCast(try ctx.attribute(.multiprocessor_count));
         const gb10 = try ctx.attribute(.compute_capability_major) == 12 and try ctx.attribute(.compute_capability_minor) == 1;
         e.affine = try cuda.qlinear.Affine4Kernels.resolve(d, e.mods[0], e.mods[1], e.mods[2], e.mods[3], sms, gb10);
@@ -389,7 +597,7 @@ pub const Engine = struct {
         errdefer e.tables.free();
         e.staged = try cuda.HostBuffer.alloc(d, tables_len);
         errdefer e.staged.free();
-        e.host_logits = try cuda.HostBuffer.alloc(d, most_verify * g.vocab * 2);
+        e.host_logits = try cuda.HostBuffer.alloc(d, TerminalOutput.init(most_verify, g.vocab).bytes);
         errdefer e.host_logits.free();
         if (e.numerics == .mlx_sanitized) try e.warm(gpa);
         return e;
@@ -415,6 +623,7 @@ pub const Engine = struct {
         var it = e.graphs.valueIterator();
         while (it.next()) |x| x.deinit();
         e.graphs.deinit(e.gpa);
+        if (e.terminal) |*t| t.module.unload();
         e.host_logits.free();
         e.staged.free();
         e.tables.free();
@@ -494,7 +703,7 @@ pub const Engine = struct {
         e.pm = try t.alloc(R * g.q_heads * max_chunks * 4);
         e.pl = try t.alloc(R * g.q_heads * max_chunks * 4);
         e.po = try t.alloc(R * g.q_heads * max_chunks * head_dim * 4);
-        e.logits = try t.alloc(most_verify * g.vocab * 2);
+        e.logits = try t.alloc(TerminalOutput.init(most_verify, g.vocab).bytes);
         if (e.numerics == .hf_modelopt) {
             const rows = try t.alloc(R * hfInputWidth(g));
             const part = try t.alloc(hf_part_bytes);
@@ -614,6 +823,9 @@ pub const Engine = struct {
     pub fn forward(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
         if (!e.placement.ownsEmbedding() or !e.placement.ownsHead()) return error.QwenRequiresPipeline;
         const shape = try e.prepare(parts, ids, keep);
+        errdefer {
+            for (parts) |p| p.cache.terminal_greedy = null;
+        }
         try e.execute(shape);
         try e.finish(parts, keep, shape);
         commit(parts, shape.record);
@@ -631,7 +843,6 @@ pub const Engine = struct {
         try validateHfWindow(e.numerics, e.bounded_hf_prefill, parts, ids.len, keep);
         var total: usize = 0;
         for (parts) |p| {
-            try p.cache.settle(e);
             if (p.rows == 0 or p.cache.len + p.rows > p.cache.cap) return error.QwenContextFull;
             total += p.rows;
         }
@@ -643,6 +854,11 @@ pub const Engine = struct {
         for (ids) |id| if (id >= g.vocab) return error.InvalidQwenToken;
         for (parts) |p| if (p.parents != null and !record) return error.InvalidQwenParents;
         for (parts) |p| if (p.images != null and record) return error.InvalidQwenImages;
+        for (parts) |p| p.cache.terminal_greedy = null;
+        errdefer {
+            for (parts) |p| p.cache.terminal_greedy = null;
+        }
+        for (parts) |p| try p.cache.settle(e);
         // the prompt GEMM only for prompt chunks: a window's rows keep the bits of one-row steps
         const prompt = !record;
         // the tables
@@ -690,12 +906,13 @@ pub const Engine = struct {
         const lone = total == 1 and parts.len == 1;
         const bucket: usize = if (lone) 1 else if (total <= 16) 16 else most_verify;
         const windows: usize = if (lone) 1 else max_segs;
-        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant, .expert_up_layout = e.expert_up_layout };
+        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant, .expert_up_layout = e.expert_up_layout, .terminal_greedy = e.terminal != null and !record };
         e.features = if (images) |im| im.features else 0;
         return shape;
     }
 
     pub fn execute(e: *Engine, shape: Shape) !void {
+        if (shape.terminal_greedy and (e.numerics != .hf_modelopt or !e.placement.ownsHead() or e.terminal == null or shape.record or !shape.prompt)) return error.UnsupportedQwenTerminalGreedy;
         try validateCombined(e.numerics, shape.expert_up_n8, shape.expert_up_split_m, shape.reuse_fp8_quant);
         if (shape.expert_up_n8 and (e.numerics != .hf_modelopt or (shape.prompt and shape.total > most_window))) return error.UnsupportedQwenExpertUp;
         if (shape.heads_all and e.numerics != .hf_modelopt) return error.UnsupportedQwenWindow;
@@ -1118,10 +1335,14 @@ pub const Engine = struct {
             p.cache.last = if (record and p.rows > 1) .{ .start = p.cache.len, .rows = p.rows } else null;
             p.cache.len += p.rows;
             p.cache.written = p.cache.len;
+            if (p.cache.terminal_greedy) |pick| {
+                if (record or pick.position != p.cache.len) p.cache.terminal_greedy = null;
+            }
         }
     }
 
     pub fn finish(e: *Engine, parts: []const Part, keep: Keep, shape: Shape) !void {
+        for (parts) |p| p.cache.terminal_greedy = null;
         if (!e.placement.ownsHead()) {
             try e.stream.synchronize();
             return;
@@ -1144,10 +1365,16 @@ pub const Engine = struct {
                 @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
             },
             .logits, .last, .prompt_logits => {
-                const out = e.host_logits.bytes[0 .. heads * g.vocab * 2];
+                const output = TerminalOutput.init(heads, g.vocab);
+                const out = e.host_logits.bytes[0..if (shape.terminal_greedy) output.bytes else output.logits_bytes];
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(out.ptr, e.logits, out.len, e.stream.handle), "cuMemcpyDtoHAsync");
                 try e.stream.synchronize();
-                if (keep == .last or keep == .prompt_logits) @memcpy(parts[0].cache.logits, e.rowLogits(heads - 1));
+                const token = if (shape.terminal_greedy) try output.token(out, g.vocab) else null;
+                if (keep == .last or keep == .prompt_logits) {
+                    const cache = parts[0].cache;
+                    @memcpy(cache.logits, e.rowLogits(heads - 1));
+                    if (token) |id| cache.terminal_greedy = .{ .position = cache.len + parts[0].rows, .token = id };
+                }
             },
         }
     }
@@ -1165,9 +1392,10 @@ pub const Engine = struct {
         expert_up_layout: cuda.experts.Nvfp4UpLayout = .lane_major,
         reuse_fp8_quant: bool = false,
         heads_all: bool = false,
+        terminal_greedy: bool = false,
 
         fn key(s: Shape) u32 {
-            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21 | @as(u32, @intFromBool(s.expert_up_split_m)) << 22 | @as(u32, @intFromBool(s.reuse_fp8_quant)) << 23 | @as(u32, @backingInt(s.expert_up_layout)) << 24;
+            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21 | @as(u32, @intFromBool(s.expert_up_split_m)) << 22 | @as(u32, @intFromBool(s.reuse_fp8_quant)) << 23 | @as(u32, @backingInt(s.expert_up_layout)) << 24 | @as(u32, @intFromBool(s.terminal_greedy)) << 25;
         }
     };
 
@@ -1279,7 +1507,13 @@ pub const Engine = struct {
         try e.norm(true, e.final_norm, total);
         // the head over the kept rows
         try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
+        if (shape.terminal_greedy) try e.pickTerminal(heads);
         try e.mark(.head);
+    }
+
+    fn pickTerminal(e: *Engine, heads: usize) !void {
+        const output = TerminalOutput.init(heads, e.g.vocab);
+        try e.terminal.?.kernels.argmax(e.stream, e.logits + (heads - 1) * e.g.vocab * 2, e.logits + output.pick_at, 1, e.g.vocab, e.g.vocab);
     }
 
     pub fn routedRows(e: *Engine, router: u64, layer: cuda.experts.Layer, shared: layers.SharedExpert, x: u64, out: u64, total: usize, wide_rows: bool) !void {
@@ -1481,16 +1715,16 @@ test "bounded HF admission is opt in and does not imply recorded windows" {
 }
 
 test "bounded HF graph keys separate every row count layout expert arm and head mode" {
-    var keys: [1024]u32 = undefined;
+    var keys: [2048]u32 = undefined;
     var count: usize = 0;
-    for (1..17) |rows| for ([_]Cache.GdnLayout{ .value_key, .key_value }) |layout| for ([_]bool{ false, true }) |n8| for ([_]bool{ false, true }) |heads| for ([_]bool{ false, true }) |split| for ([_]bool{ false, true }) |reuse| for ([_]cuda.experts.Nvfp4UpLayout{ .lane_major, .slice_major_v1 }) |up_layout| {
-        const shape: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .gdn_layout = layout, .expert_up_n8 = n8, .heads_all = heads, .expert_up_split_m = split, .reuse_fp8_quant = reuse, .expert_up_layout = up_layout };
+    for (1..17) |rows| for ([_]Cache.GdnLayout{ .value_key, .key_value }) |layout| for ([_]bool{ false, true }) |n8| for ([_]bool{ false, true }) |heads| for ([_]bool{ false, true }) |split| for ([_]bool{ false, true }) |reuse| for ([_]cuda.experts.Nvfp4UpLayout{ .lane_major, .slice_major_v1 }) |up_layout| for ([_]bool{ false, true }) |terminal| {
+        const shape: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .gdn_layout = layout, .expert_up_n8 = n8, .heads_all = heads, .expert_up_split_m = split, .reuse_fp8_quant = reuse, .expert_up_layout = up_layout, .terminal_greedy = terminal };
         const key = shape.key();
         try std.testing.expect(std.mem.indexOfScalar(u32, keys[0..count], key) == null);
         keys[count] = key;
         count += 1;
     };
-    try std.testing.expectEqual(@as(usize, 1024), count);
+    try std.testing.expectEqual(@as(usize, 2048), count);
 }
 
 test "bounded HF chain views retain every state binding and reject field corruption" {

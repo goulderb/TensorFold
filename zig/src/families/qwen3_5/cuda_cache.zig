@@ -37,6 +37,7 @@ pub const Cache = struct {
     /// Positions the newest forward wrote up to: a tap ring holds them until the next forward, whatever `keep` lands.
     written: usize = 0,
     logits: []u16,
+    terminal_greedy: ?struct { position: usize, token: u32 } = null,
     /// The newest verify window of more than one row, until its path is kept: where it started, its rows.
     last: ?struct { start: usize, rows: usize } = null,
     /// An image prompt's rotary shift (get_rope_index's rope_delta): rows after its prompt rotate at position + delta.
@@ -68,6 +69,7 @@ pub const Cache = struct {
 
     /// Ready for another stream: no rows, the recurrences and tails zero (on the engine's stream, before its forwards).
     pub fn reset(self: *Cache, e: *const Engine) !void {
+        self.terminal_greedy = null;
         self.len = 0;
         self.written = 0;
         self.last = null;
@@ -103,6 +105,7 @@ pub const Cache = struct {
         }
         self.last = null;
         self.len = last.start + path.len;
+        self.terminal_greedy = null;
         const g = e.g;
         const sg = self.seg(e, last.start, 0, last.rows);
         try e.run(e.keeps.apply, .{ 1, geometry.dk / 4, g.v_heads * g.deltas() }, .{ 32, 4, 1 }, .{ e.geo, sg, p });
@@ -123,4 +126,22 @@ test "MLX rejects candidate GDN state before allocating device memory" {
     var e: Engine = undefined;
     e.numerics = .mlx_sanitized;
     try std.testing.expectError(error.UnsupportedQwenGdnLayout, Cache.initWithLayout(std.testing.allocator, &e, 1, .key_value));
+}
+
+test "cache reset invalidates a terminal pick before a failed device clear" {
+    const Fake = struct {
+        fn fill(_: cuda.abi.DevicePtr, _: u8, _: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return cuda.abi.error_not_ready;
+        }
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuMemsetD8Async = Fake.fill;
+    var e: Engine = undefined;
+    e.stream = .{ .d = &d, .handle = @ptrFromInt(1) };
+    var cache: Cache = undefined;
+    cache.state = .{ .d = &d, .ptr = 4096, .len = 16 };
+    cache.terminal_greedy = .{ .position = 8, .token = 1 };
+    try std.testing.expectError(error.NotReady, cache.reset(&e));
+    try std.testing.expect(cache.terminal_greedy == null);
+    try std.testing.expectEqual(@as(usize, 0), cache.len);
 }
