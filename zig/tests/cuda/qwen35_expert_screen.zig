@@ -471,3 +471,308 @@ test "Qwen expert screen rejects a wrong captured kernel or launch geometry" {
     wrong.shared_bytes = 4;
     try std.testing.expectError(error.ExpertGraphKernelMismatch, checkNode(wrong, f, 128, 32));
 }
+
+const Shard = enum {
+    full8,
+    first4,
+    last4,
+
+    fn first(self: Shard) usize {
+        return if (self == .last4) 4 else 0;
+    }
+    fn count(self: Shard) usize {
+        return if (self == .full8) 8 else 4;
+    }
+    fn active(self: Shard, row: usize) bool {
+        return row >= self.first() and row < self.first() + self.count();
+    }
+};
+const shard_arms = [_]Shard{ .full8, .first4, .last4 };
+const ShardRoute = struct {
+    members: [slots]i32,
+    items: [slots][3]i32,
+    counts: [2]i32,
+
+    fn init(shard: Shard) ShardRoute {
+        var route: ShardRoute = .{ .members = undefined, .items = @splat(.{ -1, -1, -1 }), .counts = .{ @intCast(shard.count()), 0 } };
+        for (&route.members, 0..) |*member, row| member.* = @intCast(row);
+        for (0..shard.count()) |item| {
+            const row: i32 = @intCast(shard.first() + item);
+            route.items[item] = .{ row, row, 1 };
+        }
+        return route;
+    }
+};
+
+pub fn validateShardInput(input: anytype) !void {
+    if (!input.expert_shard_screen) return;
+    if (input.expert_fixture == null or input.expert_n8_screen or input.gdn_layout_screen or input.gdn_layout_ab or
+        input.expert_n8_ab or input.quant_reuse_screen or input.transport_screen or input.verify_default_policy or
+        input.router_turns or input.forced.len != 0) return error.InvalidInput;
+}
+
+fn shardHash(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn shardOutput(shard: Shard, actual: []const u8, expected: []const u8, row_bytes: usize, fp32: bool) !void {
+    if (actual.len != slots * row_bytes or expected.len != actual.len) return error.InvalidExpertOutputSize;
+    for (0..slots) |row| {
+        const bytes = actual[row * row_bytes ..][0..row_bytes];
+        if (shard.active(row)) {
+            try finite(bytes, fp32);
+            try check.sameBytes("expert shard active output", bytes, expected[row * row_bytes ..][0..row_bytes]);
+        } else for (bytes) |byte| if (byte != 0xff) return error.ExpertShardInactiveWrite;
+    }
+}
+
+fn shardRun(ex: *const X, shard: Shard, s: cuda.Stream, epi: cuda.experts.Epi, rows: cuda.experts.Rows, layer: cuda.experts.Layer, plan: cuda.grouped.Plan, output: u64) !void {
+    if (epi == .up) return ex.runN8Up(s, rows, layer, plan, output, shard.count(), -1);
+    return ex.run(s, epi, rows, layer, plan, output, shard.count(), -1);
+}
+
+fn shardNodeArgs(p: cuda.abi.KernelNodeParams, expected: *const cuda.launch.Args) ![64]u8 {
+    const actual = p.params orelse return error.ExpertGraphMissingArguments;
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for (0..expected.count) |i| {
+        const bytes: [*]const u8 = @ptrCast(actual[i] orelse return error.ExpertGraphMissingArguments);
+        const want = expected.storage[expected.offsets[i]..][0..expected.sizes[i]];
+        if (!std.mem.eql(u8, bytes[0..want.len], want)) return error.ExpertGraphArgumentMismatch;
+        h.update(bytes[0..want.len]);
+    }
+    var digest: [32]u8 = undefined;
+    h.final(&digest);
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+pub fn runShards(gpu: check.Gpu, fixture_dir: []const u8, expected_manifest_sha256: []const u8, journal: anytype) !void {
+    try floor(gpu);
+    const path = try std.fs.path.join(gpu.gpa, &.{ fixture_dir, "manifest.json" });
+    defer gpu.gpa.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(gpu.io, path, gpu.gpa, .limited(1 << 20));
+    defer gpu.gpa.free(bytes);
+    const digest = try verifyHash(bytes, expected_manifest_sha256);
+    const manifest = try std.json.parseFromSlice(Manifest, gpu.gpa, bytes, .{ .ignore_unknown_fields = true });
+    defer manifest.deinit();
+    try validateOrder(manifest.value.expert_order);
+    const sms: usize = @intCast(try gpu.ctx.attribute(.multiprocessor_count));
+    var ex = try X.load(gpu.d, sms);
+    defer ex.unload();
+    try ex.loadN8Up(sms);
+    if (try ex.n8_up.?.function.attribute(.local_size_bytes) != 0) return error.N8KernelSpill;
+    if (ex.n8_up.?.grid(8, width / X.cols) != 128 or ex.n8_up.?.grid(4, width / X.cols) != 64) return error.N8GridMismatch;
+    var s = try cuda.Stream.init(gpu.d, false);
+    defer s.deinit();
+    try journal.write(.{ .kind = "expert_shard_fixture", .ordinal = gpu.ctx.device_ordinal, .manifest_sha256 = &digest, .scope = manifest.value.scope, .expert_order = manifest.value.expert_order, .banks = banks, .slots = slots, .sm_count = sms, .floor_bytes = floor_bytes, .free_bytes = (try gpu.ctx.memInfo()).free, .measurement_scope = "isolated per-GPU operator events and host wall; no simultaneous ranks, reduction, or model gain" });
+    for ([_]cuda.experts.Epi{ .up, .down_f32 }) |epi| try shardProjection(gpu, fixture_dir, &manifest.value, journal, &ex, s, epi);
+    try floor(gpu);
+}
+
+fn shardProjection(gpu: check.Gpu, dir: []const u8, manifest: *const Manifest, journal: anytype, ex: *const X, s: cuda.Stream, epi: cuda.experts.Epi) !void {
+    const up = epi == .up;
+    const n: usize = if (up) width else dims;
+    const k: usize = if (up) dims else width;
+    const parts: usize = if (up) 2 else 1;
+    const row_bytes = n * (if (up) @as(usize, 2) else 4);
+    const one = X.bytes(1, n, k, parts);
+    const host_weights = try read(gpu, dir, manifest, if (up) "up.bin" else "down.bin", experts * one);
+    defer gpu.gpa.free(host_weights);
+    const host_scales = try read(gpu, dir, manifest, if (up) "up-scales.bin" else "down-scales.bin", experts * parts * 4);
+    defer gpu.gpa.free(host_scales);
+    try finite(host_scales, true);
+    const host_input = try read(gpu, dir, manifest, if (up) "input.bin" else "hidden.bin", (if (up) @as(usize, 1) else slots) * k * 2);
+    defer gpu.gpa.free(host_input);
+    try finite(host_input, false);
+    const saved = try read(gpu, dir, manifest, if (up) "hidden.bin" else "pairs.bin", slots * row_bytes);
+    defer gpu.gpa.free(saved);
+    try finite(saved, !up);
+    var weights = try cuda.DeviceBuffer.fromHost(gpu.d, host_weights);
+    defer weights.free();
+    var scales = try cuda.DeviceBuffer.fromHost(gpu.d, host_scales);
+    defer scales.free();
+    var input = try cuda.DeviceBuffer.fromHost(gpu.d, host_input);
+    defer input.free();
+    const layer: cuda.experts.Layer = .{ .format = .nvfp4, .up = weights.ptr, .down = weights.ptr, .up_scale = scales.ptr, .down_scale = scales.ptr, .width = width, .dims = dims, .experts = experts, .limit = 0, .relu2 = false };
+    const rows: cuda.experts.Rows = .{ .x = input.ptr, .stride = k, .slots = slots };
+    var plan_buffers: [3][3]cuda.DeviceBuffer = undefined;
+    var made_buffers: usize = 0;
+    defer for (0..made_buffers) |i| plan_buffers[i / 3][i % 3].free();
+    var plans: [3]cuda.grouped.Plan = undefined;
+    for (shard_arms, 0..) |shard, ai| {
+        const route = ShardRoute.init(shard);
+        const data = [_][]const u8{ std.mem.asBytes(&route.members), std.mem.asBytes(&route.items), std.mem.asBytes(&route.counts) };
+        var hashes: [3][64]u8 = undefined;
+        for (data, 0..) |host, bi| {
+            plan_buffers[ai][bi] = try cuda.DeviceBuffer.fromHost(gpu.d, host);
+            made_buffers += 1;
+            var downloaded: [slots * 12]u8 = undefined;
+            try plan_buffers[ai][bi].download(0, downloaded[0..host.len]);
+            try check.sameBytes("uploaded shard plan", downloaded[0..host.len], host);
+            hashes[bi] = shardHash(downloaded[0..host.len]);
+        }
+        plans[ai] = .{ .members = plan_buffers[ai][0].ptr, .items = plan_buffers[ai][1].ptr, .counts = plan_buffers[ai][2].ptr, .rank = 0, .hist = 0 };
+        try journal.write(.{ .kind = "expert_shard_plan", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .arm = @tagName(shard), .bound = shard.count(), .actual_items = route.counts[0], .members = route.members, .items = route.items[0..shard.count()], .counts = route.counts, .bindings = plans[ai], .binding_sha256 = .{ hashes[0][0..], hashes[1][0..], hashes[2][0..] }, .input_slots = slots, .first_output_row = shard.first(), .output_rows = shard.count(), .bank0_original_ids = manifest.expert_order[shard.first()..][0..shard.count()] });
+    }
+    var reference = try cuda.DeviceBuffer.alloc(gpu.d, saved.len);
+    defer reference.free();
+    var output = try cuda.DeviceBuffer.alloc(gpu.d, saved.len);
+    defer output.free();
+    const want = try gpu.gpa.alloc(u8, saved.len);
+    defer gpu.gpa.free(want);
+    const got = try gpu.gpa.alloc(u8, saved.len);
+    defer gpu.gpa.free(got);
+    try floor(gpu);
+    for (0..banks) |bank| {
+        const bl = bankLayer(layer, bank);
+        try reference.fill8(0xff, s.handle);
+        try shardRun(ex, .full8, s, epi, rows, bl, plans[0], reference.ptr);
+        try s.synchronize();
+        try reference.download(0, want);
+        try finite(want, !up);
+        if (bank == 0) try check.sameBytes("shard full8 saved real output", want, saved);
+        for (shard_arms[1..], 1..) |shard, ai| {
+            try output.fill8(0xff, s.handle);
+            try shardRun(ex, shard, s, epi, rows, bl, plans[ai], output.ptr);
+            try s.synchronize();
+            try output.download(0, got);
+            try shardOutput(shard, got, want, row_bytes, !up);
+            if (bank == 0) try shardOutput(shard, got, saved, row_bytes, !up);
+            try journal.write(.{ .kind = "expert_shard_bank_parity", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .bank = bank, .arm = @tagName(shard), .original_ids = manifest.expert_order[bank * slots + shard.first() ..][0..shard.count()], .active_bytes_exact = true, .inactive_bytes_poison = true, .saved_real_output = bank == 0 });
+        }
+    }
+    var graphs: [3]cuda.graph.Exec = undefined;
+    var made_graphs: usize = 0;
+    defer for (graphs[0..made_graphs]) |*graph| graph.deinit();
+    const f = if (up) ex.n8_up.?.function else ex.fns[1];
+    const resident = if (up) ex.n8_up.?.resident else ex.resident[1];
+    for (shard_arms, 0..) |shard, ai| {
+        try cuda.graph.beginCapture(s, .thread_local);
+        for (0..launches) |i| shardRun(ex, shard, s, epi, rows, bankLayer(layer, i % banks), plans[ai], output.ptr) catch |err| {
+            if (cuda.graph.endCapture(s)) |graph| {
+                var dead = graph;
+                dead.deinit();
+            } else |_| {}
+            return err;
+        };
+        var graph = try cuda.graph.endCapture(s);
+        defer graph.deinit();
+        if (try graph.nodeCount() != launches) return error.ExpertGraphWorkCountMismatch;
+        const grid = if (up) ex.n8_up.?.grid(shard.count(), n / X.cols) else X.decodeGridWarps(.baseline, shard.count(), n / X.cols, resident, ex.warps);
+        if (grid != (if (shard == .full8) @as(usize, 128) else 64)) return error.ExpertShardGridMismatch;
+        var nodes: [launches]cuda.graph.Node = undefined;
+        const captured = try graph.nodes(&nodes);
+        if (captured.len != launches) return error.ExpertGraphWorkCountMismatch;
+        var bank_counts: [banks]usize = @splat(0);
+        var binding_hashes: [banks][64]u8 = undefined;
+        for (captured) |node| {
+            var p: cuda.abi.KernelNodeParams = undefined;
+            try gpu.d.check(gpu.d.api.cuGraphKernelNodeGetParams_v2(node, &p), "cuGraphKernelNodeGetParams");
+            try checkNode(p, f.handle, grid, 128);
+            const args = p.params orelse return error.ExpertGraphMissingArguments;
+            const weight_ptr: *const u64 = @ptrCast(@alignCast(args[3] orelse return error.ExpertGraphMissingArguments));
+            if (weight_ptr.* < weights.ptr or (weight_ptr.* - weights.ptr) % (slots * one) != 0) return error.ExpertGraphArgumentMismatch;
+            const bank = (weight_ptr.* - weights.ptr) / (slots * one);
+            if (bank >= banks) return error.ExpertGraphArgumentMismatch;
+            const expected = X.decodeArgs(epi, rows, bankLayer(layer, bank), plans[ai], output.ptr, -1);
+            binding_hashes[bank] = try shardNodeArgs(p, &expected);
+            bank_counts[bank] += 1;
+        }
+        for (bank_counts) |count| if (count != launches / banks) return error.ExpertGraphWorkCountMismatch;
+        graphs[ai] = try graph.instantiate();
+        made_graphs += 1;
+        try graphs[ai].upload(s);
+        try s.synchronize();
+        var binding_hex: [banks][]const u8 = undefined;
+        for (&binding_hashes, &binding_hex) |*digest, *hex| hex.* = digest;
+        try journal.write(.{ .kind = "expert_shard_kernel", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .arm = @tagName(shard), .symbol = try kernelName(f), .grid = grid, .threads = 128, .regs = try f.attribute(.num_regs), .local_bytes = try f.attribute(.local_size_bytes), .resident_blocks = resident, .resident_blocks_per_sm = try f.occupancy(128, 0), .kernel_launches = launches, .verified_kernel_nodes = captured.len, .bank_node_counts = bank_counts, .argument_sha256_by_bank = binding_hex, .logical_weight_and_scale_bytes_per_launch = shard.count() * (one + parts * 4), .logical_unique_weight_and_scale_bytes = banks * shard.count() * (one + parts * 4), .allocated_weight_and_scale_bytes = experts * (one + parts * 4), .free_bytes = (try gpu.ctx.memInfo()).free });
+    }
+    var start = try cuda.Event.init(gpu.d, true);
+    defer start.deinit();
+    var end = try cuda.Event.init(gpu.d, true);
+    defer end.deinit();
+    for (shard_arms[1..], 1..) |comparison, candidate_index| {
+        var events: [2][5]f64 = undefined;
+        var walls: [2][5]f64 = undefined;
+        for (0..6) |pair| for (0..2) |order| {
+            const arm_index = (pair + order) % 2;
+            const ai = if (arm_index == 1) candidate_index else 0;
+            const shard = shard_arms[ai];
+            try output.fill8(0xff, s.handle);
+            try s.synchronize();
+            const t0 = std.Io.Clock.awake.now(gpu.io).toNanoseconds();
+            try start.record(s);
+            try graphs[ai].launchOn(s);
+            try end.record(s);
+            try end.synchronize();
+            const wall_ms = @as(f64, @floatFromInt(std.Io.Clock.awake.now(gpu.io).toNanoseconds() - t0)) / 1e6;
+            const elapsed_ms = try cuda.Event.elapsedMs(start, end);
+            if (!std.math.isFinite(elapsed_ms) or elapsed_ms <= 0 or !std.math.isFinite(wall_ms) or wall_ms <= 0) return error.InvalidExpertShardTiming;
+            try output.download(0, got);
+            try shardOutput(shard, got, want, row_bytes, !up);
+            try floor(gpu);
+            if (pair != 0) {
+                events[arm_index][pair - 1] = elapsed_ms;
+                walls[arm_index][pair - 1] = wall_ms;
+            }
+            try journal.write(.{ .kind = "expert_shard_sample", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .comparison = @tagName(comparison), .pair = pair, .warmup = pair == 0, .order = order, .arm = @tagName(shard), .elapsed_ms = elapsed_ms, .wall_ms = wall_ms, .kernel_launches = launches, .banks = banks, .final_bank = banks - 1, .active_bytes_exact = true, .inactive_bytes_poison = true, .free_bytes = (try gpu.ctx.memInfo()).free });
+        };
+        for (0..2) |arm_index| {
+            std.mem.sort(f64, &events[arm_index], {}, std.sort.asc(f64));
+            std.mem.sort(f64, &walls[arm_index], {}, std.sort.asc(f64));
+            try journal.write(.{ .kind = "expert_shard_summary", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .comparison = @tagName(comparison), .arm = @tagName(shard_arms[if (arm_index == 0) @as(usize, 0) else candidate_index]), .samples = 5, .kernel_launches_per_sample = launches, .event_ms_median = events[arm_index][2], .event_ms_min = events[arm_index][0], .event_ms_max = events[arm_index][4], .wall_ms_median = walls[arm_index][2], .wall_ms_min = walls[arm_index][0], .wall_ms_max = walls[arm_index][4] });
+        }
+    }
+    try journal.write(.{ .kind = "expert_shard_projection_complete", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .all_bank_prechecks = true, .saved_bank0_exact = true, .graph_finals_exact = true, .timed_pairs_per_comparison = 5 });
+}
+
+test "expert shard plans retain global selected rows without overlap or missing work" {
+    var covered: [slots]bool = @splat(false);
+    for (shard_arms[1..]) |shard| {
+        const route = ShardRoute.init(shard);
+        try std.testing.expectEqual(@as(i32, 4), route.counts[0]);
+        for (route.items[0..4]) |item| {
+            const row: usize = @intCast(route.members[@intCast(item[1])]);
+            try std.testing.expectEqual(@as(i32, @intCast(row)), item[0]);
+            try std.testing.expectEqual(@as(i32, 1), item[2]);
+            try std.testing.expect(shard.active(row));
+            try std.testing.expect(!covered[row]);
+            covered[row] = true;
+        }
+    }
+    for (covered) |hit| try std.testing.expect(hit);
+    const full = ShardRoute.init(.full8);
+    try std.testing.expectEqual(@as(i32, 8), full.counts[0]);
+    try std.testing.expectEqual([3]i32{ 7, 7, 1 }, full.items[7]);
+}
+
+test "expert shard output rejects wrong active bytes and any inactive write" {
+    const values: [slots]u16 = @splat(0x3f80);
+    const reference = std.mem.asBytes(&values);
+    var actual: [slots * 2]u8 = @splat(0xff);
+    @memcpy(actual[8..], reference[8..]);
+    try shardOutput(.last4, &actual, reference, 2, false);
+    actual[0] = 0;
+    try std.testing.expectError(error.ExpertShardInactiveWrite, shardOutput(.last4, &actual, reference, 2, false));
+    actual[0] = 0xff;
+    actual[8] = 0xff;
+    actual[9] = 0xff;
+    try std.testing.expectError(error.NonfiniteExpertOutput, shardOutput(.last4, &actual, reference, 2, false));
+}
+
+test "expert shard capture verifier rejects every changed argument binding" {
+    const layer: cuda.experts.Layer = .{ .format = .nvfp4, .up = 4096, .down = 8192, .up_scale = 128, .down_scale = 256, .width = width, .dims = dims, .experts = slots };
+    const plan: cuda.grouped.Plan = .{ .items = 300, .counts = 400, .members = 500, .rank = 0, .hist = 0 };
+    for ([_]cuda.experts.Epi{ .up, .down_f32 }) |epi| {
+        const expected = X.decodeArgs(epi, .{ .x = 1024, .stride = if (epi == .up) dims else width, .slots = slots }, layer, plan, 600, -1);
+        var actual = expected;
+        const p: cuda.abi.KernelNodeParams = .{ .func = @ptrFromInt(1), .grid_x = 64, .grid_y = 1, .grid_z = 1, .block_x = 128, .block_y = 1, .block_z = 1, .shared_bytes = 0, .params = actual.pointers(), .extra = null };
+        _ = try shardNodeArgs(p, &expected);
+        for (0..expected.count) |i| {
+            actual.storage[actual.offsets[i]] ^= 1;
+            try std.testing.expectError(error.ExpertGraphArgumentMismatch, shardNodeArgs(p, &expected));
+            actual.storage[actual.offsets[i]] ^= 1;
+        }
+    }
+}
