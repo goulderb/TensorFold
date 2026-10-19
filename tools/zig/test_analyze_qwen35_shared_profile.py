@@ -79,6 +79,14 @@ class AnalyzerTests(unittest.TestCase):
     def test_rejects_source_mismatch(self):
         self.reject(lambda: self.rows[0].update(source_commit="wrong"))
 
+    def test_accepts_first_eager_turn_before_any_capture(self):
+        next(r for r in self.rows if r.get("kind") == "turn").update(graph_nodes=0)
+        self.save()
+        analyzer.analyze(self.window, require_greedy=True)
+
+    def test_rejects_missing_captured_graph_nodes(self):
+        self.reject(lambda: next(r for r in self.rows if r.get("kind") == "turn" and r.get("arm") == "graph").update(graph_nodes=0))
+
     def test_rejects_controller_memory_floor(self):
         path = self.window / "window.json"
         receipt = json.loads(path.read_text())

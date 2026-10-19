@@ -136,7 +136,10 @@ def analyze(window, require_greedy=False):
             require(expected_state is None or state == expected_state, "persistent state differs across turns")
             expected_state = state
             require(r.get("graph_launches") == (2 * (p + n - 1) if r["arm"] == "graph" else 0), "graph launch count mismatch")
-            require(r.get("graph_nodes", 0) > 0, "missing graph node count")
+            if r["arm"] == "graph":
+                require(r.get("graph_nodes", 0) > 0, "missing graph node count")
+            else:
+                require(type(r.get("graph_nodes")) is int and r["graph_nodes"] >= 0, "invalid cached graph node count")
         require(both[0]["persistent_state_sha256"] == both[1]["persistent_state_sha256"], "paired final state differs")
     require(len(set(expected_tokens)) > 1, "output tokens do not evolve")
     controls = [r for r in rows if r.get("kind") == "controls"]
