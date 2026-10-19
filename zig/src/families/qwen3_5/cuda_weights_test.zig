@@ -1,6 +1,6 @@
 const std = @import("std");
 const cuda = @import("cuda");
-const W = @import("cuda_weights.zig");
+const W = @import("modelopt_cuda_weights.zig");
 const Config = @import("cuda_checkpoint.zig").Config;
 
 const Mock = struct {
@@ -25,6 +25,9 @@ const Mock = struct {
     }
     fn synchronize() callconv(.c) cuda.abi.Result {
         return if (can_sync) cuda.abi.success else cuda.abi.error_not_ready;
+    }
+    fn synchronizeStream(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        return synchronize();
     }
     fn create(stream: *cuda.abi.Stream, _: c_uint) callconv(.c) cuda.abi.Result {
         creates += 1;
@@ -52,6 +55,7 @@ const Mock = struct {
         d.api.cuMemGetInfo_v2 = memory;
         d.api.cuCtxSynchronize = synchronize;
         d.api.cuStreamCreate = create;
+        d.api.cuStreamSynchronize = synchronizeStream;
         d.api.cuStreamDestroy_v2 = destroy;
         d.api.cuMemAlloc_v2 = alloc;
         d.api.cuMemFree_v2 = free;
@@ -153,7 +157,7 @@ test "cuda Qwen capacity planning counts padded lane weights and live loading st
 
 test "official checkpoint memory plans refuse one 16 GiB GPU and admit the idle pair" {
     const Header = @import("cuda_checkpoint_test.zig").Header;
-    const engine = @import("cuda_engine.zig");
+    const engine = @import("modelopt_cuda_engine.zig");
     inline for (.{ "ornith_nvfp4", "nvidia_qwen36_nvfp4" }) |fixture| {
         var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer arena.deinit();

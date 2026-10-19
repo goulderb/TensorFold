@@ -183,3 +183,13 @@ test "cuda Qwen checkpoint refuses extra tensors only in the loaded text partiti
     _ = try mapped.get("model.language_model.layers.20.extra");
     try ck.refuseUnusedText(&mapped, 0, 40, true, true);
 }
+
+test "ModelOpt encoding dispatch preserves MLX and claims malformed ModelOpt" {
+    const a = std.testing.allocator;
+    try std.testing.expect(!try ck.claimsBytes(a, "{}"));
+    try std.testing.expect(!try ck.claimsBytes(a, "{\"quantization\":{\"bits\":4,\"group_size\":64}}"));
+    try std.testing.expect(try ck.claimsBytes(a, "{\"quantization_config\":{\"quant_method\":\"modelopt\"}}"));
+    try std.testing.expect(try ck.claimsBytes(a, "{\"quantization_config\":{\"quant_algo\":\"MIXED_PRECISION\"}}"));
+    try std.testing.expectError(error.UnsupportedQwenQuantization, ck.claimsBytes(a, "{\"quantization_config\":false}"));
+    try std.testing.expectError(error.UnsupportedModel, ck.Config.parse(a, "{\"quantization_config\":{\"quant_method\":\"modelopt\"}}"));
+}

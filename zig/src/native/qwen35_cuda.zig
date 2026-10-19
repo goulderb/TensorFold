@@ -7,6 +7,10 @@ const Allocator = std.mem.Allocator;
 
 pub const family: api.Family = .{ .model_type = "qwen3_5_moe", .formats = &.{"modelopt-mixed-nvfp4"} };
 
+pub fn claims(gpa: Allocator, io: std.Io, dir: []const u8) !bool {
+    return qwen.checkpoint.claims(gpa, io, dir);
+}
+
 pub fn refusal(o: api.Open) ?[]const u8 {
     if (o.lanes_fixed and o.lanes != 1) return "the Qwen CUDA correctness baseline serves one request at a time; use --parallel 1";
     if (o.tp != 1) return "the Qwen CUDA baseline uses a layer split, with no tensor-parallel collectives";
@@ -14,6 +18,7 @@ pub fn refusal(o: api.Open) ?[]const u8 {
     if (o.drafter != null or o.mtp_drafts != null or o.mtp_confidence != null) return "the Qwen CUDA baseline has no drafter or MTP execution";
     if (o.slide or o.recall or o.learn != null or o.learn_conversations or o.record != null) return "the Qwen CUDA baseline has no learning, recording or persistent cache";
     if (o.keep != null or o.prompt_cache_gib != null) return "the Qwen CUDA baseline keeps independent request state with no prefix cache";
+    if (o.kv8) return "the Qwen ModelOpt baseline supports BF16 KV only; omit --kv-cache fp8";
     if (o.precision != null or o.policy.len > 0) return "the Qwen CUDA baseline uses the checkpoint's FP8 activations, W4A16 experts and BF16 KV";
     if (o.segments != null and o.segments.? != 1) return "the Qwen CUDA baseline prefills one token per engine step; use --segments 1";
     return null;
@@ -116,6 +121,9 @@ test "unsupported Qwen capabilities refuse before loading CUDA" {
     o.lanes = 1;
     try std.testing.expect(refusal(o) == null);
     o.learn_conversations = true;
+    try std.testing.expect(refusal(o) != null);
+    o = base;
+    o.kv8 = true;
     try std.testing.expect(refusal(o) != null);
     o = base;
     o.segments = 2;

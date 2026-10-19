@@ -1,8 +1,27 @@
 const std = @import("std");
 const core = @import("core");
-const general = @import("config.zig");
+const general = @import("qwen35").config;
 const Tensor = core.checkpoint.Tensor;
 const DType = core.checkpoint.DType;
+
+/// Claim the encoding before geometry validation so malformed ModelOpt never falls through to MLX.
+pub fn claims(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !bool {
+    const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
+    defer gpa.free(path);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 22));
+    defer gpa.free(bytes);
+    return claimsBytes(gpa, bytes);
+}
+
+pub fn claimsBytes(gpa: std.mem.Allocator, bytes: []const u8) !bool {
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.UnsupportedQwenQuantization;
+    const quant = parsed.value.object.get("quantization_config") orelse return false;
+    if (quant != .object) return error.UnsupportedQwenQuantization;
+    if (isString(quant.object.get("quant_method"), "modelopt")) return true;
+    return quant.object.contains("quant_algo") or quant.object.contains("quantized_layers") or quant.object.contains("config_groups");
+}
 
 pub const Config = struct {
     spec: general.Spec,
