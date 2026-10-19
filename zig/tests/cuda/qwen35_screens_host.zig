@@ -8,4 +8,7 @@ test {
     _ = @import("qwen35_prefill_screen.zig");
     _ = @import("qwen35_prefill_linear_screen.zig");
     _ = @import("qwen35_prefill_gdn_screen.zig");
+    _ = @import("qwen35_operator_suite.zig");
+    _ = @import("qwen35_mma_capture_screen.zig");
+    _ = @import("qwen35_ck_stage_screen.zig");
 }
