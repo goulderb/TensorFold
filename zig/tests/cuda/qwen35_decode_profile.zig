@@ -6,6 +6,7 @@ const cuda = @import("cuda");
 const admission = @import("qwen35_probe_device.zig");
 const expert_screen = @import("qwen35_expert_screen.zig");
 const gdn_layout_screen = @import("qwen35_gdn_layout_screen.zig");
+const state_layout = @import("qwen35_state_layout.zig");
 
 comptime {
     if (options.engine_optimization != .fast) @compileError("diagnostics require ReleaseFast engine");
@@ -25,6 +26,7 @@ const Input = struct {
     expert_fixture: ?[]const u8 = null,
     expert_fixture_sha256: ?[]const u8 = null,
     gdn_layout_screen: bool = false,
+    gdn_layout_ab: bool = false,
 };
 const Journal = struct {
     a: std.mem.Allocator,
@@ -56,6 +58,7 @@ fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     const input = try std.json.parseFromSliceLeaky(Input, a, bytes, .{});
     if (input.prompt.len == 0 or input.output_tokens == 0 or input.output_tokens > 1024 or input.context > 262144 or input.context < input.output_tokens or input.prompt.len > input.context - input.output_tokens or input.forced.len > input.output_tokens or input.repetitions == 0) return error.InvalidInput;
     if (input.router_screen or input.router_candidate) return error.ArchivedDiagnosticMode;
+    if (input.gdn_layout_ab and (input.expert_fixture != null or input.gdn_layout_screen or input.forced.len != 0)) return error.InvalidInput;
     if ((input.expert_fixture == null) != (input.expert_fixture_sha256 == null)) return error.InvalidExpertFixture;
     if (input.expert_fixture_sha256) |sha| {
         if (sha.len != 64) return error.InvalidExpertFixture;
@@ -118,6 +121,135 @@ fn run(io: std.Io, s: *qwen.Session, input: Input, tokens: []u32, rows: []u16) !
     }
     const end = now(io);
     return .{ .prefill_ns = prefilled - start, .decode_ns = end - prefilled, .elapsed_ns = end - start, .appends = input.prompt.len + tokens.len - 1 };
+}
+
+fn canonicalState(a: std.mem.Allocator, s: *qwen.Session) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, "qwen35-canonical-state-v2");
+    try out.appendSlice(a, std.mem.asBytes(&s.position));
+    for (s.chain.partitions, 0..) |*p, rank| {
+        try p.context.makeCurrent();
+        try p.engine.stream.synchronize();
+        const cache = &s.caches[rank];
+        const g = p.engine.g;
+        const used = s.position * 256 * 2;
+        const bytes = try a.alloc(u8, @max(cache.state.len, used));
+        defer a.free(bytes);
+        try cache.state.download(0, bytes[0..cache.state.len]);
+        if (cache.gdn_layout == .key_value) {
+            const scratch = try a.alloc(u8, g.deltas() * g.recBytes());
+            defer a.free(scratch);
+            try state_layout.canonicalize(bytes[0..cache.state.len], scratch, g.deltas(), g.v_heads, 128);
+        }
+        try out.appendSlice(a, std.mem.asBytes(&cache.len));
+        try out.appendSlice(a, std.mem.asBytes(&cache.written));
+        try out.appendSlice(a, std.mem.asBytes(&cache.delta));
+        try out.appendSlice(a, bytes[0..cache.state.len]);
+        for (0..g.attentions() * 2 * g.kv_heads) |row| {
+            try cache.kv.download(row * cache.cap * 256 * 2, bytes[0..used]);
+            try out.appendSlice(a, bytes[0..used]);
+        }
+    }
+    try out.appendSlice(a, std.mem.sliceAsBytes(s.logits));
+    return out.toOwnedSlice(a);
+}
+
+fn layoutCheck(a: std.mem.Allocator, s: *qwen.Session, expected: []const u8, rows: []const u16, expected_rows: []const u16, tokens: []const u32, expected_tokens: []const u32) !void {
+    const state = try canonicalState(a, s);
+    defer a.free(state);
+    if (!std.mem.eql(u8, state, expected) or !std.mem.eql(u16, rows, expected_rows) or !std.mem.eql(u32, tokens, expected_tokens)) return error.GdnLayoutFullModelMismatch;
+}
+
+fn layoutControls(init: std.process.Init, s: *qwen.Session, peer: *qwen.Session, input: Input, expected: []const u8, expected_rows: []const u16, expected_tokens: []const u32, rows: []u16, tokens: []u32, j: Journal, arm: []const u8) !void {
+    const a = init.gpa;
+    captured(s.chain, true);
+    try s.reset();
+    try peer.reset();
+    try s.append(input.prompt[0..1]);
+    const saved = try canonicalState(a, s);
+    defer a.free(saved);
+    const different = [_]u32{ (input.prompt[0] + 1) % @as(u32, @intCast(s.logits.len)), (input.prompt[0] + 2) % @as(u32, @intCast(s.logits.len)) };
+    try peer.append(&different);
+    const after_peer = try canonicalState(a, s);
+    defer a.free(after_peer);
+    if (!std.mem.eql(u8, saved, after_peer)) return error.SessionIsolationMismatch;
+    const peer_saved = try canonicalState(a, peer);
+    defer a.free(peer_saved);
+    try s.append(input.prompt[1..]);
+    const peer_after = try canonicalState(a, peer);
+    defer a.free(peer_after);
+    if (!std.mem.eql(u8, peer_saved, peer_after)) return error.SessionIsolationMismatch;
+    try poisonControl(s, input);
+    _ = try run(init.io, s, input, tokens, rows);
+    try layoutCheck(a, s, expected, rows, expected_rows, tokens, expected_tokens);
+    try j.write(.{ .kind = "layout_controls", .arm = arm, .distinct_prompts_and_positions = true, .inactive_complete_state_unchanged = true, .reset_exact = true, .partial_stage_failure_poison = true, .uncommitted_lengths = true, .canonical_state_version = 2 });
+}
+
+fn layoutAB(init: std.process.Init, c: *qwen.Engine, input: Input, output: []const u8, j: Journal) !void {
+    const a = init.gpa;
+    var baseline = try c.createSession();
+    defer baseline.deinit();
+    var candidate = try c.createSessionWithLayout(.key_value);
+    defer candidate.deinit();
+    const tokens = try a.alloc(u32, input.output_tokens);
+    defer a.free(tokens);
+    const expected_tokens = try a.alloc(u32, input.output_tokens);
+    defer a.free(expected_tokens);
+    const rows = try a.alloc(u16, input.output_tokens * baseline.logits.len);
+    defer a.free(rows);
+    const expected_rows = try a.alloc(u16, rows.len);
+    defer a.free(expected_rows);
+    captured(c, false);
+    _ = try run(init.io, &baseline, input, expected_tokens, expected_rows);
+    const expected = try canonicalState(a, &baseline);
+    defer a.free(expected);
+    const state_hash = hash(expected);
+    const logit_hash = hash(std.mem.sliceAsBytes(expected_rows));
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = try std.fs.path.join(init.arena.allocator(), &.{ output, "consumed-logits.bf16" }), .data = std.mem.sliceAsBytes(expected_rows) });
+    try j.write(.{ .kind = "layout_reference", .arm = "baseline", .graph = false, .tokens = expected_tokens, .consumed_logits_sha256 = &logit_hash, .canonical_state_sha256 = &state_hash, .canonical_state_bytes = expected.len, .canonical_state_version = 2 });
+    const sessions = [_]*qwen.Session{ &baseline, &candidate };
+    const names = [_][]const u8{ "baseline", "candidate" };
+    for (c.partitions) |*p| p.engine.verify_gdn_graphs = true;
+    for (0..2) |mode| {
+        captured(c, mode == 1);
+        for (sessions, names) |session, name| {
+            _ = try run(init.io, session, input, tokens, rows);
+            try layoutCheck(a, session, expected, rows, expected_rows, tokens, expected_tokens);
+            try j.write(.{ .kind = "layout_qualification", .arm = name, .graph = mode == 1, .all_rows_tokens_and_canonical_state_exact = true });
+        }
+    }
+    for (c.partitions, 0..) |*p, rank| {
+        try j.write(.{ .kind = "layout_graph_bindings", .rank = rank, .expected_gdn_nodes = p.engine.g.deltas(), .baseline_verified_nodes = p.engine.gdn_graph_nodes_baseline, .candidate_verified_nodes = p.engine.gdn_graph_nodes_candidate });
+    }
+    for (0..6) |pair| for (0..2) |order| {
+        const index = (pair + order) % 2;
+        const session = sessions[index];
+        captured(c, true);
+        const timing = try run(init.io, session, input, tokens, rows);
+        try layoutCheck(a, session, expected, rows, expected_rows, tokens, expected_tokens);
+        var launches: usize = 0;
+        var nodes: usize = 0;
+        for (c.partitions, 0..) |*p, rank| {
+            launches += p.engine.graph_launches;
+            nodes += p.engine.graph_nodes;
+            try j.write(.{ .kind = "layout_memory", .pair = pair, .order = order, .rank = rank, .free_bytes = (try p.context.memInfo()).free, .floor_bytes = qwen.floor_bytes });
+        }
+        if (launches != c.partitions.len * timing.appends) return error.GraphWorkCountMismatch;
+        try j.write(.{ .kind = "layout_turn", .pair = pair, .order = order, .warmup = pair == 0, .arm = names[index], .graph = true, .times = timing, .graph_launches = launches, .graph_nodes = nodes, .position = session.position, .all_rows_tokens_and_canonical_state_exact = true, .consumed_logits_sha256 = &logit_hash, .canonical_state_sha256 = &state_hash, .canonical_state_version = 2, .tokens = tokens });
+    };
+    for (sessions, names, 0..) |session, name, index| try layoutControls(init, session, sessions[1 - index], input, expected, expected_rows, expected_tokens, rows, tokens, j, name);
+    {
+        var recreated = try c.createSessionWithLayout(.key_value);
+        defer recreated.deinit();
+        captured(c, true);
+        _ = try run(init.io, &recreated, input, tokens, rows);
+        try layoutCheck(a, &recreated, expected, rows, expected_rows, tokens, expected_tokens);
+        _ = try run(init.io, &baseline, input, tokens, rows);
+        try layoutCheck(a, &baseline, expected, rows, expected_rows, tokens, expected_tokens);
+        try j.write(.{ .kind = "layout_recreated_session", .candidate_exact = true, .baseline_after_candidate_exact = true });
+    }
+    try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "single-load captured GDN layout A/B with complete canonical state and logit parity", .production_qualification = false, .independent_reference_parity = "not checked by this executable" });
 }
 
 const Phase = qwen.shared_engine.Phase;
@@ -254,8 +386,9 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
         try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "isolated operator parity and timing screens", .production_qualification = false });
         return;
     }
-    const c = try qwen.Engine.open(init.gpa, init.io, dir, .{ .context = input.context, .cut = input.cut });
+    const c = try qwen.Engine.open(init.gpa, init.io, dir, .{ .context = input.context, .cut = input.cut, .captured = !input.gdn_layout_ab });
     defer c.deinit();
+    if (input.gdn_layout_ab) return layoutAB(init, c, input, output, j);
     var s = try c.createSession();
     defer s.deinit();
     const tokens = try a.alloc(u32, input.output_tokens);
