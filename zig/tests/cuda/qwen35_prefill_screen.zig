@@ -1,7 +1,8 @@
 const std = @import("std");
 
 pub fn validateInput(input: anytype) !void {
-    if (!input.prefill_operator_screen) return;
+    if (!input.prefill_operator_screen and !input.prefill_ab) return;
+    if (input.prefill_operator_screen and input.prefill_ab) return error.InvalidInput;
     if (input.expert_fixture != null or input.expert_n8_screen or input.expert_shard_screen or
         input.expert_latency_screen or input.gdn_layout_screen or input.gdn_layout_ab or
         input.expert_n8_ab or input.quant_reuse_screen or input.transport_screen or
@@ -17,6 +18,7 @@ pub fn run(gpu: @import("check.zig").Gpu, model_dir: []const u8, journal: anytyp
 test "prefill operator admission excludes every competing diagnostic mode" {
     const Input = struct {
         prefill_operator_screen: bool = true,
+        prefill_ab: bool = false,
         expert_fixture: ?[]const u8 = null,
         expert_n8_screen: bool = false,
         expert_shard_screen: bool = false,
@@ -33,6 +35,8 @@ test "prefill operator admission excludes every competing diagnostic mode" {
         forced: []const u32 = &.{},
     };
     try validateInput(Input{});
+    try validateInput(Input{ .prefill_operator_screen = false, .prefill_ab = true });
+    try std.testing.expectError(error.InvalidInput, validateInput(Input{ .prefill_ab = true }));
     inline for (.{ "expert_n8_screen", "expert_shard_screen", "expert_latency_screen", "gdn_layout_screen", "gdn_layout_ab", "expert_n8_ab", "quant_reuse_screen", "transport_screen", "verify_default_policy", "router_turns", "router_screen", "router_candidate" }) |flag| {
         var input: Input = .{};
         @field(input, flag) = true;

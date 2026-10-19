@@ -2,6 +2,18 @@
 const cuda = @import("cuda");
 const E = @import("cuda_engine.zig");
 
+const ProjectedOffsets = struct { features: usize, picks: usize, weights: usize, scores: usize, pairs: usize };
+
+fn projectedOffsets(row: usize, hidden: usize, top_k: usize, experts: usize) ProjectedOffsets {
+    return .{
+        .features = row * hidden * 2,
+        .picks = row * top_k * 4,
+        .weights = row * (top_k + 1) * 4,
+        .scores = row * (experts + 1) * 4,
+        .pairs = row * top_k * hidden * 4,
+    };
+}
+
 /// The routed rows' scratch: logits, picks and weights a row, the plan, the pairs' activations and sums.
 pub const Scratch = struct {
     logits: u64 = 0,
@@ -48,7 +60,10 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, shared: @impor
     const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
     const grouped: cuda.experts.Grouped = .{ .affine4 = &e.experts, .affine3 = &e.experts3, .nvfp4 = if (e.modelopt) |*m| &m.nvfp4_experts else null };
     if (shared == .projected) {
-        try e.modelopt.?.router.route(e.stream, x, router, router + g.experts * g.hidden * 2, s.picks, s.wts, s.logits);
+        for (0..total) |row| {
+            const at = projectedOffsets(row, g.hidden, g.top_k, g.experts);
+            try e.modelopt.?.router.route(e.stream, x + at.features, router, router + g.experts * g.hidden * 2, s.picks + at.picks, s.wts + at.weights, s.logits + at.scores);
+        }
     } else {
         try e.moe.route(e.stream, x, g.hidden, total, router, s.logits, g.hidden, count);
         try e.moe.pick(e.stream, s.logits, s.picks, s.wts, total, g.experts, g.top_k);
@@ -79,8 +94,32 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, shared: @impor
             try e.run(e.fns.mlp_act, .{ (total * width + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, @as(c_longlong, @intCast(total * width)), e.tables.ptr + E.Engine.params_at, @as(c_int, @intCast(width)) });
             try e.proj(m.down, e.act, s.shared, total, false);
             try e.mark(.shared);
-            try e.modelopt.?.router.combine(e.stream, s.y, s.wts, s.shared, out);
+            for (0..total) |row| {
+                const at = projectedOffsets(row, g.hidden, g.top_k, g.experts);
+                try e.modelopt.?.router.combine(e.stream, s.y + at.pairs, s.wts + at.weights, s.shared + at.features, out + at.features);
+            }
         },
     }
     try e.mark(.combine);
+}
+
+test "projected HF routing keeps compact picks and separate shared weights" {
+    const std = @import("std");
+    for (0..16) |row| {
+        const at = projectedOffsets(row, 2048, 8, 256);
+        try std.testing.expectEqual(row * 4096, at.features);
+        try std.testing.expectEqual(row * 32, at.picks);
+        try std.testing.expectEqual(row * 36, at.weights);
+        try std.testing.expectEqual(row * 1028, at.scores);
+        try std.testing.expectEqual(row * 65536, at.pairs);
+        const next = projectedOffsets(row + 1, 2048, 8, 256);
+        try std.testing.expectEqual(at.picks + 8 * 4, next.picks);
+        try std.testing.expectEqual(at.weights + 9 * 4, next.weights);
+        try std.testing.expect(at.picks + 8 * 4 <= 16 * 9 * 4);
+        try std.testing.expect(at.weights + 9 * 4 <= 16 * 9 * 4);
+        try std.testing.expect(at.scores + 257 * 4 <= 16 * 257 * 4);
+        try std.testing.expect(at.pairs + 8 * 2048 * 4 <= 16 * 9 * 2048 * 4);
+    }
+    const first = projectedOffsets(0, 2048, 8, 256);
+    try std.testing.expectEqual(ProjectedOffsets{ .features = 0, .picks = 0, .weights = 0, .scores = 0, .pairs = 0 }, first);
 }

@@ -25,6 +25,9 @@ pub const max_segs = 32;
 pub const most_verify = 32;
 /// A window's rows at most (exact: one-row steps' bits; qwen35.cuh's MAXW, the rows a stream's log holds).
 pub const most_window = 16;
+/// Experimental committed HF prefixes retain the decode operators' row arithmetic.
+pub const hf_prefill_rows = 16;
+const hf_part_bytes = 8 << 20;
 /// Partial attention chunks a row at most (qwen35.cuh's MAXCH): each row's chunk width grows with its own keys.
 const max_chunks = 64;
 
@@ -94,7 +97,57 @@ test "mixed GDN layouts fail before settling caches or touching CUDA" {
 }
 
 /// What a forward keeps: a prompt chunk its last row's logits, a verify window every row's draw or logits and log.
-pub const Keep = union(enum) { last, draws: []const Draw, logits };
+pub const Keep = union(enum) { last, draws: []const Draw, logits, prompt_logits };
+
+fn records(keep: Keep) bool {
+    return keep == .draws or keep == .logits;
+}
+
+fn validateHfWindow(numerics: checkpoint.Numerics, bounded: bool, parts: []const Part, ids: usize, keep: Keep) !void {
+    if (keep == .prompt_logits and numerics != .hf_modelopt) return error.UnsupportedQwenWindow;
+    if (numerics != .hf_modelopt) return;
+    const limit: usize = if (bounded) hf_prefill_rows else 1;
+    if (parts.len != 1 or ids == 0 or ids > limit or parts[0].rows != ids or
+        (keep != .last and !(bounded and keep == .prompt_logits))) return error.UnsupportedQwenWindow;
+    if (parts[0].parents != null or parts[0].images != null) return error.UnsupportedQwenWindow;
+}
+
+fn hfInputWidth(g: Geometry) usize {
+    return @max(g.convWidth(), g.valueWidth(), g.attnWidth(), g.hidden, g.intermediate);
+}
+
+fn chainView(base: Seg, row: usize) Seg {
+    var view = base;
+    view.row0 = base.row0 + @as(c_int, @intCast(row));
+    view.len = base.len + @as(c_int, @intCast(row));
+    view.rows = 1;
+    return view;
+}
+
+fn validateChainViews(base: Seg, views: []const Seg) !void {
+    if (base.row0 != 0 or base.rows != views.len or views.len == 0 or views.len > hf_prefill_rows) return error.QwenGdnTableMismatch;
+    for (views, 0..) |view, row| {
+        const want = chainView(base, row);
+        inline for (@typeInfo(Seg).@"struct".field_names) |name| {
+            if (@field(view, name) != @field(want, name)) return error.QwenGdnTableMismatch;
+        }
+    }
+}
+
+const GdnRoster = struct {
+    layers: usize,
+    rows: usize,
+    count: usize = 0,
+
+    fn accept(r: *GdnRoster, layer: usize, row: usize) !void {
+        if (r.rows == 0 or r.count >= r.layers * r.rows or layer != r.count / r.rows or row != r.count % r.rows) return error.QwenGdnGraphLayerMismatch;
+        r.count += 1;
+    }
+
+    fn finish(r: GdnRoster) !void {
+        if (r.count != r.layers * r.rows) return error.QwenGdnGraphWorkCountMismatch;
+    }
+};
 
 /// A kept row's draw on the device: sample.cu's keyed rule at `position`, or greedy without one.
 pub const Draw = struct { rule: ?cuda.sample.Rule, position: u64 };
@@ -113,6 +166,7 @@ pub const Engine = struct {
     graph_nodes: usize = 0,
     graph_launches: usize = 0,
     expert_up_n8: bool = false,
+    bounded_hf_prefill: bool = false,
     verify_expert_graphs: bool = false,
     expert_graph_nodes_baseline: usize = 0,
     expert_graph_nodes_n8: usize = 0,
@@ -201,7 +255,8 @@ pub const Engine = struct {
     const meta_at = rules_at + most_verify * @sizeOf(cuda.sample.Rule);
     const tokens_at = meta_at + most_verify * 4;
     pub const params_at = tokens_at + most_verify * 4; // two unused words, the rows, the windows, record
-    const src_at = params_at + 8 * 4; // an image chunk's rows' feature rows
+    const chain_segs_at = aligned(params_at + 8 * 4);
+    const src_at = chain_segs_at + hf_prefill_rows * @sizeOf(Seg); // image feature rows follow the immutable chain views
     const mpos_at = src_at + max_rows * 4; // and their t, h and w positions, max_rows apart (qwen35.cuh's MAXR)
     const tables_len = mpos_at + 3 * max_rows * 4;
 
@@ -231,6 +286,7 @@ pub const Engine = struct {
         e.graph_nodes = 0;
         e.graph_launches = 0;
         e.expert_up_n8 = e.numerics == .hf_modelopt;
+        e.bounded_hf_prefill = false;
         e.verify_expert_graphs = false;
         e.expert_graph_nodes_baseline = 0;
         e.expert_graph_nodes_n8 = 0;
@@ -284,6 +340,7 @@ pub const Engine = struct {
             defer stage.free();
             try weights.loadPlaced(e, &ck, &stage, admitted, placement);
         }
+        if (e.numerics == .hf_modelopt) try e.validateHfWorkspaces();
         _ = try e.scratch(.allocate);
         e.tables = try DeviceBuffer.alloc(d, tables_len);
         errdefer e.tables.free();
@@ -375,7 +432,7 @@ pub const Engine = struct {
         };
         const t = Take{ .e = e, .mode = mode, .total = &total };
         const g = e.g;
-        const R: usize = if (e.numerics == .hf_modelopt) 1 else max_rows;
+        const R: usize = if (e.numerics == .hf_modelopt) hf_prefill_rows else max_rows;
         const fp: usize = if (e.numerics == .hf_modelopt) 4 else 2;
         const wide = @max(g.valueWidth(), g.attnWidth(), g.hidden); // y and mix: either mixer's rows
         inline for (.{ "h", "x", "r" }) |name| @field(e, name) = try t.alloc(R * g.hidden * 2);
@@ -395,8 +452,8 @@ pub const Engine = struct {
         e.po = try t.alloc(R * g.q_heads * max_chunks * head_dim * 4);
         e.logits = try t.alloc(most_verify * g.vocab * 2);
         if (e.numerics == .hf_modelopt) {
-            const rows = try t.alloc(@max(g.convWidth(), wide));
-            const part = try t.alloc(8 << 20);
+            const rows = try t.alloc(R * hfInputWidth(g));
+            const part = try t.alloc(hf_part_bytes);
             if (mode == .allocate) {
                 e.modelopt.?.rows = rows;
                 e.modelopt.?.part = part;
@@ -404,6 +461,37 @@ pub const Engine = struct {
         }
         if (g.moe()) e.routed = try routed.Scratch.carve(t, g, R);
         return total;
+    }
+
+    fn validateHfProjection(e: *const Engine, p: Proj) !void {
+        if (p != .linear or p.inputs() > hfInputWidth(e.g)) return error.QwenLinearWorkspace;
+        const w = switch (p.linear) {
+            .nvfp4, .fp8, .bf16 => |w| w,
+            else => return error.QwenLinearWorkspace,
+        };
+        const m = e.modelopt.?;
+        var bytes = m.lane.partBytes(hf_prefill_rows, w);
+        if (p.linear == .fp8 and w.act != 0) {
+            const sk = cuda.qmmf.splitK(w.n, w.k);
+            if (sk > 1 and !m.ck.clusters) bytes = @max(bytes, hf_prefill_rows * @as(usize, w.n) * sk * 4);
+        }
+        if (bytes > hf_part_bytes) return error.QwenLinearWorkspace;
+    }
+
+    fn validateHfWorkspaces(e: *const Engine) !void {
+        for (e.layers) |layer| {
+            switch (layer.mixer) {
+                .delta => |m| inline for (.{ "qkv", "z", "a", "b", "out" }) |name| try e.validateHfProjection(@field(m, name)),
+                .attention => |m| inline for (.{ "q", "k", "v", "o" }) |name| try e.validateHfProjection(@field(m, name)),
+            }
+            switch (layer.mlp) {
+                .dense => |m| inline for (.{ "gate", "up", "down" }) |name| try e.validateHfProjection(@field(m, name)),
+                .moe => |m| if (m.shared == .projected) {
+                    inline for (.{ "gate", "up", "down" }) |name| try e.validateHfProjection(@field(m.shared.projected, name));
+                },
+            }
+        }
+        if (e.placement.ownsHead()) try e.validateHfProjection(e.head);
     }
 
     pub fn run(e: *Engine, f: cuda.Function, grid: [3]usize, block: [3]usize, args: anytype) !void {
@@ -494,10 +582,7 @@ pub const Engine = struct {
         try gdn_layout.validate(e.numerics);
         if (e.expert_up_n8 and e.numerics != .hf_modelopt) return error.UnsupportedQwenExpertUp;
         const g = e.g;
-        if (e.numerics == .hf_modelopt) {
-            if (parts.len != 1 or ids.len != 1 or parts[0].rows != 1 or keep != .last) return error.UnsupportedQwenWindow;
-            if (parts[0].parents != null or parts[0].images != null) return error.UnsupportedQwenWindow;
-        }
+        try validateHfWindow(e.numerics, e.bounded_hf_prefill, parts, ids.len, keep);
         var total: usize = 0;
         for (parts) |p| {
             try p.cache.settle(e);
@@ -505,7 +590,7 @@ pub const Engine = struct {
             total += p.rows;
         }
         if (parts.len == 0 or parts.len > max_segs or total != ids.len or total > max_rows) return error.InvalidQwenSegments;
-        const record = keep != .last;
+        const record = records(keep);
         if (record and total > e.verify_rows) return error.InvalidQwenSegments;
         if (!record and parts.len != 1) return error.InvalidQwenSegments;
         if (keep == .draws and keep.draws.len != total) return error.InvalidQwenSegments;
@@ -523,6 +608,11 @@ pub const Engine = struct {
         for (parts, 0..) |p, i| {
             segs[i] = p.cache.seg(e, p.cache.len, row0, p.rows);
             row0 += p.rows;
+        }
+        if (e.numerics == .hf_modelopt and total > 1) {
+            const views = std.mem.bytesAsSlice(Seg, st[chain_segs_at..][0 .. total * @sizeOf(Seg)]);
+            for (views, 0..) |*view, row| view.* = chainView(segs[0], row);
+            try validateChainViews(segs[0], views);
         }
         if (keep == .draws) {
             const rules = std.mem.bytesAsSlice(cuda.sample.Rule, st[rules_at..][0 .. total * @sizeOf(cuda.sample.Rule)]);
@@ -554,15 +644,19 @@ pub const Engine = struct {
         const lone = total == 1 and parts.len == 1;
         const bucket: usize = if (lone) 1 else if (total <= 16) 16 else most_verify;
         const windows: usize = if (lone) 1 else max_segs;
-        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8 };
+        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits };
         e.features = if (images) |im| im.features else 0;
         return shape;
     }
 
     pub fn execute(e: *Engine, shape: Shape) !void {
         if (shape.expert_up_n8 and (e.numerics != .hf_modelopt or (shape.prompt and shape.total > most_window))) return error.UnsupportedQwenExpertUp;
+        if (shape.heads_all and e.numerics != .hf_modelopt) return error.UnsupportedQwenWindow;
+        if (e.numerics == .hf_modelopt and (shape.total == 0 or shape.total > hf_prefill_rows or shape.nseg != 1 or shape.record or !shape.prompt or shape.taps or
+            (!e.bounded_hf_prefill and (shape.total != 1 or shape.heads_all)))) return error.UnsupportedQwenWindow;
         if (e.observer != null and e.captured) return error.QwenObserverRequiresEager;
         try shape.gdn_layout.validate(e.numerics);
+        if (e.verify_gdn_graphs and e.numerics == .hf_modelopt and shape.total > 1) try e.verifyHfChainTables(shape);
         if (shape.prompt and e.numerics == .mlx_sanitized or !e.captured) {
             // uncaptured: a prompt chunk's GEMMs dwarf its launches, and each length's graph would pay the stall
             try e.body(shape);
@@ -597,6 +691,68 @@ pub const Engine = struct {
         }
     }
 
+    fn verifyHfChainTables(e: *const Engine, shape: Shape) !void {
+        try e.stream.synchronize();
+        var base: Seg = undefined;
+        try e.tables.download(segs_at, std.mem.asBytes(&base));
+        const staged = std.mem.bytesAsSlice(Seg, e.staged.bytes[segs_at..][0..@sizeOf(Seg)])[0];
+        inline for (@typeInfo(Seg).@"struct".field_names) |name| {
+            if (@field(base, name) != @field(staged, name)) return error.QwenGdnTableMismatch;
+        }
+        var views: [hf_prefill_rows]Seg = undefined;
+        try e.tables.download(chain_segs_at, std.mem.sliceAsBytes(views[0..shape.total]));
+        try validateChainViews(base, views[0..shape.total]);
+        var params: [8]c_int = undefined;
+        try e.tables.download(params_at, std.mem.asBytes(&params));
+        if (params[2] != shape.total or params[3] != 1 or params[4] != 0) return error.QwenGdnTableMismatch;
+        var parents: [hf_prefill_rows]c_int = undefined;
+        var segments: [hf_prefill_rows]c_int = undefined;
+        var ancestors: [hf_prefill_rows]u32 = undefined;
+        try e.tables.download(rowpar_at, std.mem.sliceAsBytes(parents[0..shape.total]));
+        try e.tables.download(rowseg_at, std.mem.sliceAsBytes(segments[0..shape.total]));
+        try e.tables.download(rowanc_at, std.mem.sliceAsBytes(ancestors[0..shape.total]));
+        for (0..shape.total) |row| {
+            if (segments[row] != 0 or parents[row] != @as(c_int, @intCast(row)) - 1 or ancestors[row] != (chain_row | @as(u32, @intCast(row)))) return error.QwenGdnTableMismatch;
+        }
+    }
+
+    fn gdnArguments(e: *const Engine, shape: Shape, layer: c_int, row: usize) cuda.Args {
+        var args: cuda.Args = .{};
+        args.add(e.geo);
+        for ([_]u64{ e.q, e.k, e.v, e.g_, e.beta }) |pointer| args.add(pointer);
+        args.add(e.tables.ptr + if (shape.total > 1) chain_segs_at + row * @sizeOf(Seg) else segs_at);
+        args.add(e.tables.ptr + rowpar_at);
+        args.add(layer);
+        args.add(e.y);
+        args.add(e.tables.ptr + params_at);
+        return args;
+    }
+
+    fn checkGdnNode(e: *const Engine, p: cuda.abi.KernelNodeParams, shape: Shape, function: cuda.abi.Function) !struct { layer: usize, row: usize } {
+        const launch: hf.Launches = .{};
+        if (p.func != function or p.grid_x != 1 or p.grid_y != launch.gdn_chain_grid_y or
+            p.grid_z != e.g.v_heads * shape.nseg or p.block_x != launch.gdn_chain[0] or
+            p.block_y != launch.gdn_chain[1] or p.block_z != launch.gdn_chain[2] or p.shared_bytes != 0) return error.QwenGdnGraphKernelMismatch;
+        const actual = p.params orelse return error.QwenGdnGraphMissingArguments;
+        const layer: *const c_int = @ptrCast(@alignCast(actual[8] orelse return error.QwenGdnGraphMissingArguments));
+        const segment: *const u64 = @ptrCast(@alignCast(actual[6] orelse return error.QwenGdnGraphMissingArguments));
+        if (layer.* < 0 or layer.* >= e.g.deltas()) return error.QwenGdnGraphLayerMismatch;
+        var row: usize = 0;
+        if (shape.total > 1) {
+            const base = e.tables.ptr + chain_segs_at;
+            if (segment.* < base or (segment.* - base) % @sizeOf(Seg) != 0) return error.QwenGdnGraphArgumentMismatch;
+            row = @intCast((segment.* - base) / @sizeOf(Seg));
+            if (row >= shape.total) return error.QwenGdnGraphArgumentMismatch;
+        }
+        const want = e.gdnArguments(shape, layer.*, row);
+        for (0..want.count) |i| {
+            const got: [*]const u8 = @ptrCast(actual[i] orelse return error.QwenGdnGraphMissingArguments);
+            const bytes = want.storage[want.offsets[i]..][0..want.sizes[i]];
+            if (!std.mem.eql(u8, got[0..bytes.len], bytes)) return error.QwenGdnGraphArgumentMismatch;
+        }
+        return .{ .layer = @intCast(layer.*), .row = row };
+    }
+
     fn verifyGdnGraph(e: *const Engine, graph: cuda.graph.Graph, shape: Shape, node_count: usize) !usize {
         const bindings = e.modelopt orelse return error.UnsupportedQwenGdnLayout;
         const baseline = e.fns.gdn_chain.handle;
@@ -610,27 +766,35 @@ pub const Engine = struct {
         defer e.gpa.free(storage);
         const nodes = try graph.nodes(storage);
         if (nodes.len != node_count) return error.QwenGdnGraphWorkCountMismatch;
-        const launch: hf.Launches = .{};
-        var layers_seen: [geometry.max_layers]bool = @splat(false);
-        var count: usize = 0;
-        for (nodes) |node| {
-            var params: cuda.abi.KernelNodeParams = undefined;
-            try e.d.check(e.d.api.cuGraphKernelNodeGetParams_v2(node, &params), "cuGraphKernelNodeGetParams");
-            if (params.func != baseline and params.func != candidate) continue;
-            if (params.func != expected or params.grid_x != 1 or params.grid_y != launch.gdn_chain_grid_y or
-                params.grid_z != e.g.v_heads * shape.nseg or params.block_x != launch.gdn_chain[0] or
-                params.block_y != launch.gdn_chain[1] or params.block_z != launch.gdn_chain[2] or params.shared_bytes != 0)
-                return error.QwenGdnGraphKernelMismatch;
-            const args = params.params orelse return error.QwenGdnGraphMissingArguments;
-            const layer: *const c_int = @ptrCast(@alignCast(args[8] orelse return error.QwenGdnGraphMissingArguments));
-            if (layer.* < 0 or layer.* >= e.g.deltas()) return error.QwenGdnGraphLayerMismatch;
-            const index: usize = @intCast(layer.*);
-            if (layers_seen[index]) return error.QwenGdnGraphLayerMismatch;
-            layers_seen[index] = true;
-            count += 1;
+        const predecessors = try e.gpa.alloc(cuda.graph.Node, node_count);
+        defer e.gpa.free(predecessors);
+        var lib = e.d.lib;
+        const get_deps = lib.lookup(*const fn (cuda.abi.GraphNode, ?[*]cuda.abi.GraphNode, *usize) callconv(.c) cuda.abi.Result, "cuGraphNodeGetDependencies") orelse return error.MissingSymbol;
+        for (nodes, predecessors) |node, *previous| {
+            var deps: [2]cuda.graph.Node = .{ null, null };
+            var count: usize = deps.len;
+            try e.d.check(get_deps(node, &deps, &count), "cuGraphNodeGetDependencies");
+            if (count > 1) return error.QwenGdnGraphDependencyMismatch;
+            previous.* = if (count == 0) null else deps[0];
         }
-        if (count != e.g.deltas()) return error.QwenGdnGraphWorkCountMismatch;
-        return count;
+        var roster: GdnRoster = .{ .layers = e.g.deltas(), .rows = if (shape.total > 1) shape.total else 1 };
+        var prior: cuda.graph.Node = null;
+        for (0..node_count) |_| {
+            var found: ?usize = null;
+            for (predecessors, 0..) |previous, i| if (previous == prior) {
+                if (found != null) return error.QwenGdnGraphDependencyMismatch;
+                found = i;
+            };
+            const index = found orelse return error.QwenGdnGraphDependencyMismatch;
+            var params: cuda.abi.KernelNodeParams = undefined;
+            try e.d.check(e.d.api.cuGraphKernelNodeGetParams_v2(nodes[index], &params), "cuGraphKernelNodeGetParams");
+            prior = nodes[index];
+            if (params.func != baseline and params.func != candidate) continue;
+            const item = try e.checkGdnNode(params, shape, expected);
+            try roster.accept(item.layer, item.row);
+        }
+        try roster.finish();
+        return roster.count;
     }
 
     fn verifyExpertGraph(e: *const Engine, graph: cuda.graph.Graph, shape: Shape, node_count: usize) !usize {
@@ -702,7 +866,7 @@ pub const Engine = struct {
         const g = e.g;
         var total: usize = 0;
         for (parts) |p| total += p.rows;
-        const heads: usize = if (shape.record) total else 1;
+        const heads: usize = if (shape.record or shape.heads_all) total else 1;
         switch (keep) {
             .draws => |pk| {
                 const toks = e.tables.ptr + tokens_at;
@@ -716,11 +880,11 @@ pub const Engine = struct {
                 try e.stream.synchronize();
                 @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
             },
-            .logits, .last => {
+            .logits, .last, .prompt_logits => {
                 const out = e.host_logits.bytes[0 .. heads * g.vocab * 2];
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(out.ptr, e.logits, out.len, e.stream.handle), "cuMemcpyDtoHAsync");
                 try e.stream.synchronize();
-                if (keep == .last) @memcpy(parts[0].cache.logits, e.rowLogits(0));
+                if (keep == .last or keep == .prompt_logits) @memcpy(parts[0].cache.logits, e.rowLogits(heads - 1));
             },
         }
     }
@@ -734,9 +898,10 @@ pub const Engine = struct {
         taps: bool,
         gdn_layout: Cache.GdnLayout = .value_key,
         expert_up_n8: bool = false,
+        heads_all: bool = false,
 
         fn key(s: Shape) u32 {
-            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20;
+            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21;
         }
     };
 
@@ -751,7 +916,7 @@ pub const Engine = struct {
         const nseg: usize = shape.nseg;
         const record = shape.record;
         const prompt = shape.prompt;
-        const heads: usize = if (record) total else 1;
+        const heads: usize = if (record or shape.heads_all) total else 1;
         const t_ids = e.tables.ptr + ids_at;
         const t_segs = e.tables.ptr + segs_at;
         const t_rows = e.tables.ptr + rowseg_at;
@@ -792,7 +957,9 @@ pub const Engine = struct {
                     try e.mark(.gdn_pre);
                     try e.run(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
                     try e.mark(.conv_commit);
-                    try e.run(gdn_chain, .{ 1, if (is_hf) launch.gdn_chain_grid_y else geometry.dk / 4, g.v_heads * nseg }, if (is_hf) launch.gdn_chain else .{ 32, 4, 1 }, .{ geo, e.q, e.k, e.v, e.g_, e.beta, t_segs, t_par, layer, e.y, t_params });
+                    if (is_hf and total > 1) {
+                        for (0..total) |row| try e.run(gdn_chain, .{ 1, launch.gdn_chain_grid_y, g.v_heads }, launch.gdn_chain, .{ geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + chain_segs_at + row * @sizeOf(Seg), t_par, layer, e.y, t_params });
+                    } else try e.run(gdn_chain, .{ 1, if (is_hf) launch.gdn_chain_grid_y else geometry.dk / 4, g.v_heads * nseg }, if (is_hf) launch.gdn_chain else .{ 32, 4, 1 }, .{ geo, e.q, e.k, e.v, e.g_, e.beta, t_segs, t_par, layer, e.y, t_params });
                     try e.mark(.gdn_chain);
                     try e.run(e.fns.gdn_post, .{ 1, g.v_heads, total }, .{ if (is_hf) launch.gdn_post else 32, 1, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params });
                     try e.mark(.gdn_post);
@@ -912,4 +1079,187 @@ test "expert graph verification rejects opposite arms, wrong arguments, duplicat
     try std.testing.expectError(error.QwenExpertGraphLayerMismatch, e.verifyExpertGraph(graph, shape, 2));
     Fake.count = 0;
     try std.testing.expectError(error.QwenExpertGraphWorkCountMismatch, e.verifyExpertGraph(graph, shape, 0));
+}
+
+test "bounded HF admission is opt in and does not imply recorded windows" {
+    var cache: Cache = undefined;
+    var parts = [_]Part{.{ .cache = &cache, .rows = 1 }};
+    try validateHfWindow(.hf_modelopt, false, &parts, 1, .last);
+    try std.testing.expectError(error.UnsupportedQwenWindow, validateHfWindow(.hf_modelopt, false, &parts, 1, .prompt_logits));
+    for (1..17) |rows| {
+        parts[0].rows = rows;
+        try validateHfWindow(.hf_modelopt, true, &parts, rows, .last);
+        try validateHfWindow(.hf_modelopt, true, &parts, rows, .prompt_logits);
+        if (rows > 1) try std.testing.expectError(error.UnsupportedQwenWindow, validateHfWindow(.hf_modelopt, false, &parts, rows, .last));
+        try std.testing.expectError(error.UnsupportedQwenWindow, validateHfWindow(.hf_modelopt, true, &parts, rows, .logits));
+    }
+    for ([_]usize{ 0, 17 }) |rows| {
+        parts[0].rows = rows;
+        try std.testing.expectError(error.UnsupportedQwenWindow, validateHfWindow(.hf_modelopt, true, &parts, rows, .last));
+    }
+    parts[0].rows = 2;
+    try std.testing.expectError(error.UnsupportedQwenWindow, validateHfWindow(.hf_modelopt, true, &parts, 1, .last));
+    parts[0].parents = &.{ -1, 0 };
+    try std.testing.expectError(error.UnsupportedQwenWindow, validateHfWindow(.hf_modelopt, true, &parts, 2, .last));
+    parts[0].parents = null;
+    parts[0].images = @ptrFromInt(16);
+    try std.testing.expectError(error.UnsupportedQwenWindow, validateHfWindow(.hf_modelopt, true, &parts, 2, .last));
+    parts[0].images = null;
+    try std.testing.expectError(error.UnsupportedQwenWindow, validateHfWindow(.mlx_sanitized, true, &parts, 2, .prompt_logits));
+    try validateHfWindow(.mlx_sanitized, false, &parts, 2, .logits);
+    try std.testing.expect(!records(.last) and !records(.prompt_logits));
+    try std.testing.expect(records(.logits) and records(.{ .draws = &.{} }));
+}
+
+test "bounded HF graph keys separate every row count layout expert arm and head mode" {
+    var keys: [128]u32 = undefined;
+    var count: usize = 0;
+    for (1..17) |rows| for ([_]Cache.GdnLayout{ .value_key, .key_value }) |layout| for ([_]bool{ false, true }) |n8| for ([_]bool{ false, true }) |heads| {
+        const shape: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .gdn_layout = layout, .expert_up_n8 = n8, .heads_all = heads };
+        const key = shape.key();
+        try std.testing.expect(std.mem.indexOfScalar(u32, keys[0..count], key) == null);
+        keys[count] = key;
+        count += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 128), count);
+}
+
+test "bounded HF chain views retain every state binding and reject field corruption" {
+    const base: Seg = .{ .rec = 101, .conv = 102, .kv = 103, .tap = 0, .log = 104, .cap = 4096, .len = 127, .row0 = 0, .rows = 16, .tap_rows = 0, .taps = 0, .delta = -3 };
+    var views: [hf_prefill_rows]Seg = undefined;
+    for (&views, 0..) |*view, row| view.* = chainView(base, row);
+    try validateChainViews(base, &views);
+    for (&views) |*view| {
+        inline for (@typeInfo(Seg).@"struct".field_names) |name| {
+            @field(view, name) += 1;
+            try std.testing.expectError(error.QwenGdnTableMismatch, validateChainViews(base, &views));
+            @field(view, name) -= 1;
+        }
+    }
+    try std.testing.expectError(error.QwenGdnTableMismatch, validateChainViews(base, views[0..15]));
+    try std.testing.expect(Engine.chain_segs_at % 256 == 0);
+    try std.testing.expect(Engine.src_at >= Engine.chain_segs_at + @sizeOf(@TypeOf(views)));
+}
+
+test "bounded HF verifies uploaded row views parents ancestors and counts" {
+    const Fake = struct {
+        fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return cuda.abi.success;
+        }
+        fn copy(out: ?*anyopaque, source: cuda.abi.DevicePtr, bytes: usize) callconv(.c) cuda.abi.Result {
+            const dst: [*]u8 = @ptrCast(out.?);
+            const src: [*]const u8 = @ptrFromInt(source);
+            @memcpy(dst[0..bytes], src[0..bytes]);
+            return cuda.abi.success;
+        }
+    };
+    var driver: cuda.Driver = undefined;
+    driver.api.cuStreamSynchronize = Fake.sync;
+    driver.api.cuMemcpyDtoH_v2 = Fake.copy;
+    var host: [Engine.tables_len]u8 align(16) = @splat(0);
+    var device: [Engine.tables_len]u8 align(16) = @splat(0);
+    const base: Seg = .{ .rec = 101, .conv = 102, .kv = 103, .tap = 0, .log = 104, .cap = 4096, .len = 127, .row0 = 0, .rows = 2, .tap_rows = 0, .taps = 0, .delta = 0 };
+    @memcpy(host[Engine.segs_at..][0..@sizeOf(Seg)], std.mem.asBytes(&base));
+    const views = std.mem.bytesAsSlice(Seg, host[Engine.chain_segs_at..][0 .. 2 * @sizeOf(Seg)]);
+    for (views, 0..) |*view, row| view.* = chainView(base, row);
+    var cache: Cache = undefined;
+    try Engine.rowTables(&host, &.{.{ .cache = &cache, .rows = 2 }});
+    const params = std.mem.bytesAsSlice(c_int, host[Engine.params_at..][0..32]);
+    params[2] = 2;
+    params[3] = 1;
+    device = host;
+    var e: Engine = undefined;
+    e.stream = .{ .d = &driver, .handle = null };
+    e.tables = .{ .d = &driver, .ptr = @intFromPtr(&device), .len = device.len };
+    e.staged = .{ .d = &driver, .bytes = &host };
+    const shape: Engine.Shape = .{ .total = 2, .nseg = 1, .record = false, .prompt = true, .taps = false };
+    try e.verifyHfChainTables(shape);
+    for ([_]usize{ Engine.segs_at, Engine.chain_segs_at, Engine.chain_segs_at + @sizeOf(Seg), Engine.params_at + 8, Engine.params_at + 12, Engine.params_at + 16, Engine.rowseg_at, Engine.rowpar_at + 4, Engine.rowanc_at + 4 }) |offset| {
+        device[offset] ^= 1;
+        try std.testing.expectError(error.QwenGdnTableMismatch, e.verifyHfChainTables(shape));
+        device[offset] ^= 1;
+    }
+}
+
+test "GDN prefix roster rejects duplicates missing rows and wrong order" {
+    var roster: GdnRoster = .{ .layers = 2, .rows = 16 };
+    try std.testing.expectError(error.QwenGdnGraphLayerMismatch, roster.accept(0, 1));
+    try roster.accept(0, 0);
+    try std.testing.expectError(error.QwenGdnGraphLayerMismatch, roster.accept(0, 0));
+    try std.testing.expectError(error.QwenGdnGraphLayerMismatch, roster.accept(1, 0));
+    try std.testing.expectError(error.QwenGdnGraphWorkCountMismatch, roster.finish());
+    for (1..16) |row| try roster.accept(0, row);
+    for (0..16) |row| try roster.accept(1, row);
+    try roster.finish();
+    try std.testing.expectError(error.QwenGdnGraphLayerMismatch, roster.accept(2, 0));
+}
+
+test "GDN prefix node verifier checks all eleven ABI arguments" {
+    var e: Engine = undefined;
+    e.geo = .{ .hid = 2048, .nk = 16, .nv = 32, .qh = 16, .kvh = 2, .nl = 1 };
+    e.g = undefined;
+    e.g.layers = 1;
+    e.g.linear = @splat(true);
+    e.g.v_heads = 32;
+    e.q = 101;
+    e.k = 102;
+    e.v = 103;
+    e.g_ = 104;
+    e.beta = 105;
+    e.y = 106;
+    e.tables.ptr = 4096;
+    const shape: Engine.Shape = .{ .total = 2, .nseg = 1, .record = false, .prompt = true, .taps = false };
+    var args = e.gdnArguments(shape, 0, 1);
+    try std.testing.expectEqual(@as(usize, 11), args.count);
+    var p: cuda.abi.KernelNodeParams = .{ .func = @ptrFromInt(1), .grid_x = 1, .grid_y = 1, .grid_z = 32, .block_x = 128, .block_y = 1, .block_z = 1, .shared_bytes = 0, .params = args.pointers(), .extra = null };
+    const item = try e.checkGdnNode(p, shape, @ptrFromInt(1));
+    try std.testing.expectEqual(@as(usize, 1), item.row);
+    for (0..args.count) |i| {
+        args.storage[args.offsets[i]] ^= 1;
+        if (i == 8) {
+            try std.testing.expectError(error.QwenGdnGraphLayerMismatch, e.checkGdnNode(p, shape, @ptrFromInt(1)));
+        } else try std.testing.expectError(error.QwenGdnGraphArgumentMismatch, e.checkGdnNode(p, shape, @ptrFromInt(1)));
+        args.storage[args.offsets[i]] ^= 1;
+    }
+    p.grid_z = 64;
+    try std.testing.expectError(error.QwenGdnGraphKernelMismatch, e.checkGdnNode(p, shape, @ptrFromInt(1)));
+}
+
+test "prompt logits finish copies every row and commits terminal cache logits only" {
+    const Fake = struct {
+        fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return cuda.abi.success;
+        }
+        fn copy(out: ?*anyopaque, source: cuda.abi.DevicePtr, bytes: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            const dst: [*]u8 = @ptrCast(out.?);
+            const src: [*]const u8 = @ptrFromInt(source);
+            @memcpy(dst[0..bytes], src[0..bytes]);
+            return cuda.abi.success;
+        }
+    };
+    var driver: cuda.Driver = undefined;
+    driver.api.cuStreamSynchronize = Fake.sync;
+    driver.api.cuMemcpyDtoHAsync_v2 = Fake.copy;
+    var device = [_]u16{ 1, 2, 3, 4, 5, 6 };
+    var host: [12]u8 align(16) = @splat(0);
+    var terminal: [2]u16 = @splat(0);
+    var cache: Cache = undefined;
+    cache.logits = &terminal;
+    var e: Engine = undefined;
+    e.d = &driver;
+    e.stream = .{ .d = &driver, .handle = null };
+    e.placement = .{ .first = 0, .end = 1, .total = 1 };
+    e.g.vocab = 2;
+    e.logits = @intFromPtr(&device);
+    e.host_logits = .{ .d = &driver, .bytes = &host };
+    const parts = [_]Part{.{ .cache = &cache, .rows = 3 }};
+    var shape: Engine.Shape = .{ .total = 3, .nseg = 1, .record = false, .prompt = true, .taps = false, .heads_all = true };
+    try e.finish(&parts, .prompt_logits, shape);
+    try std.testing.expectEqualSlices(u16, device[4..6], &terminal);
+    for (0..3) |row| try std.testing.expectEqualSlices(u16, device[row * 2 ..][0..2], e.rowLogits(row));
+    terminal = .{ 99, 98 };
+    shape.record = true;
+    shape.heads_all = false;
+    try e.finish(&parts, .logits, shape);
+    try std.testing.expectEqualSlices(u16, &.{ 99, 98 }, &terminal);
 }

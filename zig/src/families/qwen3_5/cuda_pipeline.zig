@@ -11,7 +11,20 @@ pub const Options = struct {
     context: usize = 4096,
     cut: usize = 20,
     captured: bool = true,
+    prefill_rows: usize = 1,
 };
+
+fn validatePrefillRows(rows: usize) !void {
+    if (rows == 0 or rows > engine.hf_prefill_rows) return error.InvalidPrefillRows;
+}
+
+fn logitElements(rows: usize, vocab: usize) !usize {
+    return std.math.mul(usize, rows, vocab);
+}
+
+fn seamStride(hidden: usize) usize {
+    return engine.hf_prefill_rows * hidden * 2;
+}
 pub const MemoryBudget = struct {
     weights_bytes: usize,
     staging_bytes: usize,
@@ -46,10 +59,12 @@ pub const Chain = struct {
     driver: cuda.Driver,
     config: checkpoint.Config,
     context: usize,
+    prefill_rows: usize = 1,
     partitions: []Stage,
     seam: cuda.HostBuffer,
 
     pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, options: Options) !*Chain {
+        try validatePrefillRows(options.prefill_rows);
         const config = try checkpoint.Config.read(gpa, io, dir);
         if (options.context == 0 or options.context > config.context) return error.InvalidContext;
         if (options.devices.len != 1 and options.devices.len != 2) return error.InvalidDevices;
@@ -67,7 +82,7 @@ pub const Chain = struct {
         }
         const c = try gpa.create(Chain);
         errdefer gpa.destroy(c);
-        c.* = .{ .gpa = gpa, .driver = try cuda.Driver.open(), .config = config, .context = options.context, .partitions = undefined, .seam = undefined };
+        c.* = .{ .gpa = gpa, .driver = try cuda.Driver.open(), .config = config, .context = options.context, .prefill_rows = options.prefill_rows, .partitions = undefined, .seam = undefined };
         errdefer c.driver.close();
         c.partitions = try gpa.alloc(Stage, options.devices.len);
         errdefer gpa.free(c.partitions);
@@ -88,9 +103,10 @@ pub const Chain = struct {
             p.engine = try engine.Engine.initPlaced(gpa, io, &p.context, dir, admitted, placement, false);
             engines += 1;
             p.engine.captured = options.captured;
+            p.engine.bounded_hf_prefill = options.prefill_rows > 1;
             try checkCapacity((try p.context.memInfo()).free, floor_bytes);
         }
-        c.seam = try cuda.HostBuffer.alloc(&c.driver, config.geometry.hidden * 2 * 2);
+        c.seam = try cuda.HostBuffer.alloc(&c.driver, 2 * seamStride(config.geometry.hidden));
         errdefer c.seam.free();
         var warm = try c.createSession();
         defer warm.deinit();
@@ -164,39 +180,66 @@ pub const Session = struct {
     }
 
     pub fn append(s: *Session, tokens: []const u32) !void {
-        if (s.poisoned) return error.PoisonedSession;
-        if (tokens.len > s.chain.context - s.position) return error.ContextFull;
-        for (tokens) |token| if (token >= s.logits.len) return error.InvalidToken;
-        for (tokens) |token| try s.step(token);
+        try s.validateAppend(tokens);
+        var at: usize = 0;
+        while (at < tokens.len) {
+            const end = at + @min(s.chain.prefill_rows, tokens.len - at);
+            try s.stepRows(tokens[at..end], .last);
+            at = end;
+        }
     }
 
-    fn step(s: *Session, token: u32) !void {
+    pub fn appendLogitRows(s: *Session, tokens: []const u32, out: []u16) !void {
+        if (s.poisoned) return error.PoisonedSession;
+        const expected = try logitElements(tokens.len, s.logits.len);
+        if (out.len != expected) return error.InvalidLogits;
+        try s.validateAppend(tokens);
+        var at: usize = 0;
+        while (at < tokens.len) {
+            const end = at + @min(s.chain.prefill_rows, tokens.len - at);
+            const keep: engine.Keep = if (s.chain.prefill_rows > 1) .prompt_logits else .last;
+            try s.stepRows(tokens[at..end], keep);
+            const e = s.chain.partitions[s.chain.partitions.len - 1].engine;
+            for (0..end - at) |row| @memcpy(out[(at + row) * s.logits.len ..][0..s.logits.len], e.rowLogits(row));
+            at = end;
+        }
+    }
+
+    fn validateAppend(s: *const Session, tokens: []const u32) !void {
+        if (s.poisoned) return error.PoisonedSession;
+        if (s.position > s.chain.context or tokens.len > s.chain.context - s.position) return error.ContextFull;
+        for (tokens) |token| if (token >= s.logits.len) return error.InvalidToken;
+    }
+
+    fn stepRows(s: *Session, tokens: []const u32, keep: engine.Keep) !void {
         errdefer s.poisoned = true;
         const c = s.chain;
-        const bytes = c.config.geometry.hidden * 2;
+        const bytes = tokens.len * c.config.geometry.hidden * 2;
+        // The residual payload starts at the fixed maximum-row stride for every chunk.
+        const residual = seamStride(c.config.geometry.hidden);
         for (c.partitions, 0..) |*p, i| {
             try p.context.makeCurrent();
             const e = p.engine;
-            const parts = [_]engine.Part{.{ .cache = &s.caches[i], .rows = 1 }};
-            const shape = try e.prepare(&parts, &.{token}, .last);
+            const parts = [_]engine.Part{.{ .cache = &s.caches[i], .rows = tokens.len }};
+            const shape = try e.prepare(&parts, tokens, keep);
             if (i > 0) {
                 try c.driver.check(c.driver.api.cuMemcpyHtoDAsync_v2(e.h, c.seam.bytes.ptr, bytes, e.stream.handle), "pipeline h upload");
-                try c.driver.check(c.driver.api.cuMemcpyHtoDAsync_v2(e.r, c.seam.bytes.ptr + bytes, bytes, e.stream.handle), "pipeline r upload");
+                try c.driver.check(c.driver.api.cuMemcpyHtoDAsync_v2(e.r, c.seam.bytes.ptr + residual, bytes, e.stream.handle), "pipeline r upload");
             }
             try e.execute(shape);
             if (i + 1 < c.partitions.len) {
                 try c.driver.check(c.driver.api.cuMemcpyDtoHAsync_v2(c.seam.bytes.ptr, e.h, bytes, e.stream.handle), "pipeline h download");
-                try c.driver.check(c.driver.api.cuMemcpyDtoHAsync_v2(c.seam.bytes.ptr + bytes, e.r, bytes, e.stream.handle), "pipeline r download");
+                try c.driver.check(c.driver.api.cuMemcpyDtoHAsync_v2(c.seam.bytes.ptr + residual, e.r, bytes, e.stream.handle), "pipeline r download");
             }
-            try e.finish(&parts, .last, shape);
+            try e.finish(&parts, keep, shape);
             try checkCapacity((try p.context.memInfo()).free, floor_bytes);
         }
         for (s.caches[0..c.partitions.len]) |*cache| {
-            const parts = [_]engine.Part{.{ .cache = cache, .rows = 1 }};
+            const parts = [_]engine.Part{.{ .cache = cache, .rows = tokens.len }};
             engine.Engine.commit(&parts, false);
         }
         @memcpy(s.logits, s.caches[c.partitions.len - 1].logits);
-        s.position += 1;
+        s.position += tokens.len;
     }
 
     pub fn copyLogits(s: *const Session, out: []f32) !void {
@@ -205,3 +248,79 @@ pub const Session = struct {
         for (out, s.logits) |*value, bits| value.* = @bitCast(@as(u32, bits) << 16);
     }
 };
+
+test "prefill bounds reject before checkpoint or CUDA access" {
+    try std.testing.expectError(error.InvalidPrefillRows, Chain.open(std.testing.allocator, std.testing.io, "not-a-checkpoint", .{ .prefill_rows = 0 }));
+    try std.testing.expectError(error.InvalidPrefillRows, Chain.open(std.testing.allocator, std.testing.io, "not-a-checkpoint", .{ .prefill_rows = 17 }));
+    for (1..17) |rows| try validatePrefillRows(rows);
+    const defaults: Options = .{};
+    try std.testing.expectEqual(@as(usize, 1), defaults.prefill_rows);
+}
+
+test "prefill seam keeps residual payload disjoint for every admitted chunk" {
+    const stride = seamStride(2048);
+    try std.testing.expectEqual(@as(usize, 65536), stride);
+    for (1..17) |rows| {
+        const bytes = rows * 2048 * 2;
+        try std.testing.expect(bytes <= stride);
+        try std.testing.expect(stride + bytes <= 2 * stride);
+    }
+}
+
+test "diagnostic validates output shape and every token without mutation" {
+    var chain: Chain = undefined;
+    chain.context = 4;
+    var logits: [8]u16 = @splat(0x3f80);
+    var out: [16]u16 = @splat(0xa5a5);
+    var full: [32]u16 = @splat(0xa5a5);
+    var s: Session = .{ .chain = &chain, .caches = undefined, .position = 1, .logits = &logits };
+    try std.testing.expectError(error.InvalidLogits, s.appendLogitRows(&.{ 1, 2 }, out[0..15]));
+    try std.testing.expectError(error.InvalidToken, s.appendLogitRows(&.{ 1, 8 }, &out));
+    try std.testing.expectError(error.ContextFull, s.appendLogitRows(&.{ 1, 2, 3, 4 }, &full));
+    try std.testing.expectEqual(@as(usize, 1), s.position);
+    try std.testing.expect(!s.poisoned);
+    for (out) |value| try std.testing.expectEqual(@as(u16, 0xa5a5), value);
+    for (logits) |value| try std.testing.expectEqual(@as(u16, 0x3f80), value);
+    try s.appendLogitRows(&.{}, &.{});
+    s.poisoned = true;
+    try std.testing.expectError(error.PoisonedSession, s.appendLogitRows(&.{}, &.{}));
+    try std.testing.expectError(error.Overflow, logitElements(std.math.maxInt(usize), 2));
+}
+
+test "a stage bind failure poisons the chunk without committing host state" {
+    const Fake = struct {
+        fn bind(_: cuda.abi.Context) callconv(.c) cuda.abi.Result {
+            return cuda.abi.error_not_ready;
+        }
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuCtxSetCurrent = Fake.bind;
+    var stages: [2]Stage = undefined;
+    for (&stages) |*p| p.context = .{ .d = &d, .device = 0, .handle = null };
+    var chain: Chain = undefined;
+    chain.context = 64;
+    chain.prefill_rows = 2;
+    chain.config.geometry.hidden = 2048;
+    chain.partitions = &stages;
+    var logits: [8]u16 = @splat(0x3f80);
+    var out: [16]u16 = @splat(0xa5a5);
+    var s: Session = .{ .chain = &chain, .caches = undefined, .position = 3, .logits = &logits };
+    for (&s.caches) |*cache| {
+        cache.len = 3;
+        cache.written = 3;
+        cache.last = null;
+    }
+    try std.testing.expectError(error.NotReady, s.appendLogitRows(&.{ 1, 2 }, &out));
+    try std.testing.expect(s.poisoned);
+    try std.testing.expectEqual(@as(usize, 3), s.position);
+    for (s.caches) |cache| {
+        try std.testing.expectEqual(@as(usize, 3), cache.len);
+        try std.testing.expectEqual(@as(usize, 3), cache.written);
+        try std.testing.expect(cache.last == null);
+    }
+    for (logits) |value| try std.testing.expectEqual(@as(u16, 0x3f80), value);
+    for (out) |value| try std.testing.expectEqual(@as(u16, 0xa5a5), value);
+    try std.testing.expectError(error.PoisonedSession, s.append(&.{1}));
+    try std.testing.expectError(error.NotReady, s.reset());
+    try std.testing.expect(s.poisoned);
+}
