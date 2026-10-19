@@ -77,8 +77,10 @@ rows in a raw `Stream`; no decoded-row execution mode is enabled by this fix.
 The corrected tests report 46 targeted passes, with the admission root cached;
 the aggregate passes 45/45 steps, with 98 reported passes, one skip and other
 roots cached. Receipts are `chat-history-{red,green,aggregate}.log` under the
-same trial artifact directory. The first correction's native build also
-passed 60/60 steps; the final corrected source must be built and pinned again.
+same trial artifact directory. The final corrected source `973428fb` passes
+the native build at 60/60 steps and both probe builds at 56/56 steps. Their
+receipts are `chat-history-native.log`, `chat-history-probe-build.log`, and
+`chat-history-kernels-build.log` in that directory.
 
 The next HTTP probe adds a prior assistant turn and another user message. It
 now has thirteen checks. This new case requires a successful nonempty text
@@ -89,3 +91,26 @@ The review's concern about automatic tool requests was checked in
 `server/server.zig:234`: call gates are constructed only for required or named
 tool choice. Those modes remain explicitly unsupported; ordinary automatic
 tool output does not activate that guard. No tool execution is newly qualified.
+
+## Corrected candidate prepared
+
+The [corrected candidate](chat-fixed-candidate-20261018.md) has its own
+immutable runtime and inactive fleet recipe. Fleet commit `93963735` pins
+source `973428fb85203e636a94c92c80fb8bb34a79369e` and executable SHA256
+`d1f462a330bb04a13c40f47ad6ff5316d1a3cd8e5062721607488951b0413744`.
+The actual coordinator preflight verified all eight runtime and seventeen
+checkpoint pins, reported `outage_started=false`, and launched no model.
+The final fleet checks pass 145 targeted tests, Ruff, and `fleet.verify fast`.
+
+Fleet commits `4217a658` and `d48f7474` retain the rejected trial manifest,
+readable evidence and an archive of the original evidence bytes. The failed
+recipe keeps source `0934d59f` and binary `ced689d1877e`; the corrected recipe
+does not overwrite that record. Fable's final review found no actionable
+blocker in the metadata correction, history probe or trial record. Its
+[disposition](shared-host-review-20261018.md#post-trial-review-and-disposition)
+keeps the unexecuted device checks and failed numerical rows open.
+
+No second outage has taken place. The first approved window ended with the
+verified restoration at 23:47:23 UTC. The corrected thirteen-check trial needs
+fresh approval under the fleet source contract, with the same ten-minute
+experiment and ten-minute recovery bounds.

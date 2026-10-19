@@ -54,10 +54,11 @@ both derive from the same validated context passed to `Engine.open`.
 Environment refusals have pure getter tests; executing the actual launcher
 environment remains part of the device trial.
 
-## Attention retained for qualification
+## Attention retained at the pretrial review
 
-All new session/lifecycle tests use fake sessions or backends. The real CUDA
-session has not run under the shared host. Compilation does not establish it.
+At this review, all new session/lifecycle tests used fake sessions or backends.
+The later approved trial exercised real CUDA listing and raw completion before
+ordinary chat failed. Other device lifecycle behavior remains unverified.
 The four whole-model logit rows still fail their fixed diagnostic limits.
 The independent NVIDIA CPU comparison covers one expert and selected inputs;
 both projection paths share CPU PyTorch matmul. vLLM separately changes 39
@@ -97,4 +98,39 @@ The first controller safety review separately replaced child discovery by
 polling with immediate ownership of the `Popen` handle returned by the
 existing `fleet.launch.start` API. A readiness-failure mock verifies cleanup
 and attempted restoration. These fixes are CPU-tested; their device behavior
-remains part of the prepared, still unapproved window.
+was part of the subsequently approved first window.
+
+## Post-trial review and disposition
+
+Fable 5.1 reviewed the failed trial and first chat correction in round 3,
+then the history correction and expanded probe in round 4. The complete
+responses are `.artifacts/production-trial-20261018/fable-r3.md` and
+`fable-r4.md` in that directory. Round 4 reports no actionable blockers.
+
+- **Ordinary chat history would still fail.** Round 3 found that prior reply
+  spans would hit another premature refusal. Commit `973428fb` removes that
+  request-level guard. The regression fails before the change and passes
+  afterward; the shared-host fixture carries both metadata fields and asserts
+  decoded rows are disabled. The host still discards spans before prefill,
+  and the low-level backend still refuses explicit decoded-row execution.
+- **Automatic tool requests might hit the call guard.** Source inspection
+  shows that the server constructs call gates only for required or named tool
+  choice. Automatic choice does not hit the guard. No change or device tool
+  qualification is claimed.
+- **Builds were still running and fleet evidence was uncommitted.** These
+  timing observations were accurate when the reviewer read the worktrees.
+  The final source now has observed 60/60 native and 56/56 probe build
+  summaries. Fleet commits `4217a658` and `d48f7474` preserve the rejected
+  trial and original evidence bytes; `93963735` pins the corrected recipe.
+  The rejected manifest retains its original source and twelve planned checks.
+- **The corrected recipe needs independent pins.** The new inactive
+  `ornith15-qwen35-tf-chatfix` recipe has its own eight runtime pins and the
+  unchanged seventeen checkpoint pins. The actual safe preflight verifies
+  those pins without an outage. The failed recipe's pins are preserved.
+
+The reviewer retains three qualification boundaries. The four full-logit
+rows still fail their fixed limits. Nine historical lifecycle checks did not
+execute. Corrected chat, including history, has not run on hardware. The
+next probe has thirteen checks and requires a fresh approved outage because
+the first window ended with verified production restoration. CPU preparation
+and review do not close those boundaries.
