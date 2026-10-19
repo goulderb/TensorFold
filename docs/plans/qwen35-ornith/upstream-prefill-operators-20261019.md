@@ -39,10 +39,39 @@ diagnostic all-row heads in graph identity, and verify repeated chain
 bindings. It must also preserve the pipeline's commit-after-both-stages
 and poison-on-partial-failure behavior.
 
-Device evidence is pending. The independent full-logit HF quality gate
-continues to fail. This operator proof cannot establish production quality,
-capacity, serving behavior, or an overall scaling wall. The retained
-small-candidate batch remains queued after the larger prefill work.
+The isolated device gate passed on both internal GPUs. Source
+`c9918bb536dc04c5a587d9047243bf9295b9ba27`, profile SHA256
+`d51251ab9c03ff74e9da03c607d823e82d8b90cf900c167b149deb4f6acd3546`,
+and all 93 CUDA images were frozen for the protected run. The CPU build
+passed 35 host tests; sixteen CLI admission cases passed. The independent
+audit verified 2,294 ordered journal records and 528 raw files totaling
+154,864,160 bytes, including every saved linear reference/captured prefix,
+all GDN intermediate buffers, canonical cross-layout recurrence, complete
+convolution tails, finite values, canaries and continuation state. All
+sampled GPU floors passed. See the archived evidence inventory and audit
+for the precise independently reconstructed versus source-enforced limits.
+
+The protected controller and probe ended. Nemotron was restored as PID
+31948 and returned canonical `READY` request
+`3c799630-e608-4407-85de-db6270286666` at 20:54:50.606612 UTC. Clef PID
+21392 was unchanged; recovery measured 5572/5815 MiB free on the two GPUs.
+The controller recorded no cleanup or sampler failures.
+
+Fable 5.1 found no blocker in the committed test scope. Its GDN qualification
+is retained: the fixture reconstructs launches matching `hf.Launches`
+defaults. Graph argument readback proves the graph stored the fixture's
+expected values; it does not independently anchor those values to a real
+Engine forward. Both arms share that reconstruction. The continuation is
+an observable confirmation of the already compared state. The following
+shared-body gate must compare all prompt logits, full state and subsequent
+decode against the existing one-row path. Linear graph checks cover the
+known expected ABI; the CUDA query API does not expose a trailing argument
+count. Function identity and frozen image/source pins bound that check.
+
+The independent full-logit HF quality gate continues to fail. This operator
+proof does not establish production quality, capacity, serving behavior, or
+an overall scaling wall. The retained small-candidate batch remains queued
+after the larger prefill work.
 
 The existing matched default-policy run bounds the payoff: across five
 captured 64-prompt/128-output turns, median prefill is 0.4923853 s
