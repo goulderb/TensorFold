@@ -10,6 +10,7 @@ const gdn_layout_screen = @import("qwen35_gdn_layout_screen.zig");
 const state_layout = @import("qwen35_state_layout.zig");
 const quant_reuse_screen = @import("qwen35_quant_reuse_screen.zig");
 const transport_screen = @import("qwen35_transport_screen.zig");
+const prefill_screen = @import("qwen35_prefill_screen.zig");
 
 comptime {
     if (options.engine_optimization != .fast) @compileError("diagnostics require ReleaseFast engine");
@@ -37,11 +38,13 @@ const Input = struct {
     quant_reuse_screen: bool = false,
     transport_screen: bool = false,
     verify_default_policy: bool = false,
+    prefill_operator_screen: bool = false,
 };
 const Journal = struct {
     a: std.mem.Allocator,
     io: std.Io,
     file: std.Io.File,
+    directory: []const u8,
     pub fn write(j: Journal, value: anytype) !void {
         var out: std.Io.Writer.Allocating = .init(j.a);
         defer out.deinit();
@@ -69,6 +72,7 @@ fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     if (input.prompt.len == 0 or input.output_tokens == 0 or input.output_tokens > 1024 or input.context > 262144 or input.context < input.output_tokens or input.prompt.len > input.context - input.output_tokens or input.forced.len > input.output_tokens or input.repetitions == 0) return error.InvalidInput;
     try expert_screen.validateShardInput(input);
     try expert_latency_screen.validateInput(input);
+    try prefill_screen.validateInput(input);
     if (input.router_screen or input.router_candidate) return error.ArchivedDiagnosticMode;
     if (input.gdn_layout_ab and input.expert_n8_ab) return error.InvalidInput;
     if ((input.gdn_layout_ab or input.expert_n8_ab) and (input.expert_fixture != null or input.gdn_layout_screen or input.quant_reuse_screen or input.transport_screen or input.forced.len != 0)) return error.InvalidInput;
@@ -398,7 +402,7 @@ pub fn main(init: std.process.Init) !u8 {
     try std.Io.Dir.cwd().createDir(init.io, args[3], .default_dir);
     const file = try std.Io.Dir.cwd().createFile(init.io, try std.fs.path.join(a, &.{ args[3], "results.jsonl" }), .{ .exclusive = true });
     defer file.close(init.io);
-    const j: Journal = .{ .a = a, .io = init.io, .file = file };
+    const j: Journal = .{ .a = a, .io = init.io, .file = file, .directory = args[3] };
     execute(init, args[1], args[3], input, j) catch |err| {
         try j.write(.{ .kind = "failure", .error_name = @errorName(err) });
         return 1;
@@ -415,10 +419,10 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
         defer driver.close();
         break :blk try admitted.verify(a, &driver);
     };
-    const single_gpu_micro = input.expert_fixture != null or input.gdn_layout_screen or input.quant_reuse_screen;
+    const single_gpu_micro = input.expert_fixture != null or input.gdn_layout_screen or input.quant_reuse_screen or input.prefill_operator_screen;
     const micro = single_gpu_micro or input.transport_screen;
     if (micro) {
-        try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = "isolated Qwen operator screens; no model load or model throughput claim", .driver_kind = "qwen35-decode-profile", .expert_shard_screen = input.expert_shard_screen, .expert_latency_screen = input.expert_latency_screen, .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
+        try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = if (input.prefill_operator_screen) "isolated partial-checkpoint prefill operators; no complete model load or model throughput claim" else "isolated Qwen operator screens; no model load or model throughput claim", .driver_kind = "qwen35-decode-profile", .expert_shard_screen = input.expert_shard_screen, .expert_latency_screen = input.expert_latency_screen, .prefill_operator_screen = input.prefill_operator_screen, .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
         if (input.transport_screen) try transport_screen.run(init.gpa, init.io, .{ identities[0].ordinal, identities[1].ordinal }, j);
         if (single_gpu_micro) for (identities) |identity| {
             var driver = try cuda.Driver.open();
@@ -431,6 +435,7 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
             }
             if (input.gdn_layout_screen) try gdn_layout_screen.run(gpu, j);
             if (input.quant_reuse_screen) try quant_reuse_screen.run(gpu, j);
+            if (input.prefill_operator_screen) try prefill_screen.run(gpu, dir, j);
         };
         try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "isolated operator parity and timing screens", .production_qualification = false });
         return;
@@ -451,8 +456,7 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
     if (input.verify_default_policy) for (s.caches) |cache| {
         if (cache.gdn_layout != .key_value) return error.DefaultGdnLayoutPolicyMismatch;
     };
-    try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = "changing-token changing-position eager and captured shared Qwen forwards", .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut,
-        .default_policies = if (input.verify_default_policy) .{ .enabled = true, .expert_up_n8 = c.partitions[0].engine.expert_up_n8, .gdn_layout = @tagName(s.caches[0].gdn_layout), .verify_expert_graphs = c.partitions[0].engine.verify_expert_graphs, .verify_gdn_graphs = c.partitions[0].engine.verify_gdn_graphs } else null });
+    try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = "changing-token changing-position eager and captured shared Qwen forwards", .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut, .default_policies = if (input.verify_default_policy) .{ .enabled = true, .expert_up_n8 = c.partitions[0].engine.expert_up_n8, .gdn_layout = @tagName(s.caches[0].gdn_layout), .verify_expert_graphs = c.partitions[0].engine.verify_expert_graphs, .verify_gdn_graphs = c.partitions[0].engine.verify_gdn_graphs } else null });
     const tokens = try a.alloc(u32, input.output_tokens);
     const expected_tokens = try a.alloc(u32, input.output_tokens);
     const rows = try a.alloc(u16, input.output_tokens * s.logits.len);
@@ -476,8 +480,7 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
             try j.write(.{ .kind = "memory", .pair = pair, .order = order, .rank = rank, .free_bytes = (try p.context.memInfo()).free, .floor_bytes = qwen.floor_bytes });
         }
         if (graph and launches != 2 * timing.appends) return error.GraphWorkCountMismatch;
-        try j.write(.{ .kind = "turn", .pair = pair, .order = order, .warmup = pair == 0, .arm = if (graph) "graph" else "eager", .graph = graph, .times = timing, .elapsed_ns = timing.elapsed_ns, .steps = timing.appends, .graph_launches = launches, .graph_nodes = nodes, .position = s.position, .exact_rows_tokens_and_final_state = true, .consumed_logits_sha256 = &expected_hash, .persistent_state_sha256 = &state, .tokens = tokens,
-            .default_policies = if (input.verify_default_policy) .{ .expert_up_n8 = c.partitions[0].engine.expert_up_n8, .gdn_layout = @tagName(s.caches[0].gdn_layout), .verify_expert_graphs = c.partitions[0].engine.verify_expert_graphs, .verify_gdn_graphs = c.partitions[0].engine.verify_gdn_graphs, .graph_verifiers = .{ .{ .rank = 0, .expert_baseline_nodes = c.partitions[0].engine.expert_graph_nodes_baseline, .expert_n8_nodes = c.partitions[0].engine.expert_graph_nodes_n8, .gdn_baseline_nodes = c.partitions[0].engine.gdn_graph_nodes_baseline, .gdn_candidate_nodes = c.partitions[0].engine.gdn_graph_nodes_candidate }, .{ .rank = 1, .expert_baseline_nodes = c.partitions[1].engine.expert_graph_nodes_baseline, .expert_n8_nodes = c.partitions[1].engine.expert_graph_nodes_n8, .gdn_baseline_nodes = c.partitions[1].engine.gdn_graph_nodes_baseline, .gdn_candidate_nodes = c.partitions[1].engine.gdn_graph_nodes_candidate } } } else null });
+        try j.write(.{ .kind = "turn", .pair = pair, .order = order, .warmup = pair == 0, .arm = if (graph) "graph" else "eager", .graph = graph, .times = timing, .elapsed_ns = timing.elapsed_ns, .steps = timing.appends, .graph_launches = launches, .graph_nodes = nodes, .position = s.position, .exact_rows_tokens_and_final_state = true, .consumed_logits_sha256 = &expected_hash, .persistent_state_sha256 = &state, .tokens = tokens, .default_policies = if (input.verify_default_policy) .{ .expert_up_n8 = c.partitions[0].engine.expert_up_n8, .gdn_layout = @tagName(s.caches[0].gdn_layout), .verify_expert_graphs = c.partitions[0].engine.verify_expert_graphs, .verify_gdn_graphs = c.partitions[0].engine.verify_gdn_graphs, .graph_verifiers = .{ .{ .rank = 0, .expert_baseline_nodes = c.partitions[0].engine.expert_graph_nodes_baseline, .expert_n8_nodes = c.partitions[0].engine.expert_graph_nodes_n8, .gdn_baseline_nodes = c.partitions[0].engine.gdn_graph_nodes_baseline, .gdn_candidate_nodes = c.partitions[0].engine.gdn_graph_nodes_candidate }, .{ .rank = 1, .expert_baseline_nodes = c.partitions[1].engine.expert_graph_nodes_baseline, .expert_n8_nodes = c.partitions[1].engine.expert_graph_nodes_n8, .gdn_baseline_nodes = c.partitions[1].engine.gdn_graph_nodes_baseline, .gdn_candidate_nodes = c.partitions[1].engine.gdn_graph_nodes_candidate } } } else null });
     };
     var peer = try c.createSession();
     defer peer.deinit();
@@ -499,6 +502,5 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
     if (!std.mem.eql(u16, rows, expected_rows)) return error.PoisonResetMismatch;
     try j.write(.{ .kind = "controls", .all_consumed_rows_equal = true, .changing_tokens_and_positions = true, .interleaved_session_isolation = true, .reset = true, .partial_stage_failure_poison = true, .uncommitted_lengths = true });
     try trace(init, &s, input, j);
-    try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "shared engine eager/captured parity and session controls", .production_qualification = false, .independent_reference_parity = "not checked by this executable",
-        .default_policies = if (input.verify_default_policy) .{ .expert_up_n8 = c.partitions[0].engine.expert_up_n8, .gdn_layout = @tagName(s.caches[0].gdn_layout), .verify_expert_graphs = c.partitions[0].engine.verify_expert_graphs, .verify_gdn_graphs = c.partitions[0].engine.verify_gdn_graphs, .graph_verifiers = .{ .{ .rank = 0, .expert_baseline_nodes = c.partitions[0].engine.expert_graph_nodes_baseline, .expert_n8_nodes = c.partitions[0].engine.expert_graph_nodes_n8, .gdn_baseline_nodes = c.partitions[0].engine.gdn_graph_nodes_baseline, .gdn_candidate_nodes = c.partitions[0].engine.gdn_graph_nodes_candidate }, .{ .rank = 1, .expert_baseline_nodes = c.partitions[1].engine.expert_graph_nodes_baseline, .expert_n8_nodes = c.partitions[1].engine.expert_graph_nodes_n8, .gdn_baseline_nodes = c.partitions[1].engine.gdn_graph_nodes_baseline, .gdn_candidate_nodes = c.partitions[1].engine.gdn_graph_nodes_candidate } } } else null });
+    try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "shared engine eager/captured parity and session controls", .production_qualification = false, .independent_reference_parity = "not checked by this executable", .default_policies = if (input.verify_default_policy) .{ .expert_up_n8 = c.partitions[0].engine.expert_up_n8, .gdn_layout = @tagName(s.caches[0].gdn_layout), .verify_expert_graphs = c.partitions[0].engine.verify_expert_graphs, .verify_gdn_graphs = c.partitions[0].engine.verify_gdn_graphs, .graph_verifiers = .{ .{ .rank = 0, .expert_baseline_nodes = c.partitions[0].engine.expert_graph_nodes_baseline, .expert_n8_nodes = c.partitions[0].engine.expert_graph_nodes_n8, .gdn_baseline_nodes = c.partitions[0].engine.gdn_graph_nodes_baseline, .gdn_candidate_nodes = c.partitions[0].engine.gdn_graph_nodes_candidate }, .{ .rank = 1, .expert_baseline_nodes = c.partitions[1].engine.expert_graph_nodes_baseline, .expert_n8_nodes = c.partitions[1].engine.expert_graph_nodes_n8, .gdn_baseline_nodes = c.partitions[1].engine.gdn_graph_nodes_baseline, .gdn_candidate_nodes = c.partitions[1].engine.gdn_graph_nodes_candidate } } } else null });
 }

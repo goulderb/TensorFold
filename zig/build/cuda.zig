@@ -157,7 +157,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         .target = target,
         .optimize = .ReleaseSafe,
         .link_libc = true,
-        .imports = &.{ .{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core, mods.qwen35) }, .{ .name = "cuda", .module = cuda }, .{ .name = "lanes", .module = mods.lanes } },
+        .imports = &.{ .{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core, mods.qwen35) }, .{ .name = "cuda", .module = cuda }, .{ .name = "lanes", .module = mods.lanes }, .{ .name = "core", .module = mods.core } },
     }) });
     qwen_decode_profile.root_module.addOptions("qwen_bench_options", qwen_bench_options);
     b.step("qwen35-decode-profile", "Build only the Qwen35 eager/graph diagnostic; never run it").dependOn(&b.addInstallArtifact(qwen_decode_profile, .{}).step);
@@ -420,7 +420,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
         .target = host,
         .optimize = .ReleaseSafe,
         .link_libc = true,
-        .imports = &.{.{ .name = "cuda", .module = cuda }},
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "qwen35_cuda", .module = qwen35 }, .{ .name = "core", .module = mods.core } },
     });
     b.step("test-qwen35-screens-host", "CPU-only expert and GDN screen admission and layout controls").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen35_screens })).step);
     qwen35_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen35_probe_admission })).step);

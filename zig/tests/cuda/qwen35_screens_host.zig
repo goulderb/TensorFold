@@ -5,4 +5,7 @@ test {
     _ = @import("qwen35_state_layout.zig");
     _ = @import("qwen35_quant_reuse_screen.zig");
     _ = @import("qwen35_transport_screen.zig");
+    _ = @import("qwen35_prefill_screen.zig");
+    _ = @import("qwen35_prefill_linear_screen.zig");
+    _ = @import("qwen35_prefill_gdn_screen.zig");
 }
