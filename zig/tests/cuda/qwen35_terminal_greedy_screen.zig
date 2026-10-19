@@ -140,7 +140,7 @@ const Buffers = struct {
                 b.row_sync_count += 1;
                 const dst = b.snapshots[index * vocab ..][0..vocab];
                 @memcpy(dst, b.host_logits.slice(u16)[guard / 2 ..][0..vocab]);
-                b.picks[index] = .{ .token = try argmax(dst), .nonfinite = 0 };
+                b.picks[index] = .{ .token = try argmax(b.host_logits.slice(u16)[guard / 2 ..][0..vocab]), .nonfinite = 0 };
             },
             .device => {
                 try kernels.argmax(stream, input, b.pick.ptr + guard, 1, vocab, vocab);
@@ -421,4 +421,53 @@ test "terminal greedy manifest dimensions hashes and token bounds reject mutatio
     bad = good;
     bad.sha256 = "z";
     try std.testing.expectError(error.InvalidTerminalGreedyFixture, validateManifest(bad));
+}
+
+test "terminal host row copies an independent archive and consumes the pinned hot row" {
+    const Fake = struct {
+        fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return cuda.abi.success;
+        }
+        fn copy(out: ?*anyopaque, source: cuda.abi.DevicePtr, bytes: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            const dst: [*]u8 = @ptrCast(out.?);
+            const src: [*]const u8 = @ptrFromInt(source);
+            @memcpy(dst[0..bytes], src[0..bytes]);
+            return cuda.abi.success;
+        }
+    };
+    const a = std.testing.allocator;
+    const source = try a.alloc(u16, 2 * vocab);
+    defer a.free(source);
+    @memset(source, 0xbf80);
+    source[13] = 0x4100;
+    source[vocab + 7] = 0x4000;
+    source[vocab + 257] = 0x4000;
+    const archive = try a.alloc(u16, 2 * vocab);
+    defer a.free(archive);
+    @memset(archive, 0xffff);
+    const host = try a.alignedAlloc(u8, .@"16", row_bytes + guard * 2);
+    defer a.free(host);
+    @memset(host, 0xa5);
+    var driver: cuda.Driver = undefined;
+    driver.api.cuStreamSynchronize = Fake.sync;
+    driver.api.cuMemcpyDtoHAsync_v2 = Fake.copy;
+    var b: Buffers = .{ .logits = .{ .d = &driver, .ptr = @intFromPtr(source.ptr) - guard, .len = 2 * row_bytes + guard * 2, .borrowed = true }, .pick = undefined, .host_logits = .{ .d = &driver, .bytes = host }, .host_pick = undefined, .snapshots = archive };
+    const gpu: check.Gpu = .{ .d = &driver, .ctx = undefined, .gpa = a, .io = undefined };
+    const kernels: cuda.tree_round.Kernels = undefined;
+    try b.row(gpu, &kernels, .{ .d = &driver, .handle = null }, .host, 1);
+    const hot = b.host_logits.slice(u16)[guard / 2 ..][0..vocab];
+    const copied = archive[vocab..][0..vocab];
+    try std.testing.expect(hot.ptr != copied.ptr);
+    try std.testing.expectEqualSlices(u16, source[vocab..], hot);
+    try std.testing.expectEqualSlices(u16, hot, copied);
+    for (archive[0..vocab]) |bits| try std.testing.expectEqual(@as(u16, 0xffff), bits);
+    try std.testing.expectEqual(@as(u32, 7), b.picks[1].token);
+    try std.testing.expectEqual(@as(usize, 1), b.dtoh_count);
+    try std.testing.expectEqual(@as(usize, row_bytes), b.dtoh_bytes);
+    try std.testing.expectEqual(@as(usize, 1), b.row_sync_count);
+    try std.testing.expectEqual(@as(usize, 0), b.kernel_launches);
+    try canaries(host, row_bytes);
+    copied[7] = 0;
+    try std.testing.expectEqual(@as(u32, 257), try argmax(copied));
+    try std.testing.expectEqual(@as(u32, 7), try argmax(hot));
 }
