@@ -2,7 +2,24 @@ const std = @import("std");
 const cuda = @import("cuda");
 const check = @import("check.zig");
 const X = cuda.experts.Nvfp4Experts;
-const variants = std.meta.tags(X.Variant);
+const Arm = enum {
+    wn4_baseline,
+    wn4_n16_pipe4,
+    wn1_baseline,
+
+    fn warps(self: Arm) usize {
+        return if (self == .wn1_baseline) 1 else 4;
+    }
+
+    fn variant(self: Arm) X.Variant {
+        return if (self == .wn4_n16_pipe4) .n16_pipe4 else .baseline;
+    }
+
+    fn engine(self: Arm, engines: *const [2]X) *const X {
+        return &engines[if (self == .wn1_baseline) @as(usize, 1) else 0];
+    }
+};
+const arms = std.meta.tags(Arm);
 const experts = 256;
 const dims = 2048;
 const width = 512;
@@ -13,6 +30,29 @@ const bound = cuda.grouped.maxItems(slots, experts, 16);
 const floor_bytes = 1536 * 1024 * 1024;
 const FilePin = struct { bytes: usize, sha256: []const u8 };
 const Manifest = struct { scope: []const u8, expert_order: []const usize, files: std.json.ArrayHashMap(FilePin) };
+
+fn validateOrder(order: []const usize) !void {
+    if (order.len != experts) return error.InvalidExpertOrder;
+    var seen: [experts]bool = @splat(false);
+    for (order) |id| {
+        if (id >= experts or seen[id]) return error.InvalidExpertOrder;
+        seen[id] = true;
+    }
+}
+
+fn kernelName(f: cuda.Function) ![]const u8 {
+    var lib = f.d.lib;
+    const get_name = lib.lookup(*const fn (*?[*:0]const u8, cuda.abi.Function) callconv(.c) cuda.abi.Result, "cuFuncGetName") orelse return error.MissingSymbol;
+    var name: ?[*:0]const u8 = null;
+    try f.d.check(get_name(&name, f.handle), "cuFuncGetName");
+    return std.mem.span(name orelse return error.MissingSymbol);
+}
+
+fn checkNode(p: cuda.abi.KernelNodeParams, f: cuda.abi.Function, grid: usize, block: usize) !void {
+    if (p.func != f or p.grid_x != grid or p.grid_y != 1 or p.grid_z != 1 or
+        p.block_x != block or p.block_y != 1 or p.block_z != 1 or p.shared_bytes != 0)
+        return error.ExpertGraphKernelMismatch;
+}
 
 fn verifyHash(bytes: []const u8, expected: []const u8) ![64]u8 {
     var hash: [32]u8 = undefined;
@@ -40,6 +80,7 @@ fn read(gpu: check.Gpu, dir: []const u8, manifest: *const Manifest, name: []cons
 
 fn finite(bytes: []const u8, fp32: bool) !void {
     const stride: usize = if (fp32) 4 else 2;
+    if (bytes.len % stride != 0) return error.InvalidExpertOutputSize;
     var offset: usize = 0;
     while (offset < bytes.len) : (offset += stride) {
         const bits: u32 = if (fp32)
@@ -69,27 +110,25 @@ pub fn run(gpu: check.Gpu, fixture_dir: []const u8, expected_manifest_sha256: []
     const manifest_sha256 = try verifyHash(manifest_bytes, expected_manifest_sha256);
     const manifest = try std.json.parseFromSlice(Manifest, gpu.gpa, manifest_bytes, .{ .ignore_unknown_fields = true });
     defer manifest.deinit();
-    if (manifest.value.expert_order.len != experts) return error.InvalidExpertOrder;
-    var seen: [experts]bool = @splat(false);
-    for (manifest.value.expert_order) |id| {
-        if (id >= experts or seen[id]) return error.InvalidExpertOrder;
-        seen[id] = true;
-    }
+    try validateOrder(manifest.value.expert_order);
     try journal.write(.{ .kind = "expert_fixture", .ordinal = gpu.ctx.device_ordinal, .manifest_sha256 = &manifest_sha256, .scope = manifest.value.scope, .expert_order = manifest.value.expert_order, .bank0_original_ids = manifest.value.expert_order[0..slots], .bank0_remapped_ids = [8]usize{ 0, 1, 2, 3, 4, 5, 6, 7 } });
     const sms: usize = @intCast(try gpu.ctx.attribute(.multiprocessor_count));
-    var ex = try X.load(gpu.d, sms);
-    defer ex.unload();
-    try ex.loadCandidates(sms);
+    var engines: [2]X = undefined;
+    engines[0] = try X.loadWarps(gpu.d, sms, 4);
+    defer engines[0].unload();
+    try engines[0].loadCandidates(sms);
+    engines[1] = try X.loadWarps(gpu.d, sms, 1);
+    defer engines[1].unload();
     var mod = try cuda.Module.load(gpu.d, cuda.kernels.experts);
     defer mod.unload();
     const router = try cuda.grouped.Router.resolve(mod);
     var stream = try cuda.Stream.init(gpu.d, false);
     defer stream.deinit();
-    for ([_]cuda.experts.Epi{ .up, .down_f32 }) |epi| try projection(gpu, fixture_dir, &manifest.value, journal, &ex, router, stream, epi);
+    for ([_]cuda.experts.Epi{ .up, .down_f32 }) |epi| try projection(gpu, fixture_dir, &manifest.value, journal, &engines, router, stream, epi);
     try floor(gpu);
 }
 
-fn projection(gpu: check.Gpu, dir: []const u8, manifest: *const Manifest, journal: anytype, ex: *const X, router: cuda.grouped.Router, s: cuda.Stream, epi: cuda.experts.Epi) !void {
+fn projection(gpu: check.Gpu, dir: []const u8, manifest: *const Manifest, journal: anytype, engines: *const [2]X, router: cuda.grouped.Router, s: cuda.Stream, epi: cuda.experts.Epi) !void {
     const up = epi == .up;
     const n: usize = if (up) width else dims;
     const k: usize = if (up) dims else width;
@@ -143,25 +182,27 @@ fn projection(gpu: check.Gpu, dir: []const u8, manifest: *const Manifest, journa
     for (0..banks) |bank| {
         const bl = bankLayer(layer, bank);
         try reference.fill8(0xff, s.handle);
-        try ex.runVariant(.baseline, s, epi, rows, bl, plan, reference.ptr, bound, -1);
+        try engines[0].runVariant(.baseline, s, epi, rows, bl, plan, reference.ptr, bound, -1);
         try s.synchronize();
         try reference.download(0, want);
         try finite(want, !up);
         if (bank == 0) try check.sameBytes("bank0 saved real expert output", want, saved);
-        for (variants[1..]) |variant| {
+        for (arms[1..]) |arm| {
             try output.fill8(0xff, s.handle);
-            try ex.runVariant(variant, s, epi, rows, bl, plan, output.ptr, bound, -1);
+            try arm.engine(engines).runVariant(arm.variant(), s, epi, rows, bl, plan, output.ptr, bound, -1);
             try s.synchronize();
             try output.download(0, got);
             try finite(got, !up);
-            try check.sameBytes(@tagName(variant), got, want);
-            try journal.write(.{ .kind = "expert_bank_parity", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .bank = bank, .variant = @tagName(variant), .finite = true, .bit_exact = true, .saved_real_output = bank == 0 });
+            try check.sameBytes(@tagName(arm), got, want);
+            try journal.write(.{ .kind = "expert_bank_parity", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .bank = bank, .variant = @tagName(arm), .warps = arm.warps(), .finite = true, .bit_exact = true, .saved_real_output = bank == 0 });
         }
     }
-    var graphs: [variants.len]cuda.graph.Exec = undefined;
+    var graphs: [arms.len]cuda.graph.Exec = undefined;
     var made: usize = 0;
     defer for (graphs[0..made]) |*graph| graph.deinit();
-    for (variants, 0..) |variant, vi| {
+    for (arms, 0..) |arm, vi| {
+        const ex = arm.engine(engines);
+        const variant = arm.variant();
         try cuda.graph.beginCapture(s, .thread_local);
         for (0..launches) |i| ex.runVariant(variant, s, epi, rows, bankLayer(layer, i % banks), plan, output.ptr, bound, -1) catch |err| {
             if (cuda.graph.endCapture(s)) |graph| {
@@ -178,15 +219,26 @@ fn projection(gpu: check.Gpu, dir: []const u8, manifest: *const Manifest, journa
         try graphs[vi].upload(s);
         try s.synchronize();
         const ei: usize = @backingInt(epi);
-        const resident = if (vi == 0) ex.resident[ei] else ex.candidate_resident[vi - 1][ei];
-        const f = if (vi == 0) ex.fns[ei] else ex.candidate_fns[vi - 1][ei];
-        try journal.write(.{ .kind = "expert_kernel", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .variant = @tagName(variant), .grid = X.decodeGrid(variant, bound, n / X.cols, resident), .block = 128, .regs = try f.attribute(.num_regs), .local_bytes = try f.attribute(.local_size_bytes), .resident_blocks = resident, .kernel_launches = launches, .banks = banks, .logical_weight_and_scale_bytes_per_launch = slots * (one + parts * 4), .logical_unique_weight_and_scale_bytes = experts * (one + parts * 4) });
+        const variant_index = @backingInt(variant);
+        const resident = if (variant == .baseline) ex.resident[ei] else ex.candidate_resident[variant_index - 1][ei];
+        const f = if (variant == .baseline) ex.fns[ei] else ex.candidate_fns[variant_index - 1][ei];
+        const grid = X.decodeGridWarps(variant, bound, n / X.cols, resident, arm.warps());
+        const block = arm.warps() * 32;
+        var nodes: [launches]cuda.graph.Node = undefined;
+        const captured = try graph.nodes(&nodes);
+        if (captured.len != launches) return error.ExpertGraphWorkCountMismatch;
+        var params: cuda.abi.KernelNodeParams = undefined;
+        for (captured) |node| {
+            try gpu.d.check(gpu.d.api.cuGraphKernelNodeGetParams_v2(node, &params), "cuGraphKernelNodeGetParams");
+            try checkNode(params, f.handle, grid, block);
+        }
+        try journal.write(.{ .kind = "expert_kernel", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .variant = @tagName(arm), .warps = arm.warps(), .symbol = try kernelName(f), .grid = params.grid_x, .block = params.block_x, .regs = try f.attribute(.num_regs), .local_bytes = try f.attribute(.local_size_bytes), .resident_blocks = resident, .resident_blocks_per_sm = try f.occupancy(@intCast(block), 0), .kernel_launches = launches, .verified_kernel_nodes = captured.len, .banks = banks, .logical_weight_and_scale_bytes_per_launch = slots * (one + parts * 4), .logical_unique_weight_and_scale_bytes = experts * (one + parts * 4) });
     }
     var start = try cuda.Event.init(gpu.d, true);
     defer start.deinit();
     var end = try cuda.Event.init(gpu.d, true);
     defer end.deinit();
-    for (variants[1..], 1..) |variant, candidate_index| {
+    for (arms[1..], 1..) |arm, candidate_index| {
         for (0..6) |pair| for (0..2) |order| {
             const candidate = (pair + order) % 2 == 1;
             const vi = if (candidate) candidate_index else 0;
@@ -200,7 +252,7 @@ fn projection(gpu: check.Gpu, dir: []const u8, manifest: *const Manifest, journa
             try finite(got, !up);
             try check.sameBytes("timed graph final bank output", got, want);
             try floor(gpu);
-            try journal.write(.{ .kind = "expert_sample", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .comparison = @tagName(variant), .pair = pair, .warmup = pair == 0, .order = order, .arm = @tagName(variants[vi]), .elapsed_ms = elapsed_ms, .kernel_launches = launches, .banks = banks, .final_bank = (launches - 1) % banks, .finite = true, .bit_exact_final = true });
+            try journal.write(.{ .kind = "expert_sample", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .comparison = @tagName(arm), .pair = pair, .warmup = pair == 0, .order = order, .arm = @tagName(arms[vi]), .elapsed_ms = elapsed_ms, .kernel_launches = launches, .banks = banks, .final_bank = (launches - 1) % banks, .finite = true, .bit_exact_final = true });
         };
     }
     try journal.write(.{ .kind = "expert_projection_complete", .ordinal = gpu.ctx.device_ordinal, .epi = @tagName(epi), .all_bank_prechecks = true, .saved_bank0_exact = true, .graph_finals_exact = true, .timed_pairs_per_candidate = 5 });
@@ -214,8 +266,13 @@ test "Qwen expert screen uses eight items and covers all real expert banks" {
     const last = bankLayer(layer, banks - 1);
     try std.testing.expectEqual(X.bytes(experts, width, dims, 2), last.up + X.bytes(slots, width, dims, 2));
     try std.testing.expectEqual(X.bytes(experts, dims, width, 1), last.down + X.bytes(slots, dims, width, 1));
-    try std.testing.expectEqual(@as(usize, 32), X.decodeGrid(.baseline, bound, width / X.cols, 10000));
-    try std.testing.expectEqual(@as(usize, 64), X.decodeGrid(.n16, bound, width / X.cols, 10000));
+    for (arms, [3]usize{ 32, 64, 128 }, [3]usize{ 128, 256, 512 }) |arm, up_grid, down_grid| {
+        try std.testing.expectEqual(up_grid, X.decodeGridWarps(arm.variant(), bound, width / X.cols, 10000, arm.warps()));
+        try std.testing.expectEqual(down_grid, X.decodeGridWarps(arm.variant(), bound, dims / X.cols, 10000, arm.warps()));
+        try std.testing.expectEqual(@as(usize, 7), X.decodeGridWarps(arm.variant(), bound, width / X.cols, 7, arm.warps()));
+    }
+    try std.testing.expectEqual(@as(usize, 32), Arm.wn1_baseline.warps() * 32);
+    try std.testing.expectEqual(@as(usize, 128), Arm.wn4_n16_pipe4.warps() * 32);
     try std.testing.expectEqual(@as(f32, 0), last.limit);
     try std.testing.expect(!last.relu2);
 }
@@ -228,4 +285,49 @@ test "Qwen expert screen rejects changed fixture bytes and nonfinite output" {
     try finite(&.{ 0x80, 0x3f }, false);
     try std.testing.expectError(error.NonfiniteExpertOutput, finite(&.{ 0xff, 0xff, 0xff, 0xff }, true));
     try std.testing.expectError(error.NonfiniteExpertOutput, finite(&.{ 0xff, 0xff }, false));
+    try std.testing.expectError(error.InvalidExpertOutputSize, finite(&.{0}, false));
+    try std.testing.expectError(error.InvalidExpertOutputSize, finite(&.{ 0, 0 }, true));
+}
+
+test "Qwen expert screen rejects missing repeated and out of range fixture experts" {
+    var order: [experts]usize = undefined;
+    for (&order, 0..) |*id, i| id.* = experts - 1 - i;
+    try validateOrder(&order);
+    try std.testing.expectError(error.InvalidExpertOrder, validateOrder(order[0 .. experts - 1]));
+    order[0] = order[1];
+    try std.testing.expectError(error.InvalidExpertOrder, validateOrder(&order));
+    order[0] = experts;
+    try std.testing.expectError(error.InvalidExpertOrder, validateOrder(&order));
+}
+
+test "Qwen expert screen manifest requires byte counts and hashes" {
+    const bytes =
+        \\{"scope":"real layer zero","expert_order":[0],"files":{"input.bin":{"bytes":4096,"sha256":"abc"}},"source":"retained capture"}
+    ;
+    const parsed = try std.json.parseFromSlice(Manifest, std.testing.allocator, bytes, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const pin = parsed.value.files.map.get("input.bin").?;
+    try std.testing.expectEqual(@as(usize, 4096), pin.bytes);
+    try std.testing.expectEqualStrings("abc", pin.sha256);
+    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Manifest, std.testing.allocator,
+        \\{"scope":"real layer zero","expert_order":[0],"files":{"input.bin":{"bytes":4096}}}
+    , .{}));
+    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(Manifest, std.testing.allocator,
+        \\{"scope":"real layer zero","expert_order":[0],"files":{"input.bin":{"sha256":"abc"}}}
+    , .{}));
+}
+
+test "Qwen expert screen rejects a wrong captured kernel or launch geometry" {
+    const f: cuda.abi.Function = @ptrFromInt(1);
+    const p: cuda.abi.KernelNodeParams = .{ .func = f, .grid_x = 128, .grid_y = 1, .grid_z = 1, .block_x = 32, .block_y = 1, .block_z = 1, .shared_bytes = 0, .params = null, .extra = null };
+    try checkNode(p, f, 128, 32);
+    try std.testing.expectError(error.ExpertGraphKernelMismatch, checkNode(p, @ptrFromInt(2), 128, 32));
+    try std.testing.expectError(error.ExpertGraphKernelMismatch, checkNode(p, f, 32, 32));
+    try std.testing.expectError(error.ExpertGraphKernelMismatch, checkNode(p, f, 128, 128));
+    var wrong = p;
+    wrong.grid_y = 2;
+    try std.testing.expectError(error.ExpertGraphKernelMismatch, checkNode(wrong, f, 128, 32));
+    wrong = p;
+    wrong.shared_bytes = 4;
+    try std.testing.expectError(error.ExpertGraphKernelMismatch, checkNode(wrong, f, 128, 32));
 }
