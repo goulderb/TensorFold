@@ -47,3 +47,23 @@ The preliminary probe build passed 57 steps and the cached rebuild passed five.
 The CPU-only host target passed 47 tests across eight build steps. The fleet
 fast gate and 41 controller tests pass. Source is checkpointed before the final
 source-pinned rebuild and the first device execution.
+
+## First device run and bounded instrumentation repair
+
+The first detached controller started at 13:48:15 UTC with source `db51c8f9`
+and a 14:08:15 recovery deadline. It observed exactly 953 captured nodes and
+passed the ordinary-append comparison, all sixteen intermediate graph/eager
+state digests, and all six pair comparisons. The fixed-step paired median was
+31.827 ms eager versus 28.340 ms graph. These remain partial diagnostic results
+because phase timing then failed and the probe did not complete successfully.
+
+`cuEventElapsedTime` returned CUDA_ERROR_INVALID_VALUE for default-captured
+events. NVIDIA documents default events as graph dependency edges. The bounded
+repair records explicit external event nodes with `cuEventRecordWithFlags`.
+The ordinary eager/graph comparison is unchanged. A fresh pinned run repeats
+the whole experiment before accepting phase results.
+
+The controller restored Nemotron at 13:49:42 UTC as PID 16488 and obtained a
+fresh canonical `READY`, request `9c2173d4-34cb-4603-9942-64371b17f4b9`, with
+paid fallback disabled. Clef remained unchanged. The overall first window is
+marked failed because its diagnostic child failed, despite successful recovery.

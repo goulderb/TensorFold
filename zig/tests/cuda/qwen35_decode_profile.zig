@@ -107,10 +107,12 @@ const Tap = struct {
     used: usize = 0,
     current_layer: usize = 99,
     stream: cuda.Stream,
+    record_external: *const fn (cuda.abi.Event, cuda.abi.Stream, c_uint) callconv(.c) cuda.abi.Result,
     fn init(a: std.mem.Allocator, d: *cuda.Driver, stream: cuda.Stream) !Tap {
         const stamps = try a.alloc(Stamp, 400);
         for (stamps) |*stamp| stamp.* = .{ .event = try cuda.Event.init(d, true) };
-        return .{ .stamps = stamps, .stream = stream };
+        const record = d.lib.lookup(*const fn (cuda.abi.Event, cuda.abi.Stream, c_uint) callconv(.c) cuda.abi.Result, "cuEventRecordWithFlags") orelse return error.MissingExternalEventSymbol;
+        return .{ .stamps = stamps, .stream = stream, .record_external = record };
     }
     pub fn layer(self: *Tap, id: usize) void {
         self.current_layer = id;
@@ -120,7 +122,7 @@ const Tap = struct {
         const stamp = &self.stamps[self.used];
         stamp.phase = phase;
         stamp.layer = self.current_layer;
-        try stamp.event.record(self.stream);
+        try self.stream.d.check(self.record_external(stamp.event.handle, self.stream.handle, 1), "cuEventRecordWithFlags(EXTERNAL)");
         self.used += 1;
     }
     fn deinit(self: *Tap) void {
