@@ -170,6 +170,51 @@ if any(row["kind"] == "router_graph_nodes" for row in rows):
         extra = [r["phased_elapsed_ns"] / r["control_elapsed_ns"] - 1 for r in candidate_profile]
         result["router_candidate"]["event_instrumentation_overhead_fraction"] = {
             "median": statistics.median(extra), "range": [min(extra), max(extra)]}
+graph_setup = [r for r in rows if r["kind"] == "generation_graph_setup"]
+if graph_setup:
+    assert len(graph_setup) == 1 and graph_setup[0]["nodes"] == 993 and graph_setup[0]["dynamic_nodes"] == 21
+    assert graph_setup[0]["elapsed_ns"] > 0
+    controls = [r for r in rows if r["kind"] == "generation_graph_controls"]
+    assert len(controls) == 1 and controls[0]["admission_before_mutation"] and controls[0]["stale_position_changes_state"]
+    graph_parity = [r for r in rows if r["kind"] == "generation_graph_parity"]
+    assert len(graph_parity) == 1 and graph_parity[0]["rows"] == 128 and graph_parity[0]["exact_rows_tokens_and_final_state"]
+    graph_tokens = graph_parity[0]["reference_tokens"]
+    assert len(graph_tokens) == 128
+    graph_turns = [r for r in rows if r["kind"] == "generation_graph_turn"]
+    assert len(graph_turns) == 12
+    values = defaultdict(lambda: defaultdict(list))
+    pair_gains = []
+    for pair in range(6):
+        both = [r for r in graph_turns if r["pair"] == pair]
+        assert len(both) == 2 and [r["order"] for r in both] == [0, 1]
+        assert [r["graph"] for r in both] == ([False, True] if pair % 2 == 0 else [True, False])
+        for row in both:
+            assert row["warmup"] == (pair == 0) and row["tokens"] == graph_tokens and row["position"] == 191
+            assert row["exact_rows_tokens_and_final_state"]
+            assert [row[k] for k in ("observed_graph_appends", "observed_graph_launches", "observed_parameter_updates")] == ([191, 382, 4011] if row["graph"] else [0, 0, 0])
+            t = row["times"]
+            assert t["decode_tokens"] == 127 and t["appends"] == 191 and t["draws"] == 128
+            assert t["total_ns"] == t["ttft_ns"] + t["decode_ns"]
+            assert t["decode_ns"] > 0 and t["ttft_ns"] >= t["prefill_ns"] > 0 and t["reset_ns"] >= 0
+            if pair:
+                arm = values["graph" if row["graph"] else "eager"]
+                arm["decode_tokens_per_second"].append(127e9 / t["decode_ns"])
+                for name in ("total_ns", "prefill_ns", "ttft_ns", "reset_ns"):
+                    arm[name.removesuffix("_ns") + "_seconds"].append(t[name] / 1e9)
+        if pair:
+            durations = {r["graph"]: r["times"]["total_ns"] for r in both}
+            pair_gains.append(1 - durations[True] / durations[False])
+    result["changing_position_generation"] = {
+        "scope": "synthetic 64-input/128-output greedy, cooperative router, two serial GPU partitions; warmed compute graphs",
+        "arms": {arm: {name: {"median": statistics.median(v), "range": [min(v), max(v)]} for name, v in data.items()} for arm, data in values.items()},
+        "measured_pairs": 5,
+        "paired_complete_turn_latency_reductions": pair_gains,
+        "graph_construction_seconds": graph_setup[0]["elapsed_ns"] / 1e9,
+        "exact_consumed_bf16_rows": 128,
+        "exact_final_persistent_state": True,
+        "stale_position_negative_control_passed": True,
+        "production_qualified": False,
+    }
 serialized = json.dumps(result, indent=2) + "\n"
 if args.output:
     args.output.write_text(serialized, encoding="utf-8", newline="\n")

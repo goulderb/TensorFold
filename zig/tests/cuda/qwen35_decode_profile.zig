@@ -5,6 +5,7 @@ const qwen = @import("qwen35_cuda");
 const cuda = @import("cuda");
 const admission = @import("qwen35_probe_device.zig");
 const turn = @import("qwen35_sampler_turn.zig");
+const generation_graph = @import("qwen35_generation_graph.zig");
 
 comptime {
     if (options.engine_optimization != .fast) @compileError("diagnostics require ReleaseFast engine");
@@ -267,6 +268,53 @@ fn profilePhases(init: std.process.Init, s: *qwen.Session, baseline: Snapshot, i
     }
 }
 
+fn graphGeneration(init: std.process.Init, s: *qwen.Session, input: Input, hash_buffer: []u8, j: Journal) !void {
+    const a = init.arena.allocator();
+    routeMode(s, true);
+    const setup_start = now(init.io);
+    var replay = try generation_graph.Replay.init(a, s);
+    defer replay.deinit();
+    try j.write(.{ .kind = "generation_graph_setup", .elapsed_ns = now(init.io) - setup_start, .nodes = replay.partitions[0].nodes + replay.partitions[1].nodes, .dynamic_nodes = replay.partitions[0].patches.len + replay.partitions[1].patches.len });
+    try s.reset();
+    if (replay.append(&.{ 17, 248320 })) |_| return error.InvalidAdmissionAccepted else |err| if (err != error.InvalidToken) return err;
+    s.position = s.engine.capacity;
+    if (replay.append(&.{17})) |_| return error.InvalidAdmissionAccepted else |err| if (err != error.ContextFull) return err;
+    s.position = 0;
+    if (replay.appends != 0 or replay.updates != 0 or replay.launches != 0 or s.poisoned) return error.AdmissionMutatedState;
+    try s.append(&.{ 17, 18 });
+    const proper = try stateHash(s, hash_buffer);
+    try s.reset();
+    try replay.appendFrozenPosition(&.{ 17, 18 });
+    const frozen = try stateHash(s, hash_buffer);
+    if (std.mem.eql(u8, &proper, &frozen)) return error.NegativeControlInsensitive;
+    try j.write(.{ .kind = "generation_graph_controls", .admission_before_mutation = true, .stale_position_changes_state = true });
+    var sampler = try turn.Sampler.init(init.gpa, s.logits.len);
+    defer sampler.deinit();
+    var reference: [128]u32 = undefined;
+    var output: [128]u32 = undefined;
+    const reference_rows = try a.alloc(u16, 128 * s.logits.len);
+    const actual_rows = try a.alloc(u16, reference_rows.len);
+    _ = try turn.run(true, init.io, s, &sampler, .current, input.prompt, &reference, reference_rows);
+    const reference_state = try stateHash(s, hash_buffer);
+    replay.clearCounts();
+    _ = try turn.runWithAppender(true, init.io, s, &replay, &sampler, .current, input.prompt, &output, actual_rows);
+    const actual_state = try stateHash(s, hash_buffer);
+    if (!std.mem.eql(u32, &reference, &output) or !std.mem.eql(u16, reference_rows, actual_rows) or !std.mem.eql(u8, &reference_state, &actual_state) or s.position != 191) return error.GraphGenerationParityMismatch;
+    try j.write(.{ .kind = "generation_graph_parity", .rows = 128, .exact_rows_tokens_and_final_state = true, .state_and_logits_sha256 = &actual_state, .reference_tokens = reference });
+    for (0..6) |pair| for (0..2) |order| {
+        const graph = (pair + order) % 2 == 1;
+        replay.clearCounts();
+        const timing = if (graph)
+            try turn.runWithAppender(false, init.io, s, &replay, &sampler, .current, input.prompt, &output, &.{})
+        else
+            try turn.run(false, init.io, s, &sampler, .current, input.prompt, &output, &.{});
+        const state = try stateHash(s, hash_buffer);
+        if (!std.mem.eql(u32, &reference, &output) or !std.mem.eql(u8, &reference_state, &state) or s.position != 191) return error.GraphGenerationRepeatMismatch;
+        if (graph and (replay.appends != 191 or replay.launches != 382 or replay.updates != 4011)) return error.GraphWorkCountMismatch;
+        try j.write(.{ .kind = "generation_graph_turn", .pair = pair, .order = order, .warmup = pair == 0, .graph = graph, .times = timing, .observed_graph_appends = replay.appends, .observed_graph_launches = replay.launches, .observed_parameter_updates = replay.updates, .position = s.position, .exact_rows_tokens_and_final_state = true, .tokens = output });
+    };
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
@@ -385,6 +433,7 @@ fn execute(init: std.process.Init, model_dir: []const u8, input: Input, j: Journ
     routeMode(&s, true);
     try profilePhases(init, &s, baseline, input, position, &cooperative, hash_buffer, j, true);
     try generation(init, &s, input, j);
+    try graphGeneration(init, &s, input, hash_buffer, j);
     try floor(e);
     try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "fixed-step and synthetic 64/128 greedy router self-parity; independent numerical gate remains open", .production_qualification = false });
 }

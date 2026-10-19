@@ -117,3 +117,41 @@ Astra's source review identifies the 7168 prior-pick comparisons and repeated
 pointer reads as credible cost, but source alone cannot prove generated load
 counts or their runtime share. Candidate phase profiling now repeats the same
 separate event/control graph protocol to expose the residual route cost.
+
+R4 (`ccf0b58d`) passed: real decode medians 30.676 to 64.001 tok/s, candidate
+range 63.473–64.083. Complete turn is 6.145 to 2.912 seconds. Candidate routing
+is 3.107 ms in the separate phase run. The PTX comparison confirms original
+global picks loads survive in the selector while the unrolled version uses
+distinct selected-ID registers and has no PTX local operations. PTX does not
+establish final SASS spills. Nemotron restored at 14:13:35 UTC as PID 27496,
+READY request 924fe246-1c95-4eaa-9b92-c4411861f3e7.
+
+## Changing-position graph design
+
+The next bounded proof should change no CUDA math. Both Astra and Fable favor
+updating the embedding-token node and two position-taking attention nodes per
+full layer. Keep original Graph and Exec together; identify nodes by their
+function handles, copy their typed arguments, and update only token/position.
+The competing design adds three metadata-pointer kernels and a device step
+record; reserve that for a measured excessive node-update cost. Per-position
+graph caching adds unnecessary setup and storage.
+
+Caller sketch: capture a probe-owned `GenerationReplay` for the existing
+session; use `turn.runWithAppender(..., session, replay, ...)` for graph turns
+and the existing `turn.run` for eager turns. Session owns position, reset and
+logits; the replay owns graph lifetimes and node arguments. Keep contexts,
+seam copies, completion, floor queries, full logits download and sampling in
+both timed paths. Graph construction is separate and reported. Expect exactly
+21 parameter updates and two graph launches per append at this topology.
+Require all consumed rows/tokens and final persistent state to match, five
+alternating measured turn pairs, correct counters, reset reuse and admission
+rejection before mutation. Production defaults remain unchanged.
+
+The Fable design report has two factual errors retained with its original text:
+decode throughput is `127e9 / decode_ns`, not `191 / total_seconds`; prompt
+prefill is excluded from that denominator and reported separately. The fixed
+`step` implementation includes contexts, seam copies, stream completion, floor
+queries and full logits download; its graphs include only partition compute.
+Its statement that these costs are absent from graph timing is incorrect.
+`cuGraphKernelNodeGetParams_v2` already exists in the ABI. Keep floor queries
+in both arms to isolate graph replay. A fresh judge reviews these corrections.

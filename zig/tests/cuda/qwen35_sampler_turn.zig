@@ -94,17 +94,21 @@ fn now(io: std.Io) i96 {
 
 // Capture is used only in the untimed parity pass; measured turns instantiate it off.
 pub fn run(comptime capture: bool, io: std.Io, session: anytype, sampler: anytype, arm: Arm, prompt: []const u32, output: []u32, rows: []u16) !Times {
+    return runWithAppender(capture, io, session, session, sampler, arm, prompt, output, rows);
+}
+
+pub fn runWithAppender(comptime capture: bool, io: std.Io, session: anytype, appender: anytype, sampler: anytype, arm: Arm, prompt: []const u32, output: []u32, rows: []u16) !Times {
     if (prompt.len == 0 or output.len == 0 or sampler.values.len != session.logits.len) return error.InvalidTurn;
     if (capture and rows.len != output.len * session.logits.len) return error.InvalidCapture;
     for (prompt) |id| if (id >= session.logits.len) return error.InvalidToken;
     const reset_start = now(io);
     try session.reset();
     const start = now(io);
-    for (prompt) |token| try session.append(&.{token});
+    for (prompt) |token| try appender.append(&.{token});
     const prefilled = now(io);
     var first: i96 = 0;
     for (output, 0..) |*token, i| {
-        if (i != 0) try session.append(output[i - 1 .. i]);
+        if (i != 0) try appender.append(output[i - 1 .. i]);
         if (capture) @memcpy(rows[i * session.logits.len ..][0..session.logits.len], session.logits[0..]);
         token.* = try sampler.draw(arm, session.logits[0..], session.position);
         if (i == 0) first = now(io);
