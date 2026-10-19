@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const rt = @import("rt.zig");
+const windows = @import("builtin").os.tag == .windows;
 
 const platform = @import("sys");
 const pread = platform.c.pread;
@@ -13,6 +14,29 @@ fn open(path: [*:0]const u8, flags: c_int) c_int {
     return platform.c.open(path, .{}, @as(platform.c.mode_t, 0));
 }
 
+const win = struct {
+    const Overlapped = extern struct { internal: usize = 0, internal_high: usize = 0, offset: u32, offset_high: u32, event: ?*anyopaque = null };
+    extern "c" fn _wopen(path: [*:0]const u16, flags: c_int, ...) c_int;
+    extern "c" fn _close(fd: c_int) c_int;
+    extern "c" fn _get_osfhandle(fd: c_int) isize;
+    extern "kernel32" fn ReadFile(h: *anyopaque, buf: [*]u8, n: u32, read: *u32, overlapped: *Overlapped) callconv(.winapi) i32;
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
+};
+
+fn readAt(fd: c_int, buf: []u8, off: u64) isize {
+    if (!windows) return pread(fd, buf.ptr, buf.len, @intCast(off));
+    const handle = win._get_osfhandle(fd);
+    if (handle < 0) return -1;
+    var ov: win.Overlapped = .{ .offset = @truncate(off), .offset_high = @truncate(off >> 32) };
+    var n: u32 = 0;
+    if (win.ReadFile(@ptrFromInt(@as(usize, @intCast(handle))), buf.ptr, @intCast(@min(buf.len, 1 << 30)), &n, &ov) != 0) return n;
+    return if (win.GetLastError() == 38) 0 else -1;
+}
+
+fn closeFile(fd: c_int) void {
+    if (windows) _ = win._close(fd) else _ = close(fd);
+}
+
 const chunk_bytes: usize = 64 << 20;
 
 pub const Info = struct { fd: c_int, off: u64, len: u64, dtype: []const u8 };
@@ -20,7 +44,7 @@ pub const Info = struct { fd: c_int, off: u64, len: u64, dtype: []const u8 };
 pub fn readExact(fd: c_int, buf: []u8, off: u64) !void {
     var done: usize = 0;
     while (done < buf.len) {
-        const n = pread(fd, buf.ptr + done, buf.len - done, @intCast(off + done));
+        const n = readAt(fd, buf[done..], off + done);
         if (n <= 0) return error.ReadFailed;
         done += @intCast(n);
     }
@@ -29,7 +53,11 @@ pub fn readExact(fd: c_int, buf: []u8, off: u64) !void {
 fn openPath(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) !c_int {
     const path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ dir, name }, 0);
     defer gpa.free(path);
-    const fd = open(path.ptr, 0);
+    const fd = if (windows) blk: {
+        const wide = try std.unicode.utf8ToUtf16LeAllocZ(gpa, path);
+        defer gpa.free(wide);
+        break :blk win._wopen(wide.ptr, 0x8000); // _O_RDONLY | _O_BINARY
+    } else open(path.ptr, 0);
     if (fd < 0) return error.OpenFailed;
     return fd;
 }
@@ -37,13 +65,13 @@ fn openPath(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) !c_int {
 /// Whole small file (config.json, the index) into memory.
 pub fn readFile(gpa: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {
     const fd = try openPath(gpa, dir, name);
-    defer _ = close(fd);
+    defer closeFile(fd);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var buf: [1 << 16]u8 = undefined;
     var off: u64 = 0;
     while (true) {
-        const n = pread(fd, &buf, buf.len, @intCast(off));
+        const n = readAt(fd, &buf, off);
         if (n < 0) return error.ReadFailed;
         if (n == 0) break;
         try out.appendSlice(gpa, buf[0..@intCast(n)]);
@@ -170,3 +198,29 @@ pub const Loader = struct {
         return b;
     }
 };
+
+test "binary files and positional reads preserve bytes and reject a short span" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const bytes = try gpa.alloc(u8, (1 << 16) + 17);
+    defer gpa.free(bytes);
+    for (bytes, 0..) |*byte, i| byte.* = @truncate(i * 37);
+    try tmp.dir.writeFile(io, .{ .sub_path = "权重.bin", .data = bytes });
+    const dir = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer gpa.free(dir);
+    const actual = try readFile(gpa, dir, "权重.bin");
+    defer gpa.free(actual);
+    try std.testing.expectEqualSlices(u8, bytes, actual);
+    const fd = try openPath(gpa, dir, "权重.bin");
+    defer closeFile(fd);
+    var part: [7]u8 = undefined;
+    try readExact(fd, &part, 19);
+    try std.testing.expectEqualSlices(u8, bytes[19..26], &part);
+    try readExact(fd, &part, 1);
+    try std.testing.expectEqualSlices(u8, bytes[1..8], &part);
+    try std.testing.expectError(error.ReadFailed, readExact(fd, &part, bytes.len - 2));
+    try std.testing.expectError(error.ReadFailed, readExact(fd, &part, (@as(u64, 1) << 32) + 1));
+    try std.testing.expectError(error.OpenFailed, readFile(gpa, dir, "missing"));
+}

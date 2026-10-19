@@ -232,9 +232,14 @@ fn nemotronSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
 
 /// Host unit tests of the Intel GPU runtime, the Nemotron family on it and its CLI (no GPU, no ocloc), on any host.
 pub fn hostTests(b: *std.Build, step: *std.Build.Step) void {
+    const host_step = b.step("test-xpu-host", "The Intel GPU runtime's host unit tests without GPU work");
     const host = b.graph.host;
     const xpu = runtime(b, host, .debug, &.{}, zeModule(b, host, .debug));
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = host, .optimize = .debug, .link_libc = true });
     const mods = family(b, host, .debug, xpu, lanes);
-    for ([_]*std.Build.Module{ xpu, mods.nemotron, cliModule(b, host, .debug, xpu, mods), zeModule(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    for ([_]*std.Build.Module{ xpu, mods.nemotron, cliModule(b, host, .debug, xpu, mods), zeModule(b, host, .debug) }) |m| {
+        const run = b.addRunArtifact(b.addTest(.{ .root_module = m }));
+        step.dependOn(&run.step);
+        host_step.dependOn(&run.step);
+    }
 }
