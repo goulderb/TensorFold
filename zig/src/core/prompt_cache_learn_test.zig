@@ -1,7 +1,7 @@
 //! The prompt cache's learned-state tests: harness states kept on disk, the cap, the disk floor and peers' halves.
 const std = @import("std");
+const platform = @import("sys");
 const pc = @import("prompt_cache.zig");
-const fsys = @import("lanes").learned_fs;
 const imprint = @import("prompt_imprint.zig");
 const rmTree = @import("prompt_imprint_test.zig").rmTree;
 const Store = pc.Store;
@@ -15,7 +15,7 @@ test "a learned harness state outlives its store: a fresh session on a new one r
     defer arena.deinit();
     const a = arena.allocator();
     var root_buf: [128]u8 = undefined;
-    const root = try fsys.tempRoot(&root_buf, "learn-test");
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/tf-learn-test-{d}", .{platform.c.getpid()});
     const rules: pc.Rules = .{ .lookahead = 1, .min_prompt = 0, .min_gap = 1 };
     const harness = [_]u32{ 7, 7, 7, 7, 7, 7 }; // shared by every session: a state at 5 reads it all (lookahead 1)
     const key = imprint.Imprint.keyOf(&harness);
@@ -51,7 +51,7 @@ test "past the learned-state cap the least recently used state is forgotten, and
     defer arena.deinit();
     const a = arena.allocator();
     var root_buf: [128]u8 = undefined;
-    const root = try fsys.tempRoot(&root_buf, "learn-cap");
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/tf-learn-cap-{d}", .{platform.c.getpid()});
     defer rmTree(root);
     const rules: pc.Rules = .{ .lookahead = 1, .min_prompt = 0, .min_gap = 1 };
     const one = [_]u32{ 7, 7, 7, 7, 7, 7 };
@@ -68,8 +68,8 @@ test "past the learned-state cap the least recently used state is forgotten, and
     try std.testing.expectEqual(fresh(&p2), f.pass(&s, &p2, try s.begin(a, &p2, 7, &.{5}, &.{}, null, &.{})));
     try std.testing.expect(im.has(imprint.Imprint.keyOf(&two)) and !im.has(imprint.Imprint.keyOf(&one)));
     var path: [512]u8 = undefined;
-    try std.testing.expectError(error.Missing, fsys.unlink(try Fake.file(&path, im.dir, imprint.Imprint.keyOf(&one)))); // its file went too
-    fsys.unlink(try Fake.file(&path, im.dir, imprint.Imprint.keyOf(&two))) catch {}; // a file lost behind the store's back
+    try std.testing.expect(platform.c.unlink(try Fake.file(&path, im.dir, imprint.Imprint.keyOf(&one))) != 0); // its file went too
+    _ = platform.c.unlink(try Fake.file(&path, im.dir, imprint.Imprint.keyOf(&two))); // a file lost behind the store's back
     var g: Fake = .{ .gpa = gpa };
     var t = Store.init(gpa, g.learned(), rules, 1 << 20);
     defer t.deinit();
@@ -88,7 +88,7 @@ test "learned states are prompt arithmetic: a request that decodes rows below on
     defer arena.deinit();
     const a = arena.allocator();
     var root_buf: [128]u8 = undefined;
-    const root = try fsys.tempRoot(&root_buf, "learn-spans");
+    const root = try std.fmt.bufPrint(&root_buf, "/tmp/tf-learn-spans-{d}", .{platform.c.getpid()});
     defer rmTree(root);
     const rules: pc.Rules = .{ .lookahead = 1, .min_prompt = 0, .min_gap = 1 };
     const harness = [_]u32{ 7, 7, 7, 7, 7, 7 };
@@ -139,7 +139,7 @@ test "Store learning preserves the disk floor, backs off writes across keys, and
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var path: [128]u8 = undefined;
-    const root = try fsys.tempRoot(&path, "learn-backoff");
+    const root = try std.fmt.bufPrint(&path, "/tmp/tf-learn-backoff-{d}", .{platform.c.getpid()});
     defer rmTree(root);
     var im = try imprint.Imprint.open(a, root, 11, 1 << 20);
     defer im.deinit();
@@ -181,7 +181,7 @@ test "learning reserves the existing index rewrite above the disk floor and resu
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var path: [128]u8 = undefined;
-    const root = try fsys.tempRoot(&path, "learn-index-floor");
+    const root = try std.fmt.bufPrint(&path, "/tmp/tf-learn-index-floor-{d}", .{platform.c.getpid()});
     defer rmTree(root);
     var im = try imprint.Imprint.open(a, root, 12, 1 << 20);
     defer im.deinit();
@@ -214,7 +214,7 @@ test "actual Store learn writes neither half on peer refusal, backs off, and rem
     };
     const a = std.testing.allocator;
     var path: [128]u8 = undefined;
-    const root = try fsys.tempRoot(&path, "pair-refuse");
+    const root = try std.fmt.bufPrint(&path, "/tmp/tf-pair-refuse-{d}", .{platform.c.getpid()});
     defer rmTree(root);
     var im = try imprint.Imprint.open(a, root, 51, 1 << 20);
     defer im.deinit();
@@ -243,11 +243,10 @@ test "actual Store learn writes neither half on peer refusal, backs off, and rem
     try std.testing.expectEqual(@as(u64, 0), im.admission.reserved);
     var file_path: [512]u8 = undefined;
     const file = try Fake.file(&file_path, im.dir, imprint.Imprint.keyOf(prompt[0..6]));
-    if (fsys.open(file, .{})) |fd| {
-        fsys.close(fd);
+    const fd = platform.c.open(file, .{ .ACCMODE = .RDONLY }, @as(platform.c.mode_t, 0));
+    if (fd >= 0) {
+        _ = platform.c.close(fd);
         return error.OrphanedHalf;
-    } else |err| {
-        if (err != error.Missing) return err;
     }
 }
 test "under-cap disk pressure selects the same LRU victim before either half is persisted" {
@@ -265,15 +264,16 @@ test "under-cap disk pressure selects the same LRU victim before either half is 
     };
     const a = std.testing.allocator;
     var path: [128]u8 = undefined;
-    const root = try fsys.tempRoot(&path, "pair-victim");
+    const root = try std.fmt.bufPrint(&path, "/tmp/tf-pair-victim-{d}", .{platform.c.getpid()});
     defer rmTree(root);
     var im = try imprint.Imprint.open(a, root, 52, 1 << 20);
     defer im.deinit();
     try im.add(imprint.Imprint.keyOf(&.{ 1, 2 }), 1, &.{ 1, 2 }, &.{}, 16);
     var victim_path: [512]u8 = undefined;
-    const victim_fd = fsys.open(try Fake.file(&victim_path, im.dir, imprint.Imprint.keyOf(&.{ 1, 2 })), .{ .access = .write, .create = true }) catch return error.Create;
-    try std.testing.expect(fsys.truncate(victim_fd, 16));
-    fsys.close(victim_fd);
+    const victim_fd = platform.c.open(try Fake.file(&victim_path, im.dir, imprint.Imprint.keyOf(&.{ 1, 2 })), .{ .ACCMODE = .WRONLY, .CREAT = true }, @as(platform.c.mode_t, 0o600));
+    if (victim_fd < 0) return error.Create;
+    try std.testing.expectEqual(@as(c_int, 0), platform.c.ftruncate(victim_fd, 16));
+    _ = platform.c.close(victim_fd);
     im.admission = .{ .floor = 100, .free = Disk.free, .clock = Disk.clock };
     const prompt = [_]u32{ 7, 7, 7, 7, 7, 7, 9, 10 };
     Disk.space = 100 + 105 + 256 + (6 * 4) + (try im.indexScratchBytes()) - 8;

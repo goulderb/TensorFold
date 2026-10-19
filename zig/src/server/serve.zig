@@ -1,6 +1,6 @@
 //! A server's life: keys, the listening socket, the startup lines, the live line, and a clean stop on SIGTERM or SIGINT.
 const std = @import("std");
-const builtin = @import("builtin");
+const platform = @import("sys");
 const api = @import("engine_api");
 const json = @import("json");
 const auth = @import("auth.zig");
@@ -11,9 +11,8 @@ const listener_mod = @import("listener.zig");
 const model_text = @import("model_text.zig");
 const server_mod = @import("server.zig");
 const recall_routes = @import("recall_routes.zig");
-const win32 = @import("win32.zig");
 const Allocator = std.mem.Allocator;
-const posix = std.posix;
+const posix = platform.posix;
 
 var stop_requested: std.atomic.Value(bool) = .init(false);
 
@@ -21,18 +20,8 @@ fn onStop(_: posix.SIG) callconv(.c) void {
     stop_requested.store(true, .release);
 }
 
-fn onConsoleStop() void {
-    stop_requested.store(true, .release);
-}
-
 /// SIGTERM and SIGINT stop the server cleanly; SIGHUP rereads the key file; SIGPIPE is ignored, as Python ignores it.
-/// On Windows, Ctrl+C, Ctrl+Break and console close stop it, and the reload event stands in for SIGHUP.
 pub fn installSignals(keys: bool) void {
-    if (comptime builtin.os.tag == .windows) {
-        if (!win32.installConsoleStop(onConsoleStop)) log.line("console control handler refused: Ctrl+C will end the process without a clean stop", .{});
-        if (keys) auth.installHangup();
-        return;
-    }
     const stop: posix.Sigaction = .{ .handler = .{ .handler = onStop }, .mask = posix.sigemptyset(), .flags = 0 };
     posix.sigaction(.TERM, &stop, null);
     posix.sigaction(.INT, &stop, null);
@@ -46,7 +35,7 @@ pub fn stopping() bool {
 }
 
 /// The hard limit macOS reads as unlimited.
-const rlim_infinity: u64 = if (builtin.os.tag == .windows) 0 else std.c.RLIM.INFINITY;
+const rlim_infinity: u64 = platform.c.RLIM.INFINITY;
 
 /// The targets to try, in order: the hard limit when finite, else the fallbacks 65536 then 10240, first that works; never an unlimited soft limit, since a loop over every descriptor would do absurd work.
 fn fillTargets(max: u64, out: *[2]u64) []const u64 {
@@ -61,8 +50,6 @@ fn fillTargets(max: u64, out: *[2]u64) []const u64 {
 
 /// Best-effort raise of the soft open-file limit so idle keep-alives cannot exhaust a default 1024; a failure keeps the current limits, and null (caller logs) means nothing moved.
 fn raiseOpenFileLimit() ?[2]u64 {
-    // Windows has no per-process descriptor limit to raise: Winsock's socket count is not an rlimit
-    if (comptime builtin.os.tag == .windows) return null;
     const limit = posix.getrlimit(.NOFILE) catch return null;
     const cur: u64 = @intCast(limit.cur);
     if (cur == rlim_infinity) return null; // already unlimited
@@ -144,13 +131,13 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
         .compact_keep = args.compact_keep,
         .compact_memory = args.compact_memory,
-        .slide = args.slide,
         .slide_graph = args.slide_graph,
         .slide_forget_fail = s.forget_fail,
         .cortheon = args.cortheon,
         .cortheon_search_key = env(s, "BRAVE_SEARCH_API_KEY"),
         .saved_conversations = args.learn_conversations,
         .identity = s.identity,
+        .environ = s.environ,
     };
     const srv = server_mod.Server.init(gpa, io, s.engine, s.text, config, if (store.enabled()) &store else null) catch {
         std.debug.print("tensorfold: the server could not start\n", .{});
@@ -239,13 +226,8 @@ test "the targets are the hard limit, or the fallbacks under an unlimited one" {
     try std.testing.expectEqualSlices(u64, &.{ 65536, 10240 }, fillTargets(rlim_infinity, &buf));
 }
 
-test "the raise is a no-op where there is no descriptor rlimit" {
-    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
-    try std.testing.expect(raiseOpenFileLimit() == null);
-}
-
 test "the raise lifts a low soft limit, and a second raise does nothing" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // no descriptor limits to raise
     const before = try posix.getrlimit(.NOFILE);
     defer posix.setrlimit(.NOFILE, before) catch {};
     if (@as(u64, @intCast(before.max)) <= 256) return error.SkipZigTest;

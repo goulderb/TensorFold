@@ -1,7 +1,7 @@
 //! Replaced tensors written into a checkpoint's own shards, index and config: in place when sizes hold, else by rename.
 const std = @import("std");
+const platform = @import("sys");
 const st = @import("safetensors.zig");
-const fsys = @import("lanes").learned_fs;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Value = std.json.Value;
@@ -182,7 +182,7 @@ pub fn create(gpa: Allocator, path: []const u8, metadata: []const [2][]const u8,
     pieces.items[0] = head;
     pieces.items[1] = text;
     pieces.items[2] = spaces;
-    try commitFile(arena, try stageFile(arena, path, pieces.items), path);
+    try writeFile(arena, path, pieces.items);
 }
 
 /// `edits` written over their tensors where they lie, if each keeps its dtype and size (else false, nothing written).
@@ -201,12 +201,18 @@ fn inPlace(gpa: Allocator, io: Io, path: []const u8, edits: []const Replacement)
     }
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
-    const fd = fsys.open(try arena_state.allocator().dupeSentinel(u8, path, 0), .{ .access = .write }) catch return error.ShardWrite;
-    defer fsys.close(fd);
+    const fd = platform.c.open(try arena_state.allocator().dupeSentinel(u8, path, 0), .{ .ACCMODE = .WRONLY });
+    if (fd < 0) return error.ShardWrite;
+    defer _ = platform.c.close(fd);
     for (edits, places[0..edits.len]) |r, at| {
-        if (!fsys.writeAt(fd, r.bytes, @intCast(at))) return error.ShardWrite;
+        var done: usize = 0;
+        while (done < r.bytes.len) {
+            const n = platform.c.pwrite(fd, r.bytes.ptr + done, @min(r.bytes.len - done, 1 << 30), @intCast(at + done));
+            if (n <= 0) return error.ShardWrite;
+            done += @intCast(n);
+        }
     }
-    if (!fsys.sync(fd)) return error.ShardWrite;
+    if (platform.c.fsync(fd) != 0) return error.ShardWrite;
     return true;
 }
 
@@ -216,8 +222,8 @@ pub fn rewrite(gpa: Allocator, io: Io, path: []const u8, edits: []const Replacem
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var file = try st.File.open(gpa, io, path);
-    var file_open = true;
-    defer if (file_open) file.close(io);
+    var mapped = true;
+    defer if (mapped) file.close(io);
     for (edits) |r| if (!file.names.contains(r.name)) return error.MissingTensor;
     const raw = file.map.memory;
     const original = try std.json.parseFromSliceLeaky(Value, arena, raw[8..file.data], .{});
@@ -253,10 +259,11 @@ pub fn rewrite(gpa: Allocator, io: Io, path: []const u8, edits: []const Replacem
     const spaces = try arena.alloc(u8, padded - text.len);
     @memset(spaces, ' ');
     try pieces.insertSlice(arena, 0, &.{ &head, text, spaces });
-    const tmp = try stageFile(arena, path, pieces.items);
-    file_open = false;
-    file.close(io); // the pieces point into this map: staged first, unmapped before the rename (Windows refuses a mapped file)
-    try commitFile(arena, tmp, path);
+    const tmp = try writeTemp(arena, path, pieces.items);
+    // the pieces are written; the map goes before the rename, since Windows refuses to replace a mapped file
+    file.close(io);
+    mapped = false;
+    try commit(arena, tmp, path);
     return @as(i64, @intCast(offset)) - @as(i64, @intCast(before));
 }
 
@@ -319,32 +326,40 @@ fn readJson(arena: Allocator, io: Io, path: []const u8) !Value {
 
 fn writeJson(arena: Allocator, path: []const u8, v: Value) !void {
     const text = try std.json.Stringify.valueAlloc(arena, v, .{ .whitespace = .indent_2 });
-    try commitFile(arena, try stageFile(arena, path, &.{ text, "\n" }), path);
+    try writeFile(arena, path, &.{ text, "\n" });
 }
 
 /// `parts` to `path` through `path`.tmp, synced, then renamed over it; a reader sees the old file or the new one.
-/// `parts` to `path`.tmp, synced; `commitFile` then renames it over `path`.
-fn stageFile(arena: Allocator, path: []const u8, parts: []const []const u8) ![:0]const u8 {
+fn writeFile(arena: Allocator, path: []const u8, parts: []const []const u8) !void {
+    try commit(arena, try writeTemp(arena, path, parts), path);
+}
+
+/// `parts` written and synced to `path`.tmp, which is returned.
+fn writeTemp(arena: Allocator, path: []const u8, parts: []const []const u8) ![:0]const u8 {
     const tmp = try std.fmt.allocPrintSentinel(arena, "{s}.tmp", .{path}, 0);
-    const fd = fsys.open(tmp, .{ .access = .write, .create = true, .trunc = true, .mode = 0o644 }) catch return error.ShardWrite;
-    errdefer fsys.unlink(tmp) catch {};
-    defer fsys.close(fd);
+    const fd = platform.c.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(platform.c.mode_t, 0o644));
+    if (fd < 0) return error.ShardWrite;
+    errdefer _ = platform.c.unlink(tmp);
+    defer _ = platform.c.close(fd);
     for (parts) |p| try put(fd, p);
-    if (!fsys.sync(fd)) return error.ShardWrite;
+    if (platform.c.fsync(fd) != 0) return error.ShardWrite;
     return tmp;
 }
 
-/// The staged `tmp` over `path`: a reader sees the old file or the new one.
-fn commitFile(arena: Allocator, tmp: [:0]const u8, path: []const u8) !void {
+/// `tmp` renamed over `path`; a failed rename removes `tmp`.
+fn commit(arena: Allocator, tmp: [:0]const u8, path: []const u8) !void {
+    errdefer _ = platform.c.unlink(tmp);
     const dest = try arena.dupeSentinel(u8, path, 0);
-    fsys.rename(tmp, dest) catch {
-        fsys.unlink(tmp) catch {};
-        return error.ShardWrite;
-    };
+    if (platform.c.rename(tmp, dest) != 0) return error.ShardWrite;
 }
 
-fn put(fd: fsys.Fd, b: []const u8) !void {
-    fsys.write(fd, b) catch return error.ShardWrite;
+fn put(fd: c_int, b: []const u8) !void {
+    var done: usize = 0;
+    while (done < b.len) {
+        const n = platform.c.write(fd, b.ptr + done, @min(b.len - done, 1 << 30));
+        if (n <= 0) return error.ShardWrite;
+        done += @intCast(n);
+    }
 }
 
 test "a whole file written with its metadata reads back tensor for tensor" {
@@ -508,41 +523,6 @@ test "a tensor grown in its shard: the shard is rewritten, the index's total mov
     try std.testing.expectEqualStrings("x", (try field(config, "model_type")).string);
 }
 
-test "a folder whose shard is a symlink or a hard link is refused for learning; its own files pass" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "blobs");
-    for ([_][]const u8{ "config.json", index_name, "model-00001-of-00002.safetensors", "blobs/b2", "notes.txt" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "x" });
-    // Windows creates symlinks only with Developer Mode or the symlink privilege; without it there is no link to test.
-    tmp.dir.symLink(io, "model-00001-of-00002.safetensors", "readme-link", .{}) catch |e| return if (e == error.PermissionDenied) error.SkipZigTest else e;
-    const dir = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
-    try std.testing.expect((try linked(arena, io, dir)) == null);
-    try tmp.dir.symLink(io, "blobs/b2", "model-00002-of-00002.safetensors", .{});
-    try std.testing.expectEqualStrings("model-00002-of-00002.safetensors", (try linked(arena, io, dir)).?);
-    try tmp.dir.deleteFile(io, "model-00002-of-00002.safetensors");
-    try tmp.dir.hardLink("blobs/b2", tmp.dir, "model-00002-of-00002.safetensors", io, .{});
-    try std.testing.expectEqualStrings("model-00002-of-00002.safetensors", (try linked(arena, io, dir)).?);
-}
-
-test "a shared expert an earlier release saved unquantized is found; quantized ones and other modules pass" {
-    const io = std.testing.io;
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data =
-        \\{"quantization":{"group_size":64,"bits":4,"backbone.layers.9.mixer.out_proj":false}}
-    });
-    try std.testing.expect((try plainShared(arena, io, dir)) == null);
-    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data =
-        \\{"quantization":{"group_size":64,"bits":4,"backbone.layers.15.mixer.shared_experts.down_proj":false}}
-    });
-    try std.testing.expectEqualStrings("backbone.layers.15.mixer.shared_experts.down_proj", (try plainShared(arena, io, dir)).?);
+test {
+    _ = @import("shard_edit_link_test.zig");
 }

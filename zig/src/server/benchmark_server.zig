@@ -1,5 +1,6 @@
 //! The benchmark's own serve child: lock, flags, environment, port, readiness and a stop that always reaps.
 const std = @import("std");
+const platform = @import("sys");
 const builtin = @import("builtin");
 const json = @import("json");
 const cli = @import("cli.zig");
@@ -69,7 +70,7 @@ fn openLock(io: std.Io, path: []const u8) !std.Io.File {
     const cwd = std.Io.Dir.cwd();
     const existing: std.Io.Dir.OpenFileOptions = .{ .mode = .read_write, .follow_symlinks = false, .allow_directory = false };
     return cwd.openFile(io, path, existing) catch |e| switch (e) {
-        error.FileNotFound => cwd.createFile(io, path, .{ .exclusive = true, .truncate = false, .permissions = if (comptime @import("builtin").os.tag == .windows) .default_file else .fromMode(0o600) }) catch |c| switch (c) {
+        error.FileNotFound => cwd.createFile(io, path, .{ .exclusive = true, .truncate = false, .permissions = .fromMode(0o600) }) catch |c| switch (c) {
             error.PathAlreadyExists => cwd.openFile(io, path, existing),
             else => c,
         },
@@ -81,8 +82,7 @@ fn openLock(io: std.Io, path: []const u8) !std.Io.File {
 pub fn lockRun(io: std.Io, bench_dir: []const u8, problem: *[]const u8) ?std.Io.File {
     const cwd = std.Io.Dir.cwd();
     const cannot = "Could not create the benchmark lock; check the TensorFold directory permissions";
-    const dir_perm: std.Io.File.Permissions = if (comptime @import("builtin").os.tag == .windows) .default_dir else .fromMode(0o700);
-    _ = cwd.createDirPathStatus(io, bench_dir, dir_perm) catch {
+    _ = cwd.createDirPathStatus(io, bench_dir, .fromMode(0o700)) catch {
         problem.* = cannot;
         return null;
     };
@@ -121,8 +121,7 @@ pub const Managed = struct {
         const child_argv = o.argv orelse try argv(a, plan);
         const lock = lockRun(io, o.bench_dir, problem) orelse return null;
         const cwd = std.Io.Dir.cwd();
-        const log_perm: std.Io.File.Permissions = if (comptime @import("builtin").os.tag == .windows) .default_file else .fromMode(0o600);
-        const log = cwd.createFile(io, log_path, .{ .exclusive = true, .read = true, .permissions = log_perm }) catch {
+        const log = cwd.createFile(io, log_path, .{ .exclusive = true, .read = true, .permissions = .fromMode(0o600) }) catch {
             lock.close(io);
             problem.* = "Benchmark server could not start; check local checkpoint and directory permissions";
             return null;
@@ -187,14 +186,6 @@ pub const Managed = struct {
 
     /// TERM, a grace period, KILL, another; always closes the log and the lock. Null when reaped.
     pub fn stop(m: *Managed) ?[]const u8 {
-        if (comptime builtin.os.tag == .windows) {
-            if (!m.closed) {
-                m.closed = true;
-                m.log.close(m.io);
-                m.lock.close(m.io);
-            }
-            return null;
-        }
         if (m.closed) return null;
         m.closed = true;
         defer {
@@ -220,13 +211,12 @@ pub const Managed = struct {
 
     /// The child is released from a second Ctrl-C while its exited pid is still reserved, and only then reaped.
     fn exited(m: *Managed) bool {
-        if (comptime builtin.os.tag == .windows) return true;
         if (m.reaped) return true;
         if (!ended(m.pid)) return false;
         stop_flag.releaseChild(m.pid);
         var status: c_int = 0;
         while (true) {
-            const rc = std.c.waitpid(m.pid, &status, 0);
+            const rc = platform.c.waitpid(m.pid, &status, 0);
             if (rc >= 0 or posix.errno(rc) != .INTR) break;
         }
         m.reaped = true;
@@ -235,7 +225,7 @@ pub const Managed = struct {
 };
 
 const wait = struct {
-    extern "c" fn waitid(idtype: c_uint, id: c_uint, info: *std.c.siginfo_t, options: c_int) c_int;
+    extern "c" fn waitid(idtype: c_uint, id: c_uint, info: *platform.c.siginfo_t, options: c_int) c_int;
     const p_pid = 1;
     const exited: c_int = if (builtin.os.tag == .linux) std.os.linux.W.EXITED else 0x4;
     const no_wait: c_int = if (builtin.os.tag == .linux) std.os.linux.W.NOWAIT else 0x20;
@@ -243,10 +233,9 @@ const wait = struct {
 
 /// True once ``pid`` has exited, or is no child of this process, without reaping it.
 pub fn ended(pid: posix.pid_t) bool {
-    if (comptime builtin.os.tag == .windows) return false;
-    var info: std.c.siginfo_t = undefined;
+    var info: platform.c.siginfo_t = undefined;
     @memset(std.mem.asBytes(&info), 0);
-    const rc = wait.waitid(wait.p_pid, @intCast(pid), &info, wait.exited | wait.no_wait | std.c.W.NOHANG);
+    const rc = wait.waitid(wait.p_pid, @intCast(pid), &info, wait.exited | wait.no_wait | platform.c.W.NOHANG);
     if (rc < 0) return posix.errno(rc) == .CHILD;
     const got = if (builtin.os.tag == .linux) info.fields.common.first.piduid.pid else info.pid;
     return got == pid;

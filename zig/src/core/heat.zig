@@ -1,6 +1,6 @@
 //! Opt-in wait before a prompt chunk when the hottest thermal zone is above a band.
 const std = @import("std");
-const env = @import("env.zig");
+const platform = @import("sys");
 
 pub const default_root = "/sys/class/thermal";
 
@@ -18,10 +18,8 @@ pub const Gate = struct {
 
     /// TF_HEAT_HIGH and TF_HEAT_LOW in degrees, both or neither (neither: no read); TF_HEAT_ROOT moves the zones.
     pub fn fromEnv() !Gate {
-        var high_buf: [64]u8 = undefined;
-        var low_buf: [64]u8 = undefined;
-        const root = (try envSpan(&root_buf, "TF_HEAT_ROOT")) orelse default_root;
-        return .{ .bands = try bandsFrom(try envSpan(&high_buf, "TF_HEAT_HIGH"), try envSpan(&low_buf, "TF_HEAT_LOW")), .root = root };
+        const root = envSpan("TF_HEAT_ROOT") orelse default_root;
+        return .{ .bands = try bandsFrom(envSpan("TF_HEAT_HIGH"), envSpan("TF_HEAT_LOW")), .root = root };
     }
 
     /// `read` returns the gathered maximum in celsius. `sleep_fn` stands in for the 2 s pause.
@@ -131,11 +129,9 @@ fn noteNoZone(root: []const u8) void {
     std.log.warn("no readable thermal zone under {s}; running without a heat wait", .{root});
 }
 
-/// The zone folder is copied once into this, so the Gate keeps it past the lookup.
-var root_buf: [512]u8 = undefined;
-
-fn envSpan(buf: []u8, name: []const u8) !?[]const u8 {
-    const s = (try env.getInto(buf, name)) orelse return null;
+fn envSpan(name: [*:0]const u8) ?[]const u8 {
+    const p = platform.c.getenv(name) orelse return null;
+    const s = std.mem.span(p);
     if (s.len == 0) return null;
     return s;
 }
@@ -199,12 +195,19 @@ test "the chunk runs under the high band, and a hot reading waits until the low 
     try std.testing.expectEqual(@as(u32, 1), stuck.sleeps); // a cancel ends the wait after the pause it came in
 }
 
-fn putEnv(name: []const u8, value: ?[]const u8) void {
-    env.set(name, value) catch @panic("environment");
+const env = if (@import("builtin").os.tag == .windows) @import("sys").c else struct {
+    extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: i32) i32;
+    extern "c" fn unsetenv(name: [*:0]const u8) i32;
+};
+
+fn putEnv(name: [*:0]const u8, value: ?[*:0]const u8) void {
+    if (value) |v| {
+        _ = env.setenv(name, v, 1);
+    } else _ = env.unsetenv(name);
 }
 
 test "TF_HEAT_HIGH and TF_HEAT_LOW set the bands together, and TF_HEAT_ROOT the zones' folder" {
-    const keys = [_][]const u8{ "TF_HEAT_HIGH", "TF_HEAT_LOW", "TF_HEAT_ROOT" };
+    const keys = [_][*:0]const u8{ "TF_HEAT_HIGH", "TF_HEAT_LOW", "TF_HEAT_ROOT" };
     defer for (keys) |k| putEnv(k, null);
     for (keys) |k| putEnv(k, null);
     try std.testing.expect((try Gate.fromEnv()).bands == null);

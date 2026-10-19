@@ -1,7 +1,7 @@
 //! Server output: ``[tensorfold]`` lines on stdout, and the live status line they clear first.
 const std = @import("std");
+const platform = @import("sys");
 const Conn = @import("http_conn.zig").Conn;
-const platform = @import("platform");
 const afterChars = @import("reply_text.zig").afterChars;
 
 var global_io: ?std.Io = null;
@@ -22,7 +22,12 @@ pub fn io() std.Io {
 const clear = "\r\x1b[2K";
 
 fn writeOut(bytes: []const u8) void {
-    platform.stdoutWrite(bytes);
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = platform.c.write(1, bytes[off..].ptr, bytes.len - off);
+        if (platform.c.errno(rc) != .SUCCESS or rc <= 0) return;
+        off += @intCast(rc);
+    }
 }
 
 /// One ``[tensorfold] ...`` line.

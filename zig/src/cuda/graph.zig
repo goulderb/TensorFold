@@ -19,6 +19,9 @@ fn soft(d: *const Driver, res: abi.Result, what: []const u8) Error!void {
 
 /// Starts capturing `stream`; every launch on it is recorded until `endCapture`, nothing runs.
 pub fn beginCapture(stream: Stream, mode: abi.CaptureMode) Error!void {
+    const source = @import("copy_source.zig");
+    try source.captureBegin(stream, mode);
+    errdefer source.captureEnd(stream);
     try soft(stream.d, stream.d.api.cuStreamBeginCapture_v2(stream.handle, mode), "cuStreamBeginCapture");
 }
 
@@ -26,6 +29,7 @@ pub fn beginCapture(stream: Stream, mode: abi.CaptureMode) Error!void {
 pub fn endCapture(stream: Stream) Error!Graph {
     var g: abi.Graph = null;
     try soft(stream.d, stream.d.api.cuStreamEndCapture(stream.handle, &g), "cuStreamEndCapture");
+    @import("copy_source.zig").captureEnd(stream);
     return .{ .d = stream.d, .handle = g };
 }
 

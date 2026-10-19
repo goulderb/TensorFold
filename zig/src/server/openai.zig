@@ -354,7 +354,7 @@ const Run = struct {
         r.out.vt.reply(r.out.ctx, if (kind_ok) cx.status() else 500, wrapError(a, body) catch return);
     }
 
-    /// A reply that ended before anything was sent: a refusal's 400, a failure's 500, nothing when the client left.
+    /// An unsent reply: request 400, unavailable 503, failure 500, nothing when the client left.
     fn unsent(r: *Run, cx: *Cx, e: chat.Failure, field: []const u8) void {
         switch (e) {
             error.Cancelled => {},
@@ -436,30 +436,25 @@ const Run = struct {
     const StreamSink = struct {
         run: *Run,
         tools: bool,
-        opened: bool = false,
         prompt_len: usize,
-        pending: std.ArrayList(Value) = .empty,
+        opened: bool = false,
+        pending: std.ArrayList(Value) = .empty, // research progress waits for actual engine admission
 
-        fn accepted(ctx: *anyopaque) error{Closed}!void {
+        fn begin(ctx: *anyopaque, _: usize) error{Closed}!void {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
             if (s.opened) return;
             const r = s.run;
             try r.out.vt.open(r.out.ctx, s.prompt_len);
             s.opened = true;
             if (!s.tools and r.is_chat) try r.emit(r.chunk(roleDelta(r.a) catch return error.Closed, null) catch return error.Closed);
-            var pending = s.pending;
-            s.pending = .empty;
-            defer pending.deinit(r.a);
-            for (pending.items) |delta| try call(s, delta);
+            for (s.pending.items) |delta| try call(ctx, delta);
+            s.pending.clearRetainingCapacity();
         }
 
         fn call(ctx: *anyopaque, delta: Value) error{Closed}!void {
             const s: *StreamSink = @ptrCast(@alignCast(ctx));
             const r = s.run;
-            if (!s.opened) {
-                s.pending.append(r.a, delta) catch return error.Closed;
-                return;
-            }
+            if (!s.opened) return s.pending.append(r.a, delta) catch error.Closed;
             if (!s.tools) {
                 // completions stream text only, with its logprob rows when asked
                 if (!r.is_chat and delta != .string and (delta != .object or delta.object.get("content") == null)) return;
@@ -509,7 +504,7 @@ const Run = struct {
         const a = r.a;
         const tools = r.plan.input.tools.len > 0;
         var cx: Cx = .{ .a = a };
-        // a context-window refusal is reported inside the stream; every other refusal is still a 400 before it opens
+        // Context-window refusals stay streamed; other pre-admission refusals retain their HTTP status.
         var compaction: ?compact.Stamp = null;
         const prepared = if (r.srv.config.compact_at == null) chat.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
             if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
@@ -522,9 +517,12 @@ const Run = struct {
             compaction = ready.stamp;
             break :blk ready.prepared;
         };
+        var handed = false; // generate gives the preparing count back from here on
+        defer if (!handed) chat.release(r.srv, prepared.preparing);
         var sink_state: StreamSink = .{ .run = r, .tools = tools, .prompt_len = prepared.prompt_len };
         defer sink_state.pending.deinit(a);
-        const sink: chat.Sink = .{ .ctx = &sink_state, .call = StreamSink.call, .accepted = StreamSink.accepted };
+        handed = true;
+        const sink: chat.Sink = .{ .ctx = &sink_state, .call = StreamSink.call, .begin = StreamSink.begin };
         var reply = (if (r.turn) |t| cortheon.loop.stream(t, r.srv, &cx, &r.plan.input, prepared, sink, gone) else chat.generate(r.srv, &cx, prepared, sink, gone)) catch |e| {
             if (!sink_state.opened) return r.unsent(&cx, e, field);
             switch (e) {

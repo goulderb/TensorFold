@@ -1,6 +1,6 @@
 //! Bounded-name learned directories: both ranks plan the same identity deletions before either writes.
 const std = @import("std");
-const fsys = @import("learned_fs.zig");
+const platform = @import("sys");
 pub fn rootOf(dir: []const u8) []const u8 {
     return std.fs.path.dirname(dir) orelse ".";
 }
@@ -13,21 +13,24 @@ fn isCurrent(keep: []const u8, id: u64) bool {
     return std.mem.eql(u8, std.fs.path.basename(keep), formatted);
 }
 pub fn next(root: []const u8, keep: []const u8, after: ?u64) !?u64 {
-    var d = fsys.openDir(root) catch return error.LearnedDirectoryRead;
-    defer fsys.closeDir(&d);
+    var buf: [1100]u8 = undefined;
+    const d = platform.c.opendir(try std.fmt.bufPrintSentinel(&buf, "{s}", .{root}, 0)) orelse return error.LearnedDirectoryRead;
+    defer _ = platform.c.closedir(d);
     var out: ?u64 = null;
-    while (fsys.next(&d)) |ent| {
-        if (ent.name.len != 16) continue;
-        const id = std.fmt.parseInt(u64, ent.name, 16) catch continue;
+    while (platform.c.readdir(d)) |ent| {
+        const name = std.mem.sliceTo(&ent.name, 0);
+        if (name.len != 16) continue;
+        const id = std.fmt.parseInt(u64, name, 16) catch continue;
         if (id == std.math.maxInt(u64)) return error.LearnedDirectoryType;
-        if (ent.kind != .dir) return error.LearnedDirectoryType;
+        if (ent.type != platform.c.DT.DIR) return error.LearnedDirectoryType;
         if (isCurrent(keep, id) or (after != null and id <= after.?)) continue;
         if (out == null or id < out.?) out = id;
     }
     return out;
 }
 pub fn unlink(file: [:0]const u8) !void {
-    fsys.unlink(file) catch |err| if (err != error.Missing) return error.LearnedUnlink;
+    const rc = platform.c.unlink(file);
+    if (rc != 0 and platform.c.errno(rc) != .NOENT) return error.LearnedUnlink;
 }
 
 fn stateKey(name: []const u8) ?u64 {
@@ -50,38 +53,38 @@ fn identityName(name: []const u8) bool {
 }
 
 fn unlinkAt(fd: c_int, name: [*:0]const u8) !void {
-    const rc = std.c.unlinkat(fd, name, 0);
-    if (rc != 0 and std.c.errno(rc) != .NOENT) return error.LearnedUnlink;
+    const rc = platform.c.unlinkat(fd, name, 0);
+    if (rc != 0 and platform.c.errno(rc) != .NOENT) return error.LearnedUnlink;
 }
 
 /// Only the configured root may be an alias; cleanup never follows an identity or file link.
 pub fn cleanupParts(root: []const u8) !void {
     var buf: [1100]u8 = undefined;
-    const fd = std.c.open(try std.fmt.bufPrintSentinel(&buf, "{s}", .{root}, 0), .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, @as(std.c.mode_t, 0));
+    const fd = platform.c.open(try std.fmt.bufPrintSentinel(&buf, "{s}", .{root}, 0), .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, @as(platform.c.mode_t, 0));
     if (fd < 0) return error.LearnedDirectoryRead;
-    const d = std.c.fdopendir(fd) orelse {
-        _ = std.c.close(fd);
+    const d = platform.c.fdopendir(fd) orelse {
+        _ = platform.c.close(fd);
         return error.LearnedDirectoryRead;
     };
-    defer _ = std.c.closedir(d);
-    while (std.c.readdir(d)) |ent| {
+    defer _ = platform.c.closedir(d);
+    while (platform.c.readdir(d)) |ent| {
         const name = std.mem.sliceTo(&ent.name, 0);
-        if (ent.type == std.c.DT.REG and std.mem.eql(u8, name, "clock.part")) {
+        if (ent.type == platform.c.DT.REG and std.mem.eql(u8, name, "clock.part")) {
             try unlinkAt(fd, @ptrCast(&ent.name));
             continue;
         }
         if (!identityName(name)) continue;
-        if (ent.type != std.c.DT.DIR) return error.LearnedDirectoryType;
-        const sub_fd = std.c.openat(fd, @ptrCast(&ent.name), .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
+        if (ent.type != platform.c.DT.DIR) return error.LearnedDirectoryType;
+        const sub_fd = platform.c.openat(fd, @ptrCast(&ent.name), .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true }, @as(platform.c.mode_t, 0));
         if (sub_fd < 0) return error.LearnedDirectoryRead;
-        const sub = std.c.fdopendir(sub_fd) orelse {
-            _ = std.c.close(sub_fd);
+        const sub = platform.c.fdopendir(sub_fd) orelse {
+            _ = platform.c.close(sub_fd);
             return error.LearnedDirectoryRead;
         };
         {
-            defer _ = std.c.closedir(sub);
-            while (std.c.readdir(sub)) |file| {
-                if (file.type == std.c.DT.REG and partName(std.mem.sliceTo(&file.name, 0))) try unlinkAt(sub_fd, @ptrCast(&file.name));
+            defer _ = platform.c.closedir(sub);
+            while (platform.c.readdir(sub)) |file| {
+                if (file.type == platform.c.DT.REG and partName(std.mem.sliceTo(&file.name, 0))) try unlinkAt(sub_fd, @ptrCast(&file.name));
             }
         }
     }
@@ -89,15 +92,15 @@ pub fn cleanupParts(root: []const u8) !void {
 
 /// Payloads have no token metadata to recover a lost index entry; only exact owned, unreferenced names go.
 pub fn removeUnindexed(dir: [:0]const u8, metas: anytype) !void {
-    const fd = std.c.open(dir, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
+    const fd = platform.c.open(dir, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true }, @as(platform.c.mode_t, 0));
     if (fd < 0) return error.LearnedDirectoryRead;
-    const d = std.c.fdopendir(fd) orelse {
-        _ = std.c.close(fd);
+    const d = platform.c.fdopendir(fd) orelse {
+        _ = platform.c.close(fd);
         return error.LearnedDirectoryRead;
     };
-    defer _ = std.c.closedir(d);
-    while (std.c.readdir(d)) |ent| {
-        if (ent.type != std.c.DT.REG) continue;
+    defer _ = platform.c.closedir(d);
+    while (platform.c.readdir(d)) |ent| {
+        if (ent.type != platform.c.DT.REG) continue;
         const name = std.mem.sliceTo(&ent.name, 0);
         const key = stateKey(name) orelse continue;
         const indexed = for (metas) |x| {
@@ -108,25 +111,31 @@ pub fn removeUnindexed(dir: [:0]const u8, metas: anytype) !void {
     }
 }
 pub fn bytes(dir: [:0]const u8) !u64 {
-    var d = fsys.openDir(dir) catch |err| return if (err == error.Missing) 0 else error.LearnedDirectoryRead;
-    defer fsys.closeDir(&d);
+    const d = platform.c.opendir(dir) orelse return if (platform.c.errno(-1) == .NOENT) 0 else error.LearnedDirectoryRead;
+    defer _ = platform.c.closedir(d);
     var n: u64 = 0;
-    while (fsys.next(&d)) |ent| {
-        if (std.mem.eql(u8, ent.name, ".") or std.mem.eql(u8, ent.name, "..")) continue;
-        if (ent.kind != .file) return error.LearnedDirectoryType;
+    while (platform.c.readdir(d)) |ent| {
+        const name = std.mem.sliceTo(&ent.name, 0);
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        if (ent.type != platform.c.DT.REG) return error.LearnedDirectoryType;
         var buf: [1400]u8 = undefined;
-        const f = try std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, ent.name }, 0);
-        const fd = fsys.open(f, .{ .nofollow = true }) catch return error.LearnedDirectoryRead;
-        defer fsys.close(fd);
-        const end = fsys.size(fd) catch return error.LearnedDirectoryRead;
-        n = try std.math.add(u64, n, end);
+        const f = try std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0);
+        const fd = platform.c.open(f, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(platform.c.mode_t, 0));
+        if (fd < 0) return error.LearnedDirectoryRead;
+        const end = platform.c.lseek(fd, 0, platform.c.SEEK.END);
+        _ = platform.c.close(fd);
+        if (end < 0) return error.LearnedDirectoryRead;
+        n = try std.math.add(u64, n, @intCast(end));
     }
     return n;
 }
 pub fn fileBytes(file: [:0]const u8) !u64 {
-    const fd = fsys.open(file, .{ .nofollow = true }) catch |err| return if (err == error.Missing) 0 else error.LearnedDirectoryRead;
-    defer fsys.close(fd);
-    return fsys.size(fd) catch error.LearnedDirectoryRead;
+    const fd = platform.c.open(file, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(platform.c.mode_t, 0));
+    if (fd < 0) return if (platform.c.errno(fd) == .NOENT) 0 else error.LearnedDirectoryRead;
+    defer _ = platform.c.close(fd);
+    const end = platform.c.lseek(fd, 0, platform.c.SEEK.END);
+    if (end < 0) return error.LearnedDirectoryRead;
+    return @intCast(end);
 }
 pub fn otherBytes(root: []const u8, keep: []const u8, id: u64) !u64 {
     if (isCurrent(keep, id)) return 0;
@@ -148,15 +157,20 @@ pub fn total(root: []const u8) !u64 {
 pub fn used(root: []const u8, id: u64) !u64 {
     var buf: [1100]u8 = undefined;
     const f = try std.fmt.bufPrintSentinel(&buf, "{s}/{x:0>16}/used", .{ root, id }, 0);
-    const fd = fsys.open(f, .{ .nofollow = true }) catch |err| return if (err == error.Missing) 0 else error.LearnedDirectoryRead;
-    defer fsys.close(fd);
+    const fd = platform.c.open(f, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(platform.c.mode_t, 0));
+    if (fd < 0) return if (platform.c.errno(fd) == .NOENT) 0 else error.LearnedDirectoryRead;
+    defer _ = platform.c.close(fd);
     var n: u64 = 0;
     const data = std.mem.asBytes(&n);
     var done: usize = 0;
     while (done < data.len) {
-        const count = fsys.read(fd, data[done..]) catch return error.LearnedDirectoryRead;
+        const count = platform.c.read(fd, data.ptr + done, data.len - done);
+        if (count < 0) {
+            if (platform.c.errno(count) == .INTR) continue;
+            return error.LearnedDirectoryRead;
+        }
         if (count == 0) return 0; // A torn recency hint is oldest; it cannot make a learned payload valid.
-        done += count;
+        done += @intCast(count);
     }
     return n;
 }
@@ -165,24 +179,24 @@ pub fn removeOther(root: []const u8, keep: []const u8, id: u64) !void {
     var buf: [1100]u8 = undefined;
     const dir = try path(&buf, root, id);
     _ = try bytes(dir);
-    {
-        var d = fsys.openDir(dir) catch |err| return if (err == error.Missing) {} else error.LearnedDirectoryRead;
-        defer fsys.closeDir(&d);
-        while (fsys.next(&d)) |ent| {
-            if (std.mem.eql(u8, ent.name, ".") or std.mem.eql(u8, ent.name, "..")) continue;
-            if (ent.kind != .file) return error.LearnedDirectoryType;
-            var f: [1400]u8 = undefined;
-            try unlink(try std.fmt.bufPrintSentinel(&f, "{s}/{s}", .{ dir, ent.name }, 0));
-        }
+    const d = platform.c.opendir(dir) orelse return if (platform.c.errno(-1) == .NOENT) {} else error.LearnedDirectoryRead;
+    defer _ = platform.c.closedir(d);
+    while (platform.c.readdir(d)) |ent| {
+        const name = std.mem.sliceTo(&ent.name, 0);
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        if (ent.type != platform.c.DT.REG) return error.LearnedDirectoryType;
+        var f: [1400]u8 = undefined;
+        try unlink(try std.fmt.bufPrintSentinel(&f, "{s}/{s}", .{ dir, name }, 0));
     }
-    fsys.rmdir(dir) catch |err| if (err != error.Missing) return error.LearnedUnlink;
+    const rc = platform.c.rmdir(dir);
+    if (rc != 0 and platform.c.errno(rc) != .NOENT) return error.LearnedUnlink;
 }
 test "acknowledged deletion refuses a directory and accepts an absent file" {
-    var buf: [256]u8 = undefined;
-    const dir = try fsys.tempRoot(&buf, "unlink");
-    try fsys.mkdir(dir);
-    defer fsys.rmdir(dir) catch {};
+    var buf: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrintSentinel(&buf, "/tmp/tf-unlink-{d}", .{platform.c.getpid()}, 0);
+    try std.testing.expectEqual(@as(c_int, 0), platform.c.mkdir(dir, 0o700));
+    defer _ = platform.c.rmdir(dir);
     try std.testing.expectError(error.LearnedUnlink, unlink(dir));
-    var missing: [300]u8 = undefined;
+    var missing: [160]u8 = undefined;
     try unlink(try std.fmt.bufPrintSentinel(&missing, "{s}/absent", .{dir}, 0));
 }

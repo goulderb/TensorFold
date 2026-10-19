@@ -1,39 +1,44 @@
-//! The CUDA driver opened at run time: libcuda.so.1's (nvcuda.dll's) versioned entry points in one table, and checked calls.
+//! The CUDA driver opened at run time: libcuda.so.1's versioned entry points in one table, and checked calls.
 
 const std = @import("std");
+const platform = @import("sys");
 const abi = @import("abi.zig");
-const dynlib = @import("dynlib.zig");
 
-pub const Error = error{ DriverUnavailable, MissingSymbol, CudaFailed, OutOfDeviceMemory, NotReady, NotFound, Invalid };
+pub const Error = error{ CopySourceLimit, StageBusy, StageUnprepared, UnownedCaptureSource, OutOfMemory, DriverUnavailable, MissingSymbol, CudaFailed, OutOfDeviceMemory, NotReady, NotFound, Invalid };
 
 pub const Driver = struct {
-    lib: dynlib.Library,
+    lib: platform.DynLib,
     api: abi.Api,
 
-    /// libcuda.so.1 by the dynamic linker's search; nvcuda.dll from System32 alone.
     pub fn open() Error!Driver {
-        return openPath(dynlib.cuda_driver);
+        return openPath(platform.cuda_driver);
     }
 
-    /// Resolves every field of `abi.Api` by its exact name; a missing symbol refuses the whole driver. `path` is a
-    /// bare name searched as `open` does, or an absolute path.
+    /// Resolves every field of `abi.Api` by its exact name; a missing symbol refuses the whole driver.
     pub fn openPath(path: []const u8) Error!Driver {
-        var lib = dynlib.Library.open(path) catch return error.DriverUnavailable;
+        var lib = platform.DynLib.open(path) catch return error.DriverUnavailable;
         errdefer lib.close();
-        var missing: []const u8 = "";
-        const api = lib.resolve(abi.Api, &missing) catch {
-            std.log.err("{s} has no {s}", .{ path, missing });
-            return error.MissingSymbol;
-        };
+        var api: abi.Api = undefined;
+        const info = @typeInfo(abi.Api).@"struct";
+        inline for (info.field_names, info.field_types) |name, T| {
+            @field(api, name) = lib.lookup(T, name) orelse {
+                std.log.err("{s} has no {s}", .{ path, name });
+                return error.MissingSymbol;
+            };
+        }
         const d: Driver = .{ .lib = lib, .api = api };
         try d.check(api.cuInit(0), "cuInit");
         return d;
     }
 
     pub fn close(self: *Driver) void {
+        if (@import("copy_source.zig").keepDriver(self)) return;
         self.lib.close();
     }
 
+    pub fn synchronize(self: *const Driver) Error!void {
+        try @import("copy_source.zig").synchronizeContext(self);
+    }
     /// Logs a failed call with the driver's own name and text for the code; NOT_READY is a state, not a failure.
     pub fn check(self: *const Driver, res: abi.Result, what: []const u8) Error!void {
         if (res == abi.success) return;
@@ -91,8 +96,3 @@ pub const Driver = struct {
         return std.mem.sliceTo(buf, 0);
     }
 };
-
-test "a driver that is not installed is refused as DriverUnavailable before any CUDA call" {
-    try std.testing.expectError(error.DriverUnavailable, Driver.openPath("tf-no-such-cuda-driver-4e1c.dll"));
-    try std.testing.expectError(error.DriverUnavailable, Driver.openPath("tf-no-such-cuda-driver-4e1c.so"));
-}

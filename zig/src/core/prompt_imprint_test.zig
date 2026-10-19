@@ -1,52 +1,54 @@
 //! Learned prompt states on disk: reopen, eviction order, removal and the sweep of other identities.
 const std = @import("std");
+const platform = @import("sys");
 const imp = @import("prompt_imprint.zig");
-const fsys = @import("lanes").learned_fs;
 const Imprint = imp.Imprint;
 
 /// `root`, its identity directories and their files removed (a test's scratch tree, two levels deep).
 pub fn rmTree(root: []const u8) void {
     var buf: [512]u8 = undefined;
     const r = std.fmt.bufPrintSentinel(&buf, "{s}", .{root}, 0) catch return;
-    var d = fsys.openDir(r) catch return;
-    while (fsys.next(&d)) |ent| {
-        if (ent.name[0] == '.') continue;
+    const d = platform.c.opendir(r) orelse return;
+    while (platform.c.readdir(d)) |ent| {
+        const name = std.mem.sliceTo(&ent.name, 0);
+        if (name[0] == '.') continue;
         var sub: [512]u8 = undefined;
-        const p = std.fmt.bufPrintSentinel(&sub, "{s}/{s}", .{ root, ent.name }, 0) catch continue;
-        if (fsys.unlink(p)) |_| continue else |_| {}
-        var s = fsys.openDir(p) catch {
-            fsys.rmdir(p) catch {};
-            continue;
-        };
-        while (fsys.next(&s)) |f| {
-            if (f.name[0] == '.') continue;
-            var fb: [600]u8 = undefined;
-            fsys.unlink(std.fmt.bufPrintSentinel(&fb, "{s}/{s}", .{ p, f.name }, 0) catch continue) catch {};
+        const p = std.fmt.bufPrintSentinel(&sub, "{s}/{s}", .{ root, name }, 0) catch continue;
+        if (platform.c.unlink(p) == 0) continue;
+        if (platform.c.opendir(p)) |s| {
+            while (platform.c.readdir(s)) |f| {
+                const fname = std.mem.sliceTo(&f.name, 0);
+                if (fname[0] == '.') continue;
+                var fb: [600]u8 = undefined;
+                _ = platform.c.unlink(std.fmt.bufPrintSentinel(&fb, "{s}/{s}", .{ p, fname }, 0) catch continue);
+            }
+            _ = platform.c.closedir(s);
         }
-        fsys.closeDir(&s);
-        fsys.rmdir(p) catch {};
+        _ = platform.c.rmdir(p);
     }
-    fsys.closeDir(&d);
-    fsys.rmdir(r) catch {};
+    _ = platform.c.closedir(d);
+    _ = platform.c.rmdir(r);
 }
 
-fn scratch(buf: []u8, tag: []const u8) ![:0]const u8 {
-    return fsys.tempRoot(buf, tag);
+fn scratch(buf: []u8, tag: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "/tmp/tf-imprint-{s}-{d}", .{ tag, platform.c.getpid() });
 }
 
 /// A file of `n` bytes at `dir`/`name`.
 fn fill(dir: []const u8, name: []const u8, n: usize) !void {
     var buf: [512]u8 = undefined;
-    const fd = fsys.open(try std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0), .{ .access = .write, .create = true, .trunc = true }) catch return error.TestFile;
-    defer fsys.close(fd);
+    const fd = platform.c.open(try std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(platform.c.mode_t, 0o600));
+    if (fd < 0) return error.TestFile;
+    defer _ = platform.c.close(fd);
     var zeros: [256]u8 = @splat(0);
     var left = n;
     while (left > 0) : (left -= @min(left, zeros.len)) try imp.writeAll(fd, zeros[0..@min(left, zeros.len)]);
 }
 
 fn exists(path: []const u8) bool {
-    var d = fsys.openDir(path) catch return false;
-    fsys.closeDir(&d);
+    var buf: [512]u8 = undefined;
+    const d = platform.c.opendir(std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return false) orelse return false;
+    _ = platform.c.closedir(d);
     return true;
 }
 
