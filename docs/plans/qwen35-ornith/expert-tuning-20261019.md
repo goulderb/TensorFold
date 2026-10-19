@@ -165,3 +165,38 @@ down remains baseline because the tiny down deltas were order-sensitive.
 Require exact untimed consumed rows and timed tokens/final state, all work
 counters, five alternating pairs, and actual in-process memory readings.
 Independent numerical qualification and serving integration remain open.
+
+## Full changing-position result
+
+The [matched full-turn trial](evidence/router-tuning-20261019/r3/analysis.json)
+passes at source a3491a681b4c600230b8e1b5903bd4ae57f33d73. The pinned
+executable SHA256 is
+3e2b0da3128907f49f0b3c3d6cd94d04993790f750cf9f21308151b0cbc96287.
+
+Five measured pairs after an excluded warmup show baseline decode median
+81.959 tok/s (81.903-82.061), parallel router 102.935 (102.749-102.979).
+Median full turn falls from 2.257920 to 1.784287 seconds, with median paired
+latency reduction 21.0%. A second five-pair comparison has parallel router
+102.752 tok/s and router plus up 107.144 (107.096-107.303). Its median full
+turn falls from 1.786652 to 1.711066 seconds, a further 4.23% paired reduction.
+The complete bundle is about 30.7% faster in decode than the matched baseline;
+the full-turn median is about 24.2% lower. Cross-comparison bundle percentages
+use medians from separate paired comparisons, rather than an extra matched
+baseline/bundle pair. The incremental up trial reused the already earned
+model load; its smaller gain did not cause another outage.
+
+All three captures contain 993 nodes and 21 dynamic nodes. Per rank they
+contain 20 selected-router, 20 up and 20 baseline-down calls, with expected
+symbols and launch grids checked from the captured graph. Every untimed arm
+matches 128 consumed BF16 logit rows, tokens and final state. Every timed turn
+matches tokens/final state and performs 191 appends, 382 launches and 4011
+parameter updates, ending at position 191. Admission and stale-position
+negative controls pass. Timings include sampling, logits downloads, host
+handoffs, reset accounting and per-append memory checks.
+
+Minimum in-process free memory is 4605/5351 MiB with all three graphs and the
+full checkpoint resident. The controller's restoration receipt is retained.
+This remains a synthetic 64/128 c1 context-4096 diagnostic, with serial layer
+partitions. It is not HTTP throughput, family-wide checkpoint qualification
+or production promotion. The runtime's new expert-up selector field defaults
+to baseline; the diagnostic alone selects the candidate modes.
