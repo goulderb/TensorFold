@@ -316,6 +316,11 @@ No additional external kernel source is imported by this consolidation.
 and changes only persistent recurrence indexing from value/key to key/value.
 The local host overlay records cache layout in graph identity and preserves
 the baseline binding for exact comparisons. It imports no further donor code.
+The N8 expert-up specialization adapts TensorFold's existing NVFP4 decode
+template with fewer fragments per warp, four warps per block and scalar packed
+word loads. The original kernel attribution remains in its source header.
+Its shared-engine binding changes only the HF ModelOpt up projection and keeps
+the original projection available for matched comparisons.
 
 ## Pictures in the native engine
 

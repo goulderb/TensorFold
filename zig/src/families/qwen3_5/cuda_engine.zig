@@ -230,7 +230,7 @@ pub const Engine = struct {
         e.captured = true;
         e.graph_nodes = 0;
         e.graph_launches = 0;
-        e.expert_up_n8 = false;
+        e.expert_up_n8 = e.numerics == .hf_modelopt;
         e.verify_expert_graphs = false;
         e.expert_graph_nodes_baseline = 0;
         e.expert_graph_nodes_n8 = 0;
