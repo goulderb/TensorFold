@@ -49,3 +49,9 @@ carrier graph is positive. Retain it for actual-body integration and a new
 matched measurement; its earlier CPU-only estimate is not a model result.
 The combined trial does not replace
 independent HF quality, serving, capacity or promotion gates.
+
+The shared activation/down composition now matches the original HF outputs
+on all six saved rows on both GPUs. Native controls remain exact. This is a
+quality boundary, not a throughput candidate or a full-network pass. The
+[proof](upstream-shared-down-20261019.md) retains every raw output and the
+independent review of the frozen host evidence. Full-MoE composition follows.
