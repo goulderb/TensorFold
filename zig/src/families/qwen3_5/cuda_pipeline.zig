@@ -24,10 +24,10 @@ pub const MemoryBudget = struct {
 };
 
 pub fn memoryBudget(plan: weights.Plan, admitted: checkpoint.Admitted, placement: checkpoint.Placement, context: usize, streams: usize) !MemoryBudget {
-    if (context == 0 or streams == 0) return error.InvalidContext;
+    if (context == 0 or context > admitted.geometry.context or streams == 0) return error.InvalidContext;
     const g = try placement.localGeometry(admitted.geometry);
     const scratch = try engine.Engine.scratchBytes(admitted, placement);
-    const per_stream = g.stateBytes() + g.kvBytes(context, false) + engine.aligned(g.logBytes(1));
+    const per_stream = g.stateBytes() + g.kvBytes(context, false) + engine.aligned(g.logBytes(if (admitted.numerics() == .hf_modelopt) 1 else engine.most_window));
     const states = try std.math.mul(usize, per_stream, streams);
     const fixed = try std.math.add(usize, plan.weights_bytes, scratch);
     const steady = try std.math.add(usize, fixed, states);
@@ -53,6 +53,7 @@ pub const Chain = struct {
         const config = try checkpoint.Config.read(gpa, io, dir);
         if (options.context == 0 or options.context > config.context) return error.InvalidContext;
         if (options.devices.len != 1 and options.devices.len != 2) return error.InvalidDevices;
+        for (options.devices) |device| if (device < 0) return error.InvalidDevices;
         if (options.devices.len == 2 and (options.devices[0] == options.devices[1] or options.cut == 0 or options.cut >= config.geometry.layers)) return error.InvalidPartition;
         const admitted: checkpoint.Admitted = .{ .geometry = config.geometry, .encoding = .{ .modelopt = config } };
         var placements: [2]checkpoint.Placement = undefined;

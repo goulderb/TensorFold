@@ -33,4 +33,5 @@ test {
     _ = @import("cuda_checkpoint_test.zig");
     _ = @import("cuda_modelopt_weights.zig");
     _ = pipeline;
+    _ = @import("cuda_pipeline_test.zig");
 }

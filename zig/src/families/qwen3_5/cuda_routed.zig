@@ -53,16 +53,21 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, shared: @impor
         try e.moe.route(e.stream, x, g.hidden, total, router, s.logits, g.hidden, count);
         try e.moe.pick(e.stream, s.logits, s.picks, s.wts, total, g.experts, g.top_k);
     }
+    try e.mark(.route);
     try e.plan.route(e.stream, s.picks, pairs, count, tile, plan);
+    try e.mark(.expert_plan);
     const rows_in: cuda.experts.Rows = .{ .x = x, .stride = g.hidden, .slots = slots };
     const act_in: cuda.experts.Rows = .{ .x = s.act, .stride = g.intermediate };
     if (wide) {
         try grouped.prompt(e.stream, .up, rows_in, layer, plan, s.act, items, -1);
+        try e.mark(.expert_up);
         try grouped.prompt(e.stream, .down_bf16, act_in, layer, plan, s.y, items, -1);
     } else {
         try grouped.decode(e.stream, .up, rows_in, layer, plan, s.act, items, -1);
+        try e.mark(.expert_up);
         try grouped.decode(e.stream, .down_f32, act_in, layer, plan, s.y, items, -1);
     }
+    try e.mark(.expert_down);
     switch (shared) {
         .stacked => try e.moe.combine(e.stream, s.y, !wide, s.wts, out, total, slots, g.hidden),
         .projected => |m| {
@@ -71,7 +76,9 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, shared: @impor
             try e.proj(m.up, x, e.up, total, false);
             try e.run(e.fns.mlp_act, .{ (total * width + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, @as(c_longlong, @intCast(total * width)), e.tables.ptr + E.Engine.params_at, @as(c_int, @intCast(width)) });
             try e.proj(m.down, e.act, s.shared, total, false);
+            try e.mark(.shared);
             try e.modelopt.?.router.combine(e.stream, s.y, s.wts, s.shared, out);
         },
     }
+    try e.mark(.combine);
 }

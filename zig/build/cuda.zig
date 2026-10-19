@@ -152,31 +152,12 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const qwen_bench_options = b.addOptions();
     qwen_bench_options.addOption(std.builtin.OptimizeMode, "engine_optimization", optimize);
     qwen_bench_options.addOption([]const u8, "source_commit", b.option([]const u8, "qwen35-probe-source", "Source revision embedded in the Qwen tuning probes") orelse "unrecorded");
-    const qwen_head_cost = b.addExecutable(.{ .name = "tf-qwen35-head-cost", .root_module = b.createModule(.{
-        .root_source_file = b.path("zig/tests/cuda/qwen35_head_cost.zig"),
-        .target = target,
-        .optimize = .ReleaseSafe,
-        .link_libc = true,
-        .imports = &.{ .{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core, mods.qwen35) }, .{ .name = "cuda", .module = cuda } },
-    }) });
-    qwen_head_cost.root_module.addOptions("qwen_bench_options", qwen_bench_options);
-    b.step("qwen35-head-cost", "Build only the Qwen35 final norm and head cost probe; never run it").dependOn(&b.addInstallArtifact(qwen_head_cost, .{}).step);
-    const sampler_before = b.createModule(.{ .root_source_file = b.path("zig/tests/fixtures/qwen35/sampler_before.zig"), .target = target, .optimize = .ReleaseFast });
-    const qwen_sampler_ab = b.addExecutable(.{ .name = "tf-qwen35-sampler-ab", .root_module = b.createModule(.{
-        .root_source_file = b.path("zig/tests/cuda/qwen35_sampler_ab.zig"),
-        .target = target,
-        .optimize = .ReleaseSafe,
-        .link_libc = true,
-        .imports = &.{ .{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core, mods.qwen35) }, .{ .name = "cuda", .module = cuda }, .{ .name = "lanes", .module = mods.lanes }, .{ .name = "sampler_before", .module = sampler_before } },
-    }) });
-    qwen_sampler_ab.root_module.addOptions("qwen_bench_options", qwen_bench_options);
-    b.step("qwen35-sampler-ab", "Build only the paired Qwen35 sampler turn benchmark; never run it").dependOn(&b.addInstallArtifact(qwen_sampler_ab, .{}).step);
     const qwen_decode_profile = b.addExecutable(.{ .name = "tf-qwen35-decode-profile", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/cuda/qwen35_decode_profile.zig"),
         .target = target,
         .optimize = .ReleaseSafe,
         .link_libc = true,
-        .imports = &.{ .{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core, mods.qwen35) }, .{ .name = "cuda", .module = cuda }, .{ .name = "lanes", .module = mods.lanes }, .{ .name = "sampler_before", .module = sampler_before } },
+        .imports = &.{ .{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core, mods.qwen35) }, .{ .name = "cuda", .module = cuda }, .{ .name = "lanes", .module = mods.lanes } },
     }) });
     qwen_decode_profile.root_module.addOptions("qwen_bench_options", qwen_bench_options);
     b.step("qwen35-decode-profile", "Build only the Qwen35 eager/graph diagnostic; never run it").dependOn(&b.addInstallArtifact(qwen_decode_profile, .{}).step);

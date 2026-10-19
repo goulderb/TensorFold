@@ -62,6 +62,9 @@ pub const Keep = union(enum) { last, draws: []const Draw, logits };
 /// A kept row's draw on the device: sample.cu's keyed rule at `position`, or greedy without one.
 pub const Draw = struct { rule: ?cuda.sample.Rule, position: u64 };
 
+pub const Phase = enum { begin, embedding, input_norm, mixer_inputs, gdn_pre, conv_commit, gdn_chain, gdn_post, attention, mixer_output, post_norm, route, expert_plan, expert_up, expert_down, shared, combine, dense, head };
+pub const Observer = struct { ptr: *anyopaque, mark: *const fn (*anyopaque, Phase, usize) anyerror!void };
+
 pub const Engine = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -70,6 +73,10 @@ pub const Engine = struct {
     numerics: checkpoint.Numerics,
     modelopt: ?modelopt.Bindings = null,
     captured: bool = true,
+    graph_nodes: usize = 0,
+    graph_launches: usize = 0,
+    observer: ?Observer = null,
+    observed_layer: usize = 0,
     geo: Geo,
     stream: cuda.Stream,
     mods: [16]cuda.Module,
@@ -177,6 +184,10 @@ pub const Engine = struct {
         e.numerics = admitted.numerics();
         e.modelopt = null;
         e.captured = true;
+        e.graph_nodes = 0;
+        e.graph_launches = 0;
+        e.observer = null;
+        e.observed_layer = 0;
         e.geo = .{ .hid = @intCast(g.hidden), .nk = @intCast(g.k_heads), .nv = @intCast(g.v_heads), .qh = @intCast(g.q_heads), .kvh = @intCast(g.kv_heads), .nl = @intCast(g.deltas()) };
         e.verify_rows = most_verify;
         e.kv8 = kv8;
@@ -296,7 +307,7 @@ pub const Engine = struct {
         var e: Engine = undefined;
         e.g = try placement.localGeometry(admitted.geometry);
         e.numerics = admitted.numerics();
-        return e.scratch(.measure);
+        return aligned(tables_len) + try e.scratch(.measure);
     }
 
     /// The scratch rows' bytes (`measure`: summed, nothing taken), or the rows themselves from the arena.
@@ -509,9 +520,12 @@ pub const Engine = struct {
                 };
                 var captured = try cuda.graph.endCapture(e.stream);
                 defer captured.deinit();
+                const nodes = try captured.nodeCount();
                 gop.value_ptr.* = try captured.instantiate();
+                e.graph_nodes += nodes;
             }
             try gop.value_ptr.launchOn(e.stream);
+            e.graph_launches += 1;
         }
     }
 
@@ -567,6 +581,10 @@ pub const Engine = struct {
         }
     };
 
+    pub fn mark(e: *Engine, phase: Phase) !void {
+        if (e.observer) |o| try o.mark(o.ptr, phase, e.observed_layer);
+    }
+
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).
     fn body(e: *Engine, shape: Shape) !void {
         const g = e.g;
@@ -586,14 +604,19 @@ pub const Engine = struct {
         const is_hf = e.numerics == .hf_modelopt;
         const launch: hf.Launches = .{};
 
+        e.observed_layer = e.placement.first;
+        try e.mark(.begin);
         if (e.placement.ownsEmbedding()) try e.embed(t_ids, e.h, total, t_params);
         // an image chunk's rows take the tower's features, and rotate at their staged t, h, w positions
         const mpos: u64 = if (e.features != 0) e.tables.ptr + mpos_at else 0;
         if (e.features != 0) try e.run(e.fns.splice, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.features, e.tables.ptr + src_at, @as(c_int, @intCast(g.hidden)), t_params });
+        try e.mark(.embedding);
         var di: usize = 0;
         var ai: c_int = 0;
         for (e.layers, 0..) |l, i| {
+            e.observed_layer = e.placement.first + i;
             try e.norm(e.placement.first + i != 0, l.input_norm, total);
+            try e.mark(.input_norm);
             switch (l.mixer) {
                 .delta => |m| {
                     const layer: c_int = @intCast(di);
@@ -601,10 +624,15 @@ pub const Engine = struct {
                     try e.proj(m.z, e.x, e.z, total, prompt);
                     try e.proj(m.a, e.x, e.a, total, prompt);
                     try e.proj(m.b, e.x, e.b, total, prompt);
+                    try e.mark(.mixer_inputs);
                     try e.run(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, total }, .{ if (is_hf) launch.gdn_pre else 32, 1, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
+                    try e.mark(.gdn_pre);
                     try e.run(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
+                    try e.mark(.conv_commit);
                     try e.run(e.fns.gdn_chain, .{ 1, if (is_hf) launch.gdn_chain_grid_y else geometry.dk / 4, g.v_heads * nseg }, if (is_hf) launch.gdn_chain else .{ 32, 4, 1 }, .{ geo, e.q, e.k, e.v, e.g_, e.beta, t_segs, t_par, layer, e.y, t_params });
+                    try e.mark(.gdn_chain);
                     try e.run(e.fns.gdn_post, .{ 1, g.v_heads, total }, .{ if (is_hf) launch.gdn_post else 32, 1, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params });
+                    try e.mark(.gdn_post);
                     try e.proj(m.out, e.mix, e.r, total, prompt);
                     di += 1;
                 },
@@ -613,17 +641,21 @@ pub const Engine = struct {
                     try e.proj(m.q, e.x, e.qraw, total, prompt);
                     try e.proj(m.k, e.x, e.kraw, total, prompt);
                     try e.proj(m.v, e.x, e.vraw, total, prompt);
+                    try e.mark(.mixer_inputs);
                     try e.run(e.fns.head_norm, .{ total * g.q_heads, 1, 1 }, .{ if (is_hf) launch.head_norm else 64, 1, 1 }, .{ e.qraw, m.q_norm, e.qn, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), g.eps, t_params });
                     try e.run(e.fns.head_norm, .{ total * g.kv_heads, 1, 1 }, .{ if (is_hf) launch.head_norm else 64, 1, 1 }, .{ e.kraw, m.k_norm, e.kn, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(g.kv_heads * head_dim)), @as(c_int, head_dim), g.eps, t_params });
                     try e.run(if (e.kv8) e.fp8.rope else e.fns.rope, .{ total, 1, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qn, e.kn, e.vraw, t_segs, t_rows, t_anc, ai, t_params, mpos });
                     try e.run(if (e.kv8) e.fp8.attn_partial else e.fns.attn_partial, .{ if (is_hf) 1 else max_chunks, if (is_hf) g.q_heads else g.kv_heads, total }, if (is_hf) launch.attn_partial else .{ 32 * group, 1, 1 }, .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po });
                     try e.run(e.fns.attn_merge, .{ g.q_heads, total, 1 }, .{ if (is_hf) launch.attn_merge else 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
                     try e.run(e.fns.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params });
+                    try e.mark(.attention);
                     try e.proj(m.o, e.mix, e.r, total, prompt);
                     ai += 1;
                 },
             }
+            try e.mark(.mixer_output);
             try e.norm(true, l.post_norm, total);
+            try e.mark(.post_norm);
             switch (l.mlp) {
                 .dense => |m| {
                     try e.proj(m.gate, e.x, e.gate, total, prompt);
@@ -631,6 +663,7 @@ pub const Engine = struct {
                     const n: c_longlong = @intCast(total * g.intermediate);
                     try e.run(e.fns.mlp_act, .{ (total * g.intermediate + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)) });
                     try e.proj(m.down, e.act, e.r, total, prompt);
+                    try e.mark(.dense);
                 },
                 .moe => |m| try e.routedRows(m.router, m.experts, m.shared, e.x, e.r, total, prompt and total > most_window),
             }
@@ -642,6 +675,7 @@ pub const Engine = struct {
         try e.norm(true, e.final_norm, total);
         // the head over the kept rows
         try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
+        try e.mark(.head);
     }
 
     pub const routedRows = routed.rows;
