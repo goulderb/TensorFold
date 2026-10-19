@@ -1,4 +1,4 @@
-"""Validate and summarize a restored single-load Qwen GDN layout A/B window."""
+"""Validate and summarize a restored single-load Qwen full-model A/B window."""
 from __future__ import annotations
 
 import argparse
@@ -16,9 +16,14 @@ VOCAB = 248320
 PROMPT = 64
 OUTPUT = 128
 APPENDS = PROMPT + OUTPUT - 1
-EXPECTED_NODES = 15
+DECODE_APPENDS = OUTPUT - 1
 ARMS = ("baseline", "candidate")
 SCOPE = "single-load captured GDN layout A/B with complete canonical state and logit parity"
+EXPERT_SCOPE = "single-load captured expert N8 A/B with complete canonical state and logit parity"
+MECHANISMS = {
+    "gdn_layout": {"prefix": "layout", "nodes_key": "expected_gdn_nodes", "nodes": 15, "scope": SCOPE},
+    "expert_n8": {"prefix": "expert", "nodes_key": "expected_expert_nodes", "nodes": 20, "scope": EXPERT_SCOPE},
+}
 
 
 def require(ok: bool, message: str) -> None:
@@ -38,7 +43,10 @@ def valid_digest(value) -> bool:
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
-def analyze(window: Path):
+def analyze(window: Path, mechanism: str = "gdn_layout"):
+    require(mechanism in MECHANISMS, f"unknown A/B mechanism: {mechanism}")
+    config = MECHANISMS[mechanism]
+    prefix = config["prefix"]
     window = Path(window)
     receipt = read_json(window / "window.json")
     plan = read_json(window / "plan.json")
@@ -64,7 +72,17 @@ def analyze(window: Path):
     input_bytes = input_path.read_bytes()
     require(sha256_bytes(input_bytes) == pin.get("input_sha256"), "copied input SHA256 differs from plan")
     profile_input = json.loads(input_bytes)
-    require(len(profile_input.get("prompt", [])) == PROMPT and profile_input.get("output_tokens") == OUTPUT and profile_input.get("context") == 4096 and profile_input.get("cut") == 20 and profile_input.get("forced") == [] and profile_input.get("gdn_layout_ab") is True, "input is not the pinned greedy 64/128 GDN layout run")
+    common_shape = (len(profile_input.get("prompt", [])) == PROMPT and profile_input.get("output_tokens") == OUTPUT
+                    and profile_input.get("context") == 4096 and profile_input.get("cut") == 20 and profile_input.get("forced") == [])
+    if mechanism == "gdn_layout":
+        mechanism_flags_valid = profile_input.get("gdn_layout_ab") is True and profile_input.get("expert_n8_ab") in (None, False)
+        shape_message = "input is not the pinned greedy 64/128 GDN layout run"
+    else:
+        mechanism_flags_valid = profile_input.get("expert_n8_ab") is True and profile_input.get("gdn_layout_ab") in (None, False)
+        mechanism_flags_valid = mechanism_flags_valid and all(profile_input.get(k) not in (True,) for k in (
+            "expert_wn2_screen", "expert_n8_screen", "gdn_layout_screen", "quant_reuse_screen", "transport_screen"))
+        shape_message = "input is not the pinned greedy 64/128 expert N8 run"
+    require(common_shape and mechanism_flags_valid, shape_message)
     experiments = receipt.get("experiments", [])
     run = [x for x in experiments if x.get("name") == "profile"]
     require(len(run) == 1 and run[0].get("passed") is True and run[0].get("exit_code") == 0 and run[0].get("completion", {}).get("kind") == "complete", "controller records failed or incomplete profile")
@@ -79,17 +97,17 @@ def analyze(window: Path):
     result_path = window / "profile-results" / "results.jsonl"
     rows = [json.loads(line) for line in result_path.read_text(encoding="utf-8").splitlines() if line]
     require(rows and rows[0].get("kind") == "start" and rows[-1].get("kind") == "complete", "journal boundaries invalid")
-    kinds = {"start", "complete", "layout_reference", "layout_qualification", "layout_graph_bindings", "layout_turn", "layout_memory", "layout_controls", "layout_recreated_session"}
+    kinds = {"start", "complete", *(f"{prefix}_{suffix}" for suffix in ("reference", "qualification", "graph_bindings", "turn", "memory", "controls", "recreated_session"))}
     require(all(r.get("kind") in kinds for r in rows), "unknown journal row kind")
     require(sum(r["kind"] == "start" for r in rows) == sum(r["kind"] == "complete" for r in rows) == 1, "duplicate start or completion")
     start, complete = rows[0], rows[-1]
     require(start.get("source_commit") == source and start.get("implementation") == "shared-qwen-engine", "journal source or implementation differs")
     require([(x.get("ordinal"), x.get("uuid")) for x in start.get("identities", [])] == list(enumerate(UUIDS)), "physical GPU UUID order differs")
     require((start.get("prompt_tokens"), start.get("output_tokens"), start.get("context"), start.get("cut")) == (PROMPT, OUTPUT, 4096, 20), "journal input shape differs")
-    require(complete.get("correctness_pass") is True and complete.get("production_qualification") is False and complete.get("scope") == SCOPE and complete.get("independent_reference_parity") == "not checked by this executable", "completion scope or independent reference disclosure invalid")
+    require(complete.get("correctness_pass") is True and complete.get("production_qualification") is False and complete.get("scope") == config["scope"] and complete.get("independent_reference_parity") == "not checked by this executable", "completion scope or independent reference disclosure invalid")
     require(not any(r.get("kind") == "failure" for r in rows), "journal contains failure row")
 
-    ref_rows = [r for r in rows if r["kind"] == "layout_reference"]
+    ref_rows = [r for r in rows if r["kind"] == f"{prefix}_reference"]
     require(len(ref_rows) == 1, "expected exactly one layout reference")
     reference = ref_rows[0]
     require(reference.get("arm") == "baseline" and reference.get("graph") is False and reference.get("canonical_state_version") == 2 and reference.get("canonical_state_bytes", 0) > 0, "invalid eager baseline reference")
@@ -114,22 +132,23 @@ def analyze(window: Path):
     logits_sha = sha.hexdigest()
     require(valid_digest(reference.get("consumed_logits_sha256")) and reference["consumed_logits_sha256"] == logits_sha and valid_digest(reference.get("canonical_state_sha256")), "reference payload or canonical-state hash invalid")
 
-    qualifications = [r for r in rows if r["kind"] == "layout_qualification"]
+    qualifications = [r for r in rows if r["kind"] == f"{prefix}_qualification"]
     require(len(qualifications) == 4 and {(r.get("arm"), r.get("graph")) for r in qualifications} == {(a, g) for a in ARMS for g in (False, True)}, "qualification roster incomplete or duplicated")
     for r in qualifications:
         require(r.get("all_rows_tokens_and_canonical_state_exact") is True, "eager/captured qualification parity failed")
-    bindings = [r for r in rows if r["kind"] == "layout_graph_bindings"]
+    bindings = [r for r in rows if r["kind"] == f"{prefix}_graph_bindings"]
     require(len(bindings) == 2 and {r.get("rank") for r in bindings} == {0, 1}, "graph-binding roster incomplete")
     for r in bindings:
-        require(r.get("expected_gdn_nodes") == EXPECTED_NODES and r.get("baseline_verified_nodes") == EXPECTED_NODES and r.get("candidate_verified_nodes") == EXPECTED_NODES, "graph binding node count mismatch")
+        nodes_key = config["nodes_key"]
+        require(r.get(nodes_key) == config["nodes"] and r.get("baseline_verified_nodes") == config["nodes"] and r.get("candidate_verified_nodes") == config["nodes"], "graph binding node count mismatch")
 
-    memories = [r for r in rows if r["kind"] == "layout_memory"]
+    memories = [r for r in rows if r["kind"] == f"{prefix}_memory"]
     expected_slots = {(pair, order, rank) for pair in range(6) for order in range(2) for rank in range(2)}
     require(len(memories) == 24 and {(r.get("pair"), r.get("order"), r.get("rank")) for r in memories} == expected_slots, "per-turn GPU memory samples incomplete or duplicated")
     for r in memories:
         require(type(r.get("free_bytes")) is int and r["free_bytes"] >= FLOOR and r.get("floor_bytes") == FLOOR, "per-turn GPU memory floor failed")
 
-    turns = [r for r in rows if r["kind"] == "layout_turn"]
+    turns = [r for r in rows if r["kind"] == f"{prefix}_turn"]
     require(len(turns) == 12, "expected one warmup and five paired turns")
     turns.sort(key=lambda r: (r["pair"], r["order"]))
     arm_times = {a: {"turn_seconds": [], "decode_seconds": []} for a in ARMS}
@@ -154,26 +173,31 @@ def analyze(window: Path):
                 arm_times[r["arm"]]["decode_seconds"].append(decode)
         if pair:
             paired.append((times["baseline"] - times["candidate"]) / times["baseline"])
-    controls = [r for r in rows if r["kind"] == "layout_controls"]
+    controls = [r for r in rows if r["kind"] == f"{prefix}_controls"]
     require(len(controls) == 2 and {r.get("arm") for r in controls} == set(ARMS), "layout control roster incomplete")
     for r in controls:
         require(all(r.get(k) is True for k in ("distinct_prompts_and_positions", "inactive_complete_state_unchanged", "reset_exact", "partial_stage_failure_poison", "uncommitted_lengths")) and r.get("canonical_state_version") == 2, "layout controls failed")
-    recreated = [r for r in rows if r["kind"] == "layout_recreated_session"]
+    recreated = [r for r in rows if r["kind"] == f"{prefix}_recreated_session"]
     require(len(recreated) == 1 and recreated[0].get("candidate_exact") is True and recreated[0].get("baseline_after_candidate_exact") is True, "recreated-session parity failed")
 
     summaries = {}
     for arm, metrics in arm_times.items():
         summaries[arm] = {}
         for name, values in metrics.items():
-            summaries[arm][name] = {"median": statistics.median(values), "range": [min(values), max(values)]}
+            summary = {"median": statistics.median(values), "range": [min(values), max(values)]}
+            if name == "decode_seconds":
+                rates = [DECODE_APPENDS / value for value in values]
+                summary["appends_per_second"] = {"median": statistics.median(rates), "range": [min(rates), max(rates)]}
+            summaries[arm][name] = summary
     median_saving = statistics.median(paired)
     spread = max(paired) - min(paired)
     return {
         "source_commit": source,
+        "mechanism": mechanism,
         "executable_sha256": pin["sha256"],
         "input_sha256": pin["input_sha256"],
         "input": {"prompt_tokens": PROMPT, "output_tokens": OUTPUT, "context": 4096, "cut": 20, "greedy": True},
-        "scope": "synthetic single-load full-engine captured GDN layout A/B; not HTTP production performance or physical DRAM bandwidth",
+        "scope": f"synthetic {config['scope']}; not HTTP production performance or physical DRAM bandwidth",
         "independent_reference_gate": "FAILS; this executable does not check independent reference parity",
         "controller_minimum_free_mib": {u: min(sample["free_mib"][u] for sample in memory) for u in UUIDS},
         "arms": summaries,
@@ -195,8 +219,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("window", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--mechanism", choices=tuple(MECHANISMS), default="gdn_layout")
     args = parser.parse_args()
-    output = json.dumps(analyze(args.window), indent=2) + "\n"
+    output = json.dumps(analyze(args.window, args.mechanism), indent=2) + "\n"
     if args.output:
         args.output.write_text(output, encoding="utf-8", newline="\n")
     print(output, end="")
