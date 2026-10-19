@@ -40,6 +40,7 @@ const Input = struct {
     verify_default_policy: bool = false,
     prefill_operator_screen: bool = false,
     prefill_ab: bool = false,
+    combined_ab: bool = false,
 };
 const Journal = struct {
     a: std.mem.Allocator,
@@ -67,6 +68,16 @@ fn hash(bytes: []const u8) [64]u8 {
     h.update(bytes);
     return finishHash(&h);
 }
+fn kernelName(f: cuda.Function) ![]const u8 {
+    var lib = f.d.lib;
+    const get_name = lib.lookup(*const fn (*?[*:0]const u8, cuda.abi.Function) callconv(.c) cuda.abi.Result, "cuFuncGetName") orelse return error.MissingSymbol;
+    var name: ?[*:0]const u8 = null;
+    try f.d.check(get_name(&name, f.handle), "cuFuncGetName");
+    return std.mem.span(name orelse return error.MissingSymbol);
+}
+fn bundleResources(j: Journal, rank: usize, arm: []const u8, f: cuda.Function, resident: usize, threads: u32, grid_cap: ?usize) !void {
+    try j.write(.{ .kind = "bundle_resources", .rank = rank, .arm = arm, .symbol = try kernelName(f), .resident_blocks = resident, .threads = threads, .grid_cap = grid_cap, .regs = try f.attribute(.num_regs), .local_bytes = try f.attribute(.local_size_bytes), .static_shared_bytes = try f.attribute(.shared_size_bytes), .dynamic_shared_bytes = 0, .resident_blocks_per_sm = try f.occupancy(threads, 0) });
+}
 fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     const input = try std.json.parseFromSliceLeaky(Input, a, bytes, .{});
@@ -74,7 +85,7 @@ fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     try expert_screen.validateShardInput(input);
     try expert_latency_screen.validateInput(input);
     try prefill_screen.validateInput(input);
-    if (input.prefill_ab and (input.prompt.len != 64 or input.output_tokens != 128 or input.context != 4096 or input.cut != 20)) return error.InvalidInput;
+    if ((input.prefill_ab or input.combined_ab) and (input.prompt.len != 64 or input.output_tokens != 128 or input.context != 4096 or input.cut != 20)) return error.InvalidInput;
     if (input.router_screen or input.router_candidate) return error.ArchivedDiagnosticMode;
     if (input.gdn_layout_ab and input.expert_n8_ab) return error.InvalidInput;
     if ((input.gdn_layout_ab or input.expert_n8_ab) and (input.expert_fixture != null or input.gdn_layout_screen or input.quant_reuse_screen or input.transport_screen or input.forced.len != 0)) return error.InvalidInput;
@@ -385,11 +396,13 @@ fn poisonControl(s: *qwen.Session, input: Input) !void {
     return error.MissingInjectedFailure;
 }
 
-fn prefillMode(c: *qwen.Engine, rows: usize, graph: bool) void {
+fn prefillMode(c: *qwen.Engine, rows: usize, graph: bool, bundle: bool) void {
     c.prefill_rows = rows;
     captured(c, graph);
     for (c.partitions) |*p| {
         p.engine.bounded_hf_prefill = rows > 1;
+        p.engine.expert_up_split_m = bundle;
+        p.engine.reuse_fp8_quant = bundle;
     }
 }
 
@@ -437,12 +450,12 @@ fn prefillPrefix(init: std.process.Init, serial: *qwen.Session, batch: *qwen.Ses
     const count = rows * vocab;
     const reference = serial_rows[0..count];
     const candidate = batch_rows[0..count];
-    prefillMode(c, 1, graph);
+    prefillMode(c, 1, graph, false);
     try serial.reset();
     if (start != 0) try serial.append(input.prompt[0..start]);
     try serial.appendLogitRows(input.prompt[0..rows], reference);
     const serial_launches = prefillLaunches(c);
-    prefillMode(c, 16, graph);
+    prefillMode(c, 16, graph, input.combined_ab);
     try batch.reset();
     if (start != 0) try batch.append(input.prompt[0..start]);
     try batch.appendLogitRows(input.prompt[0..rows], candidate);
@@ -457,10 +470,10 @@ fn prefillPrefix(init: std.process.Init, serial: *qwen.Session, batch: *qwen.Ses
     const state = try prefillState(init.gpa, serial, batch, j, label, graph and rows == 64 and start == 7);
     const continuation = [_]u32{ input.token, (input.token + 1) % @as(u32, @intCast(vocab)), (input.token + 2) % @as(u32, @intCast(vocab)) };
     for (continuation, 0..) |token, r| {
-        prefillMode(c, 1, graph);
+        prefillMode(c, 1, graph, false);
         try serial.append(&.{token});
         @memcpy(serial_rows[r * vocab ..][0..vocab], serial.logits);
-        prefillMode(c, 16, graph);
+        prefillMode(c, 16, graph, input.combined_ab);
         try batch.append(&.{token});
         @memcpy(batch_rows[r * vocab ..][0..vocab], batch.logits);
         if (!std.mem.eql(u16, serial.logits, batch.logits)) {
@@ -480,7 +493,7 @@ fn prefillPrefix(init: std.process.Init, serial: *qwen.Session, batch: *qwen.Ses
 fn prefillSessionControls(init: std.process.Init, serial: *qwen.Session, batch: *qwen.Session, input: Input, j: Journal) !void {
     const a = init.gpa;
     const c = serial.chain;
-    prefillMode(c, 16, true);
+    prefillMode(c, 16, true, input.combined_ab);
     try serial.reset();
     try batch.reset();
     try serial.append(input.prompt[0..16]);
@@ -498,7 +511,7 @@ fn prefillSessionControls(init: std.process.Init, serial: *qwen.Session, batch: 
     const after_serial = try canonicalState(a, batch);
     defer a.free(after_serial);
     if (!std.mem.eql(u8, saved_batch, after_serial)) return error.PrefillSessionIsolation;
-    prefillMode(c, 16, false);
+    prefillMode(c, 16, false, input.combined_ab);
     try batch.reset();
     const empty = try canonicalState(a, batch);
     defer a.free(empty);
@@ -545,7 +558,7 @@ fn prefillAB(init: std.process.Init, c: *qwen.Engine, input: Input, output: []co
     for ([_]bool{ false, true }) |graph| for ([_]usize{ 0, 7 }) |start| {
         for ([_]usize{ 1, 2, 3, 15, 16, 17, 31, 32, 64 }) |rows| try prefillPrefix(init, &serial, &batch, input, rows, start, graph, serial_rows, batch_rows, j);
     };
-    prefillMode(c, 1, false);
+    prefillMode(c, 1, false, false);
     const expected_tokens = try a.alloc(u32, input.output_tokens);
     defer a.free(expected_tokens);
     const tokens = try a.alloc(u32, input.output_tokens);
@@ -555,8 +568,10 @@ fn prefillAB(init: std.process.Init, c: *qwen.Engine, input: Input, output: []co
     const expected_state = try canonicalState(a, &serial);
     defer a.free(expected_state);
     try prefillFile(j, "turn-reference-state.bin", expected_state);
-    for ([_]usize{ 1, 16 }) |rows| {
-        prefillMode(c, rows, true);
+    for (0..2) |arm| {
+        const rows: usize = if (input.combined_ab or arm == 1) 16 else 1;
+        const bundle = input.combined_ab and arm == 1;
+        prefillMode(c, rows, true, bundle);
         _ = try run(init.io, &batch, input, tokens, batch_rows);
         const state = try canonicalState(a, &batch);
         defer a.free(state);
@@ -565,14 +580,24 @@ fn prefillAB(init: std.process.Init, c: *qwen.Engine, input: Input, output: []co
             try prefillFile(j, try std.fmt.allocPrint(j.a, "normal-gate-rows{d}-failure-state.bin", .{rows}), state);
             return error.PrefillTurnMismatch;
         }
-        try j.write(.{ .kind = "prefill_normal_gate", .prefill_rows = rows, .graph_launches = prefillLaunches(c), .logits_sha256 = &hash(std.mem.sliceAsBytes(batch_rows)), .state_sha256 = &hash(state), .validators_enabled = true, .timing_reported = false });
+        try j.write(.{ .kind = "prefill_normal_gate", .prefill_rows = rows, .bundle_enabled = bundle, .graph_launches = prefillLaunches(c), .logits_sha256 = &hash(std.mem.sliceAsBytes(batch_rows)), .state_sha256 = &hash(state), .validators_enabled = true, .timing_reported = false });
     }
     var qualified_shapes: [2]usize = undefined;
     var qualified_nodes: [2]usize = undefined;
     for (c.partitions, 0..) |*p, rank| {
         const e = p.engine;
         if (!e.verify_gdn_graphs or !e.verify_expert_graphs or e.gdn_graph_nodes_candidate == 0 or e.expert_graph_nodes_n8 == 0 or e.gdn_graph_nodes_baseline != 0 or e.expert_graph_nodes_baseline != 0) return error.PrefillBindingProof;
-        try j.write(.{ .kind = "prefill_bindings", .rank = rank, .gdn_candidate_nodes = e.gdn_graph_nodes_candidate, .gdn_baseline_nodes = e.gdn_graph_nodes_baseline, .expert_n8_nodes = e.expert_graph_nodes_n8, .expert_baseline_nodes = e.expert_graph_nodes_baseline, .graph_nodes = e.graph_nodes, .cached_shapes = e.graphs.count(), .validators_disabled_after_qualification = true });
+        if (input.combined_ab and (e.expert_graph_nodes_split_m == 0 or e.quant_graph_nodes_reuse == 0 or e.quant_graphs_verified == 0)) return error.PrefillBindingProof;
+        try j.write(.{ .kind = "prefill_bindings", .rank = rank, .gdn_candidate_nodes = e.gdn_graph_nodes_candidate, .gdn_baseline_nodes = e.gdn_graph_nodes_baseline, .expert_n8_nodes = e.expert_graph_nodes_n8, .expert_split_m_nodes = e.expert_graph_nodes_split_m, .expert_baseline_nodes = e.expert_graph_nodes_baseline, .quant_baseline_nodes = e.quant_graph_nodes_baseline, .quant_reuse_nodes = e.quant_graph_nodes_reuse, .quant_graphs_verified = e.quant_graphs_verified, .graph_nodes = e.graph_nodes, .cached_shapes = e.graphs.count(), .validators_disabled_after_qualification = true });
+        if (input.combined_ab) {
+            try p.context.makeCurrent();
+            const experts = e.modelopt.?.nvfp4_experts;
+            const n8 = experts.n8_up orelse return error.PrefillBindingProof;
+            const split = experts.split_m_up orelse return error.PrefillBindingProof;
+            try bundleResources(j, rank, "n8", n8.function, n8.resident, cuda.experts.Nvfp4Experts.N8Up.threads, null);
+            try bundleResources(j, rank, "split_m", split.function, split.resident, cuda.experts.Nvfp4Experts.SplitMUp.threads, 128);
+            for (e.expert_graph_roster.items) |node| try j.write(.{ .kind = "bundle_geometry", .rank = rank, .node = node });
+        }
         e.verify_gdn_graphs = false;
         e.verify_expert_graphs = false;
         qualified_shapes[rank] = e.graphs.count();
@@ -580,7 +605,7 @@ fn prefillAB(init: std.process.Init, c: *qwen.Engine, input: Input, output: []co
     }
     for (0..6) |pair| for (0..2) |order| {
         const candidate = (pair + order) % 2 == 1;
-        prefillMode(c, if (candidate) 16 else 1, true);
+        prefillMode(c, if (candidate or input.combined_ab) 16 else 1, true, input.combined_ab and candidate);
         for (c.partitions) |p| if (p.engine.verify_gdn_graphs or p.engine.verify_expert_graphs) return error.PrefillTimingValidators;
         const timing = try run(init.io, &batch, input, tokens, batch_rows);
         for (c.partitions, 0..) |p, rank| if (p.engine.graphs.count() != qualified_shapes[rank] or p.engine.graph_nodes != qualified_nodes[rank]) return error.PrefillUnqualifiedGraph;
@@ -595,12 +620,12 @@ fn prefillAB(init: std.process.Init, c: *qwen.Engine, input: Input, output: []co
         if (!exact) return error.PrefillTurnMismatch;
         try prefillMetadata(&batch);
         const launches = prefillLaunches(c);
-        const body_calls = (if (candidate) @as(usize, 4) else 64) + input.output_tokens - 1;
+        const body_calls = (if (candidate or input.combined_ab) @as(usize, 4) else 64) + input.output_tokens - 1;
         if (launches != body_calls * c.partitions.len) return error.PrefillGraphWorkCount;
-        try j.write(.{ .kind = "prefill_turn", .pair = pair, .order = order, .warmup = pair == 0, .arm = if (candidate) "batch16" else "serial1", .prefill_rows = c.prefill_rows, .times = timing, .body_calls_per_rank = body_calls, .graph_launches = launches, .validators_enabled = false, .qualified_graph_cache_unchanged = true, .all_consumed_logits_tokens_and_state_exact = true, .logits_sha256 = &hash(std.mem.sliceAsBytes(batch_rows)), .state_sha256 = &hash(state), .tokens = tokens });
+        try j.write(.{ .kind = "prefill_turn", .pair = pair, .order = order, .warmup = pair == 0, .arm = if (input.combined_ab) (if (candidate) @as([]const u8, "bundle_on") else "bundle_off") else (if (candidate) @as([]const u8, "batch16") else "serial1"), .bundle_enabled = input.combined_ab and candidate, .prefill_rows = c.prefill_rows, .times = timing, .body_calls_per_rank = body_calls, .graph_launches = launches, .validators_enabled = false, .qualified_graph_cache_unchanged = true, .all_consumed_logits_tokens_and_state_exact = true, .logits_sha256 = &hash(std.mem.sliceAsBytes(batch_rows)), .state_sha256 = &hash(state), .tokens = tokens });
     };
     try prefillSessionControls(init, &serial, &batch, input, j);
-    try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "shared Engine bounded prefill parity and matched C=1 turns", .production_qualification = false, .independent_hf_quality_gate = "unchanged FAIL" });
+    try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = if (input.combined_ab) "shared Engine retained-candidate bundle parity and matched C=1 turns" else "shared Engine bounded prefill parity and matched C=1 turns", .production_qualification = false, .independent_hf_quality_gate = "unchanged FAIL" });
 }
 
 pub fn main(init: std.process.Init) !u8 {
@@ -660,10 +685,10 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
         try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "isolated operator parity and timing screens", .production_qualification = false });
         return;
     }
-    const c = try qwen.Engine.open(init.gpa, init.io, dir, .{ .context = input.context, .cut = input.cut, .captured = !input.gdn_layout_ab and !input.expert_n8_ab and !input.verify_default_policy and !input.prefill_ab, .prefill_rows = if (input.prefill_ab) 16 else 1 });
+    const c = try qwen.Engine.open(init.gpa, init.io, dir, .{ .context = input.context, .cut = input.cut, .captured = !input.gdn_layout_ab and !input.expert_n8_ab and !input.verify_default_policy and !input.prefill_ab and !input.combined_ab, .prefill_rows = if (input.prefill_ab or input.combined_ab) 16 else 1 });
     defer c.deinit();
-    if (input.prefill_ab) {
-        try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = "shared Engine bounded prefill parity and matched C=1 turns", .prefill_rows = 16, .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
+    if (input.prefill_ab or input.combined_ab) {
+        try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = if (input.combined_ab) "shared Engine retained-candidate bundle parity and matched C=1 turns" else "shared Engine bounded prefill parity and matched C=1 turns", .prefill_rows = 16, .combined_ab = input.combined_ab, .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
         return prefillAB(init, c, input, output, j);
     }
     if (input.gdn_layout_ab or input.expert_n8_ab) {

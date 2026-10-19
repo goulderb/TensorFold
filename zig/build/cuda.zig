@@ -284,6 +284,9 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const host = b.graph.host;
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/build/check_fatbins.zig"), .target = host }) })).step);
     const cuda = runtime(b, host, .debug, &.{});
+    const bundle_operators = b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{ "split-M", "atomic FP8" } }));
+    bundle_operators.has_side_effects = true;
+    b.step("test-qwen35-bundle-operators-host", "Split-M and atomic FP8 group tests (CPU only)").dependOn(&bundle_operators.step);
     @import("h3_host.zig").targets(b, cuda, step);
     const mods = family(b, host, .debug, cuda, draft_ids);
     const contract_glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);

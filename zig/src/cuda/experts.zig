@@ -348,6 +348,7 @@ pub const Nvfp4Experts = struct {
     candidate_resident: [3][4]usize,
     candidates_loaded: bool = false,
     n8_up: ?N8Up = null,
+    split_m_up: ?SplitMUp = null,
 
     pub const N8Up = struct {
         function: Function,
@@ -357,6 +358,16 @@ pub const Nvfp4Experts = struct {
 
         pub fn grid(binding: N8Up, items: usize, nb: usize) usize {
             return @min((items * nb * slices + threads / 32 - 1) / (threads / 32), binding.resident);
+        }
+    };
+
+    pub const SplitMUp = struct {
+        function: Function,
+        resident: usize,
+        pub const threads = 256;
+
+        pub fn grid(binding: SplitMUp, items: usize, nb: usize) usize {
+            return @min(items * nb, binding.resident, 128);
         }
     };
 
@@ -454,6 +465,17 @@ pub const Nvfp4Experts = struct {
         e.n8_up = .{ .function = f, .resident = @max(1, try f.occupancy(N8Up.threads, 0)) * sms };
     }
 
+    pub fn loadSplitMUp(e: *Nvfp4Experts, sms: usize) !void {
+        var handle: @import("abi.zig").Function = null;
+        const result = e.mod.d.api.cuModuleGetFunction(&handle, e.mod.handle, "tf_nvfp4_n8_split_m_swiglu");
+        if (result == @import("abi.zig").error_not_found) return;
+        try e.mod.d.check(result, "cuModuleGetFunction split-M up");
+        const f: Function = .{ .d = e.mod.d, .handle = handle };
+        const per_sm = try f.occupancy(SplitMUp.threads, 0);
+        if (per_sm == 0 or sms == 0) return error.NoResidentExpertBlock;
+        e.split_m_up = .{ .function = f, .resident = per_sm * sms };
+    }
+
     pub fn validateN8Up(l: Layer) !void {
         if (l.format != .nvfp4 or l.relu2) return error.UnsupportedN8ExpertUp;
         if (l.width == 0 or l.width % cols != 0 or l.dims == 0 or l.dims % 32 != 0) return error.UnsupportedN8ExpertUp;
@@ -466,6 +488,20 @@ pub const Nvfp4Experts = struct {
         if (grid == 0) return;
         var args = decodeArgs(.up, in, l, p, out, skip);
         try launch_.launch(binding.function, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = N8Up.threads, .y = 1, .z = 1 } }, s, &args);
+    }
+
+    pub fn validateSplitMUp(l: Layer) !void {
+        if (l.format != .nvfp4 or l.relu2) return error.UnsupportedSplitMExpertUp;
+        if (l.width == 0 or l.width % cols != 0 or l.dims == 0 or l.dims % 32 != 0) return error.UnsupportedSplitMExpertUp;
+    }
+
+    pub fn runSplitMUp(e: *const Nvfp4Experts, s: Stream, in: Rows, l: Layer, p: Plan, out: u64, items: usize, skip: i32) !void {
+        try validateSplitMUp(l);
+        const binding = e.split_m_up orelse return error.CandidateNotLoaded;
+        const grid = binding.grid(items, l.width / cols);
+        if (grid == 0) return;
+        var args = decodeArgs(.up, in, l, p, out, skip);
+        try launch_.launch(binding.function, .{ .grid = .{ .x = @intCast(grid), .y = 1, .z = 1 }, .block = .{ .x = SplitMUp.threads, .y = 1, .z = 1 } }, s, &args);
     }
 
     pub fn unload(e: *Nvfp4Experts) void {
@@ -713,4 +749,159 @@ test "N8 up covers four slices per block with the common 14 argument ABI" {
     try std.testing.expectEqual(@as(usize, 14), args.count);
     try std.testing.expectEqualSlices(u16, &.{ 8, 4, 4, 8, 8, 4, 4, 8, 8, 8, 8, 4, 4, 4 }, args.sizes[0..args.count]);
     for (values, 0..) |value, i| try std.testing.expectEqual(value, args.integer(i).?);
+}
+
+test "split-M optional resolution ignores only a missing symbol" {
+    const abi = @import("abi.zig");
+    const Fake = struct {
+        var result: abi.Result = abi.success;
+        var occupancy_result: abi.Result = abi.success;
+        var blocks: c_int = 2;
+        var occupancy_calls: usize = 0;
+        var exact_name = false;
+        var threads: c_int = 0;
+        var shared: usize = 1;
+
+        fn function(out: *abi.Function, _: abi.Module, name: [*:0]const u8) callconv(.c) abi.Result {
+            exact_name = std.mem.eql(u8, std.mem.span(name), "tf_nvfp4_n8_split_m_swiglu");
+            out.* = if (result == abi.success) @ptrFromInt(1) else null;
+            return result;
+        }
+        fn occupancy(out: *c_int, _: abi.Function, block_size: c_int, dynamic_shared: usize) callconv(.c) abi.Result {
+            occupancy_calls += 1;
+            threads = block_size;
+            shared = dynamic_shared;
+            out.* = blocks;
+            return occupancy_result;
+        }
+    };
+    var d: Driver = .{ .lib = undefined, .api = undefined };
+    d.api.cuModuleGetFunction = Fake.function;
+    d.api.cuOccupancyMaxActiveBlocksPerMultiprocessor = Fake.occupancy;
+    var e: Nvfp4Experts = undefined;
+    e.mod = .{ .d = &d, .handle = null };
+    e.n8_up = .{ .function = undefined, .resident = 192 };
+    e.split_m_up = null;
+    Fake.occupancy_calls = 0;
+    Fake.result = abi.error_not_found;
+    try e.loadSplitMUp(84);
+    try std.testing.expect(e.split_m_up == null);
+    try std.testing.expectEqual(@as(usize, 192), e.n8_up.?.resident);
+    try std.testing.expectEqual(@as(usize, 0), Fake.occupancy_calls);
+    try std.testing.expect(Fake.exact_name);
+    Fake.result = abi.error_not_ready;
+    try std.testing.expectError(error.NotReady, e.loadSplitMUp(84));
+    try std.testing.expectEqual(@as(usize, 0), Fake.occupancy_calls);
+    Fake.result = abi.success;
+    Fake.occupancy_result = abi.error_not_ready;
+    try std.testing.expectError(error.NotReady, e.loadSplitMUp(84));
+    try std.testing.expect(e.split_m_up == null);
+    Fake.occupancy_result = abi.success;
+    Fake.blocks = 0;
+    try std.testing.expectError(error.NoResidentExpertBlock, e.loadSplitMUp(84));
+    Fake.blocks = 2;
+    try e.loadSplitMUp(84);
+    try std.testing.expectEqual(@as(usize, 168), e.split_m_up.?.resident);
+    try std.testing.expectEqual(@as(c_int, 256), Fake.threads);
+    try std.testing.expectEqual(@as(usize, 0), Fake.shared);
+    try std.testing.expectEqual(@as(abi.Function, @ptrFromInt(1)), e.split_m_up.?.function.handle);
+}
+
+test "split-M rejects unsupported layers and missing binding before CUDA" {
+    var e: Nvfp4Experts = undefined;
+    e.split_m_up = null;
+    var l: Layer = .{ .format = .nvfp4, .up = 0, .down = 0, .width = 512, .dims = 2048, .experts = 256 };
+    l.relu2 = true;
+    try std.testing.expectError(error.UnsupportedSplitMExpertUp, e.runSplitMUp(undefined, undefined, l, undefined, 0, 1, -1));
+    l.relu2 = false;
+    l.format = .affine4;
+    try std.testing.expectError(error.UnsupportedSplitMExpertUp, e.runSplitMUp(undefined, undefined, l, undefined, 0, 1, -1));
+    l.format = .nvfp4;
+    for ([_]usize{ 0, 1, 511, 513 }) |width| {
+        l.width = width;
+        try std.testing.expectError(error.UnsupportedSplitMExpertUp, e.runSplitMUp(undefined, undefined, l, undefined, 0, 1, -1));
+    }
+    l.width = 512;
+    for ([_]usize{ 0, 1, 2047, 2049 }) |dims| {
+        l.dims = dims;
+        try std.testing.expectError(error.UnsupportedSplitMExpertUp, e.runSplitMUp(undefined, undefined, l, undefined, 0, 1, -1));
+    }
+    l.dims = 2048;
+    try std.testing.expectError(error.CandidateNotLoaded, e.runSplitMUp(undefined, undefined, l, undefined, 0, 1, -1));
+    e.split_m_up = .{ .function = undefined, .resident = 168 };
+    try e.runSplitMUp(undefined, undefined, l, undefined, 0, 0, -1);
+}
+
+test "split-M capped persistent grid covers every logical tile exactly once" {
+    const resident = [_]usize{ 0, 1, 70, 128, 192 };
+    for ([_]usize{ 0, 1, 2, 8, 20, 128, 256 }) |items| for ([_]usize{ 1, 3, 16, 32 }) |nb| for (resident) |blocks| {
+        const binding: Nvfp4Experts.SplitMUp = .{ .function = undefined, .resident = blocks };
+        const grid = binding.grid(items, nb);
+        const logical = items * nb;
+        try std.testing.expect(grid <= 128 and grid <= blocks and grid <= logical);
+        if (blocks == 0 or logical == 0) {
+            try std.testing.expectEqual(@as(usize, 0), grid);
+            continue;
+        }
+        try std.testing.expect(grid > 0);
+        var visits: [8192]u8 = @splat(0);
+        for (0..grid) |block| {
+            var tile = block;
+            while (tile < logical) : (tile += grid) visits[tile] += 1;
+        }
+        for (visits[0..logical]) |count| try std.testing.expectEqual(@as(u8, 1), count);
+    };
+    const split: Nvfp4Experts.SplitMUp = .{ .function = undefined, .resident = 192 };
+    const n8: Nvfp4Experts.N8Up = .{ .function = undefined, .resident = 192 };
+    try std.testing.expectEqual(@as(usize, 128), split.grid(20, 16));
+    try std.testing.expectEqual(@as(usize, 192), n8.grid(20, 16));
+}
+
+test "split-M retains source rows skip and all 14 decode arguments" {
+    const abi = @import("abi.zig");
+    const Mock = struct {
+        var function: usize = 0;
+        var grid: [3]u32 = undefined;
+        var block: [3]u32 = undefined;
+        var shared: u32 = 0;
+        var values: [14]u64 = undefined;
+        fn launch(f: abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint, dynamic_shared: c_uint, _: abi.Stream, params: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) abi.Result {
+            function = @intFromPtr(f);
+            grid = .{ gx, gy, gz };
+            block = .{ bx, by, bz };
+            shared = dynamic_shared;
+            for (0..14) |i| values[i] = switch (i) {
+                1, 2, 5, 6, 11, 12, 13 => @as(*align(1) const u32, @ptrCast(params.?[i].?)).*,
+                else => @as(*align(1) const u64, @ptrCast(params.?[i].?)).*,
+            };
+            return abi.success;
+        }
+    };
+    var d: Driver = undefined;
+    d.api.cuLaunchKernel = Mock.launch;
+    var e: Nvfp4Experts = undefined;
+    e.split_m_up = .{ .function = .{ .d = &d, .handle = @ptrFromInt(1) }, .resident = 192 };
+    e.n8_up = .{ .function = .{ .d = &d, .handle = @ptrFromInt(2) }, .resident = 192 };
+    const stream: Stream = .{ .d = &d, .handle = null };
+    const l: Layer = .{ .format = .nvfp4, .up = 101, .down = 102, .up_scale = 103, .down_scale = 104, .width = 512, .dims = 2048, .experts = 256, .limit = 2.0 };
+    const p: Plan = .{ .items = 201, .counts = 202, .members = 203, .rank = 204, .hist = 205 };
+    for ([_]usize{ 1, 20 }) |items| for ([_]usize{ 0, 8 }) |slots| for ([_]i32{ -1, 0, 1, 255 }) |skip| {
+        const in: Rows = .{ .x = 301, .stride = 2112, .slots = slots };
+        const values = [_]u64{ 301, 2112, slots, 101, 103, 64, 16, 201, 202, 203, 302, 512, @as(u32, @bitCast(@as(f32, 2.0))), @as(u32, @bitCast(skip)) };
+        try e.runSplitMUp(stream, in, l, p, 302, items, skip);
+        try std.testing.expectEqual(@as(usize, 1), Mock.function);
+        try std.testing.expectEqual([3]u32{ @intCast(@min(items * 16, 128)), 1, 1 }, Mock.grid);
+        try std.testing.expectEqual([3]u32{ 256, 1, 1 }, Mock.block);
+        try std.testing.expectEqual(@as(u32, 0), Mock.shared);
+        try std.testing.expectEqualSlices(u64, &values, &Mock.values);
+        try e.runN8Up(stream, in, l, p, 302, items, skip);
+        try std.testing.expectEqual(@as(usize, 2), Mock.function);
+        try std.testing.expectEqual([3]u32{ @intCast(@min(items * 16, 192)), 1, 1 }, Mock.grid);
+        try std.testing.expectEqual([3]u32{ 128, 1, 1 }, Mock.block);
+        try std.testing.expectEqualSlices(u64, &values, &Mock.values);
+        const args = Nvfp4Experts.decodeArgs(.up, in, l, p, 302, skip);
+        try std.testing.expectEqual(@as(usize, 14), args.count);
+        try std.testing.expectEqualSlices(u16, &.{ 8, 4, 4, 8, 8, 4, 4, 8, 8, 8, 8, 4, 4, 4 }, args.sizes[0..args.count]);
+        for (values, 0..) |value, i| try std.testing.expectEqual(value, args.integer(i).?);
+    };
 }

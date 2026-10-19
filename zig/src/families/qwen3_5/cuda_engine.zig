@@ -28,6 +28,20 @@ pub const most_window = 16;
 /// Experimental committed HF prefixes retain the decode operators' row arithmetic.
 pub const hf_prefill_rows = 16;
 const hf_part_bytes = 8 << 20;
+pub const ExpertGraphNode = struct {
+    shape_key: u32,
+    total: u8,
+    heads_all: bool,
+    layer_local: usize,
+    layer_global: usize,
+    arm: enum { baseline, n8, split_m },
+    grid: [3]u32,
+    block: [3]u32,
+    shared_bytes: u32,
+    abi_count: usize,
+    argument_bytes: usize,
+    args_sha256: [64]u8,
+};
 /// Partial attention chunks a row at most (qwen35.cuh's MAXCH): each row's chunk width grows with its own keys.
 const max_chunks = 64;
 
@@ -99,6 +113,11 @@ test "mixed GDN layouts fail before settling caches or touching CUDA" {
 /// What a forward keeps: a prompt chunk its last row's logits, a verify window every row's draw or logits and log.
 pub const Keep = union(enum) { last, draws: []const Draw, logits, prompt_logits };
 
+fn validateCombined(numerics: checkpoint.Numerics, n8: bool, split: bool, reuse: bool) !void {
+    if (split and (numerics != .hf_modelopt or !n8)) return error.UnsupportedQwenExpertUp;
+    if (reuse and numerics != .hf_modelopt) return error.UnsupportedQwenQuantReuse;
+}
+
 fn records(keep: Keep) bool {
     return keep == .draws or keep == .logits;
 }
@@ -166,10 +185,17 @@ pub const Engine = struct {
     graph_nodes: usize = 0,
     graph_launches: usize = 0,
     expert_up_n8: bool = false,
+    expert_up_split_m: bool = false,
+    reuse_fp8_quant: bool = false,
     bounded_hf_prefill: bool = false,
     verify_expert_graphs: bool = false,
     expert_graph_nodes_baseline: usize = 0,
     expert_graph_nodes_n8: usize = 0,
+    expert_graph_nodes_split_m: usize = 0,
+    expert_graph_roster: std.ArrayList(ExpertGraphNode) = .empty,
+    quant_graph_nodes_baseline: usize = 0,
+    quant_graph_nodes_reuse: usize = 0,
+    quant_graphs_verified: usize = 0,
     verify_gdn_graphs: bool = false,
     gdn_graph_nodes_baseline: usize = 0,
     gdn_graph_nodes_candidate: usize = 0,
@@ -286,10 +312,17 @@ pub const Engine = struct {
         e.graph_nodes = 0;
         e.graph_launches = 0;
         e.expert_up_n8 = e.numerics == .hf_modelopt;
+        e.expert_up_split_m = false;
+        e.reuse_fp8_quant = false;
         e.bounded_hf_prefill = false;
         e.verify_expert_graphs = false;
         e.expert_graph_nodes_baseline = 0;
         e.expert_graph_nodes_n8 = 0;
+        e.expert_graph_nodes_split_m = 0;
+        e.expert_graph_roster = .empty;
+        e.quant_graph_nodes_baseline = 0;
+        e.quant_graph_nodes_reuse = 0;
+        e.quant_graphs_verified = 0;
         e.verify_gdn_graphs = false;
         e.gdn_graph_nodes_baseline = 0;
         e.gdn_graph_nodes_candidate = 0;
@@ -368,6 +401,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        e.expert_graph_roster.deinit(e.gpa);
         var it = e.graphs.valueIterator();
         while (it.next()) |x| x.deinit();
         e.graphs.deinit(e.gpa);
@@ -581,6 +615,7 @@ pub const Engine = struct {
         for (parts[1..]) |p| if (p.cache.gdn_layout != gdn_layout) return error.MixedQwenGdnLayouts;
         try gdn_layout.validate(e.numerics);
         if (e.expert_up_n8 and e.numerics != .hf_modelopt) return error.UnsupportedQwenExpertUp;
+        try validateCombined(e.numerics, e.expert_up_n8, e.expert_up_split_m, e.reuse_fp8_quant);
         const g = e.g;
         try validateHfWindow(e.numerics, e.bounded_hf_prefill, parts, ids.len, keep);
         var total: usize = 0;
@@ -644,12 +679,13 @@ pub const Engine = struct {
         const lone = total == 1 and parts.len == 1;
         const bucket: usize = if (lone) 1 else if (total <= 16) 16 else most_verify;
         const windows: usize = if (lone) 1 else max_segs;
-        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits };
+        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant };
         e.features = if (images) |im| im.features else 0;
         return shape;
     }
 
     pub fn execute(e: *Engine, shape: Shape) !void {
+        try validateCombined(e.numerics, shape.expert_up_n8, shape.expert_up_split_m, shape.reuse_fp8_quant);
         if (shape.expert_up_n8 and (e.numerics != .hf_modelopt or (shape.prompt and shape.total > most_window))) return error.UnsupportedQwenExpertUp;
         if (shape.heads_all and e.numerics != .hf_modelopt) return error.UnsupportedQwenWindow;
         if (e.numerics == .hf_modelopt and (shape.total == 0 or shape.total > hf_prefill_rows or shape.nseg != 1 or shape.record or !shape.prompt or shape.taps or
@@ -676,8 +712,15 @@ pub const Engine = struct {
                 const nodes = try captured.nodeCount();
                 const gdn_nodes = if (e.verify_gdn_graphs) try e.verifyGdnGraph(captured, shape, nodes) else 0;
                 const expert_nodes = if (e.verify_expert_graphs) try e.verifyExpertGraph(captured, shape, nodes) else 0;
+                const quant_nodes = if (e.verify_expert_graphs) try e.verifyQuantGraph(captured, shape, nodes) else 0;
                 gop.value_ptr.* = try captured.instantiate();
-                if (shape.expert_up_n8) {
+                if (e.verify_expert_graphs) {
+                    e.quant_graphs_verified += 1;
+                    if (shape.reuse_fp8_quant) e.quant_graph_nodes_reuse += quant_nodes else e.quant_graph_nodes_baseline += quant_nodes;
+                }
+                if (shape.expert_up_split_m) {
+                    e.expert_graph_nodes_split_m += expert_nodes;
+                } else if (shape.expert_up_n8) {
                     e.expert_graph_nodes_n8 += expert_nodes;
                 } else e.expert_graph_nodes_baseline += expert_nodes;
                 e.graph_nodes += nodes;
@@ -797,14 +840,192 @@ pub const Engine = struct {
         return roster.count;
     }
 
-    fn verifyExpertGraph(e: *const Engine, graph: cuda.graph.Graph, shape: Shape, node_count: usize) !usize {
+    const CkProjection = struct { weight: cuda.qmmf.Weight, x: u64, out: u64, rows: usize, quant: bool };
+
+    fn addCkProjection(e: *const Engine, list: *std.ArrayList(CkProjection), p: Proj, x: u64, out: u64, rows: usize, quant: bool) !void {
+        if (p == .linear and p.linear == .fp8 and p.linear.fp8.act != 0) {
+            try list.append(e.gpa, .{ .weight = p.linear.fp8, .x = x, .out = out, .rows = rows, .quant = quant });
+        }
+    }
+
+    fn addCkGroup(e: *const Engine, list: *std.ArrayList(CkProjection), projections: []const Proj, outputs: []const u64, shape: Shape) !void {
+        var targets: [3]cuda.qlinear.Target = undefined;
+        for (projections, outputs, 0..) |p, out, i| {
+            if (p != .linear) return error.QwenFormatNotLoaded;
+            targets[i] = .{ .weight = p.linear, .output = out };
+        }
+        const together = shape.reuse_fp8_quant and e.modelopt.?.linear().canDecodeTogether(targets[0..projections.len], .{ .x = e.x, .part = e.modelopt.?.part }, shape.total);
+        for (projections, outputs, 0..) |p, out, i| try e.addCkProjection(list, p, e.x, out, shape.total, !together or i == 0);
+    }
+
+    fn ckPlan(e: *const Engine, shape: Shape) !std.ArrayList(CkProjection) {
+        var list: std.ArrayList(CkProjection) = .empty;
+        errdefer list.deinit(e.gpa);
+        for (e.layers) |layer| {
+            switch (layer.mixer) {
+                .delta => |m| {
+                    try e.addCkGroup(&list, &.{ m.qkv, m.z }, &.{ e.qkv, e.z }, shape);
+                    try e.addCkProjection(&list, m.a, e.x, e.a, shape.total, true);
+                    try e.addCkProjection(&list, m.b, e.x, e.b, shape.total, true);
+                    try e.addCkProjection(&list, m.out, e.mix, e.r, shape.total, true);
+                },
+                .attention => |m| {
+                    try e.addCkGroup(&list, &.{ m.q, m.k, m.v }, &.{ e.qraw, e.kraw, e.vraw }, shape);
+                    try e.addCkProjection(&list, m.o, e.mix, e.r, shape.total, true);
+                },
+            }
+            const dense: ?layers.Dense = switch (layer.mlp) {
+                .dense => |m| m,
+                .moe => |m| if (m.shared == .projected) m.shared.projected else null,
+            };
+            if (dense) |m| {
+                try e.addCkProjection(&list, m.gate, e.x, e.gate, shape.total, true);
+                try e.addCkProjection(&list, m.up, e.x, e.up, shape.total, true);
+                try e.addCkProjection(&list, m.down, e.act, if (layer.mlp == .dense) e.r else e.routed.shared, shape.total, true);
+            }
+        }
+        if (e.placement.ownsHead()) {
+            const heads: usize = if (shape.record or shape.heads_all) shape.total else 1;
+            try e.addCkProjection(&list, e.head, e.x + (shape.total - heads) * e.g.hidden * 2, e.logits, heads, true);
+        }
+        return list;
+    }
+
+    const CkNode = struct {
+        function: cuda.abi.Function,
+        grid: [3]usize,
+        shared: usize = 0,
+        threads: usize = 128,
+        args: cuda.Args = .{},
+
+        fn check(want: *const CkNode, got: cuda.abi.KernelNodeParams) !void {
+            if (got.func != want.function or got.grid_x != want.grid[0] or got.grid_y != want.grid[1] or got.grid_z != want.grid[2] or
+                got.block_x != want.threads or got.block_y != 1 or got.block_z != 1 or got.shared_bytes != want.shared) return error.QwenQuantGraphKernelMismatch;
+            const args = got.params orelse return error.QwenQuantGraphArgumentMismatch;
+            for (0..want.args.count) |i| {
+                const actual: [*]const u8 = @ptrCast(args[i] orelse return error.QwenQuantGraphArgumentMismatch);
+                const bytes = want.args.storage[want.args.offsets[i]..][0..want.args.sizes[i]];
+                if (!std.mem.eql(u8, actual[0..bytes.len], bytes)) return error.QwenQuantGraphArgumentMismatch;
+            }
+        }
+    };
+
+    fn ckNode(e: *const Engine, p: CkProjection, kind: enum { quant, lane, reduce }) CkNode {
+        const m = e.modelopt.?;
+        const q = p.weight;
+        const sk = cuda.qmmf.splitK(q.n, q.k);
+        const cluster = sk > 1 and sk <= 8 and m.ck.clusters;
+        var node: CkNode = .{ .function = null, .grid = .{ 1, 1, 1 } };
+        switch (kind) {
+            .quant => {
+                node.function = m.ck.quant8_fn.handle;
+                node.grid[0] = (p.rows * (q.k / 16) + 127) / 128;
+                node.args.add(p.x);
+                for ([_]usize{ q.k, p.rows, q.k }) |v| node.args.add(@as(i32, @intCast(v)));
+                node.args.add(cuda.ck.inverse(q.act));
+                node.args.add(m.rows);
+            },
+            .lane => {
+                node.function = m.ck.lane[@intFromBool(cluster)].handle;
+                node.grid = .{ (q.n + 63) / 64, 1, sk };
+                node.shared = 4 * (16 * 64 + 64 * 64);
+                node.args.add(m.rows);
+                node.args.add(q.codes);
+                node.args.add(cuda.ck.alpha(q.act, q.scale));
+                node.args.add(p.out);
+                node.args.add(m.part);
+                for ([_]usize{ p.rows, q.n, q.k, sk, 1 }) |v| node.args.add(@as(i32, @intCast(v)));
+            },
+            .reduce => {
+                node.function = m.ck.reduce.handle;
+                node.grid[0] = (p.rows * q.n + 255) / 256;
+                node.threads = 256;
+                node.args.add(m.part);
+                node.args.add(p.out);
+                node.args.add(@as(i64, @intCast(p.rows * q.n)));
+                node.args.add(@as(i32, @intCast(sk)));
+                node.args.add(cuda.ck.alpha(q.act, q.scale));
+            },
+        }
+        return node;
+    }
+
+    fn orderedGraphNodes(e: *const Engine, graph: cuda.graph.Graph, node_count: usize) ![]cuda.graph.Node {
+        const nodes = try e.gpa.alloc(cuda.graph.Node, node_count);
+        defer e.gpa.free(nodes);
+        if ((try graph.nodes(nodes)).len != node_count) return error.QwenQuantGraphWorkCountMismatch;
+        const previous = try e.gpa.alloc(cuda.graph.Node, node_count);
+        defer e.gpa.free(previous);
+        var lib = e.d.lib;
+        const get = lib.lookup(*const fn (cuda.abi.GraphNode, ?[*]cuda.abi.GraphNode, *usize) callconv(.c) cuda.abi.Result, "cuGraphNodeGetDependencies") orelse return error.MissingSymbol;
+        for (nodes, previous) |node, *pred| {
+            var deps: [2]cuda.graph.Node = .{ null, null };
+            var count: usize = deps.len;
+            try e.d.check(get(node, &deps, &count), "cuGraphNodeGetDependencies");
+            if (count > 1) return error.QwenQuantGraphDependencyMismatch;
+            pred.* = if (count == 0) null else deps[0];
+        }
+        const ordered = try e.gpa.alloc(cuda.graph.Node, node_count);
+        errdefer e.gpa.free(ordered);
+        var prior: cuda.graph.Node = null;
+        for (ordered) |*out| {
+            var found: ?usize = null;
+            for (previous, 0..) |pred, i| if (pred == prior) {
+                if (found != null) return error.QwenQuantGraphDependencyMismatch;
+                found = i;
+            };
+            out.* = nodes[found orelse return error.QwenQuantGraphDependencyMismatch];
+            prior = out.*;
+        }
+        return ordered;
+    }
+
+    fn verifyQuantGraph(e: *const Engine, graph: cuda.graph.Graph, shape: Shape, node_count: usize) !usize {
+        if (e.numerics != .hf_modelopt) return error.UnsupportedQwenQuantReuse;
+        var plan = try e.ckPlan(shape);
+        defer plan.deinit(e.gpa);
+        var expected: std.ArrayList(CkNode) = .empty;
+        defer expected.deinit(e.gpa);
+        var quants: usize = 0;
+        for (plan.items) |p| {
+            if (p.quant) {
+                try expected.append(e.gpa, e.ckNode(p, .quant));
+                quants += 1;
+            }
+            try expected.append(e.gpa, e.ckNode(p, .lane));
+            const sk = cuda.qmmf.splitK(p.weight.n, p.weight.k);
+            if (sk > 1 and !(sk <= 8 and e.modelopt.?.ck.clusters)) try expected.append(e.gpa, e.ckNode(p, .reduce));
+        }
+        const nodes = try e.orderedGraphNodes(graph, node_count);
+        defer e.gpa.free(nodes);
+        const c = e.modelopt.?.ck;
+        var count: usize = 0;
+        for (nodes) |node| {
+            var p: cuda.abi.KernelNodeParams = undefined;
+            try e.d.check(e.d.api.cuGraphKernelNodeGetParams_v2(node, &p), "cuGraphKernelNodeGetParams");
+            var relevant = p.func == c.quant8_fn.handle or p.func == c.reduce.handle;
+            for (c.lane) |f| relevant = relevant or p.func == f.handle;
+            if (!relevant) continue;
+            if (count >= expected.items.len) return error.QwenQuantGraphWorkCountMismatch;
+            try expected.items[count].check(p);
+            count += 1;
+        }
+        if (count != expected.items.len) return error.QwenQuantGraphWorkCountMismatch;
+        return quants;
+    }
+
+    fn verifyExpertGraph(e: *Engine, graph: cuda.graph.Graph, shape: Shape, node_count: usize) !usize {
+        const roster_start = e.expert_graph_roster.items.len;
+        errdefer e.expert_graph_roster.items.len = roster_start;
         const bindings = e.modelopt orelse return error.UnsupportedQwenExpertUp;
         const experts = bindings.nvfp4_experts;
         const n8 = experts.n8_up orelse return error.CandidateNotLoaded;
         const baseline = experts.fns[0].handle;
         const candidate = n8.function.handle;
         if (baseline == candidate) return error.QwenExpertGraphKernelMismatch;
-        const expected = if (shape.expert_up_n8) candidate else baseline;
+        const split = experts.split_m_up;
+        const split_function = if (split) |v| v.function.handle else null;
+        const expected = if (shape.expert_up_split_m) (split orelse return error.UnsupportedQwenExpertUp).function.handle else if (shape.expert_up_n8) candidate else baseline;
         const storage = try e.gpa.alloc(cuda.graph.Node, node_count);
         defer e.gpa.free(storage);
         const nodes = try graph.nodes(storage);
@@ -814,7 +1035,7 @@ pub const Engine = struct {
         for (nodes) |node| {
             var params: cuda.abi.KernelNodeParams = undefined;
             try e.d.check(e.d.api.cuGraphKernelNodeGetParams_v2(node, &params), "cuGraphKernelNodeGetParams");
-            if (params.func != baseline and params.func != candidate) continue;
+            if (params.func != baseline and params.func != candidate and params.func != split_function) continue;
             if (params.func != expected) return error.QwenExpertGraphKernelMismatch;
             const args = params.params orelse return error.QwenExpertGraphMissingArguments;
             const up: *const u64 = @ptrCast(@alignCast(args[3] orelse return error.QwenExpertGraphMissingArguments));
@@ -828,17 +1049,37 @@ pub const Engine = struct {
                 const expert_count = if (m.shared == .projected) e.g.experts else e.g.experts + 1;
                 const items = cuda.grouped.maxItems(@as(usize, shape.total) * slots, expert_count, 16);
                 const nb = m.experts.width / cuda.experts.Nvfp4Experts.cols;
-                const grid = if (shape.expert_up_n8) n8.grid(items, nb) else cuda.experts.Nvfp4Experts.decodeGridWarps(.baseline, items, nb, experts.resident[0], experts.warps);
-                const threads = if (shape.expert_up_n8) cuda.experts.Nvfp4Experts.N8Up.threads else experts.warps * 32;
+                const grid = if (shape.expert_up_split_m) split.?.grid(items, nb) else if (shape.expert_up_n8) n8.grid(items, nb) else cuda.experts.Nvfp4Experts.decodeGridWarps(.baseline, items, nb, experts.resident[0], experts.warps);
+                const threads = if (shape.expert_up_split_m) cuda.experts.Nvfp4Experts.SplitMUp.threads else if (shape.expert_up_n8) cuda.experts.Nvfp4Experts.N8Up.threads else experts.warps * 32;
                 if (params.grid_x != grid or params.grid_y != 1 or params.grid_z != 1 or params.block_x != threads or
                     params.block_y != 1 or params.block_z != 1 or params.shared_bytes != 0) return error.QwenExpertGraphKernelMismatch;
                 const plan: cuda.grouped.Plan = .{ .members = e.routed.members, .items = e.routed.items, .counts = e.routed.counts, .rank = e.routed.rank, .hist = e.routed.hist };
                 const expected_args = cuda.experts.Nvfp4Experts.decodeArgs(.up, .{ .x = e.x, .stride = e.g.hidden, .slots = slots }, m.experts, plan, e.routed.act, -1);
+                var digest = std.crypto.hash.sha2.Sha256.init(.{});
+                var argument_bytes: usize = 0;
                 for (0..expected_args.count) |a| {
                     const actual: [*]const u8 = @ptrCast(args[a] orelse return error.QwenExpertGraphMissingArguments);
                     const bytes = expected_args.storage[expected_args.offsets[a]..][0..expected_args.sizes[a]];
                     if (!std.mem.eql(u8, actual[0..bytes.len], bytes)) return error.QwenExpertGraphArgumentMismatch;
+                    digest.update(actual[0..bytes.len]);
+                    argument_bytes += bytes.len;
                 }
+                var hash: [32]u8 = undefined;
+                digest.final(&hash);
+                try e.expert_graph_roster.append(e.gpa, .{
+                    .shape_key = shape.key(),
+                    .total = shape.total,
+                    .heads_all = shape.heads_all,
+                    .layer_local = index,
+                    .layer_global = e.placement.first + index,
+                    .arm = if (params.func == split_function) .split_m else if (params.func == candidate) .n8 else .baseline,
+                    .grid = .{ params.grid_x, params.grid_y, params.grid_z },
+                    .block = .{ params.block_x, params.block_y, params.block_z },
+                    .shared_bytes = params.shared_bytes,
+                    .abi_count = expected_args.count,
+                    .argument_bytes = argument_bytes,
+                    .args_sha256 = std.fmt.bytesToHex(hash, .lower),
+                });
                 layers_seen[index] = true;
                 matched = true;
                 count += 1;
@@ -898,10 +1139,12 @@ pub const Engine = struct {
         taps: bool,
         gdn_layout: Cache.GdnLayout = .value_key,
         expert_up_n8: bool = false,
+        expert_up_split_m: bool = false,
+        reuse_fp8_quant: bool = false,
         heads_all: bool = false,
 
         fn key(s: Shape) u32 {
-            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21;
+            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21 | @as(u32, @intFromBool(s.expert_up_split_m)) << 22 | @as(u32, @intFromBool(s.reuse_fp8_quant)) << 23;
         }
     };
 
@@ -948,8 +1191,12 @@ pub const Engine = struct {
             switch (l.mixer) {
                 .delta => |m| {
                     const layer: c_int = @intCast(di);
-                    try e.proj(m.qkv, e.x, e.qkv, total, prompt);
-                    try e.proj(m.z, e.x, e.z, total, prompt);
+                    if (shape.reuse_fp8_quant) {
+                        _ = try e.modelopt.?.linear().decodeTogether(e.stream, &.{ .{ .weight = m.qkv.linear, .output = e.qkv }, .{ .weight = m.z.linear, .output = e.z } }, .{ .x = e.x, .part = e.modelopt.?.part }, total);
+                    } else {
+                        try e.proj(m.qkv, e.x, e.qkv, total, prompt);
+                        try e.proj(m.z, e.x, e.z, total, prompt);
+                    }
                     try e.proj(m.a, e.x, e.a, total, prompt);
                     try e.proj(m.b, e.x, e.b, total, prompt);
                     try e.mark(.mixer_inputs);
@@ -968,9 +1215,13 @@ pub const Engine = struct {
                 },
                 .attention => |m| {
                     const aw = g.attnWidth();
-                    try e.proj(m.q, e.x, e.qraw, total, prompt);
-                    try e.proj(m.k, e.x, e.kraw, total, prompt);
-                    try e.proj(m.v, e.x, e.vraw, total, prompt);
+                    if (shape.reuse_fp8_quant) {
+                        _ = try e.modelopt.?.linear().decodeTogether(e.stream, &.{ .{ .weight = m.q.linear, .output = e.qraw }, .{ .weight = m.k.linear, .output = e.kraw }, .{ .weight = m.v.linear, .output = e.vraw } }, .{ .x = e.x, .part = e.modelopt.?.part }, total);
+                    } else {
+                        try e.proj(m.q, e.x, e.qraw, total, prompt);
+                        try e.proj(m.k, e.x, e.kraw, total, prompt);
+                        try e.proj(m.v, e.x, e.vraw, total, prompt);
+                    }
                     try e.mark(.mixer_inputs);
                     try e.run(e.fns.head_norm, .{ total * g.q_heads, 1, 1 }, .{ if (is_hf) launch.head_norm else 64, 1, 1 }, .{ e.qraw, m.q_norm, e.qn, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), g.eps, t_params });
                     try e.run(e.fns.head_norm, .{ total * g.kv_heads, 1, 1 }, .{ if (is_hf) launch.head_norm else 64, 1, 1 }, .{ e.kraw, m.k_norm, e.kn, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(g.kv_heads * head_dim)), @as(c_int, head_dim), g.eps, t_params });
@@ -995,7 +1246,7 @@ pub const Engine = struct {
                     try e.proj(m.down, e.act, e.r, total, prompt);
                     try e.mark(.dense);
                 },
-                .moe => |m| try routed.rows(e, m.router, m.experts, m.shared, e.x, e.r, total, prompt and total > most_window, shape.expert_up_n8),
+                .moe => |m| try routed.rows(e, m.router, m.experts, m.shared, e.x, e.r, total, prompt and total > most_window, shape.expert_up_n8, shape.expert_up_split_m),
             }
             if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == e.placement.first + i) {
                 try e.run(e.fns.tap, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
@@ -1009,7 +1260,7 @@ pub const Engine = struct {
     }
 
     pub fn routedRows(e: *Engine, router: u64, layer: cuda.experts.Layer, shared: layers.SharedExpert, x: u64, out: u64, total: usize, wide_rows: bool) !void {
-        return routed.rows(e, router, layer, shared, x, out, total, wide_rows, false);
+        return routed.rows(e, router, layer, shared, x, out, total, wide_rows, false, false);
     }
 
     /// Row `i`'s logits from the newest forward that kept logits.
@@ -1042,11 +1293,15 @@ test "expert graph verification rejects opposite arms, wrong arguments, duplicat
     bindings.nvfp4_experts.resident[0] = 192;
     bindings.nvfp4_experts.warps = 4;
     bindings.nvfp4_experts.n8_up = .{ .function = .{ .d = &driver, .handle = @ptrFromInt(2) }, .resident = 192 };
+    bindings.nvfp4_experts.split_m_up = .{ .function = .{ .d = &driver, .handle = @ptrFromInt(3) }, .resident = 168 };
     const expert_layer: cuda.experts.Layer = .{ .format = .nvfp4, .up = 101, .down = 102, .up_scale = 103, .down_scale = 104, .width = 512, .dims = 2048, .experts = 256 };
     var local_layers: [1]Layer = undefined;
     local_layers[0].mlp = .{ .moe = .{ .router = 0, .experts = expert_layer, .shared = .{ .projected = undefined } } };
     var e: Engine = undefined;
     e.gpa = std.testing.allocator;
+    e.expert_graph_roster = .empty;
+    defer e.expert_graph_roster.deinit(e.gpa);
+    e.placement = .{ .first = 5, .end = 6, .total = 40 };
     e.d = &driver;
     e.modelopt = bindings;
     e.g = undefined;
@@ -1075,10 +1330,90 @@ test "expert graph verification rejects opposite arms, wrong arguments, duplicat
     args.storage[args.offsets[10]] ^= 1;
     try std.testing.expectError(error.QwenExpertGraphArgumentMismatch, e.verifyExpertGraph(graph, shape, 1));
     args.storage[args.offsets[10]] ^= 1;
+    shape.expert_up_split_m = true;
+    try std.testing.expectError(error.QwenExpertGraphKernelMismatch, e.verifyExpertGraph(graph, shape, 1));
+    Fake.params.func = @ptrFromInt(3);
+    Fake.params.block_x = 256;
+    try std.testing.expectEqual(@as(usize, 1), try e.verifyExpertGraph(graph, shape, 1));
+    for (0..args.count) |i| {
+        args.storage[args.offsets[i]] ^= 1;
+        if (i == 3) {
+            try std.testing.expectError(error.QwenExpertGraphLayerMismatch, e.verifyExpertGraph(graph, shape, 1));
+        } else try std.testing.expectError(error.QwenExpertGraphArgumentMismatch, e.verifyExpertGraph(graph, shape, 1));
+        args.storage[args.offsets[i]] ^= 1;
+    }
     Fake.count = 2;
     try std.testing.expectError(error.QwenExpertGraphLayerMismatch, e.verifyExpertGraph(graph, shape, 2));
     Fake.count = 0;
     try std.testing.expectError(error.QwenExpertGraphWorkCountMismatch, e.verifyExpertGraph(graph, shape, 0));
+    try std.testing.expectEqual(@as(usize, 3), e.expert_graph_roster.items.len);
+    const roster = e.expert_graph_roster.items;
+    try std.testing.expectEqual(.baseline, roster[0].arm);
+    try std.testing.expectEqual(.n8, roster[1].arm);
+    try std.testing.expectEqual(.split_m, roster[2].arm);
+    try std.testing.expectEqual(@as(usize, 5), roster[2].layer_global);
+    try std.testing.expectEqual(@as(usize, 14), roster[2].abi_count);
+    try std.testing.expectEqual([3]u32{ 128, 1, 1 }, roster[2].grid);
+    try std.testing.expectEqual([3]u32{ 256, 1, 1 }, roster[2].block);
+    try std.testing.expectEqualSlices(u8, &roster[0].args_sha256, &roster[2].args_sha256);
+}
+
+test "combined candidates require HF and split-M requires the N8 contract" {
+    try validateCombined(.hf_modelopt, true, true, true);
+    try validateCombined(.hf_modelopt, false, false, true);
+    try validateCombined(.mlx_sanitized, false, false, false);
+    try std.testing.expectError(error.UnsupportedQwenExpertUp, validateCombined(.hf_modelopt, false, true, false));
+    try std.testing.expectError(error.UnsupportedQwenExpertUp, validateCombined(.mlx_sanitized, true, true, false));
+    try std.testing.expectError(error.UnsupportedQwenQuantReuse, validateCombined(.mlx_sanitized, false, false, true));
+}
+
+test "quant graph plans derive compatible groups and attest all quant lane reduction arguments" {
+    var e: Engine = undefined;
+    e.gpa = std.testing.allocator;
+    e.x = 1024;
+    var m: modelopt.Bindings = undefined;
+    m.rows = 1048576;
+    m.part = 2097152;
+    m.ck.clusters = false;
+    m.ck.quant8_fn.handle = @ptrFromInt(1);
+    m.ck.lane[0].handle = @ptrFromInt(2);
+    m.ck.reduce.handle = @ptrFromInt(3);
+    e.modelopt = m;
+    const w: cuda.qlinear.Weight = .{ .fp8 = .{ .mode = .fp8, .codes = 256, .scales = 0, .n = 64, .k = 4096, .npad = 128, .act = 0.5, .scale = 0.25 } };
+    var projections = [_]Proj{ .{ .linear = w }, .{ .linear = w }, .{ .linear = w } };
+    var list: std.ArrayList(Engine.CkProjection) = .empty;
+    defer list.deinit(e.gpa);
+    var shape: Engine.Shape = .{ .total = 16, .nseg = 1, .record = false, .prompt = true, .taps = false, .reuse_fp8_quant = true };
+    try e.addCkGroup(&list, &projections, &.{ 3145728, 4194304, 5242880 }, shape);
+    try std.testing.expectEqual(@as(usize, 3), list.items.len);
+    try std.testing.expect(list.items[0].quant and !list.items[1].quant and !list.items[2].quant);
+    inline for (.{ .quant, .lane, .reduce }) |kind| {
+        var want = e.ckNode(list.items[1], kind);
+        const pristine = want;
+        var actual: cuda.abi.KernelNodeParams = .{ .func = want.function, .grid_x = @intCast(want.grid[0]), .grid_y = @intCast(want.grid[1]), .grid_z = @intCast(want.grid[2]), .block_x = @intCast(want.threads), .block_y = 1, .block_z = 1, .shared_bytes = @intCast(want.shared), .params = want.args.pointers(), .extra = null };
+        try pristine.check(actual);
+        for (0..want.args.count) |i| {
+            want.args.storage[want.args.offsets[i]] ^= 1;
+            try std.testing.expectError(error.QwenQuantGraphArgumentMismatch, pristine.check(actual));
+            want.args.storage[want.args.offsets[i]] ^= 1;
+        }
+        actual.grid_x += 1;
+        try std.testing.expectError(error.QwenQuantGraphKernelMismatch, pristine.check(actual));
+    }
+    list.clearRetainingCapacity();
+    projections[2].linear.fp8.act = 0.25;
+    try e.addCkGroup(&list, &projections, &.{ 3145728, 4194304, 5242880 }, shape);
+    for (list.items) |p| try std.testing.expect(p.quant);
+    list.clearRetainingCapacity();
+    projections[2].linear = .{ .bf16 = w.fp8 };
+    try e.addCkGroup(&list, &projections, &.{ 3145728, 4194304, 5242880 }, shape);
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+    for (list.items) |p| try std.testing.expect(p.quant);
+    list.clearRetainingCapacity();
+    projections[2].linear = w;
+    shape.reuse_fp8_quant = false;
+    try e.addCkGroup(&list, &projections, &.{ 3145728, 4194304, 5242880 }, shape);
+    for (list.items) |p| try std.testing.expect(p.quant);
 }
 
 test "bounded HF admission is opt in and does not imply recorded windows" {
@@ -1112,16 +1447,16 @@ test "bounded HF admission is opt in and does not imply recorded windows" {
 }
 
 test "bounded HF graph keys separate every row count layout expert arm and head mode" {
-    var keys: [128]u32 = undefined;
+    var keys: [512]u32 = undefined;
     var count: usize = 0;
-    for (1..17) |rows| for ([_]Cache.GdnLayout{ .value_key, .key_value }) |layout| for ([_]bool{ false, true }) |n8| for ([_]bool{ false, true }) |heads| {
-        const shape: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .gdn_layout = layout, .expert_up_n8 = n8, .heads_all = heads };
+    for (1..17) |rows| for ([_]Cache.GdnLayout{ .value_key, .key_value }) |layout| for ([_]bool{ false, true }) |n8| for ([_]bool{ false, true }) |heads| for ([_]bool{ false, true }) |split| for ([_]bool{ false, true }) |reuse| {
+        const shape: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .gdn_layout = layout, .expert_up_n8 = n8, .heads_all = heads, .expert_up_split_m = split, .reuse_fp8_quant = reuse };
         const key = shape.key();
         try std.testing.expect(std.mem.indexOfScalar(u32, keys[0..count], key) == null);
         keys[count] = key;
         count += 1;
     };
-    try std.testing.expectEqual(@as(usize, 128), count);
+    try std.testing.expectEqual(@as(usize, 512), count);
 }
 
 test "bounded HF chain views retain every state binding and reject field corruption" {
