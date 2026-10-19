@@ -14,6 +14,7 @@ pub const Scratch = struct {
     hist: u64 = 0,
     act: u64 = 0,
     y: u64 = 0,
+    shared: u64 = 0,
 
     /// Carves it from `t` (the engine's scratch taker) for `most` rows.
     pub fn carve(t: anytype, g: E.Geometry, most: usize) !Scratch {
@@ -30,23 +31,28 @@ pub const Scratch = struct {
             .hist = try t.alloc(((pairs + 1023) / 1024) * count * 4),
             .act = try t.alloc(pairs * g.intermediate * 2),
             .y = try t.alloc(pairs * g.hidden * 4),
+            .shared = try t.alloc(most * g.hidden * 2),
         };
     }
 };
 
 /// Routed experts over `total` normed rows at x into out; `wide` rows take the prefill kernels, else decode's.
-pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, x: u64, out: u64, total: usize, wide: bool) !void {
+pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, shared: @import("cuda_layers.zig").SharedExpert, x: u64, out: u64, total: usize, wide: bool) !void {
     const g = e.g;
     const s = e.routed;
-    const slots = g.slots();
-    const count = g.experts + 1;
+    const slots = if (shared == .projected) g.top_k else g.slots();
+    const count = if (shared == .projected) g.experts else g.experts + 1;
     const pairs = total * slots;
     const tile: usize = if (wide) 64 else 16;
     const items = cuda.grouped.maxItems(pairs, count, tile);
     const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
-    const grouped: cuda.experts.Grouped = .{ .affine4 = &e.experts, .affine3 = &e.experts3 };
-    try e.moe.route(e.stream, x, g.hidden, total, router, s.logits, g.hidden, count);
-    try e.moe.pick(e.stream, s.logits, s.picks, s.wts, total, g.experts, g.top_k);
+    const grouped: cuda.experts.Grouped = .{ .affine4 = &e.experts, .affine3 = &e.experts3, .nvfp4 = if (e.modelopt) |*m| &m.nvfp4_experts else null };
+    if (shared == .projected) {
+        try e.modelopt.?.router.route(e.stream, x, router, router + g.experts * g.hidden * 2, s.picks, s.wts, s.logits);
+    } else {
+        try e.moe.route(e.stream, x, g.hidden, total, router, s.logits, g.hidden, count);
+        try e.moe.pick(e.stream, s.logits, s.picks, s.wts, total, g.experts, g.top_k);
+    }
     try e.plan.route(e.stream, s.picks, pairs, count, tile, plan);
     const rows_in: cuda.experts.Rows = .{ .x = x, .stride = g.hidden, .slots = slots };
     const act_in: cuda.experts.Rows = .{ .x = s.act, .stride = g.intermediate };
@@ -57,5 +63,15 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, x: u64, out: u
         try grouped.decode(e.stream, .up, rows_in, layer, plan, s.act, items, -1);
         try grouped.decode(e.stream, .down_f32, act_in, layer, plan, s.y, items, -1);
     }
-    try e.moe.combine(e.stream, s.y, !wide, s.wts, out, total, slots, g.hidden);
+    switch (shared) {
+        .stacked => try e.moe.combine(e.stream, s.y, !wide, s.wts, out, total, slots, g.hidden),
+        .projected => |m| {
+            const width = m.gate.outputs();
+            try e.proj(m.gate, x, e.gate, total, false);
+            try e.proj(m.up, x, e.up, total, false);
+            try e.run(e.fns.mlp_act, .{ (total * width + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, @as(c_longlong, @intCast(total * width)), e.tables.ptr + E.Engine.params_at, @as(c_int, @intCast(width)) });
+            try e.proj(m.down, e.act, s.shared, total, false);
+            try e.modelopt.?.router.combine(e.stream, s.y, s.wts, s.shared, out);
+        },
+    }
 }

@@ -6,6 +6,9 @@ const geometry = @import("cuda_geometry.zig");
 const weights = @import("cuda_weights.zig");
 const caches = @import("cuda_cache.zig");
 const routed = @import("cuda_routed.zig");
+const checkpoint = @import("cuda_checkpoint.zig");
+const modelopt = @import("cuda_modelopt.zig");
+const hf = @import("cuda_hf.zig");
 
 pub const Geometry = geometry.Geometry;
 pub const Cache = caches.Cache;
@@ -63,6 +66,10 @@ pub const Engine = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
     g: Geometry,
+    placement: checkpoint.Placement,
+    numerics: checkpoint.Numerics,
+    modelopt: ?modelopt.Bindings = null,
+    captured: bool = true,
     geo: Geo,
     stream: cuda.Stream,
     mods: [16]cuda.Module,
@@ -142,14 +149,23 @@ pub const Engine = struct {
     const rules_at = rowanc_at + max_rows * 4;
     const meta_at = rules_at + most_verify * @sizeOf(cuda.sample.Rule);
     const tokens_at = meta_at + most_verify * 4;
-    const params_at = tokens_at + most_verify * 4; // two unused words, the rows, the windows, record
+    pub const params_at = tokens_at + most_verify * 4; // two unused words, the rows, the windows, record
     const src_at = params_at + 8 * 4; // an image chunk's rows' feature rows
     const mpos_at = src_at + max_rows * 4; // and their t, h and w positions, max_rows apart (qwen35.cuh's MAXR)
     const tables_len = mpos_at + 3 * max_rows * 4;
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kv8: bool) !*Engine {
-        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         const g = try Geometry.read(gpa, io, dir);
+        return initPlaced(gpa, io, ctx, dir, .{ .geometry = g, .encoding = .mlx }, .{ .first = 0, .end = g.layers, .total = g.layers }, kv8);
+    }
+
+    pub fn initPlaced(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, admitted: checkpoint.Admitted, placement: checkpoint.Placement, kv8: bool) !*Engine {
+        const g = try placement.localGeometry(admitted.geometry);
+        if (admitted.numerics() == .hf_modelopt and kv8) return error.UnsupportedQwenKv;
+        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+        var ck = try core.Checkpoint.openModel(gpa, io, dir);
+        defer ck.close();
+        const allocation = try weights.plan(&ck, admitted, placement);
         const d = ctx.d;
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
@@ -157,6 +173,10 @@ pub const Engine = struct {
         e.gpa = gpa;
         e.d = d;
         e.g = g;
+        e.placement = placement;
+        e.numerics = admitted.numerics();
+        e.modelopt = null;
+        e.captured = true;
         e.geo = .{ .hid = @intCast(g.hidden), .nk = @intCast(g.k_heads), .nv = @intCast(g.v_heads), .qh = @intCast(g.q_heads), .kvh = @intCast(g.kv_heads), .nl = @intCast(g.deltas()) };
         e.verify_rows = most_verify;
         e.kv8 = kv8;
@@ -167,7 +187,7 @@ pub const Engine = struct {
         e.features = 0;
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
-        e.arena = try DeviceBuffer.alloc(d, weights.total(g) + try e.scratch(.measure));
+        e.arena = try DeviceBuffer.alloc(d, allocation.weights_bytes + try e.scratch(.measure));
         errdefer e.arena.free();
         try e.arena.fill8(0, null); // touched once now: the driver commits memory on first touch, slowly
         const kk = cuda.kernels;
@@ -192,15 +212,15 @@ pub const Engine = struct {
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
         e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
+        if (e.numerics == .hf_modelopt) e.modelopt = try modelopt.Bindings.load(ctx, &e.fns);
+        errdefer if (e.modelopt) |*m| m.unload();
         e.layers = try gpa.alloc(Layer, g.layers);
         errdefer gpa.free(e.layers);
-        var ck = try core.Checkpoint.openModel(gpa, io, dir);
-        defer ck.close();
         {
             // each projection as stored, packed from here; freed before the server counts what streams can use
-            var stage = try DeviceBuffer.alloc(d, weights.stageBytes(g));
+            var stage = try DeviceBuffer.alloc(d, allocation.staging_bytes);
             defer stage.free();
-            try weights.load(e, &ck, &stage);
+            try weights.loadPlaced(e, &ck, &stage, admitted, placement);
         }
         _ = try e.scratch(.allocate);
         e.tables = try DeviceBuffer.alloc(d, tables_len);
@@ -209,7 +229,7 @@ pub const Engine = struct {
         errdefer e.staged.free();
         e.host_logits = try cuda.HostBuffer.alloc(d, most_verify * g.vocab * 2);
         errdefer e.host_logits.free();
-        try e.warm(gpa);
+        if (e.numerics == .mlx_sanitized) try e.warm(gpa);
         return e;
     }
 
@@ -237,6 +257,7 @@ pub const Engine = struct {
         e.tables.free();
         e.arena.free();
         e.gpa.free(e.layers);
+        if (e.modelopt) |*m| m.unload();
         e.affine.deinit();
         e.wide.deinit();
         for (&e.mods) |*m| m.unload();
@@ -246,7 +267,7 @@ pub const Engine = struct {
 
     /// A stream's device bytes at a `cap`-token window: recurrences, convolution tails, keys and values, taps, log.
     pub fn streamBytes(e: *const Engine, cap: usize) usize {
-        return e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + e.g.logBytes(most_window);
+        return e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + e.g.logBytes(if (e.numerics == .hf_modelopt) 1 else most_window);
     }
 
     /// A stream's tap ring: tap_rows rows of the tapped layers' residuals.
@@ -256,6 +277,7 @@ pub const Engine = struct {
 
     /// The layers a drafter taps, told before the streams' caches exist; each forward then fills their rings.
     pub fn setTaps(e: *Engine, taps: []const u32) !void {
+        if (e.numerics == .hf_modelopt) return error.UnsupportedQwenTaps;
         if (taps.len > e.taps.len) return error.TooManyTaps;
         for (taps) |t| if (t >= e.g.layers) return error.BadTap;
         @memcpy(e.taps[0..taps.len], taps);
@@ -268,6 +290,13 @@ pub const Engine = struct {
         if (at + bytes > e.arena.len) return error.ArenaExhausted;
         e.arena_at = at + bytes;
         return e.arena.ptr + at;
+    }
+
+    pub fn scratchBytes(admitted: checkpoint.Admitted, placement: checkpoint.Placement) !usize {
+        var e: Engine = undefined;
+        e.g = try placement.localGeometry(admitted.geometry);
+        e.numerics = admitted.numerics();
+        return e.scratch(.measure);
     }
 
     /// The scratch rows' bytes (`measure`: summed, nothing taken), or the rows themselves from the arena.
@@ -284,11 +313,13 @@ pub const Engine = struct {
         };
         const t = Take{ .e = e, .mode = mode, .total = &total };
         const g = e.g;
-        const R = max_rows;
+        const R: usize = if (e.numerics == .hf_modelopt) 1 else max_rows;
+        const fp: usize = if (e.numerics == .hf_modelopt) 4 else 2;
         const wide = @max(g.valueWidth(), g.attnWidth(), g.hidden); // y and mix: either mixer's rows
         inline for (.{ "h", "x", "r" }) |name| @field(e, name) = try t.alloc(R * g.hidden * 2);
-        inline for (.{ "y", "mix", "z", "v" }) |name| @field(e, name) = try t.alloc(R * wide * 2);
-        inline for (.{ "q", "k" }) |name| @field(e, name) = try t.alloc(R * g.k_heads * geometry.dk * 2);
+        e.y = try t.alloc(R * wide * fp);
+        inline for (.{ "mix", "z", "v" }) |name| @field(e, name) = try t.alloc(R * wide * 2);
+        inline for (.{ "q", "k" }) |name| @field(e, name) = try t.alloc(R * g.k_heads * geometry.dk * fp);
         e.qkv = try t.alloc(R * g.convWidth() * 2);
         inline for (.{ "gate", "up", "act" }) |name| @field(e, name) = try t.alloc(R * g.intermediate * 2);
         e.xs = try t.alloc(R * (@max(g.intermediate, wide) / 64) * 4);
@@ -301,6 +332,14 @@ pub const Engine = struct {
         e.pl = try t.alloc(R * g.q_heads * max_chunks * 4);
         e.po = try t.alloc(R * g.q_heads * max_chunks * head_dim * 4);
         e.logits = try t.alloc(most_verify * g.vocab * 2);
+        if (e.numerics == .hf_modelopt) {
+            const rows = try t.alloc(@max(g.convWidth(), wide));
+            const part = try t.alloc(8 << 20);
+            if (mode == .allocate) {
+                e.modelopt.?.rows = rows;
+                e.modelopt.?.part = part;
+            }
+        }
         if (g.moe()) e.routed = try routed.Scratch.carve(t, g, R);
         return total;
     }
@@ -319,11 +358,16 @@ pub const Engine = struct {
 
     /// `proj` with group sums `xs` and device counts `params` (0: all real); prompts past 16 rows take a prompt GEMM.
     pub fn projSums(e: *Engine, l: Proj, x: u64, xs: u64, out: u64, rows: usize, prompt: bool, params: u64) !void {
+        if (l == .linear) {
+            const m = &(e.modelopt orelse return error.QwenFormatNotLoaded);
+            return m.linear().decode(e.stream, l.linear, .{ .x = x, .part = m.part }, out, rows);
+        }
         const n_out = l.outputs();
         const k = l.inputs();
         if (prompt and rows > 16) return switch (l) {
             .a4 => |q| e.affine.prompt(e.stream, x, q, out, rows),
             .an => |q| e.wide.prompt(e.stream, x, q, out, rows),
+            .linear => unreachable,
         };
         try e.run(e.fns.sums, .{ rows, 1, 1 }, .{ 32, 1, 1 }, .{ x, xs, @as(c_int, @intCast(k)), params });
         var at: usize = 0;
@@ -335,6 +379,7 @@ pub const Engine = struct {
             switch (l) {
                 .a4 => |q| try e.affine.decode(e.stream, xa, sa, q, oa, n),
                 .an => |q| try e.wide.decode(e.stream, xa, sa, q, oa, n),
+                .linear => unreachable,
             }
         }
     }
@@ -346,7 +391,7 @@ pub const Engine = struct {
     }
 
     fn norm(e: *Engine, residual: bool, w: u64, rows: usize) !void {
-        try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at });
+        try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ if (e.numerics == .hf_modelopt) (hf.Launches{}).norm else 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at });
     }
 
     /// A chain row's rowanc: its index in its window, as a prompt chunk's rows outnumber the bits.
@@ -373,7 +418,19 @@ pub const Engine = struct {
 
     /// One forward over `parts`' windows, `ids` in order; `keep` names the kept rows; an unkept verify is kept first.
     pub fn forward(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
+        if (!e.placement.ownsEmbedding() or !e.placement.ownsHead()) return error.QwenRequiresPipeline;
+        const shape = try e.prepare(parts, ids, keep);
+        try e.execute(shape);
+        try e.finish(parts, keep, shape);
+        commit(parts, shape.record);
+    }
+
+    pub fn prepare(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !Shape {
         const g = e.g;
+        if (e.numerics == .hf_modelopt) {
+            if (parts.len != 1 or ids.len != 1 or parts[0].rows != 1 or keep != .last) return error.UnsupportedQwenWindow;
+            if (parts[0].parents != null or parts[0].images != null) return error.UnsupportedQwenWindow;
+        }
         var total: usize = 0;
         for (parts) |p| {
             try p.cache.settle(e);
@@ -388,7 +445,6 @@ pub const Engine = struct {
         for (ids) |id| if (id >= g.vocab) return error.InvalidQwenToken;
         for (parts) |p| if (p.parents != null and !record) return error.InvalidQwenParents;
         for (parts) |p| if (p.images != null and record) return error.InvalidQwenImages;
-        const heads: usize = if (record) total else 1;
         // the prompt GEMM only for prompt chunks: a window's rows keep the bits of one-row steps
         const prompt = !record;
         // the tables
@@ -432,10 +488,13 @@ pub const Engine = struct {
         const bucket: usize = if (lone) 1 else if (total <= 16) 16 else most_verify;
         const windows: usize = if (lone) 1 else max_segs;
         const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0 };
-        if (prompt) {
+        e.features = if (images) |im| im.features else 0;
+        return shape;
+    }
+
+    pub fn execute(e: *Engine, shape: Shape) !void {
+        if (shape.prompt and e.numerics == .mlx_sanitized or !e.captured) {
             // uncaptured: a prompt chunk's GEMMs dwarf its launches, and each length's graph would pay the stall
-            e.features = if (images) |im| im.features else 0;
-            defer e.features = 0;
             try e.body(shape);
         } else {
             const gop = try e.graphs.getOrPut(e.gpa, shape.key());
@@ -454,11 +513,25 @@ pub const Engine = struct {
             }
             try gop.value_ptr.launchOn(e.stream);
         }
+    }
+
+    pub fn commit(parts: []const Part, record: bool) void {
         for (parts) |p| {
             p.cache.last = if (record and p.rows > 1) .{ .start = p.cache.len, .rows = p.rows } else null;
             p.cache.len += p.rows;
             p.cache.written = p.cache.len;
         }
+    }
+
+    pub fn finish(e: *Engine, parts: []const Part, keep: Keep, shape: Shape) !void {
+        if (!e.placement.ownsHead()) {
+            try e.stream.synchronize();
+            return;
+        }
+        const g = e.g;
+        var total: usize = 0;
+        for (parts) |p| total += p.rows;
+        const heads: usize = if (shape.record) total else 1;
         switch (keep) {
             .draws => |pk| {
                 const toks = e.tables.ptr + tokens_at;
@@ -482,7 +555,7 @@ pub const Engine = struct {
     }
 
     /// A forward's shape, which fixes its launches: its tables and the caches' lengths are read on the device.
-    const Shape = struct {
+    pub const Shape = struct {
         total: u8,
         nseg: u8,
         record: bool,
@@ -510,15 +583,17 @@ pub const Engine = struct {
         const t_params = e.tables.ptr + params_at;
         const geo = e.geo;
         const group = g.q_heads / g.kv_heads;
+        const is_hf = e.numerics == .hf_modelopt;
+        const launch: hf.Launches = .{};
 
-        try e.embed(t_ids, e.h, total, t_params);
+        if (e.placement.ownsEmbedding()) try e.embed(t_ids, e.h, total, t_params);
         // an image chunk's rows take the tower's features, and rotate at their staged t, h, w positions
         const mpos: u64 = if (e.features != 0) e.tables.ptr + mpos_at else 0;
         if (e.features != 0) try e.run(e.fns.splice, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.features, e.tables.ptr + src_at, @as(c_int, @intCast(g.hidden)), t_params });
         var di: usize = 0;
         var ai: c_int = 0;
         for (e.layers, 0..) |l, i| {
-            try e.norm(i != 0, l.input_norm, total);
+            try e.norm(e.placement.first + i != 0, l.input_norm, total);
             switch (l.mixer) {
                 .delta => |m| {
                     const layer: c_int = @intCast(di);
@@ -526,10 +601,10 @@ pub const Engine = struct {
                     try e.proj(m.z, e.x, e.z, total, prompt);
                     try e.proj(m.a, e.x, e.a, total, prompt);
                     try e.proj(m.b, e.x, e.b, total, prompt);
-                    try e.run(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
+                    try e.run(e.fns.gdn_pre, .{ 1, 2 * g.k_heads + g.v_heads, total }, .{ if (is_hf) launch.gdn_pre else 32, 1, 1 }, .{ geo, e.qkv, t_segs, t_rows, t_par, layer, m.conv, e.a, e.b, m.a_log, m.dt_bias, e.q, e.k, e.v, e.g_, e.beta, t_params });
                     try e.run(e.fns.conv_commit, .{ (g.convWidth() + 255) / 256, nseg, 1 }, .{ 256, 1, 1 }, .{ geo, e.qkv, t_segs, t_par, layer, t_params });
-                    try e.run(e.fns.gdn_chain, .{ 1, geometry.dk / 4, g.v_heads * nseg }, .{ 32, 4, 1 }, .{ geo, e.q, e.k, e.v, e.g_, e.beta, t_segs, t_par, layer, e.y, t_params });
-                    try e.run(e.fns.gdn_post, .{ 1, g.v_heads, total }, .{ 32, 1, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params });
+                    try e.run(e.fns.gdn_chain, .{ 1, if (is_hf) launch.gdn_chain_grid_y else geometry.dk / 4, g.v_heads * nseg }, if (is_hf) launch.gdn_chain else .{ 32, 4, 1 }, .{ geo, e.q, e.k, e.v, e.g_, e.beta, t_segs, t_par, layer, e.y, t_params });
+                    try e.run(e.fns.gdn_post, .{ 1, g.v_heads, total }, .{ if (is_hf) launch.gdn_post else 32, 1, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params });
                     try e.proj(m.out, e.mix, e.r, total, prompt);
                     di += 1;
                 },
@@ -538,11 +613,11 @@ pub const Engine = struct {
                     try e.proj(m.q, e.x, e.qraw, total, prompt);
                     try e.proj(m.k, e.x, e.kraw, total, prompt);
                     try e.proj(m.v, e.x, e.vraw, total, prompt);
-                    try e.run(e.fns.head_norm, .{ total * g.q_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.qraw, m.q_norm, e.qn, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), g.eps, t_params });
-                    try e.run(e.fns.head_norm, .{ total * g.kv_heads, 1, 1 }, .{ 64, 1, 1 }, .{ e.kraw, m.k_norm, e.kn, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(g.kv_heads * head_dim)), @as(c_int, head_dim), g.eps, t_params });
+                    try e.run(e.fns.head_norm, .{ total * g.q_heads, 1, 1 }, .{ if (is_hf) launch.head_norm else 64, 1, 1 }, .{ e.qraw, m.q_norm, e.qn, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), g.eps, t_params });
+                    try e.run(e.fns.head_norm, .{ total * g.kv_heads, 1, 1 }, .{ if (is_hf) launch.head_norm else 64, 1, 1 }, .{ e.kraw, m.k_norm, e.kn, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(g.kv_heads * head_dim)), @as(c_int, head_dim), g.eps, t_params });
                     try e.run(if (e.kv8) e.fp8.rope else e.fns.rope, .{ total, 1, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qn, e.kn, e.vraw, t_segs, t_rows, t_anc, ai, t_params, mpos });
-                    try e.run(if (e.kv8) e.fp8.attn_partial else e.fns.attn_partial, .{ max_chunks, g.kv_heads, total }, .{ 32 * group, 1, 1 }, .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po });
-                    try e.run(e.fns.attn_merge, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
+                    try e.run(if (e.kv8) e.fp8.attn_partial else e.fns.attn_partial, .{ if (is_hf) 1 else max_chunks, if (is_hf) g.q_heads else g.kv_heads, total }, if (is_hf) launch.attn_partial else .{ 32 * group, 1, 1 }, .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po });
+                    try e.run(e.fns.attn_merge, .{ g.q_heads, total, 1 }, .{ if (is_hf) launch.attn_merge else 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
                     try e.run(e.fns.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params });
                     try e.proj(m.o, e.mix, e.r, total, prompt);
                     ai += 1;
@@ -557,12 +632,13 @@ pub const Engine = struct {
                     try e.run(e.fns.mlp_act, .{ (total * g.intermediate + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)) });
                     try e.proj(m.down, e.act, e.r, total, prompt);
                 },
-                .moe => |m| try e.routedRows(m.router, m.experts, e.x, e.r, total, prompt and total > most_window),
+                .moe => |m| try e.routedRows(m.router, m.experts, m.shared, e.x, e.r, total, prompt and total > most_window),
             }
             if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == i) {
                 try e.run(e.fns.tap, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
             };
         }
+        if (!e.placement.ownsHead()) return;
         try e.norm(true, e.final_norm, total);
         // the head over the kept rows
         try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);

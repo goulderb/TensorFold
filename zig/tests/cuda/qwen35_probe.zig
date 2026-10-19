@@ -97,8 +97,13 @@ pub fn main(init: std.process.Init) !u8 {
 fn plan(init: std.process.Init, dir: []const u8) !u8 {
     const a = init.arena.allocator();
     const cfg = try qwen.Config.read(init.gpa, init.io, dir);
-    const first = try qwen.weights.planPartition(init.gpa, init.io, dir, cfg, 0, 20);
-    const last = try qwen.weights.planPartition(init.gpa, init.io, dir, cfg, 20, 40);
+    var ck = try core.Checkpoint.openModel(init.gpa, init.io, dir);
+    defer ck.close();
+    const admitted: qwen.checkpoint.Admitted = .{ .geometry = cfg.geometry, .encoding = .{ .modelopt = cfg } };
+    const left: qwen.checkpoint.Placement = .{ .first = 0, .end = 20, .total = 40 };
+    const right: qwen.checkpoint.Placement = .{ .first = 20, .end = 40, .total = 40 };
+    const first = try qwen.weights.plan(&ck, admitted, left);
+    const last = try qwen.weights.plan(&ck, admitted, right);
     const Row = struct { context: usize, streams: usize, devices: [2]qwen.engine.MemoryBudget };
     var rows: std.ArrayList(Row) = .empty;
     for ([_]usize{ 4096, 32768, 65536, 131072 }) |context| {
@@ -106,8 +111,8 @@ fn plan(init: std.process.Init, dir: []const u8) !u8 {
             .context = context,
             .streams = streams,
             .devices = .{
-                try qwen.engine.memoryBudget(first, cfg, 0, 20, context, streams),
-                try qwen.engine.memoryBudget(last, cfg, 20, 40, context, streams),
+                try qwen.engine.memoryBudget(first, admitted, left, context, streams),
+                try qwen.engine.memoryBudget(last, admitted, right, context, streams),
             },
         });
     }

@@ -38,7 +38,7 @@ pub const Cache = struct {
         var kv = try DeviceBuffer.alloc(e.d, e.g.kvBytes(cap, e.kv8));
         errdefer kv.free();
         try kv.fill8(0, null); // touched now, not as the first request's keys land (the driver commits on first touch)
-        var log = try DeviceBuffer.alloc(e.d, e.g.logBytes(engine.most_window));
+        var log = try DeviceBuffer.alloc(e.d, e.g.logBytes(if (e.numerics == .hf_modelopt) 1 else engine.most_window));
         errdefer log.free();
         try log.fill8(0, null);
         var tap: ?DeviceBuffer = null;
@@ -75,6 +75,7 @@ pub const Cache = struct {
 
     /// Keeps `path` (window rows, ascending from 0): the state as that chain would leave it, a tree's keys moved down.
     pub fn keep(self: *Cache, e: *Engine, path: []const u32) !void {
+        if (e.numerics == .hf_modelopt) return error.UnsupportedQwenRewind;
         const last = self.last orelse return error.NothingToKeep;
         if (path.len == 0 or path.len > last.rows or path[0] != 0) return error.NothingToKeep;
         var p: Path = .{ .n = @intCast(path.len), .rows = @splat(0) };

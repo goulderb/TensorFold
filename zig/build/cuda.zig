@@ -415,6 +415,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     qwen35_run.has_side_effects = true;
     const qwen35_step = b.step("test-qwen35-cuda-host", "Qwen35 CUDA checkpoint and execution contracts without GPU work");
     qwen35_step.dependOn(&qwen35_run.step);
+    qwen35_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35 })).step);
     const sampler_turn = b.createModule(.{
         .root_source_file = b.path("zig/tests/cuda/qwen35_sampler_turn.zig"),
         .target = host,
