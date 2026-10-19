@@ -236,7 +236,7 @@ const Partition = struct {
         const plan: cuda.grouped.Plan = .{ .members = b.members, .items = b.items, .counts = b.counts, .rank = 0, .hist = 0 };
         try o.router.route(s, b.picks, 8, 256, 16, plan);
         try tap.mark(.expert_plan);
-        try o.grouped().decode(s, .up, .{ .x = b.x, .stride = 2048, .slots = 8 }, m.experts, plan, b.expert_hidden, 8, -1);
+        try o.nvfp4_experts.runVariant(o.expert_up_variant, s, .up, .{ .x = b.x, .stride = 2048, .slots = 8 }, m.experts, plan, b.expert_hidden, 8, -1);
         try tap.mark(.routed_up);
         try o.grouped().decode(s, .down_f32, .{ .x = b.expert_hidden, .stride = 512 }, m.experts, plan, b.pairs, 8, -1);
         try tap.mark(.routed_down);

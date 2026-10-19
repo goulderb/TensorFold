@@ -297,6 +297,12 @@ from Transformers revision `e0eb2810ac1b2caf6d082f247d8d37162ecf67a0`.
 The source headers describe the local changes. The immutable source path and
 retained license are recorded in `LICENSES/donors/README.md`.
 
+The local October 19 tuning adds an optional parallel finite-score top-eight
+selector with stable index ties, the existing ordered softmax, and a serial
+fallback for nonfinite scores. Expert screens reuse TensorFold's existing
+NVFP4 kernels and adapt its existing benchmark. No external router kernel
+is imported, and the original notices and donor credits remain applicable.
+
 ## Pictures in the native engine
 
 `zig/src/core/picture/` reads PNG, JPEG and WebP pictures to the RGB pixels Pillow loads them as (Pillow 12.3 for

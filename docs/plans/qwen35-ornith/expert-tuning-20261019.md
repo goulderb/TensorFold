@@ -140,3 +140,28 @@ old/new outputs for planted ties, signed zeros and exceptional values. At
 just over the 5% full-turn gate. This remains a projection until the matched
 full changing-token/position graph trial passes. The new symbol is optional
 and no serving path selects it during the thin proof.
+
+## Parallel selector proof
+
+The [candidate operator proof](evidence/router-tuning-20261019/r2/analysis.json)
+passes. Both GPUs match all six saved native rows and all ten planted
+tie/zero/Inf/NaN controls byte for byte. Every measured pair improves.
+Combined route median is 71.729 to 10.026 microseconds on GPU 0 and 71.752
+to 10.010 on GPU 1. Candidate combined ranges are 10.000-10.034 and
+10.004-10.145 microseconds, five samples per arm after an excluded warmup.
+
+Selection alone is approximately 65.6 to 3.94 microseconds. GPU 0 has one
+16.91-microsecond candidate selection outlier; it remains in the raw samples
+and reported range. The combined path is the relevant materiality screen.
+The demonstrated limiter was the legacy single-thread selection code; this
+does not establish physical memory-bandwidth utilization elsewhere.
+
+Transferring the combined savings unchanged projects 0.472 seconds per turn,
+or 20.8%. This earns a matched full changing-token/position comparison.
+Capture baseline and parallel graphs separately over the same session
+allocations, and verify the selected function occurs in every layer. Then
+compare the parallel graph with an additional n16_pipe4 up-only graph;
+down remains baseline because the tiny down deltas were order-sensitive.
+Require exact untimed consumed rows and timed tokens/final state, all work
+counters, five alternating pairs, and actual in-process memory readings.
+Independent numerical qualification and serving integration remain open.

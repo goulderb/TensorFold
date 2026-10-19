@@ -19,6 +19,7 @@ pub const Ops = struct {
     lane: cuda.qmmf.Lane,
     prompt: cuda.nvfp4.Prompt,
     nvfp4_experts: cuda.experts.Nvfp4Experts,
+    expert_up_variant: cuda.experts.Nvfp4Experts.Variant = .baseline,
     pack: cuda.modelopt.Packer,
     ck: cuda.ck.Ck,
     router: cuda.grouped.Router,

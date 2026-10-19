@@ -13,7 +13,7 @@ comptime {
     if (options.engine_optimization != .fast) @compileError("diagnostics require ReleaseFast engine");
 }
 
-const Input = struct { prompt: []const u32, token: u32, repetitions: usize = 16, expert_fixture: ?[]const u8 = null, expert_fixture_sha256: ?[]const u8 = null, router_screen: bool = false, router_candidate: bool = false };
+const Input = struct { prompt: []const u32, token: u32, repetitions: usize = 16, expert_fixture: ?[]const u8 = null, expert_fixture_sha256: ?[]const u8 = null, router_screen: bool = false, router_candidate: bool = false, router_turns: bool = false };
 const Journal = struct {
     a: std.mem.Allocator,
     io: std.Io,
@@ -174,6 +174,7 @@ fn step(s: *qwen.Session, token: u32, position: usize, graphs: ?[]const Captured
 fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
     const input = try std.json.parseFromSliceLeaky(Input, a, bytes, .{});
+    if (input.router_turns and (input.expert_fixture != null or input.expert_fixture_sha256 != null or input.router_screen or input.router_candidate)) return error.ConflictingDiagnosticModes;
     if ((input.expert_fixture == null) != (input.expert_fixture_sha256 == null)) return error.InvalidExpertFixturePin;
     if (input.router_screen and input.expert_fixture == null) return error.RouterScreenRequiresPinnedFixture;
     if (input.router_candidate and !input.router_screen) return error.RouterCandidateRequiresRouterScreen;
@@ -324,6 +325,148 @@ fn graphGeneration(init: std.process.Init, s: *qwen.Session, input: Input, hash_
     };
 }
 
+const TurnMode = enum {
+    baseline,
+    parallel,
+    parallel_up,
+
+    fn selectSymbol(mode: TurnMode) [:0]const u8 {
+        return if (mode == .baseline) "tf_qwen35_route_select" else "tf_qwen35_route_select_parallel";
+    }
+
+    fn upVariant(mode: TurnMode) cuda.experts.Nvfp4Experts.Variant {
+        return if (mode == .parallel_up) .n16_pipe4 else .baseline;
+    }
+
+    fn apply(mode: TurnMode, s: *qwen.Session) !void {
+        for (s.engine.partitions) |*p| {
+            try p.context.makeCurrent();
+            p.ops.cooperative_route = true;
+            p.ops.route_select_fn = try p.ops.image.function(mode.selectSymbol());
+            p.ops.expert_up_variant = mode.upVariant();
+        }
+    }
+};
+
+fn turnMemory(s: *qwen.Session, j: Journal, stage: []const u8, mode: TurnMode, comparison: []const u8, pair: usize, order: usize) !void {
+    for (s.engine.partitions, 0..) |*p, rank| {
+        try p.context.makeCurrent();
+        const memory = try p.context.memInfo();
+        try j.write(.{ .kind = "optimized_memory", .stage = stage, .arm = @tagName(mode), .comparison = comparison, .pair = pair, .order = order, .rank = rank, .free_bytes = memory.free, .floor_bytes = qwen.floor_bytes });
+        if (memory.free < qwen.floor_bytes) return error.GpuMemoryFloor;
+    }
+}
+
+fn inspectTurnGraph(a: std.mem.Allocator, replay: *generation_graph.Replay, mode: TurnMode, j: Journal) !void {
+    const X = cuda.experts.Nvfp4Experts;
+    var total_nodes: usize = 0;
+    var dynamic_nodes: usize = 0;
+    for (&replay.partitions, replay.session.engine.partitions, 0..) |*graph, *p, rank| {
+        try p.context.makeCurrent();
+        const select = try p.ops.image.function(mode.selectSymbol());
+        const up = if (mode == .parallel_up) p.ops.nvfp4_experts.candidate_fns[2][0] else p.ops.nvfp4_experts.fns[0];
+        const down = p.ops.nvfp4_experts.fns[1];
+        const grid: c_uint = if (mode == .parallel_up) 64 else 32;
+        var select_count: usize = 0;
+        var up_count: usize = 0;
+        var down_count: usize = 0;
+        const nodes = try a.alloc(cuda.graph.Node, graph.nodes);
+        defer a.free(nodes);
+        for (try graph.graph.nodes(nodes)) |node| {
+            var params: cuda.abi.KernelNodeParams = undefined;
+            try graph.exec.d.check(graph.exec.d.api.cuGraphKernelNodeGetParams_v2(node, &params), "cuGraphKernelNodeGetParams");
+            if (params.func == select.handle) {
+                select_count += 1;
+                if (params.grid_x != 1 or params.block_x != 256 or params.grid_y != 1 or params.grid_z != 1 or params.block_y != 1 or params.block_z != 1) return error.RouterGraphGridMismatch;
+            }
+            if (params.func == up.handle) {
+                up_count += 1;
+                if (params.grid_x != grid or params.block_x != 128 or params.grid_y != 1 or params.grid_z != 1 or params.block_y != 1 or params.block_z != 1) return error.ExpertGraphGridMismatch;
+            }
+            if (params.func == down.handle) down_count += 1;
+        }
+        if (select_count != 20 or up_count != 20 or down_count != 20) return error.OptimizedGraphFunctionCountMismatch;
+        total_nodes += graph.nodes;
+        dynamic_nodes += graph.patches.len;
+        try j.write(.{ .kind = "optimized_graph_partition", .arm = @tagName(mode), .rank = rank, .nodes = graph.nodes, .dynamic_nodes = graph.patches.len, .select_symbol = mode.selectSymbol(), .select_nodes = select_count, .select_grid = 1, .select_block = 256, .select_regs = try select.attribute(.num_regs), .select_local_bytes = try select.attribute(.local_size_bytes), .up_symbol = if (mode == .parallel_up) X.candidateSymbol(.n16_pipe4, 0) else X.symbols.gate_up, .up_variant = @tagName(mode.upVariant()), .up_nodes = up_count, .up_grid = grid, .up_block = 128, .up_regs = try up.attribute(.num_regs), .up_local_bytes = try up.attribute(.local_size_bytes), .down_symbol = X.symbols.down_f32, .down_nodes = down_count, .down_variant = "baseline" });
+    }
+    if (total_nodes != 993 or dynamic_nodes != 21) return error.OptimizedGraphNodeCountMismatch;
+}
+
+fn checkTurnWork(replay: *const generation_graph.Replay) !void {
+    if (replay.appends != 191 or replay.launches != 382 or replay.updates != 4011 or replay.session.position != 191) return error.OptimizedTurnWorkCountMismatch;
+}
+
+fn routerTurns(init: std.process.Init, s: *qwen.Session, input: Input, hash_buffer: []u8, j: Journal) !void {
+    const a = init.arena.allocator();
+    const modes = [_]TurnMode{ .baseline, .parallel, .parallel_up };
+    const setup_start = now(init.io);
+    for (s.engine.partitions) |*p| {
+        try p.context.makeCurrent();
+        const sms: usize = @intCast(try p.context.attribute(.multiprocessor_count));
+        try p.ops.nvfp4_experts.loadCandidates(sms);
+    }
+    var graphs: [3]generation_graph.Replay = undefined;
+    var captured: usize = 0;
+    defer for (graphs[0..captured]) |*graph| graph.deinit();
+    for (modes, &graphs) |mode, *graph| {
+        try mode.apply(s);
+        graph.* = try generation_graph.Replay.init(a, s);
+        captured += 1;
+        try inspectTurnGraph(a, graph, mode, j);
+        try turnMemory(s, j, "setup", mode, "setup", 0, 0);
+    }
+    try j.write(.{ .kind = "optimized_setup", .elapsed_ns = now(init.io) - setup_start, .modes = .{ "baseline", "parallel", "parallel_up" }, .graphs = 3, .nodes_per_graph = 993, .dynamic_nodes_per_graph = 21, .shared_engine_and_session = true, .context = s.engine.capacity, .prompt_tokens = input.prompt.len, .output_tokens = 128, .production_qualification = false });
+    const baseline = &graphs[0];
+    try TurnMode.baseline.apply(s);
+    try s.reset();
+    if (baseline.append(&.{ 17, 248320 })) |_| return error.InvalidAdmissionAccepted else |err| if (err != error.InvalidToken) return err;
+    s.position = s.engine.capacity;
+    if (baseline.append(&.{17})) |_| return error.InvalidAdmissionAccepted else |err| if (err != error.ContextFull) return err;
+    s.position = 0;
+    if (baseline.appends != 0 or baseline.updates != 0 or baseline.launches != 0 or s.poisoned) return error.AdmissionMutatedState;
+    try baseline.append(&.{ 17, 18 });
+    const proper = try stateHash(s, hash_buffer);
+    try s.reset();
+    try baseline.appendFrozenPosition(&.{ 17, 18 });
+    const frozen = try stateHash(s, hash_buffer);
+    if (std.mem.eql(u8, &proper, &frozen)) return error.NegativeControlInsensitive;
+    try j.write(.{ .kind = "optimized_controls", .admission_before_mutation = true, .stale_position_changes_state = true });
+    var sampler = try turn.Sampler.init(init.gpa, s.logits.len);
+    defer sampler.deinit();
+    var reference: [128]u32 = undefined;
+    var output: [128]u32 = undefined;
+    const reference_rows = try a.alloc(u16, 128 * s.logits.len);
+    const actual_rows = try a.alloc(u16, reference_rows.len);
+    baseline.clearCounts();
+    _ = try turn.runWithAppender(true, init.io, s, baseline, &sampler, .current, input.prompt, &reference, reference_rows);
+    try checkTurnWork(baseline);
+    const reference_state = try stateHash(s, hash_buffer);
+    try turnMemory(s, j, "correctness", .baseline, "correctness", 0, 0);
+    for (modes, &graphs) |mode, *graph| {
+        graph.clearCounts();
+        _ = try turn.runWithAppender(true, init.io, s, graph, &sampler, .current, input.prompt, &output, actual_rows);
+        const state = try stateHash(s, hash_buffer);
+        try checkTurnWork(graph);
+        if (!std.mem.eql(u32, &reference, &output) or !std.mem.eql(u16, reference_rows, actual_rows) or !std.mem.eql(u8, &reference_state, &state)) return error.OptimizedTurnParityMismatch;
+        try j.write(.{ .kind = "optimized_correctness", .arm = @tagName(mode), .logit_rows = 128, .exact_rows_tokens_and_final_state = true, .appends = graph.appends, .launches = graph.launches, .updates = graph.updates, .position = s.position, .statehash = &state, .tokens = output, .nodes = 993, .dynamic_nodes = 21 });
+        try turnMemory(s, j, "correctness", mode, "correctness", 0, 0);
+    }
+    for ([_][]const u8{ "router", "up" }, 0..) |comparison, comparison_index| {
+        for (0..6) |pair| for (0..2) |order| {
+            const index = comparison_index + (pair + order) % 2;
+            const graph = &graphs[index];
+            graph.clearCounts();
+            const timing = try turn.runWithAppender(false, init.io, s, graph, &sampler, .current, input.prompt, &output, &.{});
+            const state = try stateHash(s, hash_buffer);
+            try checkTurnWork(graph);
+            if (!std.mem.eql(u32, &reference, &output) or !std.mem.eql(u8, &reference_state, &state)) return error.OptimizedTurnRepeatMismatch;
+            try j.write(.{ .kind = "optimized_turn", .comparison = comparison, .arm = @tagName(modes[index]), .pair = pair, .order = order, .warmup = pair == 0, .times = timing, .appends = graph.appends, .launches = graph.launches, .updates = graph.updates, .position = s.position, .exact_tokens_and_final_state = true, .tokens = output, .statehash = &state });
+            try turnMemory(s, j, "post_turn", modes[index], comparison, pair, order);
+        };
+    }
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
@@ -364,7 +507,7 @@ fn execute(init: std.process.Init, model_dir: []const u8, input: Input, j: Journ
     var driver_open = true;
     defer if (driver_open) driver.close();
     const identities = try admitted.verify(a, &driver);
-    try j.write(.{ .kind = "start", .source_commit = options.source_commit, .identities = identities, .scope = if (input.router_screen) router_screen.scope else if (input.expert_fixture != null) "real layer0 expert seam with rotating banks" else "fixed-token fixed-position evolving-state forward diagnostic; not generation throughput", .position = input.prompt.len, .token = input.token, .repetitions = input.repetitions });
+    try j.write(.{ .kind = "start", .source_commit = options.source_commit, .identities = identities, .scope = if (input.router_turns) "matched changing-token changing-position graph turns; router and router plus expert up; not production qualification" else if (input.router_screen) router_screen.scope else if (input.expert_fixture != null) "real layer0 expert seam with rotating banks" else "fixed-token fixed-position evolving-state forward diagnostic; not generation throughput", .position = input.prompt.len, .token = input.token, .repetitions = input.repetitions });
     if (input.expert_fixture) |fixture_dir| {
         for (identities) |identity| {
             var context = try cuda.Context.init(&driver, identity.ordinal);
@@ -386,6 +529,12 @@ fn execute(init: std.process.Init, model_dir: []const u8, input: Input, j: Journ
     defer e.deinit();
     var s = try e.createSession();
     defer s.deinit();
+    if (input.router_turns) {
+        const hash_buffer = try a.alloc(u8, 8 << 20);
+        try routerTurns(init, &s, input, hash_buffer, j);
+        try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "matched changing-token changing-position graph turns", .production_qualification = false });
+        return;
+    }
     for (input.prompt) |id| try s.append(&.{id});
     const position = s.position;
     const baseline = try Snapshot.take(a, &s);
