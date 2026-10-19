@@ -192,6 +192,28 @@ only. Each `source.json` names the producer, immutable model revision and
 header hashes. Checkpoint weights are not included and retain their producers'
 separate terms.
 
+## Qwen host sampler tuning
+
+The local change at `b864564587f00f308ff9215c9870bffcd11da61f`
+extends TensorFold's existing `zig/src/core/lanes/sampling.zig` from fork
+source `ad247b3daf045015d59bd106a88591bff961e488`. Finite greedy rows use
+an allocation-free maximum scan with the original comparator. The original
+sorting and sampled body is retained for all fallback cases. TensorFold's
+original notices, contributors and seed-salt attribution remain in place;
+this change claims no authorship of the existing sampler or model math.
+
+Generated Python sampler vectors are preserved under
+`docs/plans/qwen35-ornith/evidence/tuning-20261019/`. They were recorded by
+the existing `tools/zig/record_lanes.py` and `lanes_units.py` from TensorFold's
+Python `engine/exact_sampling.py`, checkout
+`a601ddee69f2eb41bf8faf28ab14a4255e3a8f98`. Its latest file revision is
+`8a836f2d927c19c9296634d454490a045ddf0b06`, Jürgen Schmied's seed-salt
+change, already credited in `docs/credits.md`; that commit is not a claim
+of original authorship of the whole file. The fixture manifest records the
+source and generated-byte hashes. No Python source or new external kernel
+is copied into this unit. Existing TensorFold and transitive donor licenses
+and notices remain unchanged.
+
 ## Retain notices in future changes and releases
 
 Keep original copyright headers, licenses, `NOTICE`, and credit files.

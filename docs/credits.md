@@ -81,6 +81,14 @@ contributions are in it.
   [exact_sampling.py](https://github.com/ashhart/TensorFold/blob/v0.6.6/src/tensorfold/engine/exact_sampling.py)) moves
   every prompt-derived seed in the native server too.
 
+The local Qwen 35B tuning extends TensorFold's existing shared sampler with
+an allocation-free scan for finite greedy rows; it retains the original
+ordering and sampled path. Its offline vectors were recorded from the
+existing Python sampler, including the seed-salt work credited above. See
+[the fork addendum](../LICENSES/donors/README.md#qwen-host-sampler-tuning)
+for pinned sources and local changes. GLM and Flash Next informed experiment
+boundaries; no new donor kernel was copied for this sampler change.
+
 ## Prompt reuse
 
 - @nood-co1's [#190](https://github.com/ashhart/TensorFold/pull/190) evicts first a kept state its conversation has
