@@ -5,6 +5,7 @@ const qwen = @import("qwen35_cuda");
 const cuda = @import("cuda");
 const admission = @import("qwen35_probe_device.zig");
 const expert_screen = @import("qwen35_expert_screen.zig");
+const expert_latency_screen = @import("qwen35_expert_latency_screen.zig");
 const gdn_layout_screen = @import("qwen35_gdn_layout_screen.zig");
 const state_layout = @import("qwen35_state_layout.zig");
 const quant_reuse_screen = @import("qwen35_quant_reuse_screen.zig");
@@ -29,6 +30,7 @@ const Input = struct {
     expert_fixture_sha256: ?[]const u8 = null,
     expert_n8_screen: bool = false,
     expert_shard_screen: bool = false,
+    expert_latency_screen: bool = false,
     gdn_layout_screen: bool = false,
     gdn_layout_ab: bool = false,
     expert_n8_ab: bool = false,
@@ -66,6 +68,7 @@ fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     const input = try std.json.parseFromSliceLeaky(Input, a, bytes, .{});
     if (input.prompt.len == 0 or input.output_tokens == 0 or input.output_tokens > 1024 or input.context > 262144 or input.context < input.output_tokens or input.prompt.len > input.context - input.output_tokens or input.forced.len > input.output_tokens or input.repetitions == 0) return error.InvalidInput;
     try expert_screen.validateShardInput(input);
+    try expert_latency_screen.validateInput(input);
     if (input.router_screen or input.router_candidate) return error.ArchivedDiagnosticMode;
     if (input.gdn_layout_ab and input.expert_n8_ab) return error.InvalidInput;
     if ((input.gdn_layout_ab or input.expert_n8_ab) and (input.expert_fixture != null or input.gdn_layout_screen or input.quant_reuse_screen or input.transport_screen or input.forced.len != 0)) return error.InvalidInput;
@@ -415,7 +418,7 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
     const single_gpu_micro = input.expert_fixture != null or input.gdn_layout_screen or input.quant_reuse_screen;
     const micro = single_gpu_micro or input.transport_screen;
     if (micro) {
-        try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = "isolated Qwen operator screens; no model load or model throughput claim", .driver_kind = "qwen35-decode-profile", .expert_shard_screen = input.expert_shard_screen, .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
+        try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = "isolated Qwen operator screens; no model load or model throughput claim", .driver_kind = "qwen35-decode-profile", .expert_shard_screen = input.expert_shard_screen, .expert_latency_screen = input.expert_latency_screen, .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
         if (input.transport_screen) try transport_screen.run(init.gpa, init.io, .{ identities[0].ordinal, identities[1].ordinal }, j);
         if (single_gpu_micro) for (identities) |identity| {
             var driver = try cuda.Driver.open();
@@ -424,7 +427,7 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
             defer context.deinit();
             const gpu: @import("check.zig").Gpu = .{ .d = &driver, .ctx = &context, .gpa = init.gpa, .io = init.io };
             if (input.expert_fixture) |fixture| {
-                if (input.expert_shard_screen) try expert_screen.runShards(gpu, fixture, input.expert_fixture_sha256.?, j) else if (input.expert_n8_screen) try expert_screen.runN8(gpu, fixture, input.expert_fixture_sha256.?, j) else try expert_screen.run(gpu, fixture, input.expert_fixture_sha256.?, j);
+                if (input.expert_latency_screen) try expert_latency_screen.run(gpu, fixture, input.expert_fixture_sha256.?, j) else if (input.expert_shard_screen) try expert_screen.runShards(gpu, fixture, input.expert_fixture_sha256.?, j) else if (input.expert_n8_screen) try expert_screen.runN8(gpu, fixture, input.expert_fixture_sha256.?, j) else try expert_screen.run(gpu, fixture, input.expert_fixture_sha256.?, j);
             }
             if (input.gdn_layout_screen) try gdn_layout_screen.run(gpu, j);
             if (input.quant_reuse_screen) try quant_reuse_screen.run(gpu, j);

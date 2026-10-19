@@ -1,4 +1,4 @@
-// Adapted from nvfp4/experts.cu (lines 14-149); local pipeline and column-slice A/B variants.
+// Adapted from nvfp4/experts.cu (lines 14-149); local pipeline, column-slice and split-M A/B variants.
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -37,10 +37,10 @@ struct Stage {
   uint2 xa[2], xb[2];
 };
 
-template <int M, int NC = NTW>
+template <int M, int NC = NTW, int MP = M>
 __device__ __forceinline__ void load_stage(Stage<M>& st, const uint4* blk, int g, int lane, int t,
                                            const __nv_bfloat16* x0, const __nv_bfloat16* x1, bool v0, bool v1, int slice = 0) {
-  const uint4* b = blk + (size_t)g * (M * BLOCK4);
+  const uint4* b = blk + (size_t)g * (MP * BLOCK4);
 #pragma unroll
   for (int m = 0; m < M; ++m) {
     if constexpr (NC == NTW) {
@@ -91,20 +91,20 @@ __device__ __forceinline__ void compute_stage(float (&acc)[M][1][NTW][4], const 
     }
 }
 
-template <int M, int D = 2, int NC = NTW>
+template <int M, int D = 2, int NC = NTW, int MP = M>
 __device__ __forceinline__ void k_loop(float (&acc)[M][1][NTW][4], const uint4* blk, int KG, int lane, int t,
                                        const __nv_bfloat16* x0, const __nv_bfloat16* x1, bool v0, bool v1, int slice = 0) {
   Stage<M> st[D];
 #pragma unroll
   for (int d = 0; d < D; ++d)
-    if (d < KG) load_stage<M, NC>(st[d], blk, d, lane, t, x0, x1, v0, v1, slice);
+    if (d < KG) load_stage<M, NC, MP>(st[d], blk, d, lane, t, x0, x1, v0, v1, slice);
   for (int g0 = 0; g0 < KG; g0 += D) {
 #pragma unroll
     for (int d = 0; d < D; ++d) {
       const int g = g0 + d;
       if (g < KG) {
         compute_stage<M, NC>(acc, st[d], v1, slice);
-        if (g + D < KG) load_stage<M, NC>(st[d], blk, g + D, lane, t, x0, x1, v0, v1, slice);
+        if (g + D < KG) load_stage<M, NC, MP>(st[d], blk, g + D, lane, t, x0, x1, v0, v1, slice);
       }
     }
   }
@@ -399,5 +399,54 @@ TF_NVFP4_DECODE_SET(pipe4, 4, 4, 4)
 TF_NVFP4_DECODE_SET(n16, 4, 2, 2)
 TF_NVFP4_DECODE_SET(n16_pipe4, 4, 4, 2)
 TF_NVFP4_DECODE(tf_nvfp4_n8_pipe4_swiglu, 2, 2, 4, 4, 1)
+
+extern "C" __global__ void __launch_bounds__(256) tf_nvfp4_n8_split_m_swiglu(
+    const __nv_bfloat16* __restrict__ X, int x_stride, int slots, const uint4* __restrict__ W,
+    const float* __restrict__ scale, int KG, int NB, const int* __restrict__ items,
+    const int* __restrict__ counts, const int* __restrict__ members, void* __restrict__ out,
+    int N, float limit, int skip) {
+  using namespace tf_nvfp4_experts;
+  __shared__ float gate[4][4][32];
+  const int lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
+  const int warp = threadIdx.x >> 5, part = warp >> 2, slice = warp & 3;
+  const int tiles = __ldg(counts) * NB;
+  for (int tile = blockIdx.x; tile < tiles; tile += gridDim.x) {
+    const int it = tile / NB, cb = tile % NB;
+    const int e = __ldg(items + 3 * it), first = __ldg(items + 3 * it + 1), cnt = __ldg(items + 3 * it + 2);
+    if (e == skip) continue;
+    const uint4* blk = W + ((size_t)e * NB + cb) * (size_t)KG * (2 * BLOCK4) + part * BLOCK4;
+    for (int r0 = 0; r0 < cnt; r0 += 16) {
+      const bool v0 = r0 + gq < cnt, v1 = r0 + gq + 8 < cnt;
+      const int pr0 = v0 ? __ldg(members + first + r0 + gq) : 0;
+      const int pr1 = v1 ? __ldg(members + first + r0 + gq + 8) : 0;
+      const int x0r = slots ? pr0 / slots : pr0, x1r = slots ? pr1 / slots : pr1;
+      const __nv_bfloat16* x0 = X + (size_t)x0r * x_stride;
+      const __nv_bfloat16* x1 = X + (size_t)x1r * x_stride;
+      float acc[1][1][NTW][4] = {};
+      k_loop<1, 4, 1, 2>(acc, blk, KG, lane, t, x0, x1, v0, v1, slice);
+      const float global_scale = __ldg(scale + 2 * e + part);
+#pragma unroll
+      for (int q = 0; q < 4; ++q) acc[0][0][0][q] *= global_scale;
+      if (part == 0) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) gate[slice][q][lane] = acc[0][0][0][q];
+      }
+      __syncthreads();
+      if (part == 1) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          if (!(h ? v1 : v0)) continue;
+          const size_t row = (size_t)(h ? pr1 : pr0) * N;
+          const int col = cb * COLS + 2 * t + 8 * slice;
+          const float o0 = swiglu(gate[slice][2 * h][lane], acc[0][0][0][2 * h], limit);
+          const float o1 = swiglu(gate[slice][2 * h + 1][lane], acc[0][0][0][2 * h + 1], limit);
+          *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<__nv_bfloat16*>(out) + row + col) =
+              __floats2bfloat162_rn(o0, o1);
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
 #undef TF_NVFP4_DECODE_SET
 #undef TF_NVFP4_DECODE
