@@ -1,5 +1,26 @@
 # TensorFold
 
+## About this fork
+
+This is [goulderb's development fork](https://github.com/goulderb/TensorFold) of
+[TensorFold](https://github.com/ashhart/TensorFold), by Ash Hart and the TensorFold
+contributors. It is not an official upstream release. The fork retains upstream
+history, including v1.0.12 and later v1.1.0 integration, plus local Windows CUDA,
+prompt persistence, native GLM and Qwen integration, and diagnostic work.
+
+[NOTICE](NOTICE) and the [donor and local-change record](LICENSES/donors/README.md)
+describe the adaptations and retain transitive credits. See also
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [LICENSE](LICENSE).
+No model weights are included. Retained compiled kernel assets have their own
+provenance records; checkpoint and runtime dependencies keep their separate terms.
+Development source is not a claim of production qualification for every model or
+hardware configuration.
+
+The installation and release links below point to **upstream packages**, not
+builds of this fork. Build this fork from its source for its local changes.
+
+## Upstream overview
+
 TensorFold 1.0.12 serves language models from a Zig binary on Apple Silicon and NVIDIA GPUs.
 The engine reads checkpoints, tokenizes requests and runs Metal or CUDA kernels directly.
 Serving needs no Python or MLX installation.

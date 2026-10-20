@@ -150,8 +150,6 @@ thinking-off rendering follow the public GLM recipe from Mia-AiLab. This local f
 GLM recipe code and numerical components, as described in the local fork addendum above.
 The fork's native GLM CUDA family and its opt-in imported paths have separate qualification limits;
 see `docs/glm-cuda-mia.md`.
-Apache-2.0, without including that source. Its draft inputs and thinking-off rendering follow the public GLM recipe
-from Mia-AiLab without including recipe code.
 The native CUDA GLM family (`zig/src/families/glm/cuda_*.zig`, its kernels in `zig/kernels/cuda/glm_*.cu`) implements
 the same math. Its image tower, on Metal (`zig/src/families/glm/vision.zig`) and on CUDA (`cuda_vision.zig`,
 `zig/kernels/cuda/glm_vision.cu`), and the PyTorch reference that checks it (`tools/glm_vision_ref.py`) follow
