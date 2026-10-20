@@ -6,6 +6,7 @@ const weights = @import("cuda_weights.zig");
 const engine = @import("cuda_engine.zig");
 
 pub const floor_bytes = 1536 << 20;
+pub const MoeMath = engine.MoeMath;
 pub const Options = struct {
     devices: []const c_int = &.{ 0, 1 },
     context: usize = 4096,
@@ -14,6 +15,7 @@ pub const Options = struct {
     prefill_rows: usize = 1,
     expert_up_layout: cuda.experts.Nvfp4UpLayout = .lane_major,
     terminal_greedy: bool = false,
+    moe_math: engine.MoeMath = .legacy,
 };
 
 fn validatePrefillRows(rows: usize) !void {
@@ -73,6 +75,7 @@ pub const Chain = struct {
         for (options.devices) |device| if (device < 0) return error.InvalidDevices;
         if (options.devices.len == 2 and (options.devices[0] == options.devices[1] or options.cut == 0 or options.cut >= config.geometry.layers)) return error.InvalidPartition;
         const admitted: checkpoint.Admitted = .{ .geometry = config.geometry, .encoding = .{ .modelopt = config } };
+        try engine.validateMoeMath(admitted, options.moe_math);
         var placements: [2]checkpoint.Placement = undefined;
         var budgets: [2]MemoryBudget = undefined;
         var ck = try core.Checkpoint.openModel(gpa, io, dir);
@@ -102,7 +105,7 @@ pub const Chain = struct {
         };
         for (c.partitions, placements[0..c.partitions.len]) |*p, placement| {
             try p.context.makeCurrent();
-            p.engine = try engine.Engine.initPlacedWithOptions(gpa, io, &p.context, dir, admitted, placement, false, .{ .expert_up_layout = options.expert_up_layout, .terminal_greedy = options.terminal_greedy });
+            p.engine = try engine.Engine.initPlacedWithOptions(gpa, io, &p.context, dir, admitted, placement, false, .{ .expert_up_layout = options.expert_up_layout, .terminal_greedy = options.terminal_greedy, .moe_math = options.moe_math });
             engines += 1;
             p.engine.captured = options.captured;
             p.engine.bounded_hf_prefill = options.prefill_rows > 1;

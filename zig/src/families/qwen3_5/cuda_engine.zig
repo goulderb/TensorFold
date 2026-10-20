@@ -11,6 +11,7 @@ const modelopt = @import("cuda_modelopt.zig");
 const hf = @import("cuda_hf.zig");
 
 pub const Geometry = geometry.Geometry;
+pub const MoeMath = hf.MoeMath;
 pub const Cache = caches.Cache;
 pub const tap_rows = caches.tap_rows;
 const Seg = caches.Seg;
@@ -27,6 +28,18 @@ pub const most_verify = 32;
 pub const most_window = 16;
 /// Experimental committed HF prefixes retain the decode operators' row arithmetic.
 pub const hf_prefill_rows = 16;
+
+pub fn validateMoeMath(admitted: checkpoint.Admitted, math: MoeMath) !void {
+    if (math == .legacy) return;
+    const g = admitted.geometry;
+    if (admitted.numerics() != .hf_modelopt or g.hidden != 2048 or g.intermediate != 512 or g.experts != 256 or g.top_k != 8)
+        return error.UnsupportedQwenMoeMath;
+    if (admitted.encoding.modelopt.spec.shared_width != 512) return error.UnsupportedQwenMoeMath;
+}
+
+fn validateMoeMathShape(configured: MoeMath, requested: MoeMath) !void {
+    if (configured != requested) return error.QwenMoeMathShapeMismatch;
+}
 const hf_part_bytes = 8 << 20;
 pub const ExpertGraphNode = struct {
     shape_key: u32,
@@ -506,13 +519,14 @@ pub const Engine = struct {
         return initPlaced(gpa, io, ctx, dir, .{ .geometry = g, .encoding = .mlx }, .{ .first = 0, .end = g.layers, .total = g.layers }, kv8);
     }
 
-    pub const InitOptions = struct { expert_up_layout: cuda.experts.Nvfp4UpLayout = .lane_major, terminal_greedy: bool = false };
+    pub const InitOptions = struct { expert_up_layout: cuda.experts.Nvfp4UpLayout = .lane_major, terminal_greedy: bool = false, moe_math: MoeMath = .legacy };
 
     pub fn initPlaced(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, admitted: checkpoint.Admitted, placement: checkpoint.Placement, kv8: bool) !*Engine {
         return initPlacedWithOptions(gpa, io, ctx, dir, admitted, placement, kv8, .{});
     }
 
     pub fn initPlacedWithOptions(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, admitted: checkpoint.Admitted, placement: checkpoint.Placement, kv8: bool, options: InitOptions) !*Engine {
+        try validateMoeMath(admitted, options.moe_math);
         const g = try placement.localGeometry(admitted.geometry);
         if (options.terminal_greedy and admitted.numerics() != .hf_modelopt) return error.UnsupportedQwenTerminalGreedy;
         if (options.expert_up_layout == .slice_major_v1 and (admitted.numerics() != .hf_modelopt or g.hidden != 2048 or g.intermediate != 512 or g.experts != 256)) return error.UnsupportedQwenExpertUpLayout;
@@ -596,7 +610,7 @@ pub const Engine = struct {
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
         e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
-        if (e.numerics == .hf_modelopt) e.modelopt = try modelopt.Bindings.loadWithUpLayout(ctx, &e.fns, options.expert_up_layout);
+        if (e.numerics == .hf_modelopt) e.modelopt = try modelopt.Bindings.loadWithOptions(ctx, &e.fns, .{ .up_layout = options.expert_up_layout, .moe_math = options.moe_math });
         errdefer if (e.modelopt) |*m| m.unload();
         e.layers = try gpa.alloc(Layer, g.layers);
         errdefer gpa.free(e.layers);
@@ -922,7 +936,7 @@ pub const Engine = struct {
         const lone = total == 1 and parts.len == 1;
         const bucket: usize = if (lone) 1 else if (total <= 16) 16 else most_verify;
         const windows: usize = if (lone) 1 else max_segs;
-        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant, .expert_up_layout = e.expert_up_layout, .terminal_greedy = e.terminal != null and !record };
+        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant, .expert_up_layout = e.expert_up_layout, .terminal_greedy = e.terminal != null and !record, .moe_math = e.moeMath() };
         e.features = if (images) |im| im.features else 0;
         return shape;
     }
@@ -936,6 +950,7 @@ pub const Engine = struct {
             (!e.bounded_hf_prefill and (shape.total != 1 or shape.heads_all)))) return error.UnsupportedQwenWindow;
         if (e.observer != null and e.captured) return error.QwenObserverRequiresEager;
         try e.validateUpLayout(shape.expert_up_layout, shape.expert_up_n8, shape.expert_up_split_m, shape.total);
+        try validateMoeMathShape(e.moeMath(), shape.moe_math);
         try shape.gdn_layout.validate(e.numerics);
         if (e.verify_gdn_graphs and e.numerics == .hf_modelopt and shape.total > 1) try e.verifyHfChainTables(shape);
         if (shape.prompt and e.numerics == .mlx_sanitized or !e.captured) {
@@ -1573,14 +1588,19 @@ pub const Engine = struct {
         reuse_fp8_quant: bool = false,
         heads_all: bool = false,
         terminal_greedy: bool = false,
+        moe_math: MoeMath = .legacy,
 
         fn key(s: Shape) u32 {
-            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21 | @as(u32, @intFromBool(s.expert_up_split_m)) << 22 | @as(u32, @intFromBool(s.reuse_fp8_quant)) << 23 | @as(u32, @backingInt(s.expert_up_layout)) << 24 | @as(u32, @intFromBool(s.terminal_greedy)) << 25;
+            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21 | @as(u32, @intFromBool(s.expert_up_split_m)) << 22 | @as(u32, @intFromBool(s.reuse_fp8_quant)) << 23 | @as(u32, @backingInt(s.expert_up_layout)) << 24 | @as(u32, @intFromBool(s.terminal_greedy)) << 25 | @as(u32, @backingInt(s.moe_math)) << 26;
         }
     };
 
     pub fn mark(e: *Engine, phase: Phase) !void {
         if (e.observer) |o| try o.mark(o.ptr, phase, e.observed_layer);
+    }
+
+    pub fn moeMath(e: *const Engine) MoeMath {
+        return if (e.numerics == .hf_modelopt) if (e.modelopt) |m| m.router.math else .legacy else .legacy;
     }
 
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).
@@ -2087,17 +2107,51 @@ test "bounded HF admission is opt in and does not imply recorded windows" {
     try std.testing.expect(records(.logits) and records(.{ .draws = &.{} }));
 }
 
-test "bounded HF graph keys separate every row count layout expert arm and head mode" {
-    var keys: [2048]u32 = undefined;
+test "bounded HF graph keys separate every row count layout expert arm head and math mode" {
+    var keys: [4096]u32 = undefined;
     var count: usize = 0;
-    for (1..17) |rows| for ([_]Cache.GdnLayout{ .value_key, .key_value }) |layout| for ([_]bool{ false, true }) |n8| for ([_]bool{ false, true }) |heads| for ([_]bool{ false, true }) |split| for ([_]bool{ false, true }) |reuse| for ([_]cuda.experts.Nvfp4UpLayout{ .lane_major, .slice_major_v1 }) |up_layout| for ([_]bool{ false, true }) |terminal| {
-        const shape: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .gdn_layout = layout, .expert_up_n8 = n8, .heads_all = heads, .expert_up_split_m = split, .reuse_fp8_quant = reuse, .expert_up_layout = up_layout, .terminal_greedy = terminal };
+    for (1..17) |rows| for ([_]Cache.GdnLayout{ .value_key, .key_value }) |layout| for ([_]bool{ false, true }) |n8| for ([_]bool{ false, true }) |heads| for ([_]bool{ false, true }) |split| for ([_]bool{ false, true }) |reuse| for ([_]cuda.experts.Nvfp4UpLayout{ .lane_major, .slice_major_v1 }) |up_layout| for ([_]bool{ false, true }) |terminal| for ([_]MoeMath{ .legacy, .bf16_boundaries }) |math| {
+        const shape: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .gdn_layout = layout, .expert_up_n8 = n8, .heads_all = heads, .expert_up_split_m = split, .reuse_fp8_quant = reuse, .expert_up_layout = up_layout, .terminal_greedy = terminal, .moe_math = math };
         const key = shape.key();
         try std.testing.expect(std.mem.indexOfScalar(u32, keys[0..count], key) == null);
         keys[count] = key;
         count += 1;
     };
-    try std.testing.expectEqual(@as(usize, 2048), count);
+    try std.testing.expectEqual(@as(usize, 4096), count);
+}
+
+test "BF16 MoE math refuses unsupported models before Engine or CUDA allocation" {
+    try validateMoeMath(undefined, .legacy);
+    try std.testing.expectEqual(MoeMath.legacy, (Engine.InitOptions{}).moe_math);
+    var admitted: checkpoint.Admitted = .{ .geometry = undefined, .encoding = .{ .modelopt = undefined } };
+    admitted.geometry.hidden = 2048;
+    admitted.geometry.intermediate = 512;
+    admitted.geometry.experts = 256;
+    admitted.geometry.top_k = 8;
+    admitted.encoding.modelopt.spec.shared_width = 512;
+    try validateMoeMath(admitted, .bf16_boundaries);
+    inline for (.{ "hidden", "intermediate", "experts", "top_k" }) |field| {
+        var invalid = admitted;
+        @field(invalid.geometry, field) -= 1;
+        try std.testing.expectError(error.UnsupportedQwenMoeMath, Engine.initPlacedWithOptions(undefined, undefined, undefined, "", invalid, undefined, false, .{ .moe_math = .bf16_boundaries }));
+    }
+    var invalid_shared = admitted;
+    invalid_shared.encoding.modelopt.spec.shared_width = 511;
+    try std.testing.expectError(error.UnsupportedQwenMoeMath, validateMoeMath(invalid_shared, .bf16_boundaries));
+    admitted.encoding = .mlx;
+    try std.testing.expectError(error.UnsupportedQwenMoeMath, validateMoeMath(admitted, .bf16_boundaries));
+}
+
+test "MoE math bindings and shape agree and own only graph bit 26" {
+    const baseline: Engine.Shape = .{ .total = 1, .nseg = 1, .record = false, .prompt = true, .taps = false };
+    var candidate = baseline;
+    candidate.moe_math = .bf16_boundaries;
+    try std.testing.expectEqual(@as(u32, 1 << 26), baseline.key() ^ candidate.key());
+    candidate.terminal_greedy = true;
+    try std.testing.expectEqual(@as(u32, (1 << 26) | (1 << 25)), baseline.key() ^ candidate.key());
+    for ([_]MoeMath{ .legacy, .bf16_boundaries }) |configured| for ([_]MoeMath{ .legacy, .bf16_boundaries }) |requested| {
+        if (configured == requested) try validateMoeMathShape(configured, requested) else try std.testing.expectError(error.QwenMoeMathShapeMismatch, validateMoeMathShape(configured, requested));
+    };
 }
 
 test "bounded HF chain views retain every state binding and reject field corruption" {

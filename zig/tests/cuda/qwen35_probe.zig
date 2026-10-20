@@ -12,6 +12,7 @@ const Input = struct {
     devices: []const c_int = &.{ 0, 1 },
     expected_device_uuids: []const []const u8,
     cut: usize = 20,
+    moe_math: qwen.engine.MoeMath = .legacy,
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -42,7 +43,7 @@ pub fn main(init: std.process.Init) !u8 {
         defer driver.close();
         break :blk try admission.verify(a, &driver);
     };
-    const model = try qwen.Engine.open(init.gpa, init.io, args[1], .{ .devices = input.devices, .context = input.context, .cut = input.cut });
+    const model = try qwen.Engine.open(init.gpa, init.io, args[1], .{ .devices = input.devices, .context = input.context, .cut = input.cut, .moe_math = input.moe_math });
     defer model.deinit();
     var main_session = try model.createSession();
     defer main_session.deinit();
@@ -84,7 +85,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (model.partitions, 0..) |*part, i| free_mib[i] = (try part.context.memInfo()).free / (1 << 20);
     const config_sha = try fileHash(a, init.io, args[1], "config.json");
     const index_sha = try fileHash(a, init.io, args[1], "model.safetensors.index.json");
-    const report = .{ .prompt = input.prompt, .forced = input.forced, .tokens = tokens, .vocab = 248320, .context = input.context, .devices = input.devices, .device_identities = identities, .cut = input.cut, .free_mib = free_mib[0..model.partitions.len], .config_sha256 = config_sha[0..], .index_sha256 = index_sha[0..], .session_isolation = true, .reset = true, .teacher_parity = "not checked by this executable" };
+    const report = .{ .prompt = input.prompt, .forced = input.forced, .tokens = tokens, .vocab = 248320, .context = input.context, .devices = input.devices, .device_identities = identities, .cut = input.cut, .moe_math = input.moe_math, .free_mib = free_mib[0..model.partitions.len], .config_sha256 = config_sha[0..], .index_sha256 = index_sha[0..], .session_isolation = true, .reset = true, .teacher_parity = "not checked by this executable" };
     var out: std.Io.Writer.Allocating = .init(a);
     try std.json.Stringify.value(report, .{ .whitespace = .indent_2 }, &out.writer);
     try out.writer.writeByte('\n');

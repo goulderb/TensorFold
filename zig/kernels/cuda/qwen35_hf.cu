@@ -254,6 +254,16 @@ extern "C" __global__ void tf_q35_hf_mlp_act(
     OUT[i] = b((gate * sigmoid(gate)) * bf(UP[i]));
 }
 
+// Local HF adaptation retains the shared activation's intermediate BF16 value.
+extern "C" __global__ void tf_q35_hf_shared_act_bf16(
+    const B* GATE, const B* UP, B* OUT, long long total, const int* P, int D) {
+    if (P != nullptr) total = (long long)P[2] * D;
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    const float gate = bf(GATE[i]);
+    OUT[i] = b(rbf(gate * sigmoid(gate)) * bf(UP[i]));
+}
+
 extern "C" __global__ void tf_q35_hf_route_products(
     const B* x, const B* router, const B* shared_gate, float* scores) {
     __shared__ float products[2048];
@@ -361,4 +371,29 @@ extern "C" __global__ void tf_q35_hf_combine(
     float y = 0.0f;
     for (int slot = 0; slot < 8; ++slot) y += pairs[slot * 2048 + d] * weights[slot];
     out[d] = b(y + bf(shared[d]) * weights[8]);
+}
+
+// Local HF adaptation rounds each expert operation and accumulates by expert ID.
+extern "C" __global__ void tf_q35_hf_combine_bf16(
+    const float* pairs, const float* weights, const B* shared, B* out,
+    const int* picks) {
+    const int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (d >= 2048) return;
+    float acc = 0.0f;
+    int previous = -1;
+    for (int iteration = 0; iteration < 8; ++iteration) {
+        int slot = -1, best = 256;
+        for (int candidate = 0; candidate < 8; ++candidate)
+            if (picks[candidate] > previous && picks[candidate] < best) {
+                best = picks[candidate];
+                slot = candidate;
+            }
+        const float weight = rbf(weights[slot]);
+        const float value = rbf(pairs[slot * 2048 + d]);
+        const float term = rbf(__fmul_rn(value, weight));
+        acc = rbf(__fadd_rn(acc, term));
+        previous = best;
+    }
+    const float shared_product = rbf(__fmul_rn(bf(shared[d]), rbf(weights[8])));
+    out[d] = b(__fadd_rn(acc, shared_product));
 }

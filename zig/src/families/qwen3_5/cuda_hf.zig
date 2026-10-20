@@ -2,6 +2,8 @@
 const cuda = @import("cuda");
 const layers = @import("cuda_layers.zig");
 
+pub const MoeMath = enum(u1) { legacy, bf16_boundaries };
+
 /// These dimensions are part of the numerical binding, including the reduction order.
 pub const Launches = struct {
     norm: usize = 256,
@@ -31,12 +33,18 @@ pub const Router = struct {
     products_fn: cuda.Function,
     select_fn: cuda.Function,
     combine_fn: cuda.Function,
+    math: MoeMath = .legacy,
 
     pub fn resolve(image: cuda.Module) !Router {
+        return resolveWithMath(image, .legacy);
+    }
+
+    pub fn resolveWithMath(image: cuda.Module, math: MoeMath) !Router {
         return .{
             .products_fn = try image.function("tf_q35_hf_route_products"),
             .select_fn = try image.function("tf_q35_hf_route_select_parallel"),
-            .combine_fn = try image.function("tf_q35_hf_combine"),
+            .combine_fn = try image.function(if (math == .bf16_boundaries) "tf_q35_hf_combine_bf16" else "tf_q35_hf_combine"),
+            .math = math,
         };
     }
 
@@ -52,9 +60,31 @@ pub const Router = struct {
     }
 
     /// pairs is FP32 [8,2048] in pick order. shared and out are BF16 [2048].
-    pub fn combine(self: Router, stream: cuda.Stream, pairs: u64, weights: u64, shared: u64, out: u64) !void {
+    fn combineArgs(math: MoeMath, pairs: u64, weights: u64, shared: u64, out: u64, picks: u64) cuda.Args {
         var args: cuda.Args = .{};
         for ([_]u64{ pairs, weights, shared, out }) |address| args.add(address);
+        if (math == .bf16_boundaries) args.add(picks);
+        return args;
+    }
+
+    pub fn combine(self: Router, stream: cuda.Stream, pairs: u64, weights: u64, shared: u64, out: u64, picks: u64) !void {
+        var args = combineArgs(self.math, pairs, weights, shared, out, picks);
         try cuda.launch.launch(self.combine_fn, .{ .grid = .{ .x = 8, .y = 1, .z = 1 }, .block = .{ .x = 256 } }, stream, &args);
     }
 };
+
+test "HF combine keeps the legacy ABI and appends actual picks only for BF16 boundaries" {
+    const std = @import("std");
+    for ([_]MoeMath{ .legacy, .bf16_boundaries }) |math| {
+        const args = Router.combineArgs(math, 101, 202, 303, 404, 505);
+        const count: usize = if (math == .legacy) 4 else 5;
+        try std.testing.expectEqual(count, args.count);
+        try std.testing.expectEqual(count * 8, args.used);
+        for ([_]u64{ 101, 202, 303, 404, 505 }, 0..) |value, i| {
+            if (i < count) {
+                try std.testing.expectEqual(@as(u16, 8), args.sizes[i]);
+                try std.testing.expectEqual(value, args.integer(i).?);
+            } else try std.testing.expect(args.integer(i) == null);
+        }
+    }
+}

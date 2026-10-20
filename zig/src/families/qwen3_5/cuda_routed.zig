@@ -95,12 +95,12 @@ pub fn rows(e: *E.Engine, router: u64, layer: cuda.experts.Layer, shared: @impor
             const width = m.gate.outputs();
             try e.proj(m.gate, x, e.gate, total, false);
             try e.proj(m.up, x, e.up, total, false);
-            try e.run(e.fns.mlp_act, .{ (total * width + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, @as(c_longlong, @intCast(total * width)), e.tables.ptr + E.Engine.params_at, @as(c_int, @intCast(width)) });
+            try e.run(e.modelopt.?.shared_act, .{ (total * width + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, @as(c_longlong, @intCast(total * width)), e.tables.ptr + E.Engine.params_at, @as(c_int, @intCast(width)) });
             try e.proj(m.down, e.act, s.shared, total, false);
             try e.mark(.shared);
             for (0..total) |row| {
                 const at = projectedOffsets(row, g.hidden, g.top_k, g.experts);
-                try e.modelopt.?.router.combine(e.stream, s.y + at.pairs, s.wts + at.weights, s.shared + at.features, out + at.features);
+                try e.modelopt.?.router.combine(e.stream, s.y + at.pairs, s.wts + at.weights, s.shared + at.features, out + at.features, s.picks + at.picks);
             }
         },
     }
