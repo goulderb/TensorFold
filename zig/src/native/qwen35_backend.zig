@@ -169,7 +169,7 @@ pub fn Adapter(comptime Session: type) type {
             if (self.prefill_rows == 0) return error.InvalidSession;
             if (self.prompt_at[i] < s.prompt_len) {
                 const first_chunk = self.prompt_at[i] == 0;
-                const n = @min(self.prefill_rows, s.prompt_len - self.prompt_at[i]);
+                const n = self.chunkRows(s, i);
                 try session.append(s.context.items[self.prompt_at[i]..][0..n]);
                 self.prompt_at[i] += n;
                 s.fill_at.store(@intCast(self.prompt_at[i]), .monotonic);
@@ -265,7 +265,7 @@ pub fn Adapter(comptime Session: type) type {
                 var which: [3]usize = undefined;
                 for (streams, 0..) |s, i| {
                     if (s.isCancelled()) return error.Cancelled;
-                    const n = @min(self.prefill_rows, s.prompt_len -| self.prompt_at[idx[i]]);
+                    const n = self.chunkRows(s, idx[i]);
                     if (n == 0) continue;
                     ptrs[nlive] = &self.sessions[idx[i]];
                     views[nlive] = s.context.items[self.prompt_at[idx[i]]..][0..n];
@@ -278,6 +278,16 @@ pub fn Adapter(comptime Session: type) type {
                 for (0..nlive) |j| self.advanceFill(streams[which[j]], idx[which[j]], counts[j]);
             }
             for (out) |*row| row.* = .complete;
+        }
+
+        fn chunkRows(self: *const Self, s: *lanes.Stream, i: usize) usize {
+            var n = @min(self.prefill_rows, s.prompt_len -| self.prompt_at[i]);
+            const at: u32 = @intCast(self.prompt_at[i]);
+            for (s.reuse.marks) |m| if (m > at) {
+                const gap: usize = m - at;
+                if (gap < n) n = gap;
+            };
+            return n;
         }
 
         fn advanceFill(self: *Self, s: *lanes.Stream, i: usize, n: usize) void {
@@ -724,4 +734,20 @@ test "Qwen adapter verifies two plain windows on separate sessions" {
     try std.testing.expectEqual(@as(u32, 3), sampled_a[0]);
     try std.testing.expectEqual(@as(u32, 3), sampled_b[0]);
     try backend.keep(&windows, &.{ &.{0}, &.{0} });
+}
+
+test "Qwen prefill stops on a cache mark a 16-row chunk would skip" {
+    const gpa = std.testing.allocator;
+    var session: FakeSession = .{};
+    var adapter = try Adapter(FakeSession).init(gpa, &session, 32);
+    defer adapter.deinit();
+    adapter.prefill_rows = 16;
+    const prompt = [_]u32{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    var s = try lanes.Stream.init(gpa, .{ .id = "marked", .prompt = &prompt, .max_new = 1 });
+    defer s.deinit(gpa);
+    s.reuse.marks = &.{12};
+    try adapter.backend().prefill(&s);
+    try std.testing.expectEqual(@as(usize, 2), session.append_calls);
+    try std.testing.expectEqual(@as(usize, 12), session.append_sizes[0]);
+    try std.testing.expectEqual(@as(usize, 3), session.append_sizes[1]);
 }
