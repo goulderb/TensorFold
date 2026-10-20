@@ -324,6 +324,15 @@ TensorFold. What they follow or copy:
 - The Level Zero loader and the Intel compute runtime are loaded at run time and are not bundled; `ocloc` compiles the kernels
   at build time and is not distributed.
 
+## GLM prompt latent AOT
+
+`zig/src/families/glm/prompt_aot/` contains original production TensorFold
+Triton kernels and their captured compiled bytes, with source, license and
+exact provenance retained alongside them. The local native owner changes
+loading, eligibility and persisted numerical policy. The existing TensorFold,
+MiaAI-Lab, wojo and transitive credits are retained in
+`LICENSES/donors/README.md` and its original donor documents.
+
 ## Fish Audio Drama 3 on CUDA
 
 `zig/src/families/drama3/`, `zig/kernels/cuda/drama3*.cu` and `drama3*.cuh` implement the model math of

@@ -300,6 +300,27 @@ geometry, isolate persisted numerical identity, and add guarded device proofs.
 Other families and the decode policy retain their defaults. Original,
 MiaAI-Lab, wojo and transitive notices continue to apply.
 
+## GLM prompt latent AOT kernels (2026-10-20)
+
+`zig/src/families/glm/prompt_aot/` retains unmodified production Triton
+`_sparse_onepass`, `_absorb_mma` and `_expand_mma` cubins, PTX, metadata and
+their `latent.py`/`kv8.py` sources. These are Ash Hart/TensorFold contributor
+algorithms from the patched TensorFold production distribution. Its source
+lineage is TensorFold `c4646171139ee8a3c38103eaa1699dad226ec12b`, Mia
+`b5808ac620c795ec9c0640f3ca2a2f7be21aaa63`, and
+[wojo's patch series](https://github.com/wojo/GLM-5.3-Flash-EXL3-2x-DGX-Sparks-TensorFold)
+`7fac72b346eb85549edc0d1783b6bbb3d998a5af`. The exact compared distribution is
+image `sha256:d7e14f8799ad21f7e93ba95ea78826426c98ab27d5fbfdf81bed876a2e09ce6e`;
+the module's `provenance.json` pins both actual source files, Triton 3.7.1,
+SM121 and each captured payload. The original, Mia, wojo and transitive notices
+retained above continue to apply; capture and import do not establish authorship.
+
+Local changes add a native Zig owner over the existing Triton CUDA loader,
+strict embedded-byte validation, explicit prompt eligibility and fallback,
+rank agreement, persisted numerical identity and bounded component proofs.
+The original arithmetic and captured compiled bytes are retained unchanged.
+The payloads do not include model weights or a new license grant for them.
+
 ## Retain notices in future changes and releases
 
 Keep original copyright headers, licenses, `NOTICE`, and credit files.

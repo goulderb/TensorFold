@@ -1,0 +1,45 @@
+{
+  "production_image": "sha256:d7e14f8799ad21f7e93ba95ea78826426c98ab27d5fbfdf81bed876a2e09ce6e",
+  "original_author": "Ash Hart and TensorFold contributors",
+  "original_sources": {
+    "latent.py": "73edd5297525ee5fc457c04e4e622e0413b17666c194427d9ddb993e0ce000e6",
+    "kv8.py": "a6c1886a1a4b7ef6000a62aa4bf829837738b96a0f573a20e211c5fb224b25e8"
+  },
+  "triton_version": "3.7.1",
+  "target": "sm121",
+  "kernels": {
+    "onepass": {
+      "cubin": "onepass.cubin",
+      "ptx": "onepass.ptx",
+      "symbol": "_sparse_onepass",
+      "num_warps": 8,
+      "shared": 67584,
+      "capture_directory": "C:\\Development\\prep\\glm53-production-parity-20261020\\sparse-onepass-captured",
+      "cubin_sha256": "c6af4058bd7cc02d744b1b7150fbacd8062a89200dbe7f1be3a2869d4ccd2e08",
+      "metadata_sha256": "cb0e8acf4b44543fdae6e82751960aac02ddf58fbf2901c9b5a06fea1fa06f3d"
+    },
+    "absorb": {
+      "cubin": "absorb.cubin",
+      "ptx": "absorb.ptx",
+      "symbol": "_absorb_mma",
+      "num_warps": 4,
+      "shared": 49152,
+      "capture_directory": "C:\\Development\\prep\\glm53-production-parity-20261020\\latent-mma-captured\\DJFVHMCSXEU3CQPCZ4OOWVMVZA3H647D3YPPVLRQW7ZIHIGLIY5A",
+      "cubin_sha256": "e0d640075673e53cf6a3bc6a2ff6a6e171f3c1bf21753b1ebd3c9a1885c26744",
+      "metadata_sha256": "21fde4d90b97c1911c34e198368be1d97b8de6d233318640d1439323a22da5d1"
+    },
+    "expand": {
+      "cubin": "expand.cubin",
+      "ptx": "expand.ptx",
+      "symbol": "_expand_mma",
+      "num_warps": 4,
+      "shared": 49152,
+      "capture_directory": "C:\\Development\\prep\\glm53-production-parity-20261020\\latent-mma-captured\\BZ6KPOTK4POJ526RNWQJX3TPICPOP6KWGMPXUALHYHLSOYWC3XOQ",
+      "cubin_sha256": "d66e8138e663f5d81843fe575ce6ce5e7349d9bee0d3e998648efac9d3360425",
+      "metadata_sha256": "d02cabb9630d91e8d16c992237b604aec630c4ffb653fba8d7d0ba2593a8b1c2"
+    }
+  },
+  "reuse": "Unmodified captured original production cubins/PTX/metadata and original source; local Zig owner adds eligibility and embedded integrity checks",
+  "direct_proof_script_sha256": "c4541bb5177cd35c8a8ddadbc5e71f75744518c28c403fdec1624139ebcb5b1e",
+  "runtime_asset_paths": false
+}

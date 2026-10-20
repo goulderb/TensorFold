@@ -30,6 +30,9 @@ fn cdiv(a: usize, b: usize) u32 {
 /// latent.absorb_q (BF16 kv_b): out [rows][heads][lw] bf16 = q [rows][heads][d] . wk [heads][d][lw], fp32 sums.
 pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
     if (d != 256 or lw != 512) return error.LatentShape;
+    if (set.prompt) if (set.prompt_aot) |kernels| {
+        if (try kernels.tryAbsorb(stream, .{ .input = q, .weight = wk, .out = out, .rows = rows, .heads = heads, .inner = d, .columns = lw })) return;
+    };
     try rowBlocks(set.glue.absorb_q, stream, q, wk, out, rows, heads, lw / 32);
 }
 
@@ -44,6 +47,9 @@ fn rowBlocks(f: cuda.Function, stream: cuda.Stream, in: u64, w: u64, out: u64, r
 /// latent.expand_v (BF16 kv_b): out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw].
 pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize) !void {
     if (dv != 256 or lw != 512) return error.LatentShape;
+    if (set.prompt) if (set.prompt_aot) |kernels| {
+        if (try kernels.tryExpand(stream, .{ .input = ol, .weight = wv, .out = out, .rows = rows, .heads = heads, .inner = lw, .columns = dv })) return;
+    };
     try rowBlocks(set.glue.expand_v, stream, ol, wv, out, rows, heads, dv / 16);
 }
 

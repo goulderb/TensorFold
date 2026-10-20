@@ -95,3 +95,30 @@ alternating samples showed lower component time on each tested shape.
 Those measurements do not establish an HTTP prefill speedup. A separate
 60-case screen of production's forced decode split-K table mostly increased
 component time, so that table was not adopted as a performance change.
+
+`TF_GLM_PROMPT_LATENT_AOT=1` enables a combined prompt-only latent policy:
+the exact production BF16 tensor-core absorb/expand kernels and H32 FP8 sparse
+onepass kernel, embedded with their source, license, PTX and provenance under
+`zig/src/families/glm/prompt_aot/`. The default is off. The existing native
+Triton loader owns CUDA launch behavior; serving needs no Python/JIT or new
+runtime asset directory. Generic-R MMA variants support proved prompt rows,
+and unsupported shape/alignment takes the existing operation before launch.
+LC and LS both use the FP8 cache base; the kernel adds the scale offset.
+
+Modules owns the kernels and the existing Set borrows them for prompt work.
+MTP explicitly clears that borrow, including MTP prefill. Decode and its
+captured target operation sequence keep their existing dispatch. Sparse
+dispatch preserves dense results for count-zero rows and uses the actual
+owner/replica addresses. Existing partial allocations remain available.
+Rank agreement and persisted numerical identity include the enabled policy
+and all three artifact identities; old-policy snapshots cannot cross-resume.
+Process counters record successful absorb/expand/sparse host dispatches after
+prompt readback, so serving trials can verify actual use.
+
+Separate model-free screens on both ranks found material candidates before
+this combined integration: sparse onepass saved about 16 milliseconds per
+2048-row call, while absorb/expand saved about 8 milliseconds per pair.
+Their 77-sparse-call and 88-MMA-pair 16K projections are conditional component
+arithmetic, without a TP2 multiplier. They are not additive measured HTTP
+savings. Exact native-loader replay, prompt continuation/restoration and a
+combined serving comparison remain separate acceptance gates.

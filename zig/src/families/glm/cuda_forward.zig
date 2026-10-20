@@ -27,6 +27,7 @@ const target_graph = @import("cuda_target_graph.zig");
 const target_forward = @import("cuda_target_forward.zig");
 const l2pf = @import("cuda_l2pf.zig");
 const l2pf_plan = @import("cuda_l2pf_plan.zig");
+const prompt_latent = @import("cuda_prompt_latent_aot.zig");
 
 test {
     _ = taps;
@@ -41,11 +42,12 @@ pub const PromptDispatch = struct {
     wy: [2]u64,
     overlap: [2]u64,
     fronts: [4]u64,
+    latent_aot: [3]u64,
 };
 var overlap_dispatch: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) };
 var front_dispatch: [4]std.atomic.Value(u64) = .{ .init(0), .init(0), .init(0), .init(0) };
 pub fn promptDispatch() PromptDispatch {
-    var value: PromptDispatch = .{ .wy = kda.wyDispatch(), .overlap = undefined, .fronts = undefined };
+    var value: PromptDispatch = .{ .wy = kda.wyDispatch(), .overlap = undefined, .fronts = undefined, .latent_aot = prompt_latent.dispatchCounts() };
     for (&overlap_dispatch, &value.overlap) |*counter, *count| count.* = counter.load(.monotonic);
     for (&front_dispatch, &value.fronts) |*counter, *count| count.* = counter.load(.monotonic);
     return value;
@@ -74,6 +76,7 @@ pub const Modules = struct {
     source_mods: ?[2]cuda.Module = null,
     source_dense: ?cuda.exlr8.Dense = null,
     source_upcast: ?cuda.Function = null,
+    prompt_latent: ?prompt_latent.Kernels = null,
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
@@ -83,6 +86,7 @@ pub const Modules = struct {
         m.source_mods = null;
         m.source_dense = null;
         m.source_upcast = null;
+        m.prompt_latent = null;
         var n: usize = 0;
         errdefer for (m.mods[0..n]) |*x| x.unload();
         for (&m.mods, [_][]const u8{ k.glm_kda, k.glm_ops, k.experts, k.affine4_pack, k.glm_quant, k.qmm_group, k.glm_glue, k.qmm_prefill, k.lane_gemv }) |*x, image| {
@@ -144,6 +148,7 @@ pub const Modules = struct {
     }
 
     pub fn deinit(m: *Modules) void {
+        if (m.prompt_latent) |*kernels| kernels.unload();
         if (m.source_mods) |*mods| for (mods) |*x| x.unload();
         if (m.ck) |*c| c.unload();
         if (m.mia) |*k| k.unload();
@@ -253,7 +258,7 @@ pub const Forward = struct {
     target_failure: *const fn (anyerror) void = @import("cuda_kv_owner.zig").failPair,
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue, .linear = f.linear(), .copy_rows = f.m.copy_rows, .exlr8_dense = if (f.m.source_dense) |*d| d else null, .source_upcast = f.m.source_upcast, .attn_fp8load = f.attn_fp8load, .prompt = f.ranks[0].b.prefill };
+        return .{ .glue = &f.m.glue, .linear = f.linear(), .copy_rows = f.m.copy_rows, .exlr8_dense = if (f.m.source_dense) |*d| d else null, .source_upcast = f.m.source_upcast, .attn_fp8load = f.attn_fp8load, .prompt = f.ranks[0].b.prefill, .prompt_aot = if (f.ranks[0].b.prefill) if (f.m.prompt_latent) |*kernels| kernels else null else null };
     }
 
     /// qlinear over every format a GLM checkpoint brings: NVFP4 (lane and prompt GEMM) and EXL3.
@@ -997,6 +1002,7 @@ pub const Forward = struct {
             const nch = @min(latent.chunksFor(r.st.mtp_len + n), b.nch);
             var ks = f.dsaKernels(r);
             ks.slot = 12;
+            ks.set.prompt_aot = null;
             try dsa_block.block(ks, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
         }
         try f.gather(n);

@@ -251,6 +251,14 @@ pub const Engine = struct {
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
         var m = try fw.Modules.load(d, ctx);
         errdefer m.deinit();
+        if (settings.prompt_latent_aot) {
+            var prompt_problem: ?anyerror = null;
+            if (@import("cuda_prompt_latent_aot.zig").Kernels.load(gpa, d, ctx)) |kernels| m.prompt_latent = kernels else |err| {
+                prompt_problem = err;
+            }
+            try ranks.gather(u32, d, lib, comm, stream, rank, @intFromBool(prompt_problem == null), startup);
+            for (startup) |ready| if (ready == 0) return prompt_problem orelse error.PeerPromptLatentRefused;
+        }
         if (settings.affine_prompt_policy == .glm_production) try m.affine4.enablePromptTiles(m.mods[7]);
         if (settings.weight_dense.source()) {
             var source_problem: ?anyerror = null;
@@ -825,9 +833,9 @@ pub const Engine = struct {
         const actual = fw.promptDispatch();
         const new_wy = actual.wy[0] > 0 and !e.prompt_wy_logged;
         const new_overlap = actual.overlap[0] + actual.overlap[1] > 0 and !e.prompt_overlap_logged;
-        if (!new_wy and !new_overlap) return;
-        std.log.info("GLM prompt dispatch scope=process rank={d} slot={d} rows={d} shared={} target_readback=passed wy_launches={d} wy_layer_rows={d} overlap1_chunks={d} overlap2_chunks={d} interleaved_front_rows_kda_dsa_dense_shared={any}", .{
-            e.share.rank, e.slot, rows, shared_prompt, actual.wy[0], actual.wy[1], actual.overlap[0], actual.overlap[1], actual.fronts,
+        if (!new_wy and !new_overlap and !e.settings.prompt_latent_aot) return;
+        std.log.info("GLM prompt dispatch scope=process rank={d} slot={d} rows={d} shared={} target_readback=passed wy_launches={d} wy_layer_rows={d} overlap1_chunks={d} overlap2_chunks={d} interleaved_front_rows_kda_dsa_dense_shared={any} latent_aot_absorb_expand_sparse={any}", .{
+            e.share.rank, e.slot, rows, shared_prompt, actual.wy[0], actual.wy[1], actual.overlap[0], actual.overlap[1], actual.fronts, actual.latent_aot,
         });
         e.prompt_wy_logged = e.prompt_wy_logged or new_wy;
         e.prompt_overlap_logged = e.prompt_overlap_logged or new_overlap;

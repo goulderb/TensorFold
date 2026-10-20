@@ -208,7 +208,7 @@ fn attendLocal(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
     var caches = c;
     caches.lc.ptr = base;
     if (host_pos < l.dense_limit) try denseAttention(k, stream, l, caches, s, pos, rows, nch, part_rows, scale, latent.headBlock(rows));
-    if (sparse_any) try latent.sparseAttention(k.set, stream, s.qa, caches.lc, s.tokens, s.counts, sparse.width, s.partials, s.ol, rows, l.heads, l.lw, scale);
+    if (sparse_any) try selectedAttention(k, stream, l, caches, s, rows, scale, latent.headBlock(rows));
 }
 
 /// The block's row-by-row part for a shared window: projections, norms, q_b, indexer, absorbed query, `qi`'s query.
@@ -371,8 +371,15 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
         }
     } else {
         if (host_pos < l.dense_limit) try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale, latent.headBlock(rows));
-        if (sparse_any) try latent.sparseAttention(set, stream, v.qa, c.lc, v.tokens, v.counts, sparse.width, v.partials, v.ol, rows, l.heads, l.lw, scale);
+        if (sparse_any) try selectedAttention(k, stream, l, c, v, rows, scale, latent.headBlock(rows));
     }
+}
+
+fn selectedAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, rows: usize, scale: f32, hb: usize) !void {
+    if (k.prefill) if (k.set.prompt_aot) |kernels| {
+        if (try kernels.trySparse(stream, .{ .qa = s.qa, .cache = c.lc, .tokens = s.tokens, .counts = s.counts, .out = s.ol, .rows = rows, .heads = l.heads, .lw = l.lw, .width = sparse.width, .scale = scale })) return;
+    };
+    try latent.sparseAttentionBlock(k.set, stream, s.qa, c.lc, s.tokens, s.counts, sparse.width, s.partials, s.ol, rows, l.heads, l.lw, scale, hb);
 }
 
 /// forward.dense_attention: latent.attention in `part_rows`-row blocks, each at its first row's position.
@@ -412,6 +419,6 @@ const Attention = struct {
         s.qa = qa;
         s.ol = out;
         if (a.host_pos < a.l.dense_limit) try denseAttention(a.k, a.stream, a.l, a.c, s, a.pos, a.rows, a.nch, a.rows, a.scale, a.hb);
-        if (sparseRows(a.l, a.host_pos, a.rows)) try latent.sparseAttentionBlock(a.k.set, a.stream, qa, a.c.lc, s.tokens, s.counts, sparse.width, s.partials, out, a.rows, a.l.heads, a.l.lw, a.scale, a.hb);
+        if (sparseRows(a.l, a.host_pos, a.rows)) try selectedAttention(a.k, a.stream, a.l, a.c, s, a.rows, a.scale, a.hb);
     }
 };

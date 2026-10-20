@@ -46,6 +46,8 @@ test {
     _ = @import("cuda_l2pf_plan.zig");
     _ = @import("cuda_l2pf.zig");
     _ = @import("cuda_attn_fp8load_test.zig");
+    _ = @import("cuda_prompt_latent_policy_test.zig");
+    _ = @import("cuda_prompt_latent_aot.zig");
     _ = @import("cuda_verify_plan_test.zig");
     _ = @import("cuda_checkpoint.zig");
     _ = @import("cuda_weight_source_test.zig");

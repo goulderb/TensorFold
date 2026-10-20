@@ -18,3 +18,10 @@ in LICENSES/donors/mia-b5808ac6/ and LICENSES/donors/wojo-7fac72b3/.
 Original and transitive credits, immutable source references, and local changes
 are described in LICENSES/donors/README.md. Those credits supplement, and do
 not replace, the upstream and third-party notices above.
+
+The GLM prompt latent AOT integration embeds unmodified production TensorFold
+Triton sparse-onepass and BF16 absorb/expand kernels. Local changes provide
+native ownership, validation, prompt dispatch and numerical/cache identity.
+Their exact source/image/compiler/payload provenance and retained original
+license are in zig/src/families/glm/prompt_aot/; the Mia and wojo lineage and
+transitive credits above remain applicable.

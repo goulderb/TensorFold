@@ -11,6 +11,7 @@ const profile = @import("cuda_draft_profile.zig");
 const route_trace = @import("cuda_route_trace.zig");
 const l2pf = @import("cuda_l2pf_plan.zig");
 const kda = @import("cuda_kda.zig");
+const prompt_latent = @import("cuda_prompt_latent_aot.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const Drafter = enum(u8) { off, mtp, dflash2 };
 pub const TargetGraphs = enum(u8) { off, ffn, full };
@@ -25,6 +26,7 @@ pub fn effectiveDraft(mode: Drafter, enabled: bool) !Drafter {
 pub const Settings = struct {
     kv: cache.Format = .bf16,
     attn_fp8load: bool = false,
+    prompt_latent_aot: bool = false,
     weight_dense: precision.DensePolicy = .{},
     weight_head: precision.Head = .bf16,
     exl3_decode: cuda.exl3_experts.Decode = .scalar,
@@ -56,6 +58,7 @@ pub const Settings = struct {
     pub fn hashNumerics(s: Settings, digest: *Sha256) void {
         digest.update("glm-numerics-mia-f1ee79a6-v1\x00");
         digest.update("glm-affine4-prefill-explicit-v1\x00");
+        if (s.prompt_latent_aot) digest.update(&prompt_latent.numerical_identity);
         if (s.kda_prompt == .wy32) digest.update("glm-kda-wy32-production-v1\x00");
         if (s.affine_prompt_policy == .glm_production) digest.update("glm-affine-prompt-tiles-production-v1\x00");
         if (s.prefill_overlap != 0) {
@@ -91,6 +94,12 @@ pub const Settings = struct {
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
         var s: Settings = .{};
+        if (get("TF_GLM_PROMPT_LATENT_AOT")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.prompt_latent_aot = true else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_PROMPT_LATENT_AOT: 0 or 1";
+                return error.BadSetting;
+            }
+        }
         if (get("TF_GLM_PROMPT_TILE")) |v| {
             if (std.mem.eql(u8, v, "1")) s.affine_prompt_policy = .glm_production else if (!std.mem.eql(u8, v, "0")) {
                 problem.* = "TF_GLM_PROMPT_TILE: 0 or 1";
@@ -290,7 +299,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 21,
+    layout: u32 = 22,
     world: u32,
     rank: u32,
     split: u32,
@@ -308,6 +317,7 @@ pub const Fingerprint = extern struct {
     layers: u32, // TF_GLM_LAYERS (0: all)
     kv: u32,
     attn_fp8load: u32 = 0,
+    prompt_latent_aot: u32 = 0,
     weight_dense: [32]u8 = @splat(0),
     weight_head: u32 = 0,
     exl3_decode: u32 = 0,
@@ -327,11 +337,12 @@ pub const Fingerprint = extern struct {
     program: [32]u8, // sha256 of this executable
     checkpoint: [64]u8, // the checkpoint folder's last name (the snapshot's revision), zero padded
 
-    pub const Field = enum { layout, rank, world, split, kda_wide, kda_prompt, affine_prompt_policy, target_graphs, communication, roce_max_bytes, prefetch, draft_prelaunch, pieces, prefill_overlap, prefill_pieces, layers, kv, attn_fp8load, weight_dense, weight_head, exl3_decode, exl3_routed, draft, dflash_verify, draft_profile, draft_checkpoint, vision, kv_pool_tokens, kv_shard, spill, capacity, heat_high, heat_low, config, program, checkpoint };
+    pub const Field = enum { layout, rank, world, split, kda_wide, kda_prompt, affine_prompt_policy, target_graphs, communication, roce_max_bytes, prefetch, draft_prelaunch, pieces, prefill_overlap, prefill_pieces, layers, kv, attn_fp8load, prompt_latent_aot, weight_dense, weight_head, exl3_decode, exl3_routed, draft, dflash_verify, draft_profile, draft_checkpoint, vision, kv_pool_tokens, kv_shard, spill, capacity, heat_high, heat_low, config, program, checkpoint };
 
     pub fn of(world: usize, rank: usize, s: Settings, capacity: usize, config: [32]u8, program: [32]u8, checkpoint_dir: []const u8) Fingerprint {
         var f: Fingerprint = .{ .world = @intCast(world), .rank = @intCast(rank), .split = @intFromBool(s.split), .kda_wide = @intFromBool(s.kda_wide), .kda_prompt = @backingInt(s.kda_prompt), .pieces = s.pieces, .prefill_overlap = s.prefill_overlap, .prefill_pieces = s.prefill_pieces, .layers = s.layers, .kv = @backingInt(s.kv), .kv_pool_tokens = s.kv_pool_tokens, .kv_shard = @intFromBool(s.kv_shard), .capacity = capacity, .heat_high = if (s.heat) |b| b.high_c else 0, .heat_low = if (s.heat) |b| b.low_c else 0, .config = config, .program = program, .checkpoint = @splat(0) };
         f.attn_fp8load = @intFromBool(s.attn_fp8load);
+        f.prompt_latent_aot = @intFromBool(s.prompt_latent_aot);
         f.affine_prompt_policy = @backingInt(s.affine_prompt_policy);
         f.target_graphs = @backingInt(s.target_graphs);
         f.communication = @backingInt(s.communication);
@@ -362,7 +373,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
     for (all, 0..) |f, r| {
         if (f.layout != all[0].layout) return .{ .field = .layout, .rank = r };
         if (f.rank != r) return .{ .field = .rank, .rank = r };
-        inline for (.{ "world", "split", "kda_wide", "kda_prompt", "affine_prompt_policy", "target_graphs", "communication", "roce_max_bytes", "prefetch", "draft_prelaunch", "pieces", "prefill_overlap", "prefill_pieces", "layers", "kv", "attn_fp8load", "weight_dense", "weight_head", "exl3_decode", "exl3_routed", "draft", "dflash_verify", "draft_profile", "draft_checkpoint", "vision", "kv_pool_tokens", "kv_shard", "spill", "capacity", "heat_high", "heat_low", "config", "program", "checkpoint" }) |name| {
+        inline for (.{ "world", "split", "kda_wide", "kda_prompt", "affine_prompt_policy", "target_graphs", "communication", "roce_max_bytes", "prefetch", "draft_prelaunch", "pieces", "prefill_overlap", "prefill_pieces", "layers", "kv", "attn_fp8load", "prompt_latent_aot", "weight_dense", "weight_head", "exl3_decode", "exl3_routed", "draft", "dflash_verify", "draft_profile", "draft_checkpoint", "vision", "kv_pool_tokens", "kv_shard", "spill", "capacity", "heat_high", "heat_low", "config", "program", "checkpoint" }) |name| {
             if (!std.mem.eql(u8, std.mem.asBytes(&@field(f, name)), std.mem.asBytes(&@field(all[0], name))))
                 return .{ .field = @field(Fingerprint.Field, name), .rank = r };
         }
@@ -555,7 +566,7 @@ test "target graph modes separate rank and numerical identities only when enable
     try std.testing.expect(!std.mem.eql(u8, &ffn_digest, &full_digest));
     const h: [32]u8 = @splat(0);
     var all = [_]Fingerprint{ Fingerprint.of(2, 0, unset, 8192, h, h, "target"), Fingerprint.of(2, 1, off, 8192, h, h, "target") };
-    try std.testing.expectEqual(@as(u32, 21), all[0].layout);
+    try std.testing.expectEqual(@as(u32, 22), all[0].layout);
     try std.testing.expectEqual(@as(u32, @backingInt(TargetGraphs.off)), all[0].target_graphs);
     try std.testing.expect(mismatch(&all) == null);
     all[1] = Fingerprint.of(2, 1, ffn, 8192, h, h, "target");
@@ -626,6 +637,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .layers => "TF_GLM_LAYERS",
         .kv => "TF_GLM_KV",
         .attn_fp8load => "TF_GLM_ATTN_FP8LOAD",
+        .prompt_latent_aot => "TF_GLM_PROMPT_LATENT_AOT",
         .weight_dense => "TF_GLM_DENSE and TF_GLM_DENSE_{KDA,DSA,MLP,SHARED,MTP_EH}",
         .weight_head => "TF_GLM_HEAD",
         .exl3_decode => "TF_GLM_EXL3_DECODE",
