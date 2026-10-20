@@ -1,5 +1,6 @@
 //! POST /v1/audio/speech: WAV or raw PCM whole, or raw PCM chunks with stream; only complete synthesis is audio.
 const std = @import("std");
+const sock = @import("platform").sock;
 const api = @import("engine_api");
 const json = @import("json");
 const errors = @import("errors.zig");
@@ -278,8 +279,7 @@ fn startStream(c: *Conn, sample_rate: u32) error{Closed}!void {
     const one: c_int = 1;
     _ = std.c.setsockopt(c.fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, &one, @sizeOf(c_int));
     // a blocking write into a full socket returns after the stall limit, so writeAll's poll can end a stalled stream
-    const stall: std.posix.timeval = .{ .sec = @divTrunc(c.timeouts.write_ms, 1000), .usec = @rem(c.timeouts.write_ms, 1000) * 1000 };
-    std.posix.setsockopt(c.fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&stall)) catch {};
+    sock.setWriteTimeout(c.fd, c.timeouts.write_ms) catch return error.Closed;
     return c.finish("");
 }
 
