@@ -276,7 +276,7 @@ pub const Forward = struct {
     pub fn dsaKernels(f: *const Forward, r: Rank) dsa_block.Kernels {
         return .{ .set = f.set(), .ops = f.m.ops(), .owner = switch (f.exchange) {
             .local => null,
-            .nccl => |n| .{ .d = f.d, .lib = n.lib, .comm = n.comm, .rank = r.w.share.rank },
+            .nccl => |n| .{ .d = f.d, .lib = n.lib, .comm = n.comm, .rank = r.w.share.rank, .tp_group = f.tp_group },
         } };
     }
 

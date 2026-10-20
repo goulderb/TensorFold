@@ -29,7 +29,7 @@ pub fn begin(r: fw.Rank, rows: usize) !void {
 }
 
 /// Shared mixer: prompts keep each KDA projection's original row count and arithmetic.
-/// Decode projections and DSA preparation still span the shared window.
+/// Decode projections span the shared window.
 pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: usize, rows: usize, out: u64) !void {
     const c = &r.w.config;
     const b = r.b;
@@ -78,16 +78,27 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             if (!b.prefill) try kda_block.fill(f.set(), f.stream, k, s, 0, rows, out);
         },
         .mla => |a| {
-            var sparse_any = false;
-            for (r.segs) |g| sparse_any = sparse_any or dsa_block.sparseRows(a, g.st.pos, g.rows);
-            try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, sparse_any);
+            if (b.prefill) {
+                for (r.segs) |g| try dsa_block.prepareSegment(f.set(), f.stream, a, b.dsa, b.normed + g.row0 * c.hidden * 2, c.hidden, g.row0, g.rows, dsa_block.sparseRows(a, g.st.pos, g.rows));
+            } else {
+                var sparse_any = false;
+                for (r.segs) |g| sparse_any = sparse_any or dsa_block.sparseRows(a, g.st.pos, g.rows);
+                try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, sparse_any);
+            }
             try f.prefetchSite(l.index, .o, rows);
             for (r.segs) |g| {
                 const nch = @min(latent.chunksFor(g.st.pos + g.rows), b.nch);
                 try dsa_block.attend(f.dsaKernels(r), f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);
             }
-            try latent.expandV(f.set(), f.stream, b.dsa.ol, a.wv, b.dsa.vn, rows, a.heads, a.dv, a.lw);
-            try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, out);
+            if (b.prefill) {
+                for (r.segs) |g| {
+                    try latent.expandV(f.set(), f.stream, b.dsa.ol + g.row0 * a.heads * a.lw * 2, a.wv, b.dsa.vn + g.row0 * a.heads * a.dv * 2, g.rows, a.heads, a.dv, a.lw);
+                    try dsa_block.fill(f.set(), f.stream, a, b.dsa, g.row0, g.row0 + g.rows, out + g.row0 * c.hidden * 4);
+                }
+            } else {
+                try latent.expandV(f.set(), f.stream, b.dsa.ol, a.wv, b.dsa.vn, rows, a.heads, a.dv, a.lw);
+                try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, out);
+            }
         },
     }
 }

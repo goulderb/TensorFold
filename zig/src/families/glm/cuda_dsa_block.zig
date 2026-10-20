@@ -155,6 +155,21 @@ pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
     if (qi) try b16.proj(set, stream, s.qr, l.q_lora, ix.qb, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
 }
 
+/// Keep a prompt's projection dispatch while storing its persistent rows in the packed frame.
+pub fn prepareSegment(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, row0: usize, rows: usize, qi: bool) !void {
+    var v = s;
+    v.qr += row0 * l.q_lora * 2;
+    v.xs_qr += row0 * (l.q_lora / 64) * 4;
+    v.lat += row0 * l.lw * 2;
+    v.xs_lat += row0 * (l.lw / 64) * 4;
+    v.q += row0 * l.heads * l.qk * 2;
+    v.ikr += row0 * (l.index.d + l.index.heads) * 2;
+    v.igr += row0 * l.index.d * 4;
+    v.qa += row0 * l.heads * l.lw * 2;
+    v.qi += row0 * l.index.heads * l.index.d * 2;
+    try prepare(set, stream, l, v, x, x_stride, rows, qi);
+}
+
 fn prepareInput(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize) !void {
     const width = l.q_lora + l.lw;
     switch (l.input) {
