@@ -79,7 +79,7 @@ pub const Chain = struct {
         if (options.devices.len == 2 and (options.devices[0] == options.devices[1] or options.cut == 0 or options.cut >= config.geometry.layers)) return error.InvalidPartition;
         const admitted: checkpoint.Admitted = .{ .geometry = config.geometry, .encoding = .{ .modelopt = config } };
         try engine.validateMoeMath(admitted, options.moe_math);
-        try engine.validateAttentionMode(admitted, options.attention_mode);
+        try engine.validateAttentionMode(admitted, options.attention_mode, options.kv8);
         var placements: [2]checkpoint.Placement = undefined;
         var budgets: [2]MemoryBudget = undefined;
         var ck = try core.Checkpoint.openModel(gpa, io, dir);

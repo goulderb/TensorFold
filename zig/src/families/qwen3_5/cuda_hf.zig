@@ -15,6 +15,9 @@ pub fn attnKernelNames(mode: AttentionMode) struct { partial: [:0]const u8, merg
     };
 }
 
+/// The chunked partial over --kv-cache fp8's e4m3 rows, in the HF image; it shares the chunked merge.
+pub const attn_partial8_chunked: [:0]const u8 = "tf_q35_hf_attn_partial8_chunked";
+
 /// Launch geometry for one attention mode. HF reference is serial; chunked uses qwen35.cu's grid.
 pub const AttnLaunch = struct {
     partial_grid: [3]usize,
