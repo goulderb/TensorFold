@@ -83,11 +83,24 @@ pub fn experts(gpu: Gpu, dir: []const u8) !void {
     var stream = try cuda.Stream.init(gpu.d, false); // blocking: launches wait for fromHost's legacy-stream copies
     defer stream.deinit();
 
+    try ex.loadSliceMajorUp(sms);
+    const slice_words = try a.alloc(u32, pu.len);
+    defer a.free(slice_words);
+    for (0..pu.len / 144) |b| for (0..144) |w| {
+        const dst = if (w < 128) 32 * (w % 4) + w / 4 else w;
+        slice_words[b * 144 + dst] = pu[b * 144 + w];
+    };
+    var slice_up = try cuda.DeviceBuffer.fromHost(gpu.d, std.mem.sliceAsBytes(slice_words));
+    defer slice_up.free();
+    var slice_layer = layer;
+    slice_layer.up = slice_up.ptr;
+    slice_layer.nvfp4_up_layout = .slice_major_v1;
     inline for (.{ .{ "decode", false }, .{ "prompt", true } }) |set| {
         var it = std.mem.tokenizeScalar(u8, try fx.string(set[0]), ',');
         while (it.next()) |tok| {
             const rows = try std.fmt.parseInt(usize, tok, 10);
             try oneCase(gpu, fx, router, .{ .nvfp4 = &ex }, stream, layer, rows, slots, set[1]);
+            try oneCase(gpu, fx, router, .{ .nvfp4 = &ex }, stream, slice_layer, rows, slots, set[1]);
         }
     }
 }
@@ -138,7 +151,10 @@ fn oneCase(gpu: Gpu, fx: Fixture, router: grouped.Router, g: ex_.Grouped, s: cud
     var act = try cuda.DeviceBuffer.alloc(gpu.d, pairs * l.width * 2);
     defer act.free();
     try act.fill8(0xff, s.handle); // a call that writes nothing fails rather than pass on old bytes
-    try g.decode(s, .up, .{ .x = dx.ptr, .stride = l.dims, .slots = slots }, l, plan, act.ptr, bound, -1);
+    const input: ex_.Rows = .{ .x = dx.ptr, .stride = l.dims, .slots = slots };
+    if (l.nvfp4_up_layout == .slice_major_v1) {
+        try g.nvfp4.?.runSplitMUp(s, input, l, plan, act.ptr, bound, -1);
+    } else try g.decode(s, .up, input, l, plan, act.ptr, bound, -1);
     try s.synchronize();
     const got_act = try check.download(gpu, act);
     defer a.free(got_act);

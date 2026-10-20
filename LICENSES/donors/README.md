@@ -300,7 +300,94 @@ geometry, isolate persisted numerical identity, and add guarded device proofs.
 Other families and the decode policy retain their defaults. Original,
 MiaAI-Lab, wojo and transitive notices continue to apply.
 
+## Qwen CUDA mathematical reference
+
+`zig/kernels/cuda/qwen35_ops.cu` and
+`zig/src/families/qwen3_5/cuda_kernels_test.zig` adapt the Qwen text equations
+from Hugging Face Transformers, revision
+`e0eb2810ac1b2caf6d082f247d8d37162ecf67a0`, source
+`src/transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py`.
+The original copyright names the Qwen Team and the HuggingFace Inc. team,
+Copyright 2025. The Apache-2.0 license is retained unmodified in
+`transformers-e0eb2810/LICENSE`, and the adapted files retain its header.
+
+Local changes implement fixed 35B CUDA entry points, serial persistent GDN
+state, online causal attention, deterministic top-eight routing and small
+independent host reference fixtures. The existing CUDA packing and matmul
+kernels retain their original TensorFold and donor credits. TensorFold
+`upstream/v0.6.6`, commit `cb2ebf0540f42604e2759b2ddef497861e928248`, was
+also inspected as a semantic reference. Its older Qwen GDN rounding was not
+copied into this implementation. These additions do not establish numerical
+parity with a particular fused implementation or approve a model deployment.
+
+The four Qwen checkpoint fixtures contain configuration and tensor metadata
+only. Each `source.json` names the producer, immutable model revision and
+header hashes. Checkpoint weights are not included and retain their producers'
+separate terms.
+
+## Qwen host sampler tuning
+
+The local change at `b864564587f00f308ff9215c9870bffcd11da61f`
+extends TensorFold's existing `zig/src/core/lanes/sampling.zig` from fork
+source `ad247b3daf045015d59bd106a88591bff961e488`. Finite greedy rows use
+an allocation-free maximum scan with the original comparator. The original
+sorting and sampled body is retained for all fallback cases. TensorFold's
+original notices, contributors and seed-salt attribution remain in place;
+this change claims no authorship of the existing sampler or model math.
+
+Generated Python sampler vectors are preserved under
+`docs/plans/qwen35-ornith/evidence/tuning-20261019/`. They were recorded by
+the existing `tools/zig/record_lanes.py` and `lanes_units.py` from TensorFold's
+Python `engine/exact_sampling.py`, checkout
+`a601ddee69f2eb41bf8faf28ab14a4255e3a8f98`. Its latest file revision is
+`8a836f2d927c19c9296634d454490a045ddf0b06`, Jürgen Schmied's seed-salt
+change, already credited in `docs/credits.md`; that commit is not a claim
+of original authorship of the whole file. The fixture manifest records the
+source and generated-byte hashes. No Python source or new external kernel
+is copied into this unit. Existing TensorFold and transitive donor licenses
+and notices remain unchanged.
+
 ## Retain notices in future changes and releases
+
+The October 19 Qwen operator evidence adapts TensorFold contributors'
+`zig/kernels/cuda/ck_lane.cu`, `mma4.cuh`, `qmm_frag.cuh`,
+`nvfp4_experts.cu` and `experts.cuh`, preserved at fork revision
+`62a2a679878e5d57e6949d0fd6ce009d408fc211`. The diagnostic source snapshots
+retain their original headers. The stage-depth clone changes the pipeline
+depth and entry names; the MMA clone adds FP32 trace stores and separate
+entry names. The slice-major experiment permutes complete packed words and
+changes the corresponding scalar address in a renamed split-M consumer.
+These are local diagnostic adaptations, not original authorship of the
+operators or their mathematical references. TensorFold's copyright,
+Apache-2.0 license, earlier MIT notices where applicable, NVIDIA runtime
+dependency terms and all existing transitive credits continue to apply.
+The archives pin actual source/header/compiler bytes and state the local
+changes; they do not package or relicense the checkpoint or CUDA runtime.
+The terminal-greedy screen reuses TensorFold's existing tree-round BF16
+argmax and retains the diagnostic host comparator as a source-pinned control.
+The shared-activation screen extracts the existing Qwen HF activation,
+renames its control and adds a diagnostic BF16 intermediate round plus a
+separate recorder. It retains the original mathematical-reference credits
+above; the diagnostic candidate is not a newly authored model equation.
+The isolated expert-combine screen retains the same Qwen/Transformers
+reference and native combine control. Its candidate makes BF16 route,
+down, product and accumulator boundaries explicit and visits the selected
+experts in ascending ID order. A separate recorder checks those boundaries.
+Expected HF outputs remain host comparison data. This is a local diagnostic
+adaptation, not a new model equation or a change to checkpoint licensing.
+
+The next tuning probes retain the entire original shared sampler at local
+revision `ad247b3daf045015d59bd106a88591bff961e488` as
+`zig/tests/fixtures/qwen35/sampler_before.zig`. It is a byte-identical
+benchmark control, not newly authored sampling logic. Its SHA256 is
+`c8656618cdcabd582388cf25dca2dc0b1d05333266311aebf1cfb0b61b206c41`.
+The head probe reuses the existing Qwen loader and shared norm/NVFP4 CUDA
+operators. `tools/zig/record_qwen35_head.py` reuses the existing Qwen CPU
+reference implementation to generate residual, norm and head-output data;
+the fixture manifest pins that reference source. No new external kernel,
+checkpoint weight or license text is imported by these probes. Original
+and transitive TensorFold, Qwen, NVIDIA and other retained donor credits
+continue to apply to their existing implementations.
 
 Keep original copyright headers, licenses, `NOTICE`, and credit files.
 Record immutable source revisions and state what changed. Preserve transitive
@@ -312,3 +399,12 @@ addendum and the donor documents. The packaging regression checks the bytes
 in the resulting archives. Recheck the exact artifact before publication.
 Model licenses, compiled dependencies, and container licenses need separate
 review. No public fork or release is approved by this attribution backfill.
+
+
+The opt-in Qwen slice-major expert-up representation adapts TensorFold's existing
+`modelopt_pack.cu` packer and the retained `nvfp4/experts.cu` split-M arithmetic.
+It writes the code-word permutation directly into the original up allocation and
+adds an explicit split-M consumer with slice-contiguous scalar loads. Scale words,
+down packing and arithmetic retain the original implementation. This local tuning
+adaptation imports no new donor kernel. All original and transitive notices above
+remain applicable, and checkpoint provenance and licensing remain separate.

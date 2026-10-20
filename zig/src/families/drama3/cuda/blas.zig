@@ -1,6 +1,7 @@
 //! cuBLAS (the classic API) opened at run time: the strided batched GEMM Drama 3's prompt rows and codec take.
 const std = @import("std");
 const cuda = @import("cuda");
+const platform = @import("sys");
 
 pub const Status = c_int;
 pub const Handle = ?*opaque {};
@@ -33,13 +34,14 @@ pub const Api = struct {
 
 /// The library and one handle with its workspace, bound to a stream per call.
 pub const Blas = struct {
-    lib: std.DynLib,
+    lib: platform.DynLib,
     api: Api,
     h: Handle,
 
     /// The CUDA 13 soname first, then the unversioned link name, as cuda/cublaslt.zig opens cuBLASLt.
     pub fn open(workspace: Ptr, workspace_bytes: usize) Error!Blas {
-        for ([_][]const u8{ "libcublas.so.13", "libcublas.so" }) |path| {
+        const names: []const []const u8 = if (platform.windows) &.{ "cublas64_13.dll", "cublas64_12.dll" } else &.{ "libcublas.so.13", "libcublas.so" };
+        for (names) |path| {
             return openPath(path, workspace, workspace_bytes) catch |e| switch (e) {
                 error.LibraryUnavailable => continue,
                 else => return e,
@@ -49,7 +51,7 @@ pub const Blas = struct {
     }
 
     fn openPath(path: []const u8, workspace: Ptr, workspace_bytes: usize) Error!Blas {
-        var lib = std.DynLib.open(path) catch return error.LibraryUnavailable;
+        var lib = platform.DynLib.open(path) catch return error.LibraryUnavailable;
         errdefer lib.close();
         var b: Blas = .{ .lib = lib, .api = undefined, .h = null };
         const info = @typeInfo(Api).@"struct";

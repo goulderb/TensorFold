@@ -1,0 +1,37 @@
+{
+  "repo": "nvidia/Qwen3.6-35B-A3B-NVFP4",
+  "revision": "1355db6a052410cfd62085d94b58866fd0f2c3c5",
+  "sources": [
+    {
+      "file": "model-00001-of-00003.safetensors",
+      "header_bytes": 6937600,
+      "header_sha256": "0489a7e3ccdbfd6fc395a83982c74f7ce0b4ce582b71bf73487114412843963f",
+      "tensors": 51662
+    },
+    {
+      "file": "model-00002-of-00003.safetensors",
+      "header_bytes": 8566488,
+      "header_sha256": "2c71ba7e6d99c3624cf5f11feb5f89befce3870d3810e13e9abad41f0d5acaa7",
+      "tensors": 63484
+    },
+    {
+      "file": "model-00003-of-00003.safetensors",
+      "header_bytes": 1253352,
+      "header_sha256": "62fa87171c102f8a9e36750b91d3204fc31bda19fcd890fff0f17d194aea2332",
+      "tensors": 9322
+    }
+  ],
+  "capture_script_sha256": "1e686ce92ce47aba08e7421f88913fd4e8c0d25848cc0d85963f05b74ccb7513",
+  "config_sha256": "58aefa1c9eff7989f431d748f2ddec39446cb1fd2a69acc46e285c6a37b0cecc",
+  "headers_sha256": "0466d37c5bd793e84d10972c555d4f9baa09c1dd44f5b05615b8e87e04d8c8c1",
+  "tensors": 124468,
+  "dtype_counts": {
+    "F32": 61942,
+    "BF16": 714,
+    "F8_E4M3": 30971,
+    "U8": 30841
+  },
+  "quant_method": "modelopt",
+  "quant_algo": "MIXED_PRECISION",
+  "tensor_bytes": 23407580856
+}

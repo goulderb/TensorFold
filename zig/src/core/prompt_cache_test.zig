@@ -93,6 +93,84 @@ test "a planned family's own grid gives the starts when a request names none, an
     try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, p2));
 }
 
+test "a planned grid with no history still keeps the first grid cut on a raw completion" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .planned = true, .grid = 4, .min_prompt = 0, .min_gap = 4 }, 1 << 20);
+    defer s.deinit();
+    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    const p1 = try s.begin(a, &t1, 0, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 0), p1.from);
+    try std.testing.expectEqualSlices(u32, &.{4}, p1.marks);
+    _ = f.pass(&s, &t1, p1);
+    const t2 = [_]u32{ 1, 2, 3, 4, 7, 8 };
+    const p2 = try s.begin(a, &t2, 0, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 4), p2.from);
+    try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, p2));
+}
+
+test "Qwen ModelOpt rules keep the 2048-token grid cut on a raw 2064-token completion" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .planned = true, .grid = 2048, .min_prompt = 0, .lookahead = 0 }, 1 << 20);
+    defer s.deinit();
+    const t1 = try a.alloc(u32, 2064);
+    for (t1, 0..) |*t, i| t.* = @intCast(i + 1);
+    const p1 = try s.begin(a, t1, 0, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 0), p1.from);
+    try std.testing.expectEqualSlices(u32, &.{2048}, p1.marks);
+    _ = f.pass(&s, t1, p1);
+    const t2 = try a.alloc(u32, 2064);
+    @memcpy(t2[0..2048], t1[0..2048]);
+    for (t2[2048..], 0..) |*t, i| t.* = @intCast(10_000 + i);
+    const p2 = try s.begin(a, t2, 0, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 2048), p2.from);
+    try std.testing.expectEqual(fresh(t2), f.pass(&s, t2, p2));
+}
+
+test "a short planned history before the first grid point is kept and resumed" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .planned = true, .grid = 2048, .min_prompt = 0, .lookahead = 0 }, 1 << 20);
+    defer s.deinit();
+    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    const p1 = try s.begin(a, &t1, 12, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqualSlices(u32, &.{12}, p1.marks);
+    _ = f.pass(&s, &t1, p1);
+    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 20, 21, 22, 23 };
+    const p2 = try s.begin(a, &t2, 20, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 12), p2.from);
+    try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, p2));
+}
+
+test "a planned family with named starts and no history still keeps the first start on a raw completion" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .planned = true, .min_prompt = 0, .min_gap = 4 }, 1 << 20);
+    defer s.deinit();
+    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    const p1 = try s.begin(a, &t1, 0, &.{}, &.{4}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 0), p1.from);
+    try std.testing.expectEqualSlices(u32, &.{4}, p1.marks);
+    _ = f.pass(&s, &t1, p1);
+    const t2 = [_]u32{ 1, 2, 3, 4, 7, 8 };
+    const p2 = try s.begin(a, &t2, 0, &.{}, &.{4}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 4), p2.from);
+    try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, p2));
+}
+
 /// Prompt calls of a pass from `from`: `step` rows on from each cut, sooner at any of `cuts` (as qwen27_slots.prefill).
 fn calls(len: u32, from: u32, step: u32, cuts: []const []const u32) usize {
     var n: usize = 0;

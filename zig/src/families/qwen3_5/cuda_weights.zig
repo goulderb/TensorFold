@@ -4,6 +4,32 @@ const cuda = @import("cuda");
 const core = @import("core");
 const geometry = @import("cuda_geometry.zig");
 const engine = @import("cuda_engine.zig");
+const checkpoint = @import("cuda_checkpoint.zig");
+const modelopt = @import("cuda_modelopt_weights.zig");
+
+pub const Plan = modelopt.Plan;
+
+pub fn plan(source: anytype, admitted: checkpoint.Admitted, placement: checkpoint.Placement) !Plan {
+    _ = try placement.localGeometry(admitted.geometry);
+    return switch (admitted.encoding) {
+        .modelopt => |cfg| modelopt.plan(source, cfg, placement),
+        .mlx => blk: {
+            if (!placement.ownsEmbedding() or !placement.ownsHead()) return error.UnsupportedQwenPlacement;
+            break :blk .{ .weights_bytes = total(admitted.geometry), .staging_bytes = stageBytes(admitted.geometry) };
+        },
+    };
+}
+
+pub fn loadPlaced(e: *Engine, ck: *core.Checkpoint, stage: *DeviceBuffer, admitted: checkpoint.Admitted, placement: checkpoint.Placement) !void {
+    _ = try placement.localGeometry(admitted.geometry);
+    switch (admitted.encoding) {
+        .modelopt => |cfg| try modelopt.load(e, ck, stage, cfg, placement),
+        .mlx => {
+            if (!placement.ownsEmbedding() or !placement.ownsHead()) return error.UnsupportedQwenPlacement;
+            try load(e, ck, stage);
+        },
+    }
+}
 
 const Geometry = geometry.Geometry;
 const Slot = geometry.Slot;

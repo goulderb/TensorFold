@@ -147,6 +147,34 @@ pub fn setListenReuse(h: Handle) error{OptionFailed}!void {
     return setOption(h, if (windows) .exclusive_addr else .reuse_addr, true);
 }
 
+pub fn setWriteTimeout(h: Handle, milliseconds: i32) error{OptionFailed}!void {
+    if (milliseconds <= 0) return error.OptionFailed;
+    if (windows) {
+        const value: u32 = @intCast(milliseconds);
+        if (setsockopt(sock(h), 0xffff, 0x1005, &value, @sizeOf(u32)) == SOCKET_ERROR) return error.OptionFailed;
+    } else {
+        const value: posix.timeval = .{ .sec = @divTrunc(milliseconds, 1000), .usec = @rem(milliseconds, 1000) * 1000 };
+        posix.setsockopt(h, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&value)) catch return error.OptionFailed;
+    }
+}
+
+test "socket write timeout configures the native millisecond deadline" {
+    const handle = try create(posix.AF.INET, true);
+    defer close(handle);
+    try setWriteTimeout(handle, 1234);
+    if (windows) {
+        try std.testing.expectEqual(@as(?c_int, 1234), winOpt(handle, 0xffff, 0x1005));
+    } else {
+        var value: posix.timeval = undefined;
+        var size: posix.socklen_t = @sizeOf(posix.timeval);
+        try std.testing.expect(posix.errno(posix.system.getsockopt(handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, @ptrCast(&value), &size)) == .SUCCESS);
+        const milliseconds = value.sec * 1000 + @divTrunc(value.usec, 1000);
+        try std.testing.expect(milliseconds >= 1234 and milliseconds < 1334);
+    }
+    try std.testing.expectError(error.OptionFailed, setWriteTimeout(handle, 0));
+    try std.testing.expectError(error.OptionFailed, setWriteTimeout(handle, -1));
+}
+
 pub const BindError = error{ AddressInUse, AccessDenied, BindFailed };
 
 pub fn bindAddr(h: Handle, addr: *const Address, len: u32) BindError!void {

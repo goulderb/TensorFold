@@ -55,6 +55,7 @@ pub fn run(gpu: Gpu) !void {
     defer pack.unload();
     var stream = try cuda.Stream.init(gpu.d, false); // blocking: launches wait for fromHost's legacy-stream copies
     defer stream.deinit();
+    try pack.loadSliceMajorExperts();
     try packers(gpu, rng, &pack, stream);
     const capability = try gpu.ctx.capability();
     if (capability / 10 < 8) {
@@ -160,6 +161,28 @@ fn packers(gpu: Gpu, rng: std.Random, p: *const modelopt.Packer, s: cuda.Stream)
         try s.synchronize();
         try same(gpu, "nvfp4 expert half", out, std.mem.sliceAsBytes(want[0..blk]));
     }
+    var pair_out = try cuda.DeviceBuffer.alloc(gpu.d, 2 * blk * 4);
+    defer pair_out.free();
+    const pair_want = try a.alloc(u32, 2 * blk);
+    defer a.free(pair_want);
+    const half_c = try a.alloc(u8, en * ek / 2);
+    defer a.free(half_c);
+    const half_s = try a.alloc(u8, en * ek / 16);
+    defer a.free(half_s);
+    for (0..2) |h| {
+        for (0..en) |r| {
+            @memcpy(half_c[r * ek / 2 ..][0 .. ek / 2], ec[r * ek + h * ek / 2 ..][0 .. ek / 2]);
+            @memcpy(half_s[r * ek / 16 ..][0 .. ek / 16], es[r * ek / 8 + h * ek / 16 ..][0 .. ek / 16]);
+        }
+        fx4.packOne(want[0..blk], half_c, half_s, en, ek);
+        for (0..blk / 144) |b| for (0..144) |w| {
+            const dst = if (w < 128) 32 * (w % 4) + w / 4 else w;
+            pair_want[(2 * b + h) * 144 + dst] = want[b * 144 + w];
+        };
+        try p.fp4ExpertsLayout(s, dec.ptr, des.ptr, pair_out.ptr, 1, en, 2 * ek, h * ek, ek, 2, h, .slice_major_v1);
+    }
+    try s.synchronize();
+    try same(gpu, "direct slice-major two-part expert pack with K offsets", pair_out, std.mem.sliceAsBytes(pair_want));
     check.pass("modelopt repack: fp8, bf16 and fp4 lane tiles and nvfp4 expert blocks (and column halves) equal the host packers", .{});
 }
 

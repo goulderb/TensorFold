@@ -107,9 +107,13 @@ pub const flags = [_]Flag{
     .{ .name = "--prefill-fp8", .kind = .store_true },
     .{ .name = "--no-prefill-fp8", .kind = .store_true },
     .{ .name = "--precision", .choices = &.{ "checkpoint", "full" }, .native = cuda_build },
-    // the CUDA CLI's own: the GPU ordinal, and whole prompt chunks a call runs as staggered segments
+    // the CUDA CLI's own: the GPU ordinal, whole prompt chunks a call runs as staggered segments,
+    // and Qwen ModelOpt's true multi-row prefill bound (1..16; default 1)
     .{ .name = "--device", .native = cuda_build },
     .{ .name = "--segments", .native = cuda_build },
+    // Windows CUDA native also serves this; do not gate on linux-only cuda_build.
+    .{ .name = "--prefill-rows", .native = true },
+    .{ .name = "--qwen-attention", .choices = &.{ "reference", "chunked" }, .native = true },
     // the native server's own: shared prompt states (a harness) kept on disk for later sessions and servers
     .{ .name = "--learn", .kind = .store_true, .native = true },
     .{ .name = "--learn-dir", .native = true },
@@ -181,6 +185,8 @@ pub const Args = struct {
     backend: []const u8 = "auto",
     device: ?u32 = null,
     segments: ?u32 = null,
+    prefill_rows: ?u32 = null, // Qwen ModelOpt true multi-row prefill bound (1..16; null: 1)
+    qwen_attention: ?api.QwenAttention = null, // Qwen ModelOpt attention: HF serial or upstream chunked; null: chunked serving
     precision: ?api.Precision = null, // an NVFP4 checkpoint's math on CUDA: NVIDIA's own (checkpoint) or full precision
     mtp_drafts: ?u32 = null,
     mtp_confidence: ?f64 = null,
@@ -345,7 +351,7 @@ fn recallFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usa
     return true;
 }
 
-/// The CUDA build's --device, --segments and --precision; false for any other flag.
+/// The CUDA build's --device, --segments, --prefill-rows, --qwen-attention and --precision; false for any other flag.
 fn cudaFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage) error{ Usage, OutOfMemory }!bool {
     if (std.mem.eql(u8, name, "--precision")) {
         out.precision = std.meta.stringToEnum(api.Precision, v) orelse return fail(u, a, "argument --precision: checkpoint or full: '{s}'", .{v});
@@ -354,6 +360,11 @@ fn cudaFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage
     } else if (std.mem.eql(u8, name, "--segments")) {
         const n = try int(u, a, name, v);
         out.segments = if (n >= 1) @intCast(@min(n, std.math.maxInt(u32))) else return fail(u, a, "argument --segments: a count from 1: '{s}'", .{v});
+    } else if (std.mem.eql(u8, name, "--prefill-rows")) {
+        const n = try int(u, a, name, v);
+        out.prefill_rows = if (n >= 1 and n <= 16) @intCast(n) else return fail(u, a, "argument --prefill-rows: a count from 1 to 16: '{s}'", .{v});
+    } else if (std.mem.eql(u8, name, "--qwen-attention")) {
+        out.qwen_attention = std.meta.stringToEnum(api.QwenAttention, v) orelse return fail(u, a, "argument --qwen-attention: reference or chunked: '{s}'", .{v});
     } else return false;
     return true;
 }
@@ -434,6 +445,8 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .recall = args.recall,
         .device = args.device,
         .segments = args.segments,
+        .prefill_rows = args.prefill_rows,
+        .qwen_attention = args.qwen_attention,
         .precision = args.precision,
         .mtp_drafts = args.mtp_drafts,
         .mtp_confidence = args.mtp_confidence,
@@ -505,8 +518,26 @@ test "--device and --segments: CUDA builds serve them, values checked; --speed-u
     try std.testing.expectError(error.Usage, cudaFlag(a, &out, "--segments", "0", &u));
     try std.testing.expect(try cudaFlag(a, &out, "--segments", "4", &u));
     try std.testing.expectEqual(@as(?u32, 4), out.segments);
+    try std.testing.expect(try cudaFlag(a, &out, "--prefill-rows", "16", &u));
+    try std.testing.expectEqual(@as(?u32, 16), out.prefill_rows);
+    try std.testing.expectError(error.Usage, cudaFlag(a, &out, "--prefill-rows", "0", &u));
+    try std.testing.expectError(error.Usage, cudaFlag(a, &out, "--prefill-rows", "17", &u));
+    try std.testing.expect(try cudaFlag(a, &out, "--qwen-attention", "chunked", &u));
+    try std.testing.expectEqual(@as(?api.QwenAttention, .chunked), out.qwen_attention);
+    try std.testing.expectError(error.Usage, cudaFlag(a, &out, "--qwen-attention", "parallel", &u));
     try std.testing.expect(!try cudaFlag(a, &out, "--port", "1", &u));
     try std.testing.expect(parallelFixed("3") and !parallelFixed("auto") and !parallelFixed("x"));
+    // Windows CUDA native serves --prefill-rows even though linux-only cuda_build gates --device/--segments.
+    const rows = try parse(a, &.{ "m", "--prefill-rows", "8" }, &u);
+    try std.testing.expectEqual(@as(?u32, 8), rows.prefill_rows);
+    const open = try request(a, "dir", "qwen3_5_moe", rows);
+    try std.testing.expectEqual(@as(?u32, 8), open.prefill_rows);
+    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--prefill-rows", "0" }, &u));
+    const attn = try parse(a, &.{ "m", "--qwen-attention", "chunked" }, &u);
+    try std.testing.expectEqual(@as(?api.QwenAttention, .chunked), attn.qwen_attention);
+    const attn_open = try request(a, "dir", "qwen3_5_moe", attn);
+    try std.testing.expectEqual(@as(?api.QwenAttention, .chunked), attn_open.qwen_attention);
+    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--qwen-attention", "fast" }, &u));
 }
 
 test "the GPU engine's flags: refused and unlisted unless the backend serves them, values checked" {

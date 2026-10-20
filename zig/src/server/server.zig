@@ -28,6 +28,20 @@ const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
 
+fn acceptedSocket(fd: platform.posix.socket_t) @FieldType(http_conn.Conn, "fd") {
+    return if (platform.windows) @ptrFromInt(@as(usize, @bitCast(fd))) else fd;
+}
+
+test "accepted socket preserves native handle bits at the HTTP boundary" {
+    if (platform.windows) {
+        for ([_]usize{ 1, 0x1234567887654321, 0xfffffffffffffff0 }) |bits| {
+            try std.testing.expectEqual(bits, @intFromPtr(acceptedSocket(@bitCast(bits))));
+        }
+    } else {
+        try std.testing.expectEqual(@as(platform.posix.socket_t, 7), acceptedSocket(7));
+    }
+}
+
 /// auto compacts near the window. fraction compacts past that share of it.
 pub const CompactAt = union(enum) { auto, fraction: f64 };
 
@@ -354,7 +368,7 @@ pub const Server = struct {
         defer _ = platform.posix.system.close(accepted.fd);
         var peer_buf: [64]u8 = undefined;
         const peer = listener_mod.peerText(&peer_buf, accepted.peer);
-        var conn = http_conn.Conn.init(srv.gpa, accepted.fd, peer) catch return;
+        var conn = http_conn.Conn.init(srv.gpa, acceptedSocket(accepted.fd), peer) catch return;
         defer conn.deinit();
         conn.timeouts = srv.config.timeouts;
         conn.auth_enabled = srv.keys != null and srv.keys.?.enabled();

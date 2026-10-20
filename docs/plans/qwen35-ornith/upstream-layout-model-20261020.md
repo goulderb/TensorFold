@@ -1,0 +1,43 @@
+# Immutable expert-layout model comparison
+
+The complete shared-Engine comparison passes native correctness across twelve fresh model lifetimes. Slice-major prefill is consistently faster for this bounded workload: five positive paired reductions, with a median of 1.5565%. Full-turn and decode improvements remain inconclusive because the paired signs are mixed and the observed timing spread exceeds the median gap. This result supports retaining the representation as a small prefill candidate. It does not establish a decode improvement or the requested performance scaling wall.
+
+The protected trial uses frozen source `ebde3f1caf0bcdc7ecdda20cdbbf8efb9ca05de7` and executable SHA256 `2ac433c231895b3605b04a6e39a77aebf4263105875a0b1c7f2f8668f5d50666`. The frozen build completed at 2026-10-19 23:54:55 UTC with unchanged source and image bytes. The complete source join covers 2,578 files and 93 CUDA images. The matching CPU run passed 70 tests, with all 2,104 Zig source files and 93 images joined to the build. The CUDA sources and all images are unchanged from the accepted packing proof at `74432a8ae528bd06aa12bcc031e6203a1a71287f`. Licenses, donor notices and the original upstream source context are retained in the evidence.
+
+The two arms differ in immutable expert-up layout: `lane_major` and `slice_major_v1`. Both use split-M, same-scale FP8 reuse, bounded prefill of 16 rows, the key/value GDN layout, two device partitions with cut20, and terminal greedy disabled. One model is resident at a time. Every fresh lifetime asserts the selected physical tag on every Engine and MoE layer. Each arm performs an untimed complete qualification turn with graph validators enabled before disabling validators for timing. All measured work reuses the qualified graph cache with unchanged node counts. The startup, graph qualification, parity readbacks and archival remain outside measured turns.
+
+The workload is the unchanged historical 64-token prompt, 128 greedy choices, context4096 and 127 appended decode tokens. Each measured turn includes full-logit downloads/copies and host argmax. It performs 131 body calls per rank and 262 graph launches across the two ranks. The trial excludes the first warmup pair and retains five alternating pairs with fresh sequential model loads. These are private C=1 Engine measurements, not HTTP serving throughput or a long-prompt prefill benchmark.
+
+| Phase | Median paired reduction | Paired range | Verdict |
+| --- | ---: | ---: | --- |
+| Prefill | 1.556532% | 1.356568% to 1.758556% | All five positive; gap exceeds observed arm spread |
+| Decode | 0.540853% | -0.707229% to 0.819931% | Inconclusive; mixed signs |
+| Complete turn | 0.621318% | -0.501342% to 0.868776% | Inconclusive; mixed signs |
+
+The complete paired reductions, in chronological measured-pair order, are retained below. Positive means slice-major took less wall time than matched legacy.
+
+| Pair | Prefill | Decode | Complete turn |
+| --- | ---: | ---: | ---: |
+| 1 | 1.422828% | 0.540853% | 0.621318% |
+| 2 | 1.556532% | -0.707229% | -0.501342% |
+| 3 | 1.356568% | 0.819931% | 0.868776% |
+| 4 | 1.664005% | 0.720363% | 0.806399% |
+| 5 | 1.758556% | 0.505773% | 0.620550% |
+
+The median paired savings are 1.6717 ms prefill, 5.7947 ms decode and 7.3251 ms complete turn. The larger observed within-arm ranges are 0.3782 ms, 18.1029 ms and 17.9719 ms respectively. The predeclared descriptive noise rule requires uniform paired signs and an absolute median paired gap greater than the larger within-arm range; it is not a statistical confidence interval. Both arm samples, all five pair deltas and ranges remain in the actual analysis.
+
+The independent outer audit accepts all 1,046 journal records and all six raw files, consuming the complete record/raw union exactly once. All twelve turns preserve the original native full-logit anchor `b78bb49d36d6abcc509679be4673442594072d65f53b5f0998e1474ce0582839` and canonical-state-v2 anchor `7fb71e4f454a6dd058d243337ddbcd4a189032aa44c35e3bc3289ff920acfd89`. Every raw reference/warmup byte is rechecked independently; all 128 tokens are independently derived from BF16 logits using finite checks and the original strict lower-ID tie behavior. Later full-row and complete canonical-state comparisons are enforced by the frozen source and retained hashes. The qualification witnesses cover 24 resource/binding records and 960 actual expert graph nodes, with rows1/16 and all twenty local layers on both ranks. Registers remain 114 for rebuilt legacy and 110 for the candidate, with 2,048 static shared bytes and zero local memory.
+
+The original actual audit failed at `layout_model_bindings cached_shapes`. That receipt and the original checker remain immutable. The checker had assumed that all cached shapes were qualification shapes. Frozen `Chain.open` actually creates a warm session and appends one token before returning, before the profile enables FP8 reuse and graph validators. This inserts one unverified startup graph. Qualification then captures two new shapes, rows16 and rows1, with reuse enabled. Shape-key bit23 separates both qualified keys from startup, so the startup graph is never used by timing. `Engine.execute` counts all captured nodes while incrementing the verified-graph count only with expert validation enabled. Thus the source-derived contract is three cached shapes and two verified qualification shapes.
+
+The new R2 checker checks the actual journal without changing it. Its exact diff from the original adds the mandatory frozen pipeline/Engine source proof and requires the source-derived cache count. It labels node totals `cached_graph_nodes_by_rank`, including startup; it does not claim every cached node was qualified. Absolute graph-node totals are not independently derived. Existing positive-total, cross-arm equality, unchanged-cache, graph geometry, canonical raw anchors, exact full-row comparisons and session controls remain required. Fifteen CPU controls cover the complete synthetic roster, startup removal, initialization changes, key-bit collision, wrong frozen source and graph-count counterfeits, including proof that the original checker remains red. This checker correction required no GPU rerun, model-source change, image rebuild or mutation of original evidence.
+
+The controller retained 250 physical memory samples, with minimum free memory of 5,242 MiB on the RTX 5080 and 5,867 MiB on the RTX 5070 Ti. These bounded samples exceed the 1,536 MiB floor for this short trial. They do not qualify full concurrency, occupied long contexts, sustained headroom or production sizing. The measurement was unprofiled. Hardware bandwidth, instruction utilization and the limiting resource were not measured.
+
+Controller PID 30780 and profile PID 24644 ended. Nemotron was restored as PID 27868 at 2026-10-20 00:07:48.554694 UTC. Canonical local request `8fc8f4e7-3e31-42fc-992b-465dedff6be5` returned `READY`, with 5,572/5,815 MiB physically free after restoration. Clef remained unchanged, cleanup errors were empty and the controller reported successful restoration.
+
+Actual evidence is `.artifacts/qwen35-layout-model-window-r1-20261019/analysis-r2.json`. The original preparation/approval, original actual red receipt, new approval, immutable original checker, R2 source/key proof and exact diff remain in their original artifact directories. The new review checkpoint is `.artifacts/qwen35-layout-model-proof-20261020`, with the archive under `evidence/upstream-layout-model-20261020`. Large raw logits/state, checkpoint shards and binaries remain externally pinned by size and SHA256. This archive preserves a new result without modifying the earlier packing proof.
+
+The original independent HF full-model quality gate remains **FAIL and unchanged**. This trial establishes native parity and a bounded prefill phase benefit. It does not qualify model quality, HTTP serving, promotion, a full-turn improvement, a decode improvement or a hardware scaling wall.
+
+The verified archive contains 852 original evidence members, 14,511,606 bytes, SHA256 `e06cbac6556d96246f1c2bc19301a197119eadada1e64623b2f0875bc1699b8f`. Its 350 external pins cover 25,473,879,443 bytes. The archiver independently rehashed 1,117 expected pins, replayed the actual hardened outer audit exactly, and passed the existing windows-v110 verifier and Ruff. All archive-task processes ended at 2026-10-20 00:16:15 UTC. The ZIP preserves the document snapshot before this final archive-summary paragraph; final verification and report sidecars remain in the proof directory.

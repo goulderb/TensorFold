@@ -1,7 +1,10 @@
 //! Bounded Linux TCP control channel. Tensor bytes travel over NCCL; this channel owns command order and peer EOF.
 const std = @import("std");
 const builtin = @import("builtin");
-const p = std.posix;
+const platform = @import("sys");
+const p = platform.posix;
+const c = platform.c;
+const sockets = if (platform.windows) p.system else std.c;
 const net = std.Io.net;
 
 pub const max_payload = 1 << 20;
@@ -43,8 +46,8 @@ pub const Header = struct {
 };
 
 pub fn now() u64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0 or ts.sec < 0) return 0;
+    var ts: c.timespec = undefined;
+    if (c.clock_gettime(if (platform.windows) c.CLOCK.MONOTONIC else .MONOTONIC, &ts) != 0 or ts.sec < 0) return 0;
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_ms * 1000 + @as(u64, @intCast(ts.nsec));
 }
 
@@ -53,8 +56,8 @@ pub fn deadline(ms: u64) u64 {
 }
 
 pub fn pause() void {
-    const ts: std.c.timespec = .{ .sec = 0, .nsec = 50_000 };
-    _ = std.c.nanosleep(&ts, null);
+    const ts: c.timespec = .{ .sec = 0, .nsec = 50_000 };
+    _ = c.nanosleep(&ts, null);
 }
 
 fn wait(fd: p.socket_t, events: i16, until: ?u64) !void {
@@ -74,8 +77,8 @@ pub const Link = struct {
     fd: p.socket_t,
 
     pub fn close(l: Link) void {
-        _ = std.c.shutdown(l.fd, p.SHUT.RDWR);
-        _ = std.c.close(l.fd);
+        _ = sockets.shutdown(l.fd, p.SHUT.RDWR);
+        _ = sockets.close(l.fd);
     }
 
     /// Exactly two rank processes. Retry only connection establishment, never an accepted command.
@@ -134,7 +137,7 @@ pub const Link = struct {
         var at: usize = 0;
         while (at < bytes.len) {
             if (now() >= until) return error.RankTimeout;
-            const rc = std.c.send(l.fd, bytes.ptr + at, bytes.len - at, p.MSG.NOSIGNAL);
+            const rc = if (platform.windows) sockets.write(l.fd, bytes.ptr + at, bytes.len - at) else std.c.send(l.fd, bytes.ptr + at, bytes.len - at, p.MSG.NOSIGNAL);
             switch (p.errno(rc)) {
                 .SUCCESS => {
                     if (rc == 0) return error.RankDisconnected;
@@ -151,7 +154,7 @@ pub const Link = struct {
         var at: usize = 0;
         while (at < bytes.len) {
             if (until) |end| if (now() >= end) return error.RankTimeout;
-            const rc = std.c.recv(l.fd, bytes.ptr + at, bytes.len - at, 0);
+            const rc = if (platform.windows) sockets.recvfrom(l.fd, bytes.ptr + at, bytes.len - at, 0, null, null) else std.c.recv(l.fd, bytes.ptr + at, bytes.len - at, 0);
             switch (p.errno(rc)) {
                 .SUCCESS => {
                     if (rc == 0) return error.RankDisconnected;
@@ -180,7 +183,7 @@ pub const Link = struct {
     /// A non-consuming EOF check while a GPU collective progresses. A future control frame stays queued.
     pub fn checkPeer(l: Link) !void {
         var byte: u8 = 0;
-        const rc = std.c.recv(l.fd, &byte, 1, p.MSG.PEEK | p.MSG.DONTWAIT);
+        const rc = if (platform.windows) sockets.recvfrom(l.fd, @ptrCast(&byte), 1, p.MSG.PEEK | p.MSG.DONTWAIT, null, null) else std.c.recv(l.fd, &byte, 1, p.MSG.PEEK | p.MSG.DONTWAIT);
         if (rc == 0) return error.RankDisconnected;
         if (rc < 0) switch (p.errno(rc)) {
             .AGAIN, .INTR => {},

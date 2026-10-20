@@ -60,6 +60,12 @@ test "artifact digests cover every byte and refuse a file changed between the lo
     defer gpa.free(a);
     const b = try s.file("model.safetensors", "weights-bytes");
     defer gpa.free(b);
+    {
+        const file = try std.Io.Dir.cwd().openFile(io, b, .{ .mode = .read_write });
+        defer file.close(io);
+        // The rewrite must cross a timestamp tick even on filesystems with coarse write times.
+        try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(946684800 * std.time.ns_per_s) } });
+    }
     var one = try f.Artifacts.take(gpa, try list(&.{ a, b }));
     defer one.deinit(gpa);
     const d1 = try one.digest(gpa);
