@@ -19,6 +19,8 @@ pub fn Adapter(comptime Session: type) type {
         gpa: Allocator,
         session: *Session,
         capacity: usize,
+        /// Prompt tokens per true session.append; default 1 matches FakeSession and legacy Chain.
+        prefill_rows: usize = 1,
         active: ?*lanes.Stream = null,
         prompt_at: usize = 0,
         values: []f64,
@@ -92,10 +94,14 @@ pub fn Adapter(comptime Session: type) type {
             const self = of(ptr);
             if (s.isCancelled()) return error.Cancelled;
             if (self.active != s) try self.begin(s);
+            if (self.prefill_rows == 0) return error.InvalidSession;
             if (self.prompt_at < s.prompt_len) {
-                try self.session.append(s.context.items[self.prompt_at..][0..1]);
-                self.prompt_at += 1;
+                const first_chunk = self.prompt_at == 0;
+                const n = @min(self.prefill_rows, s.prompt_len - self.prompt_at);
+                try self.session.append(s.context.items[self.prompt_at..][0..n]);
+                self.prompt_at += n;
                 s.fill_at.store(@intCast(self.prompt_at), .monotonic);
+                if (first_chunk) std.log.info("qwen prefill first chunk rows={d} position={d}", .{ n, self.session.position });
             }
             return self.prompt_at == s.prompt_len;
         }
@@ -154,6 +160,9 @@ const FakeSession = struct {
     fail: bool = false,
     greedy: ?u32 = null,
     greedy_reads: usize = 0,
+    append_calls: usize = 0,
+    last_append: usize = 0,
+    append_sizes: [8]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
 
     fn cachedGreedy(s: *FakeSession, position: u64) !?u32 {
         if (s.fail) return error.GpuFailed;
@@ -167,10 +176,16 @@ const FakeSession = struct {
         s.resets += 1;
         s.fail = false;
         s.greedy = null;
+        s.append_calls = 0;
+        s.last_append = 0;
+        s.append_sizes = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
     }
 
     fn append(s: *FakeSession, tokens: []const u32) !void {
         if (s.fail) return error.GpuFailed;
+        if (s.append_calls < s.append_sizes.len) s.append_sizes[s.append_calls] = tokens.len;
+        s.append_calls += 1;
+        s.last_append = tokens.len;
         s.position += tokens.len;
     }
 };
@@ -417,4 +432,77 @@ test "Qwen stepped prefill cancellation releases the slot and the next stream re
     try std.testing.expectEqualSlices(u32, &.{ 3, 3 }, next.emitted());
     try std.testing.expectEqual(@as(usize, 2), session.resets);
     try std.testing.expect(adapter.active == null);
+}
+
+test "Qwen bounded prefill appends true multi-row chunks with a partial final tail" {
+    const gpa = std.testing.allocator;
+    var session: FakeSession = .{};
+    var adapter = try Adapter(FakeSession).init(gpa, &session, 64);
+    defer adapter.deinit();
+    adapter.prefill_rows = 16;
+    const backend = adapter.backend();
+    var exact = try lanes.Stream.init(gpa, .{ .id = "exact16", .prompt = &@as([16]u32, @splat(1)), .max_new = 1 });
+    defer exact.deinit(gpa);
+    try std.testing.expect(try backend.vtable.prefill_step.?(backend.ptr, &exact));
+    try std.testing.expectEqual(@as(usize, 1), session.append_calls);
+    try std.testing.expectEqual(@as(usize, 16), session.last_append);
+    try std.testing.expectEqual(@as(u32, 16), exact.fill_at.load(.monotonic));
+    backend.release(&exact);
+
+    var under = try lanes.Stream.init(gpa, .{ .id = "under15", .prompt = &@as([15]u32, @splat(2)), .max_new = 1 });
+    defer under.deinit(gpa);
+    try backend.prefill(&under);
+    try std.testing.expectEqual(@as(usize, 1), session.append_calls);
+    try std.testing.expectEqual(@as(usize, 15), session.last_append);
+    try std.testing.expectEqual(@as(u32, 15), under.fill_at.load(.monotonic));
+    backend.release(&under);
+
+    var over = try lanes.Stream.init(gpa, .{ .id = "over17", .prompt = &@as([17]u32, @splat(0)), .max_new = 1 });
+    defer over.deinit(gpa);
+    try std.testing.expect(!try backend.vtable.prefill_step.?(backend.ptr, &over));
+    try std.testing.expectEqual(@as(usize, 1), session.append_calls);
+    try std.testing.expectEqual(@as(usize, 16), session.append_sizes[0]);
+    try std.testing.expectEqual(@as(u32, 16), over.fill_at.load(.monotonic));
+    try std.testing.expect(try backend.vtable.prefill_step.?(backend.ptr, &over));
+    try std.testing.expectEqual(@as(usize, 2), session.append_calls);
+    try std.testing.expectEqual(@as(usize, 1), session.append_sizes[1]);
+    try std.testing.expectEqual(@as(u32, 17), over.fill_at.load(.monotonic));
+    backend.release(&over);
+}
+
+test "Qwen bounded prefill cancels between chunks and rejects a zero bound" {
+    const gpa = std.testing.allocator;
+    var session: FakeSession = .{};
+    var adapter = try Adapter(FakeSession).init(gpa, &session, 64);
+    defer adapter.deinit();
+    adapter.prefill_rows = 16;
+    const backend = adapter.backend();
+    const Cancel = struct {
+        fn check(ptr: *anyopaque) bool {
+            const s: *FakeSession = @ptrCast(@alignCast(ptr));
+            return s.position >= 16;
+        }
+    };
+    var interrupted = try lanes.Stream.init(gpa, .{
+        .id = "chunk-cancel",
+        .prompt = &@as([20]u32, @splat(1)),
+        .max_new = 1,
+        .cancel_check = .{ .ptr = &session, .check = Cancel.check },
+    });
+    defer interrupted.deinit(gpa);
+    try std.testing.expect(!try backend.vtable.prefill_step.?(backend.ptr, &interrupted));
+    try std.testing.expectEqual(@as(usize, 16), session.position);
+    try std.testing.expectError(error.Cancelled, backend.vtable.prefill_step.?(backend.ptr, &interrupted));
+    backend.release(&interrupted);
+    try std.testing.expect(adapter.active == null);
+
+    var zero_session: FakeSession = .{};
+    var zero_adapter = try Adapter(FakeSession).init(gpa, &zero_session, 64);
+    defer zero_adapter.deinit();
+    zero_adapter.prefill_rows = 0;
+    var bad = try lanes.Stream.init(gpa, .{ .id = "zero-bound", .prompt = &.{1}, .max_new = 1 });
+    defer bad.deinit(gpa);
+    try std.testing.expectError(error.InvalidSession, zero_adapter.backend().prefill(&bad));
+    try std.testing.expectEqual(@as(usize, 1), zero_session.resets);
+    try std.testing.expectEqual(@as(usize, 0), zero_session.position);
 }

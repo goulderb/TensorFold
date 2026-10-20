@@ -288,6 +288,8 @@ pub const Open = struct {
     /// --device and --segments (CUDA); null: the backend's environment fallback, then its default.
     device: ?u32 = null,
     segments: ?u32 = null,
+    /// --prefill-rows (Qwen CUDA ModelOpt): prompt tokens per true engine step; null: 1 (legacy).
+    prefill_rows: ?u32 = null,
     /// --precision (CUDA): an NVFP4 checkpoint's math, NVIDIA's own or full precision; null: the family's default.
     precision: ?Precision = null,
     /// TENSORFOLD_MAX_QUEUED, as the engine's ``Info.max_queued``; null: no cap.

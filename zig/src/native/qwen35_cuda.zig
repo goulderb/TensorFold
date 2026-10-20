@@ -78,6 +78,11 @@ pub fn load(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = why;
         return null;
     }
+    const prefill_rows: usize = o.prefill_rows orelse 1;
+    if (prefill_rows == 0 or prefill_rows > qwen.shared_engine.hf_prefill_rows) {
+        problem.* = "Qwen CUDA --prefill-rows must be from 1 to 16";
+        return null;
+    }
     const cfg = qwen.Config.read(gpa, io, o.dir) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "Qwen ModelOpt checkpoint refused: {s}", .{@errorName(err)});
         return null;
@@ -96,7 +101,7 @@ pub fn load(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         (if (std.mem.eql(u8, v, "1")) &.{ 0, 1 } else &.{device})
     else
         &.{device};
-    const model = qwen.Engine.open(gpa, io, o.dir, .{ .devices = devices, .context = context }) catch |err| {
+    const model = qwen.Engine.open(gpa, io, o.dir, .{ .devices = devices, .context = context, .prefill_rows = prefill_rows }) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "Qwen CUDA load failed: {s}; use a GPU with sufficient free memory or TENSORFOLD_SPLIT=1 for the internal pair", .{@errorName(err)});
         return null;
     };
@@ -106,6 +111,8 @@ pub fn load(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     owner.* = .{ .gpa = gpa, .model = model, .session = try model.createSession(), .adapter = undefined };
     errdefer owner.session.deinit();
     owner.adapter = try lane.Adapter(qwen.Session).init(gpa, &owner.session, context);
+    // one bound: the live Chain value, not a second copy of the Open field
+    owner.adapter.prefill_rows = owner.session.chain.prefill_rows;
     return .{ .ctx = owner, .release = Owner.release, .backend = owner.adapter.backend(), .context = context };
 }
 
@@ -128,6 +135,20 @@ test "unsupported Qwen capabilities refuse before loading CUDA" {
     o = base;
     o.segments = 2;
     try std.testing.expect(refusal(o) != null);
+    o = base;
+    o.prefill_rows = 16;
+    try std.testing.expect(refusal(o) == null);
+}
+
+test "Qwen load refuses an invalid prefill-rows bound before CUDA open" {
+    // no Io/dir: the bound check runs before Config.read and Engine.open
+    const unused_io: std.Io = undefined;
+    for ([_]?u32{ 0, 17 }) |rows| {
+        var problem: []const u8 = "";
+        const loaded = try load(std.testing.allocator, std.testing.allocator, unused_io, .{ .dir = "missing", .model_type = "qwen3_5_moe", .prefill_rows = rows }, &problem);
+        try std.testing.expect(loaded == null);
+        try std.testing.expectEqualStrings("Qwen CUDA --prefill-rows must be from 1 to 16", problem);
+    }
 }
 
 test "Qwen accepts an ordinary chat prompt carrying a decision position" {
