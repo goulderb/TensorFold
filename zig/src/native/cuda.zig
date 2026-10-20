@@ -14,6 +14,7 @@ pub const follow = @import("cuda_follow.zig").follow;
 const lfm2 = @import("lfm2.zig");
 const glm = @import("glm_cuda");
 const qwen35 = @import("qwen35");
+const qwen_modelopt = @import("qwen35_cuda.zig");
 const Allocator = std.mem.Allocator;
 const budget = @import("cuda_memory.zig");
 const lane_backend = @import("cuda_bound.zig");
@@ -47,9 +48,17 @@ const nemotron_spill_snaps: api.prompt_cache.Snapshots.VTable = .{
 
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const serves: []const []const u8 = &.{};
+const qwen_moe_formats: []const []const u8 = blk: {
+    var formats: [qwen35.native_moe.formats.len + qwen_modelopt.family.formats.len][]const u8 = undefined;
+    @memcpy(formats[0..qwen35.native_moe.formats.len], qwen35.native_moe.formats);
+    @memcpy(formats[qwen35.native_moe.formats.len..], qwen_modelopt.family.formats);
+    const final = formats;
+    break :blk &final;
+};
+
 pub const families: []const api.Family = blk: {
     var out: [registry.len + 2]api.Family = undefined;
-    for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
+    for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = if (std.mem.eql(u8, F.model_type, qwen_modelopt.family.model_type)) qwen_moe_formats else F.formats };
     out[registry.len] = lfm2.family;
     out[registry.len + 1] = .{ .model_type = "fish_omni", .formats = &.{"fp8-block128"} };
     const final = out;
@@ -111,7 +120,7 @@ const Gpu = failed_load.Gpu;
 /// One loaded model behind the lane host: everything the engine thread reads lives here.
 pub const Host = struct {
     gpa: Allocator,
-    gpu: ?*Gpu, // null in host tests: no context to bind
+    gpu: ?*Gpu, // null when the family binds its own contexts, or in host tests
     family: *anyopaque,
     release: *const fn (*anyopaque) void,
     inner: lanes.backend.Backend,
@@ -136,6 +145,8 @@ pub const Host = struct {
     health: ?api.HealthSource = null,
     recording: ?*record.Recording = null, // --record: the recorder in front of the family's backend
     served: drafted.Served = undefined, // the family's backend, wrapped with --drafter's draft model when given
+    memory_source: ?api.MemorySource = null,
+    request_refusal: ?*const fn (*const api.Request) ?[]const u8 = null,
 
     fn followFamily(p: *anyopaque) anyerror!void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -232,7 +243,8 @@ pub const Host = struct {
         h.core.trim = h.trim;
         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
         h.host.proposers = h.proposers;
-        h.host.memory = if (h.gpu != null) .{ .read = family_memory.read } else null;
+        h.host.memory = h.memory_source orelse (if (h.gpu != null) api.MemorySource{ .read = family_memory.read } else null);
+        h.host.request_refusal = h.request_refusal;
         h.host.explain = explain;
         h.host.health = h.health;
         h.host.cache = h.store;
@@ -291,6 +303,13 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         return null;
     }
     if (std.mem.eql(u8, o.model_type, "fish_omni")) return openDrama(a, gpa, io, o, problem);
+    if (std.mem.eql(u8, o.model_type, qwen_modelopt.family.model_type)) {
+        const modelopt = qwen_modelopt.claims(gpa, io, o.dir) catch |err| {
+            problem.* = try std.fmt.allocPrint(a, "Qwen checkpoint encoding refused: {s}", .{@errorName(err)});
+            return null;
+        };
+        if (modelopt) return openQwen(a, gpa, io, o, problem);
+    }
     inline for (registry) |F| {
         if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
     }
@@ -303,6 +322,64 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     }
     problem.* = try std.fmt.allocPrint(a, "the native CUDA engine has no backend for {s} checkpoints yet", .{o.model_type});
     return null;
+}
+
+fn openQwen(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+    const loaded = try qwen_modelopt.load(a, gpa, io, o, problem) orelse return null;
+    errdefer loaded.release(loaded.ctx);
+    const h = try gpa.create(Host);
+    errdefer gpa.destroy(h);
+    h.* = .{
+        .gpa = gpa,
+        .gpu = null,
+        .family = loaded.ctx,
+        .release = loaded.release,
+        .inner = loaded.backend,
+        .vtable = undefined,
+        .cfg = undefined,
+        .clock = undefined,
+        .core = undefined,
+        .host = undefined,
+        .memory_source = .{ .read = family_memory.read },
+        .served = .{ .backend = loaded.backend, .facts = qwen_modelopt.facts, .stream_bytes = 0 },
+        .request_refusal = qwen_modelopt.requestRefusal,
+    };
+    if (o.prompt_cache_gib) |cache_gib| {
+        const cache_bytes: u64 = @intFromFloat(cache_gib * gib);
+        if (cache_bytes > 0) {
+            const pc = api.prompt_cache;
+            const store = try gpa.create(pc.Store);
+            errdefer gpa.destroy(store);
+            const copies: pc.Snapshots = .{ .ptr = loaded.ctx, .vtable = &snaps.Snaps(qwen_modelopt, null).vtable };
+            store.* = pc.Store.init(gpa, copies, snaps.cacheRules(qwen_modelopt), cache_bytes);
+            h.store = store;
+            errdefer {
+                store.deinit();
+                gpa.destroy(store);
+                h.store = null;
+            }
+        }
+    }
+    var served_facts = qwen_modelopt.facts;
+    served_facts.max_streams = loaded.lanes;
+    const window_rows: u32 = if (loaded.lanes > 1) 2 else 1;
+    if (loaded.lanes > 1) {
+        served_facts.hidden_rows = true;
+        served_facts.streams_exact = true;
+        served_facts.exact_width = 2;
+        served_facts.copy_drafts = false;
+    }
+    try h.serve(io, served_facts, window_rows, .{
+        .name = "qwen35-cuda-lanes",
+        .call_gates = true,
+        .lanes = loaded.lanes,
+        .context_window = @intCast(loaded.context),
+        .max_queued = o.max_queued orelse 8,
+        .plain_only = true,
+        .thinking_budget = false,
+        .prompt_cache = h.store != null,
+    }, null);
+    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }
 
 /// The admit's refusals: no stream fits, or --parallel asks for more than the budget holds.
@@ -767,6 +844,123 @@ test "every registered family and d1's decision engine are listed for capabiliti
     try std.testing.expectEqual(@as(usize, registry.len + 2), families.len);
     try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
     try std.testing.expectEqualStrings("lfm2_vl", families[registry.len].model_type);
+    var qwen_count: usize = 0;
+    for (families) |entry| {
+        if (!std.mem.eql(u8, entry.model_type, "qwen3_5_moe")) continue;
+        qwen_count += 1;
+        try std.testing.expectEqual(qwen35.native_moe.formats.len + qwen_modelopt.family.formats.len, entry.formats.len);
+        for (qwen35.native_moe.formats, entry.formats[0..qwen35.native_moe.formats.len]) |want, got|
+            try std.testing.expectEqualStrings(want, got);
+        try std.testing.expectEqualStrings("modelopt-mixed-nvfp4", entry.formats[entry.formats.len - 1]);
+    }
+    try std.testing.expectEqual(@as(usize, 1), qwen_count);
+}
+
+test "the Qwen host profile preserves memory reporting, direct refusals and zero-output completion" {
+    const gpa = std.testing.allocator;
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
+    defer target.deinit();
+    const Fixture = struct {
+        fn release(_: *anyopaque) void {}
+        fn memory(_: ?*anyopaque, _: bool) ?api.Memory {
+            return .{ .active = 23 };
+        }
+        mutex: std.Io.Mutex = .init,
+        done: ?api.Reason = null,
+        terminals: usize = 0,
+        tokens: usize = 0,
+        first_token: ?u32 = null,
+        fn event(ctx: *anyopaque, _: api.Id, ev: *const api.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.mutex.lockUncancelable(std.testing.io);
+            defer self.mutex.unlock(std.testing.io);
+            switch (ev.*) {
+                .tokens => |t| {
+                    if (self.first_token == null and t.len > 0) self.first_token = t[0];
+                    self.tokens += t.len;
+                },
+                .finished => |f| {
+                    self.done = f.reason;
+                    self.terminals += 1;
+                },
+                else => {},
+            }
+        }
+        fn wait(self: *@This()) !api.Reason {
+            for (0..5000) |_| {
+                self.mutex.lockUncancelable(std.testing.io);
+                const done = self.done;
+                self.mutex.unlock(std.testing.io);
+                if (done) |reason| return reason;
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            }
+            return error.TestTimedOut;
+        }
+    };
+    const h = try gpa.create(Host);
+    h.* = .{
+        .gpa = gpa,
+        .gpu = null,
+        .family = &target,
+        .release = Fixture.release,
+        .inner = target.stepped(),
+        .served = .{ .backend = target.stepped(), .facts = qwen_modelopt.facts, .stream_bytes = 0 },
+        .vtable = undefined,
+        .cfg = undefined,
+        .clock = undefined,
+        .core = undefined,
+        .host = undefined,
+        .memory_source = .{ .read = Fixture.memory },
+        .request_refusal = qwen_modelopt.requestRefusal,
+    };
+    try h.serve(std.testing.io, qwen_modelopt.facts, 1, .{ .lanes = 1, .plain_only = true, .thinking_budget = false, .call_gates = true }, null);
+    defer Host.close(h);
+    const e = h.host.engine();
+    try std.testing.expectEqual(@as(u64, 23), e.memory(false).?.active);
+    try std.testing.expect(e.info().plain_only and e.info().loop_guard);
+    try std.testing.expect(e.info().call_gates);
+    try std.testing.expectEqual(@as(u32, 0), e.info().prefill_step);
+    try std.testing.expect(!h.host.decoded_rows);
+    var refused: Fixture = .{};
+    const bad: api.Request = .{ .prompt = &.{ 2, 7, 1 }, .max_tokens = 2, .logprobs = 0 };
+    try e.submit(1, &bad, .{ .ctx = &refused, .event = Fixture.event });
+    try std.testing.expectEqual(api.Reason.failed, try refused.wait());
+    try std.testing.expectEqual(@as(usize, 0), target.prefill_count);
+    var empty: Fixture = .{};
+    const zero: api.Request = .{ .prompt = bad.prompt, .max_tokens = 0 };
+    try e.submit(2, &zero, .{ .ctx = &empty, .event = Fixture.event });
+    try std.testing.expectEqual(api.Reason.length, try empty.wait());
+    try std.testing.expectEqual(@as(usize, 0), empty.tokens);
+    var next: Fixture = .{};
+    const valid: api.Request = .{ .prompt = bad.prompt, .max_tokens = 3, .decide = 2, .decode_spans = &.{.{ 0, 2 }} };
+    try e.submit(3, &valid, .{ .ctx = &next, .event = Fixture.event });
+    try std.testing.expectEqual(api.Reason.length, try next.wait());
+    try std.testing.expectEqual(@as(usize, 3), next.tokens);
+    try std.testing.expectEqual(@as(usize, 1), refused.terminals);
+    try std.testing.expectEqual(@as(usize, 1), empty.terminals);
+    try std.testing.expectEqual(@as(usize, 1), next.terminals);
+    const Lex = struct {
+        fn blank(_: *anyopaque, _: u32) bool {
+            return false;
+        }
+        fn text(_: *anyopaque, _: std.mem.Allocator, _: u32) ![]const u8 {
+            return "body";
+        }
+        fn encode(_: *anyopaque, _: std.mem.Allocator, _: []const u8) ![]const u32 {
+            return &.{};
+        }
+    };
+    var called: Fixture = .{};
+    const call: api.Request = .{
+        .prompt = bad.prompt,
+        .max_tokens = 3,
+        .call = .{ .opener = 9, .lex = .{ .ctx = &called, .blank = Lex.blank, .text = Lex.text, .encode = Lex.encode } },
+    };
+    try e.submit(4, &call, .{ .ctx = &called, .event = Fixture.event });
+    try std.testing.expectEqual(api.Reason.length, try called.wait());
+    try std.testing.expectEqual(@as(?u32, 9), called.first_token);
+    try std.testing.expectEqual(@as(usize, 3), called.tokens);
+    try std.testing.expectEqual(@as(usize, 1), called.terminals);
 }
 
 test "a cancel during a long prompt stops it, and the next request's reply is unchanged (#291)" {
@@ -918,4 +1112,22 @@ test {
     _ = @import("cuda_vision_offer.zig");
     _ = kv_pages;
     _ = drafted;
+}
+
+test "Qwen ModelOpt checkpoint refusal stays on its native route before CUDA" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "config.json",
+        .data = "{\"model_type\":\"qwen3_5_moe\",\"quantization_config\":{\"quant_method\":\"modelopt\"}}",
+    });
+    var path: [128]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var problem: []const u8 = "";
+    try std.testing.expect(try open(arena.allocator(), gpa, io, .{ .dir = dir, .model_type = "qwen3_5_moe" }, &problem) == null);
+    try std.testing.expectEqualStrings("Qwen ModelOpt checkpoint refused: UnsupportedQwenGeometry", problem);
 }

@@ -10,6 +10,70 @@ const Event = api.Event;
 const Request = api.Request;
 const Engine = api.Engine;
 
+test "a family refuses original request fields before stream construction and serves the next request" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{}, 1, 0);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1 });
+    const Box = struct {
+        mutex: std.Io.Mutex = .init,
+        done: ?Reason = null,
+        message: []const u8 = "",
+        terminals: usize = 0,
+        tokens: usize = 0,
+        fn refuse(r: *const Request) ?[]const u8 {
+            return if (r.decode_spans.len > 0) "decoded prompt rows unsupported" else null;
+        }
+        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+            const b: *@This() = @ptrCast(@alignCast(ctx));
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            switch (e.*) {
+                .tokens => |t| b.tokens += t.len,
+                .finished => |f| {
+                    b.done = f.reason;
+                    b.message = f.message;
+                    b.terminals += 1;
+                },
+                else => {},
+            }
+        }
+        fn wait(b: *@This()) !Reason {
+            for (0..5000) |_| {
+                b.mutex.lockUncancelable(std.testing.io);
+                const done = b.done;
+                b.mutex.unlock(std.testing.io);
+                if (done) |reason| return reason;
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+            }
+            return error.TestTimedOut;
+        }
+    };
+    host.request_refusal = Box.refuse;
+    try host.start();
+    defer host.stop();
+    var refused: Box = .{};
+    const unsupported: Request = .{ .prompt = &.{ 2, 7, 1 }, .max_tokens = 2, .decode_spans = &.{.{ 1, 2 }} };
+    const engine = host.engine();
+    try engine.submit(1, &unsupported, .{ .ctx = &refused, .event = Box.event });
+    try std.testing.expectEqual(Reason.failed, try refused.wait());
+    try std.testing.expectEqualStrings("decoded prompt rows unsupported", refused.message);
+    try std.testing.expectEqual(@as(usize, 1), refused.terminals);
+    try std.testing.expectEqual(@as(usize, 0), refused.tokens);
+    try std.testing.expectEqual(@as(usize, 0), target.prefill_count);
+    var served: Box = .{};
+    const valid: Request = .{ .prompt = unsupported.prompt, .max_tokens = 2 };
+    try engine.submit(2, &valid, .{ .ctx = &served, .event = Box.event });
+    try std.testing.expectEqual(Reason.length, try served.wait());
+    try std.testing.expectEqual(@as(usize, 2), served.tokens);
+    try std.testing.expectEqual(@as(usize, 1), served.terminals);
+}
+
 test "a lane host reports its backend's memory counts, and none without them" {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{}, 1, 0);

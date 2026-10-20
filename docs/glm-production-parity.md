@@ -124,19 +124,30 @@ arithmetic, without a TP2 multiplier. They are not additive measured HTTP
 savings. Exact native-loader replay, prompt continuation/restoration and a
 combined serving comparison remain separate acceptance gates.
 
-The first combined HTTP legs saved1.965seconds(EXL3) and1.992seconds(FP4)
-at16400cold prompt tokens, with five repeats and no retries. Changed prompt
+The first combined HTTP legs saved 1.965 seconds for EXL3 and 1.992 seconds
+for FP4 at 16,400 cold prompt tokens, with five repeats and no retries. Changed prompt
 numerics also changed generated paths and some decode rates fell. The next
 portfolio therefore preserves small/tail native transform arithmetic rather
 than extending the MMA policy to shapes without a material timing proof.
 Its v2 enabled identity explicitly separates that policy from the first batch.
 
-The companion dense-prefix rule follows production's2051-key transition.
+The companion dense-prefix rule follows production's 2051-key transition.
 Only AOT-enabled real prompts with scheduled selected attention and an exact
 configured threshold match clip dense output to the prefix that sparse leaves
 untouched. All three owner/local/unowned callers retain original head block,
 key chunks, positions, cache bases and full sparse output coverage. MTP's
 cleared borrow, default-off behavior and nonstandard thresholds retain the
 previous path. A model-free both-rank screen proved full BF16 output equality,
-guards and repeatability; five alternating pairs saved about.334–.353seconds
-over11boundary layers. This conditional work saving is not an HTTP claim.
+guards and repeatability; five alternating pairs saved about 0.334–0.353 seconds
+over 11 boundary layers. This conditional work saving is not an HTTP claim.
+
+The focused FP4 HTTP confirmation at source `2dca57275bbd` passes functional28,
+strict JSON and output-hash multisets for one code/prose cohort each at c1/c8.
+Five measured cold TTFT repeats give 2.095 seconds at 4,110 prompt tokens and
+7.691 seconds at 16,400, versus retained production medians 2.089 and 7.838.
+The native pre-batch medians were 2.801 and 10.046 seconds. These are sequential
+serving legs, not an interleaved same-binary comparison. The short cohorts are
+correctness witnesses, not fresh five-repeat decode measurements. Material
+decode deficits remain, so production promotion and new whole-model runtime
+qualification are not established. Later shared-trunk integration is a
+separate CPU gate; these GPU results remain scoped to `2dca57275bbd`.

@@ -209,6 +209,18 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
     const doc = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
     defer doc.deinit();
     const root = try object(doc.value);
+    var g = try dimensions(root);
+    const q = try object(root.get("quantization") orelse return error.UnsupportedQwenQuantization);
+    if (g.moe()) {
+        const w = try expertBits(q, g.layers);
+        if (w.count != 0 and w.count != 3 * g.layers) return error.UnsupportedQwenQuantization;
+        g.expert_bits = w.bits;
+    }
+    g.bits = try widths(gpa, root, q, g);
+    return g;
+}
+
+pub fn dimensions(root: std.json.ObjectMap) !Geometry {
     const moe = blk: {
         const v = root.get("model_type") orelse return error.UnsupportedQwenConfig;
         if (v != .string) return error.UnsupportedQwenConfig;
@@ -228,7 +240,6 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
     const rope = try object(t.get("rope_parameters") orelse return error.UnsupportedQwenRotary);
     try is(rope, if (rope.get("rope_type") != null) "rope_type" else "type", []const u8, "default"); // "type": the older key
     if (try number(rope, "rope_theta") != 10000000 or try number(rope, "partial_rotary_factor") != 0.25) return error.UnsupportedQwenRotary;
-    const q = try object(root.get("quantization") orelse return error.UnsupportedQwenQuantization);
     var g: Geometry = .{
         .hidden = try integer(t, "hidden_size"),
         .intermediate = try integer(t, if (moe) "moe_intermediate_size" else "intermediate_size"),
@@ -251,12 +262,8 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
     if (moe) {
         g.experts = try integer(t, "num_experts");
         g.top_k = try integer(t, "num_experts_per_tok");
-        // the shared expert runs in the routed experts' table, so it needs their width
         if (try integer(t, "shared_expert_intermediate_size") != g.intermediate) return error.UnsupportedQwenGeometry;
         if (g.experts > 256 or g.top_k > 31 or g.top_k >= g.experts) return error.UnsupportedQwenGeometry;
-        const w = try expertBits(q, g.layers);
-        if (w.count != 0 and w.count != 3 * g.layers) return error.UnsupportedQwenQuantization;
-        g.expert_bits = w.bits;
     }
     if (g.v_heads % g.k_heads != 0 or g.q_heads % g.kv_heads != 0 or g.q_heads > max_query_heads) return error.UnsupportedQwenGeometry;
     const types = t.get("layer_types") orelse return error.UnsupportedQwenGeometry;
@@ -265,7 +272,6 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
         if (kind != .string) return error.UnsupportedQwenGeometry;
         if (std.mem.eql(u8, kind.string, "linear_attention")) g.linear[i] = true else if (!std.mem.eql(u8, kind.string, "full_attention")) return error.UnsupportedQwenGeometry;
     }
-    g.bits = try widths(gpa, root, q, g);
     return g;
 }
 

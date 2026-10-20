@@ -19,6 +19,7 @@ pub const decode = @import("decode.zig");
 pub const kernels = @import("kernels.zig");
 
 test {
+    _ = loader;
     _ = context;
     _ = launch;
     _ = decode;

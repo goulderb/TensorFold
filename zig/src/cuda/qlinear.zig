@@ -109,6 +109,13 @@ pub const Weight = union(enum) {
 
 /// Rows in: bf16 `x` rows `ldx` apart (0: packed), their 64-group sums, and the lane's slice partials (partBytes).
 pub const Rows = struct { x: u64, ldx: usize = 0, sums: u64 = 0, part: u64 = 0, native: ck.Workspace = .{} };
+pub const Target = struct { weight: Weight, output: u64 };
+
+fn disjoint(a: u64, a_bytes: usize, b: u64, b_bytes: usize) bool {
+    const a_end = std.math.add(u64, a, a_bytes) catch return false;
+    const b_end = std.math.add(u64, b, b_bytes) catch return false;
+    return a_end <= b or b_end <= a;
+}
 
 pub const AffinePromptPolicy = enum(u8) { stock, glm_production };
 pub const AffinePromptTile = enum(u8) { tile0 = 0, tile3 = 3, tile9 = 9 };
@@ -140,6 +147,52 @@ pub const Linear = struct {
     ck_rows: u64 = 0, // its e4m3 rows (at least rows * k bytes), and slice partials where no cluster meets them
     ck_part: u64 = 0,
     ggml: ?*const ggml.Kernels = null, // q8_0 and iq2xxs rows of both kinds
+
+    pub fn canDecodeTogether(l: Linear, targets: []const Target, in: Rows, rows: usize) bool {
+        const c = l.ck orelse return false;
+        if (targets.len < 2 or rows == 0 or rows > 16 or l.ck_rows == 0) return false;
+        if (targets[0].weight != .fp8) return false;
+        const first = targets[0].weight.fp8;
+        if (!(first.act > 0) or !std.math.isFinite(first.act) or first.k == 0 or first.k % 64 != 0) return false;
+        const stride = if (in.ldx == 0) first.k else in.ldx;
+        const prior = std.math.mul(usize, rows - 1, stride) catch return false;
+        const cells = std.math.add(usize, prior, first.k) catch return false;
+        const input_bytes = std.math.mul(usize, cells, 2) catch return false;
+        const encoded_bytes = std.math.mul(usize, rows, first.k) catch return false;
+        if (!disjoint(in.x, input_bytes, l.ck_rows, encoded_bytes)) return false;
+        for (targets) |target| {
+            if (target.weight != .fp8) return false;
+            const q = target.weight.fp8;
+            if (q.mode != .fp8 or q.n == 0 or q.k != first.k or @as(u32, @bitCast(q.act)) != @as(u32, @bitCast(first.act))) return false;
+            const sk = qmmf.splitK(q.n, q.k);
+            const output_cells = std.math.mul(usize, rows, q.n) catch return false;
+            const output_bytes = std.math.mul(usize, output_cells, 2) catch return false;
+            if (!disjoint(target.output, output_bytes, in.x, input_bytes) or !disjoint(target.output, output_bytes, l.ck_rows, encoded_bytes)) return false;
+            if (sk > 1 and !(sk <= 8 and c.clusters)) {
+                const part = if (l.ck_part != 0) l.ck_part else in.part;
+                if (part == 0) return false;
+                const part_bytes = std.math.mul(usize, output_cells, sk * 4) catch return false;
+                if (!disjoint(part, part_bytes, in.x, input_bytes) or !disjoint(part, part_bytes, l.ck_rows, encoded_bytes)) return false;
+            }
+        }
+        return true;
+    }
+
+    /// Own the encoded scratch lifetime through every consumer; incompatible groups keep decode's call order.
+    pub fn decodeTogether(l: Linear, s: Stream, targets: []const Target, in: Rows, rows: usize) !bool {
+        if (!l.canDecodeTogether(targets, in, rows)) {
+            for (targets) |target| try l.decode(s, target.weight, in, target.output, rows);
+            return false;
+        }
+        const c = l.ck.?;
+        const first = targets[0].weight.fp8;
+        try c.quant8(s, in.x, if (in.ldx == 0) first.k else in.ldx, rows, first.k, first.act, l.ck_rows);
+        for (targets) |target| {
+            const q = target.weight.fp8;
+            try c.lane8(s, l.ck_rows, rows, q, q.act, target.output, if (l.ck_part != 0) l.ck_part else in.part);
+        }
+        return true;
+    }
 
     /// e4m3 rows of x times an fp8 weight under its input scale, bf16 out: decode and prompt rows alike (row-exact).
     fn checkpoint(l: Linear, s: Stream, c: *const ck.Ck, q: qmmf.Weight, in: Rows, out: u64, rows: usize) !void {
@@ -757,6 +810,98 @@ test "a lane weight whose mode is not its format's is refused before any launch"
     const f8: qmmf.Weight = .{ .mode = .fp8g, .codes = 0, .scales = 0, .n = 64, .k = 64, .npad = 128 };
     try std.testing.expectError(error.FormatMismatch, l.decodeF32(s, .{ .fp8g = fp4 }, .{ .x = 0 }, 0, 1));
     try std.testing.expectError(error.EpilogueNotBuilt, l.promptF32(s, .{ .bf16 = f8 }, .{ .x = 0 }, 0, 1));
+}
+
+test "atomic FP8 reuse checks every scale format shape and workspace before encoding" {
+    var c: ck.Ck = undefined;
+    c.clusters = true;
+    var l: Linear = .{ .ck = &c, .ck_rows = 65536, .ck_part = 1048576 };
+    const w: Weight = .{ .fp8 = .{ .mode = .fp8, .codes = 256, .scales = 0, .n = 64, .k = 64, .npad = 128, .act = 0.5 } };
+    var targets = [_]Target{ .{ .weight = w, .output = 2097152 }, .{ .weight = w, .output = 3145728 } };
+    const in: Rows = .{ .x = 1024 };
+    for ([_]usize{ 1, 2, 16 }) |rows| try std.testing.expect(l.canDecodeTogether(&targets, in, rows));
+    for ([_]usize{ 0, 17 }) |rows| try std.testing.expect(!l.canDecodeTogether(&targets, in, rows));
+    for ([_]f32{ 0, -0.0, -1, std.math.inf(f32), std.math.nan(f32), @bitCast(@as(u32, 0x3f000001)) }) |act| {
+        targets[1].weight.fp8.act = act;
+        try std.testing.expect(!l.canDecodeTogether(&targets, in, 2));
+        targets[0].weight.fp8.act = act;
+        if (!(act > 0) or !std.math.isFinite(act)) try std.testing.expect(!l.canDecodeTogether(&targets, in, 2));
+        targets[0].weight = w;
+    }
+    targets[1].weight = w;
+    targets[1].weight.fp8.mode = .bf16;
+    try std.testing.expect(!l.canDecodeTogether(&targets, in, 2));
+    targets[1].weight = .{ .bf16 = w.fp8 };
+    try std.testing.expect(!l.canDecodeTogether(&targets, in, 2));
+    targets[1].weight = w;
+    targets[1].weight.fp8.k = 128;
+    try std.testing.expect(!l.canDecodeTogether(&targets, in, 2));
+    targets[1].weight = w;
+    l.ck_rows = 0;
+    try std.testing.expect(!l.canDecodeTogether(&targets, in, 2));
+    l.ck_rows = 65536;
+    l.ck = null;
+    try std.testing.expect(!l.canDecodeTogether(&targets, in, 2));
+    l.ck = &c;
+    c.clusters = false;
+    l.ck_part = 0;
+    for (&targets) |*t| t.weight.fp8.k = 4096;
+    try std.testing.expect(!l.canDecodeTogether(&targets, in, 2));
+    try std.testing.expect(l.canDecodeTogether(&targets, .{ .x = 1024, .part = 1048576 }, 2));
+}
+
+test "atomic FP8 group encodes once and fallback preserves independent call order" {
+    const abi = @import("abi.zig");
+    const Fake = struct {
+        var count: usize = 0;
+        var functions: [8]usize = undefined;
+        var outputs: [8]u64 = undefined;
+        fn launch(f: abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) abi.Result {
+            const id = @intFromPtr(f.?);
+            functions[count] = id;
+            const at: usize = if (id == 1) 5 else 3;
+            outputs[count] = @as(*const u64, @ptrCast(@alignCast(args.?[at].?))).*;
+            count += 1;
+            return 0;
+        }
+    };
+    var d: Driver = .{ .lib = undefined, .api = undefined };
+    d.api.cuLaunchKernel = Fake.launch;
+    const s: Stream = .{ .d = &d, .handle = null };
+    var c: ck.Ck = undefined;
+    c.clusters = false;
+    c.quant8_fn = .{ .d = &d, .handle = @ptrFromInt(1) };
+    c.lane[0] = .{ .d = &d, .handle = @ptrFromInt(2) };
+    const l: Linear = .{ .ck = &c, .ck_rows = 4096, .ck_part = 8192 };
+    const w: Weight = .{ .fp8 = .{ .mode = .fp8, .codes = 256, .scales = 0, .n = 64, .k = 64, .npad = 128, .act = 0.5 } };
+    var targets = [_]Target{ .{ .weight = w, .output = 12288 }, .{ .weight = w, .output = 16384 } };
+    for ([_]usize{ 1, 2, 16 }) |rows| {
+        Fake.count = 0;
+        try std.testing.expect(try l.decodeTogether(s, &targets, .{ .x = 1024 }, rows));
+        try std.testing.expectEqualSlices(usize, &.{ 1, 2, 2 }, Fake.functions[0..Fake.count]);
+        try std.testing.expectEqualSlices(u64, &.{ 4096, 12288, 16384 }, Fake.outputs[0..Fake.count]);
+    }
+    targets[1].weight.fp8.act = 0.25;
+    Fake.count = 0;
+    try std.testing.expect(!try l.decodeTogether(s, &targets, .{ .x = 1024 }, 2));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 1, 2 }, Fake.functions[0..Fake.count]);
+    try std.testing.expectEqualSlices(u64, &.{ 4096, 12288, 4096, 16384 }, Fake.outputs[0..Fake.count]);
+    targets[1].weight = w;
+    targets[0].output = 1024;
+    Fake.count = 0;
+    try std.testing.expect(!try l.decodeTogether(s, &targets, .{ .x = 1024 }, 2));
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2, 1, 2 }, Fake.functions[0..Fake.count]);
+    targets[0].output = 1024 + 2 * 64 * 2 - 2;
+    try std.testing.expect(!l.canDecodeTogether(&targets, .{ .x = 1024 }, 2));
+    targets[0].output += 2;
+    try std.testing.expect(l.canDecodeTogether(&targets, .{ .x = 1024 }, 2));
+    try std.testing.expect(!l.canDecodeTogether(&targets, .{ .x = 1024, .ldx = 128 }, 2));
+    targets[0].output = 4096;
+    try std.testing.expect(!l.canDecodeTogether(&targets, .{ .x = 1024 }, 2));
+    targets[0].output = 12288;
+    try std.testing.expect(!l.canDecodeTogether(&targets, .{ .x = 4096 }, 2));
+    try std.testing.expect(!l.canDecodeTogether(&targets, .{ .x = std.math.maxInt(u64) - 10 }, 2));
+    try std.testing.expect(!l.canDecodeTogether(&targets, .{ .x = 1024, .ldx = std.math.maxInt(usize) }, 2));
 }
 
 test {

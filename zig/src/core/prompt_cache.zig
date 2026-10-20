@@ -365,7 +365,10 @@ pub const Store = struct {
 
     /// Whether a state at `at` may start or end a prompt pass: anywhere, or a chunk start for planned families.
     fn usable(s: *const Store, at: u32, starts: []const u32) bool {
-        return at > 0 and (!s.rules.planned or s.startAt(starts, at) == at);
+        if (at == 0) return false;
+        if (!s.rules.planned or s.startAt(starts, at) == at) return true;
+        // A short chat history sits before the first grid point. The saved KV is a full prefix.
+        return s.rules.grid > 0 and starts.len == 0 and at < s.rules.grid;
     }
 
     /// The chunk start at or before `at`: the request's, else the family's grid (0 when none).
@@ -584,8 +587,20 @@ pub const Store = struct {
             if (stable > 0 and stable < history_len and stable >= history_len / 2) try want.append(a, stable);
         }
         if (!short) try want.appendSlice(a, shared);
+        // Planned families otherwise only snap the history onto the grid, so a raw
+        // completion (history 0) never kept a prefix. Emit the request's chunk
+        // starts, or the family's grid when it named none.
+        if (s.rules.planned and history == 0) {
+            if (starts.len > 0) {
+                try want.appendSlice(a, starts);
+            } else if (s.rules.grid > 0) {
+                var g = s.rules.grid;
+                while (g < prompt.len) : (g += s.rules.grid) try want.append(a, g);
+            }
+        }
         for (want.items, 0..) |w, k| {
-            const at = if (s.rules.planned) s.startAt(starts, w) else w;
+            var at = if (s.rules.planned) s.startAt(starts, w) else w;
+            if (at == 0 and k == 0 and w > 0 and s.rules.planned and s.rules.grid > 0 and starts.len == 0 and w < s.rules.grid) at = w;
             if (at <= from or at + s.rules.lookahead > prompt.len or at >= prompt.len or !s.usable(at, starts)) continue;
             const is_rewind = rewind > 0 and k == 1 and at == rewind;
             if (!is_rewind and !(k == 0 and warm_pass) and at - from < s.rules.min_gap and (k > 0 or (from > 0 and s.rules.warm == .on))) continue; // near the resume point

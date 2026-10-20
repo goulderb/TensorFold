@@ -98,8 +98,12 @@ pub const Control = struct {
             if (bounded and ticks() - t0 > c.limit) return error.EpPeerSilent;
             spins += 1;
             if (spins > 100_000) { // a long wait: back off
-                const ts: std.c.timespec = .{ .sec = 0, .nsec = 50_000 };
-                _ = std.c.nanosleep(&ts, null);
+                if (@import("builtin").is_test and @import("builtin").os.tag == .windows) {
+                    std.Io.sleep(std.testing.io, .fromNanoseconds(50_000), .awake) catch {};
+                } else {
+                    const ts: std.c.timespec = .{ .sec = 0, .nsec = 50_000 };
+                    _ = std.c.nanosleep(&ts, null);
+                }
             } else std.atomic.spinLoopHint();
         }
     }
@@ -297,8 +301,7 @@ test "early cancels: rank 0 waits for rank 1's acks, nothing is overwritten or s
     };
     var e0: ?anyerror = undefined;
     const th = try std.Thread.spawn(.{}, Rank0.run, .{ &p.c[0], &e0 });
-    const ts: std.c.timespec = .{ .sec = 0, .nsec = 200_000_000 }; // rank 1 held back while rank 0 runs ahead
-    _ = std.c.nanosleep(&ts, null);
+    try std.Io.sleep(std.testing.io, .fromMilliseconds(200), .awake);
     for (prompts, 0..) |pr, i| {
         const r = (try p.c[1].waitRequest()).?;
         try std.testing.expectEqualSlices(u32, &pr, r.prompt);

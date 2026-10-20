@@ -25,3 +25,8 @@ native ownership, validation, prompt dispatch and numerical/cache identity.
 Their exact source/image/compiler/payload provenance and retained original
 license are in zig/src/families/glm/prompt_aot/; the Mia and wojo lineage and
 transitive credits above remain applicable.
+
+The Qwen CUDA text operations and host mathematical references adapt work
+Copyright 2025 The Qwen Team and The HuggingFace Inc. team, under Apache-2.0.
+The original license and exact source revision are retained in
+LICENSES/donors/transformers-e0eb2810/ and LICENSES/donors/README.md.

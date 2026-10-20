@@ -1,0 +1,49 @@
+{
+  "repo": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
+  "revision": "1c3f884bc99aac2524f6d49bcbac8c88401afd66",
+  "sources": [
+    {
+      "file": "model-00001-of-00005.safetensors",
+      "header_bytes": 3084688,
+      "header_sha256": "84d61ac88b1e0ae2d78a1b1b614f7060b3a485ab37d187224e40899ab7ed5d18",
+      "tensors": 22058
+    },
+    {
+      "file": "model-00002-of-00005.safetensors",
+      "header_bytes": 4410744,
+      "header_sha256": "00d25b91cd6625ee273d8b92d32e08c9b32ce84a1b62842246e000903df1fc1f",
+      "tensors": 31612
+    },
+    {
+      "file": "model-00003-of-00005.safetensors",
+      "header_bytes": 4440752,
+      "header_sha256": "4bacd61f9b168d0023c145b4574be99a49e655bcacf69ad46f909fbf67d7dbbd",
+      "tensors": 31828
+    },
+    {
+      "file": "model-00004-of-00005.safetensors",
+      "header_bytes": 4455824,
+      "header_sha256": "4fef17751fb6889bdba2a1234ee1876bd762b931ceae13a407a0555da76a09d2",
+      "tensors": 32004
+    },
+    {
+      "file": "model-00005-of-00005.safetensors",
+      "header_bytes": 939328,
+      "header_sha256": "96c52994e82aafb4d31d061761548158ad592a102f8218e81a3551f6de05b414",
+      "tensors": 6854
+    }
+  ],
+  "capture_script_sha256": "1e686ce92ce47aba08e7421f88913fd4e8c0d25848cc0d85963f05b74ccb7513",
+  "config_sha256": "46cb11d0ce8048b7efa09694c7725ab8be6f0c02d4b2421c1d89316aae280850",
+  "headers_sha256": "9a9a305dc687961d39418f2a43311d67f5081acd74eab3e5adc705f48aff4357",
+  "tensors": 124356,
+  "dtype_counts": {
+    "F32": 61680,
+    "BF16": 865,
+    "F8_E4M3": 30971,
+    "U8": 30840
+  },
+  "quant_method": "compressed-tensors",
+  "quant_algo": null,
+  "tensor_bytes": 23631656648
+}

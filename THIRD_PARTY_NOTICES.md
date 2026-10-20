@@ -294,6 +294,43 @@ The multimodal rotary and image-feature integration is adapted from MiaAI-Lab's
 MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in `LICENSES/MiaAI-Lab-MIT.txt`.
 The port preserves the v0.5 CUDA execution APIs and adds an offline EXL3 vision adapter.
 
+## Qwen3.5 / Qwen3.6 CUDA text equations
+
+The serial Qwen CUDA operations and their host reference tests adapt the
+Qwen Team and HuggingFace Inc. team's Apache-2.0 mathematical implementation
+from Transformers revision `e0eb2810ac1b2caf6d082f247d8d37162ecf67a0`.
+The source headers describe the local changes. The immutable source path and
+retained license are recorded in `LICENSES/donors/README.md`.
+
+The local October 19 tuning adds an optional parallel finite-score top-eight
+selector with stable index ties, the existing ordered softmax, and a serial
+fallback for nonfinite scores. Expert screens reuse TensorFold's existing
+NVFP4 kernels and adapt its existing benchmark. No external router kernel
+is imported, and the original notices and donor credits remain applicable.
+
+The shared-engine ModelOpt overlay adapts these retained operations in
+`zig/kernels/cuda/qwen35_hf.cu` to upstream Qwen's Geo/Seg tables, read-only
+convolution tails and head-major KV layout. Its residual normalization follows
+TensorFold's existing `norms.cu` vector reduction. The overlay preserves the
+cooperative router products, parallel stable selector and ordered softmax.
+Checkpoint packing uses TensorFold's existing ModelOpt, qlinear and NVFP4
+expert implementations. The two-device coordinator transfers both residual
+buffers through pinned host memory and shares the upstream Qwen layer body.
+No additional external kernel source is imported by this consolidation.
+The optional BF16 MoE arithmetic binding preserves Transformers' shared
+activation intermediate, rounds routed products and sums, and visits selected
+experts by ID before the shared BF16 product and addition. It reuses the same
+credited equations and retains the prior binding for numerical comparisons.
+`zig/kernels/cuda/qwen35_gdn_layout.cu` retains the same attributed HF arithmetic
+and changes only persistent recurrence indexing from value/key to key/value.
+The local host overlay records cache layout in graph identity and preserves
+the baseline binding for exact comparisons. It imports no further donor code.
+The N8 expert-up specialization adapts TensorFold's existing NVFP4 decode
+template with fewer fragments per warp, four warps per block and scalar packed
+word loads. The original kernel attribution remains in its source header.
+Its shared-engine binding changes only the HF ModelOpt up projection and keeps
+the original projection available for matched comparisons.
+
 ## Pictures in the native engine
 
 `zig/src/core/picture/` reads PNG, JPEG and WebP pictures to the RGB pixels Pillow loads them as (Pillow 12.3 for
@@ -350,3 +387,12 @@ TensorFold ships no Drama 3 weights and no codec weights. [fishaudio/drama-3](ht
 and its `codec.pth` are under the Fish Audio Community License Agreement v1.0: research and non-commercial use,
 commercial use below its revenue threshold, and no Hosted Service without a separate license from Fish Audio. Users
 obtain the checkpoint and accept that license themselves.
+
+
+The opt-in Qwen slice-major expert-up representation adapts TensorFold's existing
+`modelopt_pack.cu` packer and the retained `nvfp4/experts.cu` split-M arithmetic.
+It writes the code-word permutation directly into the original up allocation and
+adds an explicit split-M consumer with slice-contiguous scalar loads. Scale words,
+down packing and arithmetic retain the original implementation. This local tuning
+adaptation imports no new donor kernel. All original and transitive notices above
+remain applicable, and checkpoint provenance and licensing remain separate.

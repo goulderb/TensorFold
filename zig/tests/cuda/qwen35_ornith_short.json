@@ -1,0 +1,12 @@
+{
+  "prompt": [760, 6511, 314, 9338, 369],
+  "forced": [11751, 13],
+  "max_tokens": 2,
+  "context": 4096,
+  "devices": [0, 1],
+  "expected_device_uuids": [
+    "GPU-f2c0ea1e-a2be-f0b4-6c23-ffe33b537a06",
+    "GPU-dd2a988c-fe38-24ab-233a-9e9bb3b2645a"
+  ],
+  "cut": 20
+}

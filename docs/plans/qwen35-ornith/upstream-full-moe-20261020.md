@@ -1,0 +1,36 @@
+# Isolated full-MoE device proof and eligibility closure
+
+The protected r2 screen passed on both physical internal GPUs. The fresh strict outer audit equals the original analysis byte-for-data after JSON decoding. It consumes all 644 journal records and all 240 raw artifacts. This proves the bounded native-input composition screen. The original full-network Hugging Face gate remains FAIL, and production qualification remains false.
+
+The actual source is `f67d2b4d91241da5aebef3ef1a1d059be89b5f29`. Its frozen profile executable is SHA256 `49a08bbf1325bbef1e06b178a198d17ae08acc5478c128b7db6b6d80260e9524`. The proof rehashes all 1272 approved dependency pins, all 2580 committed source files, all 93 embedded images, the executable, and every actual raw artifact. The approved manifest is `99704920be15691ecf5ca77cb8abe5eb69498e5f0fd9e64f3a34d4bd52295ff5`.
+
+Both GPUs reproduce the frozen and matched native complete-branch controls exactly. Candidate activation and the unchanged public qlinear shared down, qualified expert accumulation, BF16 shared product, final sum, and independent recorder pass the component checker. The recorded allocations, graph functions, all argument values and geometry, guards, and raw readbacks pass the complete pointer-chain and disjointness audit. The component owns 642 records. The other two records are the profile start and complete envelope. The actual record-kind census is preserved in `audit-summary.json` inside the archive.
+
+| Position | Eligible from original operands | Expert differences from actual HF | Final differences from actual HF |
+| --- | --- | --- | --- |
+| 0 | No | 2 | 2 |
+| 1 | No | 2008 | 1998 |
+| 2 | Yes | 0 | 0 |
+| 3 | Yes | 0 | 0 |
+| 4 | Yes | 0 | 0 |
+| 5 | No | 0 | 0 |
+
+These counts hold independently on each GPU. Positions 2, 3, and 4 alone meet the original-HF final gate. Position 5 has one original expert down-output operand difference despite final-output cancellation. It remains ineligible. Position 0 has two hidden/down-input differences and 72 rounded pair/down-output differences. Position 1 selects native expert 72 in place of HF expert 231 and has one input and one output difference among common experts.
+
+`eligibility.py` independently joins original native picks, route weights, hidden values and pairs to the original HF router and per-expert down captures by expert ID. It derives exactly `[2, 3, 4]`. Each actual GPU gate roster must equal that set. Manifest booleans and final equality cannot widen eligibility. Every HF or synthesized expected operand stays on the host. Only the five native per-position operands and original checkpoint payload enter the device fixture. No kernel receives a position-dependent math rule or fitted expert ID.
+
+Fable's pre-device r1 review reported no blockers and four non-blocking findings. The preserved r2 response closes the independently derived eligibility gap, identifies the correct final test seal, enforces actual embedded qmmf and packer image identity on physical ordinals 0 and 1, and joins the old prospective helper receipt to the successful frozen build. This is the root proof document's closure assessment. It is not a new Fable review or a full-model math verdict. The original prospective receipt and machine-specific pins remain unchanged.
+
+The final component seal records 10 tests and 77 mutation subtests. Its SHA256 is `f489b6f2f055a4391eb795dad6799dd99bfcbb1532e6ebbd0c376c95e6861573`. The earlier `tests-final.log` records 9 tests and 73 subtests. The r2 root and eligibility suite records 39 additional tests, freshly rerun by this proof. The 37 frozen CLI checks and successful 82-test host receipt are preserved. The host join compares all 2106 Zig sources to the frozen build. The source proof preserves 17 source checks and 234 dependency entries for the two r3 CUDA compilations. The immutable component package retains its own compiler dependencies, source attribution, license, NOTICE, and HF capture provenance. These CPU controls support the checker and provenance. The actual 644-record run supplies the device evidence.
+
+The actual r2 profile was PID 6816 and exited 0. Controller PID 28304 ended. A fresh read-only process observation confirmed both absent. The controller has one physical census sample, at 2026-10-20T00:26:25.063410 UTC. Its sampled minimum free memory is 15963 MiB on the RTX 5080 and 15982 MiB on the RTX 5070 Ti. This short single-sample census proves the observed floor only. It does not establish continuous peak occupancy or a serving-capacity limit. Helper cuMemGetInfo rows are diagnostic and are not substituted for that physical sample.
+
+Canonical Nemotron restoration passed at 2026-10-20T00:27:08.337197 UTC. Request `e37c00b0-5adf-41b2-915c-ebd9dafc6684` returned `READY` through the canonical local route. The restored PID was 21708, with 5572 and 5815 MiB free on the internal GPUs. Clef was unchanged and the cleanup error list was empty. This is the sealed controller's restoration observation, not a new production probe by the packager.
+
+Sealed r1 was never run and remains unchanged. The actual GPU result comes from `qwen35-full-moe-window-r2-20261020`. The later math integration commit `1fe0ecaff` and its new image beginning `57f259` are separate unqualified work and are excluded from this screen's conclusion. No latency, throughput, full-model quality, serving, capacity, or promotion claim follows from this proof. The controller's generic headline-performance flag does not change that scope.
+
+The [evidence archive](evidence/upstream-full-moe-20261020/original-evidence.zip) preserves the small evidence, original reviews and responses, eligibility proof and negative controls, historical source, licenses, test seals, CLI cases, actual controller receipt, and fresh replay. Its [index](evidence/upstream-full-moe-20261020/archive.json) supplies every archived member's actual size and SHA256. The [external readbacks](evidence/upstream-full-moe-20261020/external-readbacks.json) pin 406 binary, checkpoint, raw-array, or large-file dependencies with actual size and SHA256. No empty placeholders represent external data. Absolute original paths retain the evidence joins. Semantic replay requires those pinned originals at their original paths.
+
+From the worktree root, use the repository Python to run `.artifacts/qwen35-full-moe-rootprep-r2-20261020/analyze.py --approved .artifacts/qwen35-full-moe-window-r2-20261020/approved-pins.json --output NEW.json`. Run `docs/plans/qwen35-ornith/evidence/windows-v110-20261019/verify_archive.py docs/plans/qwen35-ornith/evidence/upstream-full-moe-20261020` for independent archived-byte verification. Run `.artifacts/qwen35-full-moe-proof-20261020/verify_external.py` to rehash every preserved external dependency. The bounded proof driver is archived. Packaging uses CPU hashing and compression only. It starts no model, GPU, compiler, controller, or service.
+
+Prove It Works selected a fresh complete replay and direct process observation. Technical Writing keeps the actual screen result separate from old preparation status and the unchanged full-model failure. No source, old sealed artifact, index, or commit is changed by this proof unit.

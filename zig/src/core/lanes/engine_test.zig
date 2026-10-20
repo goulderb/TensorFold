@@ -124,7 +124,31 @@ test "one cancelled batched prompt releases only its own cache" {
     try std.testing.expectEqual(@as(usize, 0), cancelled.emitted().len);
 }
 
+test "zero-output streams finish after prefill without drawing a token" {
+    for ([_]bool{ false, true }) |stepped| {
+        var cfg = try Config.init(gpa, .{}, 1, 0);
+        defer cfg.deinit(gpa);
+        var target: fake.Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
+        defer target.deinit();
+        var clock: fake.FixedClock = .{};
+        var engine = Engine.init(gpa, &cfg, if (stepped) target.stepped() else target.backend(), clock.clock());
+        defer engine.deinit();
+        var stream = try sm.Stream.init(gpa, .{ .id = "empty", .prompt = &.{ 2, 7, 1 }, .max_new = 0 });
+        defer stream.deinit(gpa);
+        if (stepped) {
+            var first = true;
+            while (!try engine.fillStream(&stream, first)) first = false;
+        } else try engine.addStream(&stream);
+        try std.testing.expect(stream.finished);
+        try std.testing.expectEqual(sm.Reason.length, stream.reason);
+        try std.testing.expectEqual(@as(usize, 0), stream.emitted().len);
+        try std.testing.expectEqual(@as(usize, 0), target.drawn.items.len);
+        try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
+    }
+}
+
 pub const Case = struct {
+
     prompt: []const u32,
     max_new: u32 = 40,
     sampling: ?Sampling = null,

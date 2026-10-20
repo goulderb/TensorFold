@@ -25,3 +25,13 @@ test {
     _ = reuse;
     _ = native;
 }
+
+pub const checkpoint = @import("cuda_checkpoint.zig");
+pub const weights = @import("cuda_weights.zig");
+pub const pipeline = @import("cuda_pipeline.zig");
+test {
+    _ = @import("cuda_checkpoint_test.zig");
+    _ = @import("cuda_modelopt_weights.zig");
+    _ = pipeline;
+    _ = @import("cuda_pipeline_test.zig");
+}
