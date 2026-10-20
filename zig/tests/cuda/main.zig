@@ -113,6 +113,8 @@ const usage =
     \\  nccl                      one-rank NCCL all-reduce and all-gather
     \\  rank-scatter <rank> <n> [id]  rank-order reduce-scatter (NCCL_COMM_ID or an id file) against an all-gather
     \\  roce-gather <rank>        two ranks (NCCL_COMM_ID): the RoCE all-gather against NCCL's, graph replays, time a call
+    \\  glm-taps-commit-check <draft> <aot> <rank> real drafter taps-only commit packing and synchronization proof
+    \\  glm-commit-check <config.json> model-free target recurrence commit packing proof
     \\  glm-greedy-check <rank>   model-free TP2 exact greedy sampling and rowwise/packed NCCL/RoCE timings
     \\  glm-kda-chunk-check <dir> model-free WY KDA exact production fixtures and aligned restore/decode proof
     \\  rank-sum                  the reduce-scatter's sum kernel alone, 2 to 5 ranks as each rank (one GPU, no NCCL)
@@ -292,6 +294,8 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
         return rank_scatter_tests.run(gpu, rank, world, if (rest.len > 2) rest[2] else null);
     }
     if (std.mem.eql(u8, cmd, "roce-gather")) return roce_gather_tests.run(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10));
+    if (std.mem.eql(u8, cmd, "glm-taps-commit-check")) return @import("glm_taps_commit_check.zig").run(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(usize, try arg(rest, 2), 10));
+    if (std.mem.eql(u8, cmd, "glm-commit-check")) return @import("glm_commit_check.zig").run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "glm-greedy-check")) return glm_greedy_check.run(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10));
     if (std.mem.eql(u8, cmd, "glm-kda-chunk-check")) return glm_kda_chunk_check.run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "rank-sum")) return rank_scatter_tests.sum(gpu);

@@ -167,6 +167,24 @@ pub const Loader = struct {
     fn one(l: *Loader, name: []const u8, n: usize, k: usize) !mm.Q4 {
         return l.q4(.dflash2, &.{name}, &.{n}, k);
     }
+    /// The isolated tap-commit probe never reads the target head or draft decoder weights.
+    pub fn loadTaps(l: *Loader) !TapWeights {
+        var w: TapWeights = undefined;
+        w.fc = try l.one("fc.weight", 4096, 5 * 4096);
+        w.hidden_norm = try l.raw("hidden_norm.weight", 4096, 1);
+        var buf: [192]u8 = undefined;
+        for (&w.layers, 0..) |*layer, i| {
+            const k = try std.fmt.allocPrint(l.gpa, "layers.{d}.self_attn.k_proj.weight", .{i});
+            defer l.gpa.free(k);
+            const v = try std.fmt.allocPrint(l.gpa, "layers.{d}.self_attn.v_proj.weight", .{i});
+            defer l.gpa.free(v);
+            layer.kv = try l.q4(.dflash2, &.{ k, v }, &.{ l.rank.kv * 128, l.rank.kv * 128 }, 4096);
+            layer.q_norm = try l.raw(try std.fmt.bufPrint(&buf, "layers.{d}.self_attn.q_norm.weight", .{i}), 128, 1);
+            layer.k_norm = try l.raw(try std.fmt.bufPrint(&buf, "layers.{d}.self_attn.k_norm.weight", .{i}), 128, 1);
+        }
+        return w;
+    }
+
     pub fn load(l: *Loader, rank: dc.Rank) !Weights {
         if (l.rank.rank != rank.rank or l.rank.world != rank.world) return error.BadDraftRank;
         var w: Weights = undefined;
@@ -209,6 +227,7 @@ pub const Loader = struct {
         return w;
     }
 };
+pub const TapWeights = struct { fc: mm.Q4, hidden_norm: u64, layers: [5]struct { kv: mm.Q4, q_norm: u64, k_norm: u64 } };
 pub const Weights = struct { fc: mm.Q4, head: mm.Q4, hidden_norm: u64, norm: u64, hproj: u64, layers: [5]Layer };
 
 test "checkpoint column slices retain row order and BF16 bits" {

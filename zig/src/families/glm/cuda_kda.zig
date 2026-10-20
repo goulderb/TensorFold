@@ -7,6 +7,12 @@ pub const dk = 128;
 pub const dv = 128;
 /// Windows of this many rows or more (prefill chunks) take the three-kernel chain (kda.WIDE_ROWS).
 pub const wide_rows = 64;
+
+var wy_launches = std.atomic.Value(u64).init(0);
+var wy_rows = std.atomic.Value(u64).init(0);
+pub fn wyDispatch() [2]u64 {
+    return .{ wy_launches.load(.monotonic), wy_rows.load(.monotonic) };
+}
 pub const PromptAlgorithm = enum(u8) { serial, wy32 };
 pub const chunk_rows = 32;
 pub const chunk_shared = 98560;
@@ -133,6 +139,8 @@ pub fn chunk(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, pos
     a.add(out);
     a.add(state_out);
     try cuda.launch.launch(kernel, .{ .grid = .{ .x = @intCast(c.heads) }, .block = .{ .x = 256 }, .shared = chunk_shared }, stream, &a);
+    _ = wy_launches.fetchAdd(1, .monotonic);
+    _ = wy_rows.fetchAdd(rows, .monotonic);
 }
 
 /// kda.replay: the state after the first `rows` saved rows, from state_in.

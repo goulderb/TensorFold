@@ -37,6 +37,20 @@ pub const window_rows = state.window_rows;
 pub const State = state.State;
 pub const Buffers = state.Buffers;
 
+pub const PromptDispatch = struct {
+    wy: [2]u64,
+    overlap: [2]u64,
+    fronts: [4]u64,
+};
+var overlap_dispatch: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) };
+var front_dispatch: [4]std.atomic.Value(u64) = .{ .init(0), .init(0), .init(0), .init(0) };
+pub fn promptDispatch() PromptDispatch {
+    var value: PromptDispatch = .{ .wy = kda.wyDispatch(), .overlap = undefined, .fronts = undefined };
+    for (&overlap_dispatch, &value.overlap) |*counter, *count| count.* = counter.load(.monotonic);
+    for (&front_dispatch, &value.fronts) |*counter, *count| count.* = counter.load(.monotonic);
+    return value;
+}
+
 /// The modules a forward launches from: our fatbins.
 pub const Modules = struct {
     glue: glue.Kernels,
@@ -727,6 +741,14 @@ pub const Forward = struct {
                 const lo = plan.mine + piece.off;
                 const next = if (site == .mixer) j else j + 1;
                 try f.frontRows(r, r.w.layers[next], if (site == .mixer) .ffn else .mixer, @min(lo, rows), @min(lo + piece.rows, rows));
+                const kind: usize = if (site == .mixer) switch (r.w.layers[next].ffn) {
+                    .dense => 2,
+                    .moe => 3,
+                } else switch (r.w.layers[next].mixer) {
+                    .kda => 0,
+                    .mla => 1,
+                };
+                _ = front_dispatch[kind].fetchAdd(@min(lo + piece.rows, rows) - @min(lo, rows), .monotonic);
             };
         }
         for (0..first.count) |q| try f.stream.wait(p.shared[q]);
@@ -854,7 +876,10 @@ pub const Forward = struct {
         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill and f.ranks[0].segs.len == 0) ranges(R, p.count, &cut) else 0) else 0;
         // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
         const exact_prompt = f.ranks[0].b.prefill and f.ranks[0].segs.len == 0 and f.pieces != null and prompt_split.applies(f.prefill_overlap, f.ranks[0].w.share.world, R, f.ranks[0].b.rows);
-        if (exact_prompt) try f.productionPrompt(f.pieces.?, R) else if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
+        if (exact_prompt) {
+            try f.productionPrompt(f.pieces.?, R);
+            _ = overlap_dispatch[f.prefill_overlap - 1].fetchAdd(1, .monotonic);
+        } else if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
         try f.finish(R);
         try f.joinPrefetch();
     }

@@ -91,3 +91,13 @@ test {
     _ = vision_runtime;
     _ = @import("heat"); // upstream's heat bands, run where the GLM ranks use them
 }
+
+/// Components used by the model-free tap-commit proof, without constructing a DFlash engine.
+pub const taps_fixture = struct {
+    pub const forward = @import("cuda_dflash_forward.zig");
+    pub const weights = @import("cuda_dflash_weights.zig");
+    pub const config = @import("cuda_dflash_config.zig");
+    pub const entries = @import("cuda_dflash_entries.zig");
+    pub const ops = @import("cuda_dflash_ops.zig");
+    pub const aot = @import("cuda_dflash_aot.zig");
+};

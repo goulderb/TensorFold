@@ -159,6 +159,9 @@ pub const Engine = struct {
     bm: fw.Buffers, // the MTP head's rows
     bs: ?fw.Buffers = null, // shared verify windows (with the MTP head, as the lane core shares only then)
     verify_widths: [shared_rows + 1]u64 = @splat(0),
+    verify_lone_widths: [fw.window_rows + 1]u64 = @splat(0),
+    prompt_wy_logged: bool = false,
+    prompt_overlap_logged: bool = false,
     route_trace: ?route_trace.Trace = null,
     ffn_graphs: ?target_graph.Bank = null,
     full_graphs: ?target_forward.Runtime = null,
@@ -679,6 +682,22 @@ pub const Engine = struct {
 
     /// Frees slot `slot`'s sequence (slot 0 stays: the first stream's, made at init) and binds slot 0.
     pub fn release(e: *Engine, slot: u32) void {
+        if (e.share.rank == 0 and ranks.environment("TF_GLM_VERIFY_WORK") != null) {
+            const graphs = e.targetGraphStats();
+            var forwards: u64 = 0;
+            var actual_rows: u64 = 0;
+            for (e.verify_widths, 0..) |count, width| {
+                forwards += count;
+                actual_rows += count * width;
+            }
+            for (e.verify_lone_widths, 0..) |count, width| {
+                forwards += count;
+                actual_rows += count * width;
+            }
+            std.log.info("GLM verify work scope=engine cumulative=true slot={d} successful_verify_forwards={d} successful_verify_rows={d} graph_mode={s} graph_includes_startup=true graph_eager={d} graph_captures={d} graph_replays={d} shared_widths={any} lone_widths={any}", .{
+                slot, forwards, actual_rows, @tagName(e.settings.target_graphs), graphs.site_eager, graphs.site_captures, graphs.site_replays, e.verify_widths, e.verify_lone_widths,
+            });
+        }
         e.replicas.invalidate();
         if (e.dflash) |drafter| drafter.release(slot);
         if (e.pool) |*p| p.regions.release(slot);
@@ -795,7 +814,20 @@ pub const Engine = struct {
             errdefer e.pair_failure(error.DFlashCommitFailed);
             try drafter.acceptPrompt(e.slot, e.bp.taps.?.ptr, e.bp.rows, rows, start);
         }
+        if (last) e.logPromptDispatch(rows, false);
         return first;
+    }
+
+    fn logPromptDispatch(e: *Engine, rows: usize, shared_prompt: bool) void {
+        const actual = fw.promptDispatch();
+        const new_wy = actual.wy[0] > 0 and !e.prompt_wy_logged;
+        const new_overlap = actual.overlap[0] + actual.overlap[1] > 0 and !e.prompt_overlap_logged;
+        if (!new_wy and !new_overlap) return;
+        std.log.info("GLM prompt dispatch scope=process rank={d} slot={d} rows={d} shared={} target_readback=passed wy_launches={d} wy_layer_rows={d} overlap1_chunks={d} overlap2_chunks={d} interleaved_front_rows_kda_dsa_dense_shared={any}", .{
+            e.share.rank, e.slot, rows, shared_prompt, actual.wy[0], actual.wy[1], actual.overlap[0], actual.overlap[1], actual.fronts,
+        });
+        e.prompt_wy_logged = e.prompt_wy_logged or new_wy;
+        e.prompt_overlap_logged = e.prompt_overlap_logged or new_overlap;
     }
 
     /// The chunk gate on every rank: a kept state at the mark, the heat wait, rank 0's cancel; the id exchanged first.
@@ -860,6 +892,7 @@ pub const Engine = struct {
             const own = e.view(&e.bp, &one);
             try own.commit(g.rows);
         }
+        e.logPromptDispatch(rows, true);
     }
 
     /// Device bytes retained at a prompt mark; MTP has absorbed the same prefix at these marks.
@@ -1118,6 +1151,7 @@ pub const Engine = struct {
         try e.retainRows(e.bd.fnormed, ids.len);
         if (e.dflash) |drafter| try drafter.stageWindow(e.slot, e.bd.taps.?.ptr, e.bd.rows, 0, ids.len, at);
         if (masked) try e.drawMasked(e.bd.logits, ids.len, at + 1, out) else try e.draw(e.bd.logits, ids.len, at + 1, out);
+        e.verify_lone_widths[ids.len] += 1;
     }
 
     /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
