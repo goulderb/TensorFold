@@ -51,8 +51,24 @@ matched measurement; its earlier CPU-only estimate is not a model result.
 The combined trial does not replace
 independent HF quality, serving, capacity or promotion gates.
 
+The actual full-logit ownership component now passes on both GPUs, retaining
+the Engine, Cache and Session copies and using the native Adapter. All five
+pairs favor the device path on each GPU. Head-GPU baseline variability leaves
+its precise cost estimate inconclusive. The next actual-model comparison uses
+fresh engines and actual native decode selection. See the
+[ownership evidence](upstream-terminal-ownership-20261020.md); the earlier
+eight-byte-transfer carrier remains a separate experiment.
+
 The shared activation/down composition now matches the original HF outputs
 on all six saved rows on both GPUs. Native controls remain exact. This is a
 quality boundary, not a throughput candidate or a full-network pass. The
 [proof](upstream-shared-down-20261019.md) retains every raw output and the
 independent review of the frozen host evidence. Full-MoE composition follows.
+
+Full-MoE composition subsequently passed the strict both-device audit with
+644 records and 240 raw outputs. Actual HF final comparisons are restricted
+to positions 2/3/4, independently derived from matching original operands.
+Positions 0/1/5 stay diagnostic. The new shared-engine BF16 arithmetic option
+is off by default and still requires its rebuilt-image operator gate and the
+unchanged full-network HF gate. No quality or performance acceptance follows
+from compilation of that option.
