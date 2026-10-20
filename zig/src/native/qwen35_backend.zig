@@ -62,6 +62,7 @@ pub fn Adapter(comptime Session: type) type {
         const vtable: be.Backend.VTable = .{
             .prefill = prefill,
             .prefill_step = prefillStep,
+            .prefill_batch = prefillBatch,
             .first = first,
             .queue = queue,
             .read = read,
@@ -191,6 +192,10 @@ pub fn Adapter(comptime Session: type) type {
             const self = of(ptr);
             while (!self.lock.tryLock()) std.Thread.yield() catch {};
             defer self.lock.unlock();
+            return self.queueLocked(ptr, s, feed, position);
+        }
+
+        fn queueLocked(self: *Self, ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) !u64 {
             const session = try self.sessionOf(s);
             if (session.position + 1 != position) return error.PositionMismatch;
             const token = switch (feed) {
@@ -206,13 +211,79 @@ pub fn Adapter(comptime Session: type) type {
             return @intCast(handle);
         }
 
+        fn plainWindow(w: be.Window, o: be.Verified) bool {
+            return w.held == 0 and w.tokens.len == 0 and w.parents == null and !w.early and w.masks.len == 0 and
+                w.positions.len == 1 and o.sampled.len == 1 and o.drafts.len == 0 and o.rows.len == 0;
+        }
+
         fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
-            if (windows.len != 1 or out.len != 1) return error.UnsupportedWindow;
-            const w = windows[0];
-            if (w.held != 0 or w.tokens.len != 0 or w.parents != null or w.early or w.masks.len != 0 or
-                w.positions.len != 1 or out[0].sampled.len != 1 or out[0].drafts.len != 0 or out[0].rows.len != 0)
-                return error.UnsupportedWindow;
-            out[0].sampled[0] = @intCast(try queue(ptr, w.stream, .{ .value = w.pending }, w.positions[0]));
+            if (windows.len != out.len or windows.len == 0 or windows.len > 2) return error.UnsupportedWindow;
+            for (windows, out) |w, o| if (!plainWindow(w, o)) return error.UnsupportedWindow;
+            const self = of(ptr);
+            while (!self.lock.tryLock()) std.Thread.yield() catch {};
+            defer self.lock.unlock();
+            if (windows.len == 1 or comptime !@hasDecl(Session, "pipelineRows")) {
+                for (windows, out) |w, *o| {
+                    o.sampled[0] = @intCast(try self.queueLocked(ptr, w.stream, .{ .value = w.pending }, w.positions[0]));
+                }
+                return;
+            }
+            const a = try self.sessionOf(windows[0].stream);
+            const b = try self.sessionOf(windows[1].stream);
+            if (a.position + 1 != windows[0].positions[0] or b.position + 1 != windows[1].positions[0])
+                return error.PositionMismatch;
+            try Session.pipelineRows(a, &.{windows[0].pending}, b, &.{windows[1].pending}, .last);
+            out[0].sampled[0] = @intCast(try self.draw(windows[0].stream, windows[0].positions[0]));
+            out[1].sampled[0] = @intCast(try self.draw(windows[1].stream, windows[1].positions[0]));
+        }
+
+        fn prefillBatch(ptr: *anyopaque, streams: []const *lanes.Stream, out: []be.PrefillOutcome) anyerror!void {
+            if (streams.len != 2 or out.len != 2) return;
+            if (comptime !@hasDecl(Session, "pipelineRows")) return;
+            const self = of(ptr);
+            while (!self.lock.tryLock()) std.Thread.yield() catch {};
+            defer self.lock.unlock();
+            for (streams) |s| {
+                if (s.isCancelled()) return error.Cancelled;
+                if (self.indexOf(s) == null) try self.begin(s);
+            }
+            const ia = self.indexOf(streams[0]) orelse return error.PositionMismatch;
+            const ib = self.indexOf(streams[1]) orelse return error.PositionMismatch;
+            if (self.prefill_rows == 0) return error.InvalidSession;
+            while (self.prompt_at[ia] < streams[0].prompt_len or self.prompt_at[ib] < streams[1].prompt_len) {
+                if (streams[0].isCancelled() or streams[1].isCancelled()) return error.Cancelled;
+                const na = @min(self.prefill_rows, streams[0].prompt_len -| self.prompt_at[ia]);
+                const nb = @min(self.prefill_rows, streams[1].prompt_len -| self.prompt_at[ib]);
+                if (na > 0 and nb > 0) {
+                    try Session.pipelineRows(
+                        &self.sessions[ia],
+                        streams[0].context.items[self.prompt_at[ia]..][0..na],
+                        &self.sessions[ib],
+                        streams[1].context.items[self.prompt_at[ib]..][0..nb],
+                        .last,
+                    );
+                    self.advanceFill(streams[0], ia, na);
+                    self.advanceFill(streams[1], ib, nb);
+                } else if (na > 0) {
+                    try self.sessions[ia].append(streams[0].context.items[self.prompt_at[ia]..][0..na]);
+                    self.advanceFill(streams[0], ia, na);
+                } else if (nb > 0) {
+                    try self.sessions[ib].append(streams[1].context.items[self.prompt_at[ib]..][0..nb]);
+                    self.advanceFill(streams[1], ib, nb);
+                } else break;
+            }
+            out[0] = .complete;
+            out[1] = .complete;
+        }
+
+        fn advanceFill(self: *Self, s: *lanes.Stream, i: usize, n: usize) void {
+            const first_chunk = self.prompt_at[i] == 0;
+            self.prompt_at[i] += n;
+            s.fill_at.store(@intCast(self.prompt_at[i]), .monotonic);
+            if (first_chunk) std.log.info("qwen prefill first chunk rows={d} position={d}", .{ n, self.sessions[i].position });
+            if (self.prompt_at[i] < s.prompt_len and std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(self.prompt_at[i])) != null) {
+                if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(self.prompt_at[i]));
+            }
         }
 
         fn keep(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
@@ -615,4 +686,35 @@ test "Qwen adapter binds two sessions and refuses a third" {
     try std.testing.expectEqual(@as(usize, 2), sessions[0].resets);
     backend.release(&b);
     backend.release(&c);
+}
+
+test "Qwen adapter verifies two plain windows on separate sessions" {
+    const gpa = std.testing.allocator;
+    var sessions: [2]FakeSession = .{ .{ .position = 1 }, .{ .position = 1 } };
+    var adapter = try Adapter(FakeSession).initSessions(gpa, &sessions, 32);
+    defer adapter.deinit();
+    const backend = adapter.backend();
+    var a = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &.{1}, .max_new = 4, .sampling = .{ .seed = 0, .temperature = 0 } });
+    defer a.deinit(gpa);
+    var b = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &.{2}, .max_new = 4, .sampling = .{ .seed = 0, .temperature = 0 } });
+    defer b.deinit(gpa);
+    try backend.prefill(&a);
+    try backend.prefill(&b);
+    sessions[0].position = 1;
+    sessions[1].position = 1;
+    var sampled_a: [1]u32 = undefined;
+    var sampled_b: [1]u32 = undefined;
+    const windows = [_]be.Window{
+        .{ .stream = &a, .pending = 1, .held = 0, .tokens = &.{}, .parents = null, .positions = &.{2} },
+        .{ .stream = &b, .pending = 2, .held = 0, .tokens = &.{}, .parents = null, .positions = &.{2} },
+    };
+    var verified = [_]be.Verified{
+        .{ .sampled = &sampled_a, .drafts = &.{} },
+        .{ .sampled = &sampled_b, .drafts = &.{} },
+    };
+    try backend.verify(&windows, &verified);
+    try std.testing.expectEqual(@as(usize, 2), sessions[0].position);
+    try std.testing.expectEqual(@as(usize, 2), sessions[1].position);
+    try std.testing.expectEqual(@as(u32, 3), sampled_a[0]);
+    try std.testing.expectEqual(@as(u32, 3), sampled_b[0]);
 }

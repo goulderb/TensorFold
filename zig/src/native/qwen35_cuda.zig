@@ -256,3 +256,19 @@ test "Qwen refuses unsupported direct requests and inherited pool or spill setti
 test {
     _ = lane;
 }
+
+test "two Qwen lanes plan a shared decode round without copy drafts" {
+    const gpa = std.testing.allocator;
+    var model = lane.facts;
+    model.max_streams = 2;
+    model.hidden_rows = true;
+    model.streams_exact = true;
+    model.exact_width = 2;
+    model.copy_drafts = false;
+    var cfg = try lanes.Config.init(gpa, model, 2, 1);
+    defer cfg.deinit(gpa);
+    try std.testing.expect(cfg.family_streams);
+    try std.testing.expectEqual(@as(u32, 2), cfg.batch_streams);
+    try std.testing.expectEqual(@as(u32, 0), cfg.max_copy);
+    try std.testing.expectEqual(@as(u32, 2), cfg.family_width);
+}

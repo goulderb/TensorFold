@@ -362,7 +362,14 @@ fn openQwen(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     }
     var served_facts = qwen_modelopt.facts;
     served_facts.max_streams = loaded.lanes;
-    try h.serve(io, served_facts, 1, .{
+    const window_rows: u32 = if (loaded.lanes > 1) 2 else 1;
+    if (loaded.lanes > 1) {
+        served_facts.hidden_rows = true;
+        served_facts.streams_exact = true;
+        served_facts.exact_width = 2;
+        served_facts.copy_drafts = false;
+    }
+    try h.serve(io, served_facts, window_rows, .{
         .name = "qwen35-cuda-lanes",
         .call_gates = true,
         .lanes = loaded.lanes,

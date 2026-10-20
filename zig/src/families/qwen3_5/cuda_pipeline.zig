@@ -68,7 +68,6 @@ pub const Chain = struct {
     context: usize,
     prefill_rows: usize = 1,
     partitions: []Stage,
-    seam: cuda.HostBuffer,
 
     pub fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, options: Options) !*Chain {
         try validatePrefillRows(options.prefill_rows);
@@ -91,7 +90,7 @@ pub const Chain = struct {
         }
         const c = try gpa.create(Chain);
         errdefer gpa.destroy(c);
-        c.* = .{ .gpa = gpa, .driver = try cuda.Driver.open(), .config = config, .context = options.context, .prefill_rows = options.prefill_rows, .partitions = undefined, .seam = undefined };
+        c.* = .{ .gpa = gpa, .driver = try cuda.Driver.open(), .config = config, .context = options.context, .prefill_rows = options.prefill_rows, .partitions = undefined };
         errdefer c.driver.close();
         c.partitions = try gpa.alloc(Stage, options.devices.len);
         errdefer gpa.free(c.partitions);
@@ -115,8 +114,6 @@ pub const Chain = struct {
             p.engine.bounded_hf_prefill = options.prefill_rows > 1;
             try checkCapacity((try p.context.memInfo()).free, floor_bytes);
         }
-        c.seam = try cuda.HostBuffer.alloc(&c.driver, 2 * seamStride(config.geometry.hidden));
-        errdefer c.seam.free();
         var warm = try c.createSession();
         defer warm.deinit();
         try warm.append(&.{0});
@@ -125,7 +122,6 @@ pub const Chain = struct {
 
     pub fn deinit(c: *Chain) void {
         c.partitions[c.partitions.len - 1].context.makeCurrent() catch {};
-        c.seam.free();
         for (c.partitions) |*p| {
             p.context.makeCurrent() catch {};
             p.engine.deinit();
@@ -162,6 +158,9 @@ pub const Chain = struct {
             made += 1;
             try checkCapacity((try p.context.memInfo()).free, floor_bytes);
         }
+        if (c.partitions.len > 1) {
+            s.seam = try cuda.HostBuffer.alloc(&c.driver, 2 * seamStride(c.config.geometry.hidden));
+        }
         @memset(s.logits, 0);
         return s;
     }
@@ -173,12 +172,19 @@ pub const Session = struct {
     position: usize = 0,
     logits: []u16,
     poisoned: bool = false,
+    seam: ?cuda.HostBuffer = null,
+    held_ids: [engine.hf_prefill_rows]u32 = undefined,
+    held_n: usize = 0,
+    tail_shape: ?engine.Engine.Shape = null,
+    tail_keep: engine.Keep = .last,
+    tail_open: bool = false,
 
     pub fn deinit(s: *Session) void {
         for (s.chain.partitions, 0..) |*p, i| {
             p.context.makeCurrent() catch {};
             s.caches[i].deinit(s.chain.gpa);
         }
+        if (s.seam) |*seam| seam.free();
         s.chain.gpa.free(s.logits);
     }
 
@@ -228,38 +234,116 @@ pub const Session = struct {
     }
 
     fn stepRows(s: *Session, tokens: []const u32, keep: engine.Keep) !void {
+        try s.runHead(tokens, keep);
+        if (s.chain.partitions.len > 1) {
+            try s.launchTail();
+            try s.waitTail();
+        }
+    }
+
+    /// GPU0 (or the only partition) for `tokens`. Two-GPU sessions leave GPU1 to launchTail.
+    pub fn runHead(s: *Session, tokens: []const u32, keep: engine.Keep) !void {
         s.invalidateGreedy();
         errdefer {
             s.invalidateGreedy();
             s.poisoned = true;
         }
+        if (s.tail_open) return error.TailPending;
+        if (tokens.len == 0 or tokens.len > engine.hf_prefill_rows) return error.InvalidPrefillRows;
+        try s.runPartition(0, tokens, keep, if (s.chain.partitions.len > 1) .download else .none, true);
+        if (s.chain.partitions.len == 1) {
+            s.commitRows(tokens.len);
+            return;
+        }
+        @memcpy(s.held_ids[0..tokens.len], tokens);
+        s.held_n = tokens.len;
+        s.tail_keep = keep;
+    }
+
+    /// Start GPU1 from the residual left by runHead. Does not wait for logits.
+    pub fn launchTail(s: *Session) !void {
+        errdefer {
+            s.invalidateGreedy();
+            s.poisoned = true;
+        }
+        if (s.chain.partitions.len < 2 or s.held_n == 0 or s.tail_open) return error.TailPending;
+        try s.runPartition(1, s.held_ids[0..s.held_n], s.tail_keep, .upload, false);
+        s.tail_open = true;
+    }
+
+    /// Finish GPU1, commit both caches, and copy logits.
+    pub fn waitTail(s: *Session) !void {
+        errdefer {
+            s.invalidateGreedy();
+            s.poisoned = true;
+            s.tail_open = false;
+            s.tail_shape = null;
+        }
+        if (!s.tail_open) return error.TailPending;
+        const p = &s.chain.partitions[1];
+        try p.context.makeCurrent();
+        const parts = [_]engine.Part{.{ .cache = &s.caches[1], .rows = s.held_n }};
+        try p.engine.finish(&parts, s.tail_keep, s.tail_shape orelse return error.TailPending);
+        try checkCapacity((try p.context.memInfo()).free, floor_bytes);
+        s.tail_open = false;
+        s.tail_shape = null;
+        s.commitRows(s.held_n);
+        s.held_n = 0;
+    }
+
+    const Copy = enum { none, download, upload };
+
+    fn runPartition(s: *Session, i: usize, tokens: []const u32, keep: engine.Keep, copy: Copy, wait: bool) !void {
         const c = s.chain;
+        const p = &c.partitions[i];
+        try p.context.makeCurrent();
+        const e = p.engine;
+        const parts = [_]engine.Part{.{ .cache = &s.caches[i], .rows = tokens.len }};
+        const shape = try e.prepare(&parts, tokens, keep);
         const bytes = tokens.len * c.config.geometry.hidden * 2;
-        // The residual payload starts at the fixed maximum-row stride for every chunk.
         const residual = seamStride(c.config.geometry.hidden);
-        for (c.partitions, 0..) |*p, i| {
-            try p.context.makeCurrent();
-            const e = p.engine;
-            const parts = [_]engine.Part{.{ .cache = &s.caches[i], .rows = tokens.len }};
-            const shape = try e.prepare(&parts, tokens, keep);
-            if (i > 0) {
-                try c.driver.check(c.driver.api.cuMemcpyHtoDAsync_v2(e.h, c.seam.bytes.ptr, bytes, e.stream.handle), "pipeline h upload");
-                try c.driver.check(c.driver.api.cuMemcpyHtoDAsync_v2(e.r, c.seam.bytes.ptr + residual, bytes, e.stream.handle), "pipeline r upload");
+        if (copy != .none) {
+            const seam = &(s.seam orelse return error.InvalidPartition);
+            if (copy == .upload) {
+                try c.driver.check(c.driver.api.cuMemcpyHtoDAsync_v2(e.h, seam.bytes.ptr, bytes, e.stream.handle), "pipeline h upload");
+                try c.driver.check(c.driver.api.cuMemcpyHtoDAsync_v2(e.r, seam.bytes.ptr + residual, bytes, e.stream.handle), "pipeline r upload");
             }
             try e.execute(shape);
-            if (i + 1 < c.partitions.len) {
-                try c.driver.check(c.driver.api.cuMemcpyDtoHAsync_v2(c.seam.bytes.ptr, e.h, bytes, e.stream.handle), "pipeline h download");
-                try c.driver.check(c.driver.api.cuMemcpyDtoHAsync_v2(c.seam.bytes.ptr + residual, e.r, bytes, e.stream.handle), "pipeline r download");
+            if (copy == .download) {
+                try c.driver.check(c.driver.api.cuMemcpyDtoHAsync_v2(seam.bytes.ptr, e.h, bytes, e.stream.handle), "pipeline h download");
+                try c.driver.check(c.driver.api.cuMemcpyDtoHAsync_v2(seam.bytes.ptr + residual, e.r, bytes, e.stream.handle), "pipeline r download");
             }
+        } else try e.execute(shape);
+        if (wait) {
             try e.finish(&parts, keep, shape);
             try checkCapacity((try p.context.memInfo()).free, floor_bytes);
-        }
+        } else s.tail_shape = shape;
+    }
+
+    fn commitRows(s: *Session, n: usize) void {
+        const c = s.chain;
         for (s.caches[0..c.partitions.len]) |*cache| {
-            const parts = [_]engine.Part{.{ .cache = cache, .rows = tokens.len }};
+            const parts = [_]engine.Part{.{ .cache = cache, .rows = n }};
             engine.Engine.commit(&parts, false);
         }
         @memcpy(s.logits, s.caches[c.partitions.len - 1].logits);
-        s.position += tokens.len;
+        s.position += n;
+    }
+
+    /// Overlap GPU1 of `a` with GPU0 of `b` on a two-partition chain.
+    pub fn pipelineRows(a: *Session, a_tokens: []const u32, b: *Session, b_tokens: []const u32, keep: engine.Keep) !void {
+        if (a.chain != b.chain) return error.InvalidPartition;
+        if (a.chain.partitions.len < 2) {
+            try a.stepRows(a_tokens, keep);
+            try b.stepRows(b_tokens, keep);
+            return;
+        }
+        try a.runHead(a_tokens, keep);
+        try a.launchTail();
+        try b.runHead(b_tokens, keep);
+        try a.waitTail();
+        try b.launchTail();
+        try b.waitTail();
     }
 
     pub fn copyLogits(s: *const Session, out: []f32) !void {
