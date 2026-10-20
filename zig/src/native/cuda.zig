@@ -370,6 +370,7 @@ fn openQwen(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         .max_queued = o.max_queued orelse 8,
         .plain_only = true,
         .thinking_budget = false,
+        .prompt_cache = h.store != null,
     }, null);
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }

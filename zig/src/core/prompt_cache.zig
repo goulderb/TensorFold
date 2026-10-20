@@ -584,6 +584,17 @@ pub const Store = struct {
             if (stable > 0 and stable < history_len and stable >= history_len / 2) try want.append(a, stable);
         }
         if (!short) try want.appendSlice(a, shared);
+        // Planned families otherwise only snap the history onto the grid, so a raw
+        // completion (history 0) never kept a prefix. Emit the request's chunk
+        // starts, or the family's grid when it named none.
+        if (s.rules.planned and history == 0) {
+            if (starts.len > 0) {
+                try want.appendSlice(a, starts);
+            } else if (s.rules.grid > 0) {
+                var g = s.rules.grid;
+                while (g < prompt.len) : (g += s.rules.grid) try want.append(a, g);
+            }
+        }
         for (want.items, 0..) |w, k| {
             const at = if (s.rules.planned) s.startAt(starts, w) else w;
             if (at <= from or at + s.rules.lookahead > prompt.len or at >= prompt.len or !s.usable(at, starts)) continue;
