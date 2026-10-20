@@ -65,7 +65,7 @@ quality boundary, not a throughput candidate or a full-network pass. The
 [proof](upstream-shared-down-20261019.md) retains every raw output and the
 independent review of the frozen host evidence. Full-MoE composition follows.
 
-Full-MoE composition subsequently passed the strict both-device audit with
+The [full-MoE composition](upstream-full-moe-20261020.md) subsequently passed the strict both-device audit with
 644 records and 240 raw outputs. Actual HF final comparisons are restricted
 to positions 2/3/4, independently derived from matching original operands.
 Positions 0/1/5 stay diagnostic. The new shared-engine BF16 arithmetic option
