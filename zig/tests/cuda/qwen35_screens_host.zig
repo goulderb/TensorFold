@@ -22,6 +22,8 @@ test {
     _ = @import("qwen35_slice_format_screen.zig");
     _ = @import("qwen35_layout_ab_input.zig");
     _ = @import("qwen35_full_moe_screen.zig");
+    _ = @import("qwen35_integrated_moe_screen.zig");
+    _ = @import("qwen35_moe_launch_probe.zig");
     _ = @import("qwen35_terminal_ownership_screen.zig");
     _ = @import("qwen35_terminal_ab_input.zig");
     _ = @import("qwen35_moe_math_input.zig");

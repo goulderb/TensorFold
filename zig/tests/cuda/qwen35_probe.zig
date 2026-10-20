@@ -85,7 +85,12 @@ pub fn main(init: std.process.Init) !u8 {
     for (model.partitions, 0..) |*part, i| free_mib[i] = (try part.context.memInfo()).free / (1 << 20);
     const config_sha = try fileHash(a, init.io, args[1], "config.json");
     const index_sha = try fileHash(a, init.io, args[1], "model.safetensors.index.json");
-    const report = .{ .prompt = input.prompt, .forced = input.forced, .tokens = tokens, .vocab = 248320, .context = input.context, .devices = input.devices, .device_identities = identities, .cut = input.cut, .moe_math = input.moe_math, .free_mib = free_mib[0..model.partitions.len], .config_sha256 = config_sha[0..], .index_sha256 = index_sha[0..], .session_isolation = true, .reset = true, .teacher_parity = "not checked by this executable" };
+    var loaded_math: [2]qwen.engine.MoeMath = @splat(.legacy);
+    for (model.partitions, 0..) |part, i| {
+        loaded_math[i] = part.engine.moeMath();
+        if (loaded_math[i] != input.moe_math) return error.QwenMoeMathShapeMismatch;
+    }
+    const report = .{ .prompt = input.prompt, .forced = input.forced, .tokens = tokens, .vocab = 248320, .context = input.context, .devices = input.devices, .device_identities = identities, .cut = input.cut, .requested_moe_math = input.moe_math, .actual_loaded_math = loaded_math[0..model.partitions.len], .free_mib = free_mib[0..model.partitions.len], .config_sha256 = config_sha[0..], .index_sha256 = index_sha[0..], .session_isolation = true, .reset = true, .teacher_parity = "not checked by this executable" };
     var out: std.Io.Writer.Allocating = .init(a);
     try std.json.Stringify.value(report, .{ .whitespace = .indent_2 }, &out.writer);
     try out.writer.writeByte('\n');

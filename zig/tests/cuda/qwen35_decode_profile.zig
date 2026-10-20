@@ -24,10 +24,12 @@ const terminal_graph_screen = @import("qwen35_terminal_graph_screen.zig");
 const shared_branch_screen = @import("qwen35_shared_branch_screen.zig");
 const slice_format_screen = @import("qwen35_slice_format_screen.zig");
 const layout_ab_input = @import("qwen35_layout_ab_input.zig");
+const integrated_moe_screen = @import("qwen35_integrated_moe_screen.zig");
 const full_moe_screen = @import("qwen35_full_moe_screen.zig");
 const terminal_ownership_screen = @import("qwen35_terminal_ownership_screen.zig");
 const terminal_ab_input = @import("qwen35_terminal_ab_input.zig");
 const moe_math_input = @import("qwen35_moe_math_input.zig");
+const moe_launch_probe = @import("qwen35_moe_launch_probe.zig");
 const lanes = @import("lanes");
 const native = @import("qwen35_adapter");
 
@@ -1007,6 +1009,7 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
                 .moe_semantics => |f| try moe_semantics_screen.run(gpu, f.fixture, f.fixture_sha256, f.image, f.image_sha256, j),
                 .shared_branch => |f| try shared_branch_screen.run(gpu, f.fixture, f.fixture_sha256, f.image, f.image_sha256, j),
                 .slice_format => |f| try slice_format_screen.run(gpu, f.fixture, f.fixture_sha256, j),
+                .integrated_moe => |f| try integrated_moe_screen.run(gpu, f.fixture, f.fixture_sha256, f.image, f.image_sha256, j),
                 .full_moe => |f| try full_moe_screen.run(gpu, f.fixture, f.fixture_sha256, f.image, f.image_sha256, j),
                 .terminal_ownership => |f| try terminal_ownership_screen.run(gpu, f.fixture, f.fixture_sha256, j),
             };
@@ -1047,6 +1050,12 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
     const expected_tokens = try a.alloc(u32, input.output_tokens);
     const rows = try a.alloc(u16, input.output_tokens * s.logits.len);
     const expected_rows = try a.alloc(u16, rows.len);
+    if (input.moe_math != .legacy) for (c.partitions, 0..) |part, rank| {
+        const e = part.engine;
+        if (e.moeMath() != input.moe_math) return error.QwenMoeMathShapeMismatch;
+        const binding = &e.modelopt.?;
+        try j.write(.{ .kind = "moe_math_binding", .rank = rank, .actual_loaded_math = e.moeMath(), .activation_symbol = try kernelName(binding.shared_act), .combine_symbol = try kernelName(binding.router.combine_fn), .activation_function = @intFromPtr(binding.shared_act.handle), .combine_function = @intFromPtr(binding.router.combine_fn.handle), .embedded_image_sha256 = &hash(cuda.kernels.qwen35_hf), .mode_is_immutable = true });
+    };
     captured(c, false);
     _ = try run(init.io, &s, input, expected_tokens, expected_rows);
     const expected_state = try stateHash(init.gpa, &s);
@@ -1088,5 +1097,6 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
     if (!std.mem.eql(u16, rows, expected_rows)) return error.PoisonResetMismatch;
     try j.write(.{ .kind = "controls", .all_consumed_rows_equal = true, .changing_tokens_and_positions = true, .interleaved_session_isolation = true, .reset = true, .partial_stage_failure_poison = true, .uncommitted_lengths = true });
     try trace(init, &s, input, j);
+    if (input.moe_math != .legacy) try moe_launch_probe.run(&s, input.prompt[0], j);
     try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "shared engine eager/captured parity and session controls", .production_qualification = false, .independent_reference_parity = "not checked by this executable", .default_policies = if (input.verify_default_policy) .{ .expert_up_n8 = c.partitions[0].engine.expert_up_n8, .gdn_layout = @tagName(s.caches[0].gdn_layout), .verify_expert_graphs = c.partitions[0].engine.verify_expert_graphs, .verify_gdn_graphs = c.partitions[0].engine.verify_gdn_graphs, .graph_verifiers = .{ .{ .rank = 0, .expert_baseline_nodes = c.partitions[0].engine.expert_graph_nodes_baseline, .expert_n8_nodes = c.partitions[0].engine.expert_graph_nodes_n8, .gdn_baseline_nodes = c.partitions[0].engine.gdn_graph_nodes_baseline, .gdn_candidate_nodes = c.partitions[0].engine.gdn_graph_nodes_candidate }, .{ .rank = 1, .expert_baseline_nodes = c.partitions[1].engine.expert_graph_nodes_baseline, .expert_n8_nodes = c.partitions[1].engine.expert_graph_nodes_n8, .gdn_baseline_nodes = c.partitions[1].engine.gdn_graph_nodes_baseline, .gdn_candidate_nodes = c.partitions[1].engine.gdn_graph_nodes_candidate } } } else null });
 }
