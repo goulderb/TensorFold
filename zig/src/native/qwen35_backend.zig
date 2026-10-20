@@ -288,9 +288,11 @@ pub fn Adapter(comptime Session: type) type {
 
         fn keep(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
             const self = of(ptr);
-            if (windows.len != 1 or paths.len != 1 or paths[0].len != 1 or paths[0][0] != 0 or
-                windows[0].rows() != 1 or self.indexOf(windows[0].stream) == null)
-                return error.UnsupportedRollback;
+            if (windows.len != paths.len or windows.len == 0 or windows.len > 2) return error.UnsupportedRollback;
+            for (windows, paths) |w, path| {
+                if (path.len != 1 or path[0] != 0 or w.rows() != 1 or self.indexOf(w.stream) == null)
+                    return error.UnsupportedRollback;
+            }
         }
 
         fn draft(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
@@ -717,4 +719,5 @@ test "Qwen adapter verifies two plain windows on separate sessions" {
     try std.testing.expectEqual(@as(usize, 2), sessions[1].position);
     try std.testing.expectEqual(@as(u32, 3), sampled_a[0]);
     try std.testing.expectEqual(@as(u32, 3), sampled_b[0]);
+    try backend.keep(&windows, &.{ &.{0}, &.{0} });
 }
