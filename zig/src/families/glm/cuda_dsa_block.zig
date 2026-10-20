@@ -103,6 +103,24 @@ pub fn sparseRows(l: Layer, host_pos: usize, rows: usize) bool {
     return host_pos + rows - 1 >= l.dense_limit;
 }
 
+fn densePrefix(host_pos: usize, rows: usize, dense_limit: usize, selected: bool, enabled: bool) usize {
+    if (!enabled or !selected or dense_limit != sparse.sparse_from) return rows;
+    return @min(rows, sparse.sparse_from -| host_pos);
+}
+
+test "prompt dense prefix leaves every skipped row to the scheduled selector" {
+    try std.testing.expectEqual(@as(usize, 2051), sparse.sparse_from);
+    const cases = [_][3]usize{
+        .{ 0, 2048, 2048 }, .{ 2047, 2048, 4 }, .{ 2048, 2048, 3 },
+        .{ 2049, 512, 2 },  .{ 2050, 16, 1 },   .{ 2051, 16, 0 },
+        .{ 2048, 1, 1 },    .{ 2052, 512, 0 },  .{ std.math.maxInt(usize), 2048, 0 },
+    };
+    for (cases) |case| try std.testing.expectEqual(case[2], densePrefix(case[0], case[1], 2051, true, true));
+    try std.testing.expectEqual(@as(usize, 2048), densePrefix(2048, 2048, 2051, false, true));
+    try std.testing.expectEqual(@as(usize, 2048), densePrefix(2048, 2048, 2051, true, false));
+    try std.testing.expectEqual(@as(usize, 2048), densePrefix(2048, 2048, 4096, true, true));
+}
+
 const replica_slots = 16;
 const replica_floor_rows: usize = 262144;
 
@@ -207,7 +225,8 @@ fn attendLocal(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
     entry.valid_end = end;
     var caches = c;
     caches.lc.ptr = base;
-    if (host_pos < l.dense_limit) try denseAttention(k, stream, l, caches, s, pos, rows, nch, part_rows, scale, latent.headBlock(rows));
+    const dense_rows = densePrefix(host_pos, rows, l.dense_limit, sparse_any, k.prefill and k.set.prompt_aot != null);
+    if (host_pos < l.dense_limit) try denseAttention(k, stream, l, caches, s, pos, dense_rows, nch, part_rows, scale, latent.headBlock(rows));
     if (sparse_any) try selectedAttention(k, stream, l, caches, s, rows, scale, latent.headBlock(rows));
 }
 
@@ -370,7 +389,8 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
             }
         }
     } else {
-        if (host_pos < l.dense_limit) try denseAttention(k, stream, l, c, v, pos, rows, nch, part_rows, scale, latent.headBlock(rows));
+        const dense_rows = densePrefix(host_pos, rows, l.dense_limit, sparse_any, k.prefill and k.set.prompt_aot != null);
+        if (host_pos < l.dense_limit) try denseAttention(k, stream, l, c, v, pos, dense_rows, nch, part_rows, scale, latent.headBlock(rows));
         if (sparse_any) try selectedAttention(k, stream, l, c, v, rows, scale, latent.headBlock(rows));
     }
 }
@@ -418,7 +438,9 @@ const Attention = struct {
         var s = a.s;
         s.qa = qa;
         s.ol = out;
-        if (a.host_pos < a.l.dense_limit) try denseAttention(a.k, a.stream, a.l, a.c, s, a.pos, a.rows, a.nch, a.rows, a.scale, a.hb);
-        if (sparseRows(a.l, a.host_pos, a.rows)) try selectedAttention(a.k, a.stream, a.l, a.c, s, a.rows, a.scale, a.hb);
+        const selected = sparseRows(a.l, a.host_pos, a.rows);
+        const dense_rows = densePrefix(a.host_pos, a.rows, a.l.dense_limit, selected, a.k.prefill and a.k.set.prompt_aot != null);
+        if (a.host_pos < a.l.dense_limit) try denseAttention(a.k, a.stream, a.l, a.c, s, a.pos, dense_rows, a.nch, a.rows, a.scale, a.hb);
+        if (selected) try selectedAttention(a.k, a.stream, a.l, a.c, s, a.rows, a.scale, a.hb);
     }
 };

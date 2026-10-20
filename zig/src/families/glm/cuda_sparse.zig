@@ -14,6 +14,8 @@ pub const score_loop = 32;
 pub const select_rows = 512;
 /// A row's token list: the 512 pools' tokens, then the incomplete pool's up to 3.
 pub const width = topk_pools * pool + pool - 1;
+/// First absolute query position where the selector emits a nonzero count.
+pub const sparse_from = (topk_pools + 1) * pool - 1;
 
 fn cdiv(a: usize, b: usize) usize {
     return (a + b - 1) / b;

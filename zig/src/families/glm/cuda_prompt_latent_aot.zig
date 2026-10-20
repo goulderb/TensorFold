@@ -30,7 +30,7 @@ const inventory = [_]Artifact{
 
 fn identity(artifacts: []const Artifact) [32]u8 {
     var h = Sha256.init(.{});
-    h.update("glm-prompt-latent-aot-v1:sm121:r1..2048:h32:d256:lw512:aligned16:fp8rs528:w2051:scale1/16:independent-fallback\x00");
+    h.update("glm-prompt-latent-aot-v2:sm121:mma-r2048-only:sparse-r1..2048:dense-prefix2051:h32:d256:lw512:aligned16:fp8rs528:w2051:scale1/16:independent-fallback\x00");
     for (artifacts) |a| {
         h.update(a.symbol);
         h.update("\x00");
@@ -92,7 +92,7 @@ fn aligned(pointers: []const u64) bool {
 }
 
 fn mmaEligible(a: MmaArgs, inner: usize, columns: usize) bool {
-    return a.rows > 0 and a.rows <= 2048 and a.heads == 32 and a.inner == inner and a.columns == columns and aligned(&.{ a.input, a.weight, a.out });
+    return a.rows == 2048 and a.heads == 32 and a.inner == inner and a.columns == columns and aligned(&.{ a.input, a.weight, a.out });
 }
 
 fn sparseEligible(a: SparseArgs) bool {
@@ -165,6 +165,8 @@ test "embedded prompt inventory verifies metadata and numerical identity covers 
         try std.testing.expect(@intFromPtr(a.image.ptr) % 16 == 0);
     }
     try std.testing.expectEqual(numerical_identity, identity(&inventory));
+    const previous_identity = [_]u8{ 0xeb, 0x0f, 0x48, 0xbf, 0x37, 0x52, 0x38, 0x95, 0x3d, 0x2c, 0xf1, 0x8e, 0xb6, 0xe3, 0x39, 0x2d, 0x5b, 0xe7, 0xcb, 0xec, 0xb9, 0xd5, 0xeb, 0x6b, 0x22, 0x5a, 0xb5, 0x28, 0x0c, 0x24, 0x10, 0xfb };
+    try std.testing.expect(!std.mem.eql(u8, &previous_identity, &numerical_identity));
     var changed = inventory;
     changed[2].image_sha256 = "different payload";
     try std.testing.expect(!std.mem.eql(u8, &numerical_identity, &identity(&changed)));
@@ -203,17 +205,17 @@ test "prompt AOT raw driver ABI retains runtime i32 rows and both scratch suffix
     var d: cuda.Driver = undefined;
     const k = try Mock.kernels(&d);
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
-    const a: MmaArgs = .{ .input = 16, .weight = 32, .out = 48, .rows = 65, .heads = 32, .inner = 256, .columns = 512 };
+    const a: MmaArgs = .{ .input = 16, .weight = 32, .out = 48, .rows = 2048, .heads = 32, .inner = 256, .columns = 512 };
     try std.testing.expect(try k.tryAbsorb(stream, a));
-    try std.testing.expectEqualSlices(u64, &.{ 16, 32, 48, 65, 0, 0 }, Mock.values[0..6]);
-    try std.testing.expectEqualSlices(u32, &.{ 32, 2, 4 }, &Mock.grid);
+    try std.testing.expectEqualSlices(u64, &.{ 16, 32, 48, 2048, 0, 0 }, Mock.values[0..6]);
+    try std.testing.expectEqualSlices(u32, &.{ 32, 32, 4 }, &Mock.grid);
     try std.testing.expectEqual(@as(u32, 128), Mock.threads);
     try std.testing.expectEqual(@as(u32, 49152), Mock.shared);
     var e = a;
     e.inner = 512;
     e.columns = 256;
     try std.testing.expect(try k.tryExpand(stream, e));
-    try std.testing.expectEqualSlices(u32, &.{ 32, 2, 2 }, &Mock.grid);
+    try std.testing.expectEqualSlices(u32, &.{ 32, 32, 2 }, &Mock.grid);
     const s: SparseArgs = .{ .qa = 16, .cache = .{ .ptr = 32, .format = .fp8 }, .tokens = 48, .counts = 64, .out = 80, .rows = 58, .heads = 32, .lw = 512, .width = 2051, .scale = 0.0625 };
     try std.testing.expect(try k.trySparse(stream, s));
     try std.testing.expectEqualSlices(u64, &.{ 16, 32, 32, 48, 64, 80, 0, 0 }, &Mock.values);
@@ -250,11 +252,25 @@ test "unsupported prompt layouts return false without launching" {
     try std.testing.expectEqual(@as(usize, 0), Mock.calls);
 }
 
+test "only measured full prompt chunks launch either MMA operation" {
+    var d: cuda.Driver = undefined;
+    const k = try Mock.kernels(&d);
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    for ([_]usize{ 0, 1, 3, 16, 58, 65, 83, 2049 }) |rows| {
+        var a: MmaArgs = .{ .input = 16, .weight = 32, .out = 48, .rows = rows, .heads = 32, .inner = 256, .columns = 512 };
+        try std.testing.expect(!try k.tryAbsorb(stream, a));
+        a.inner = 512;
+        a.columns = 256;
+        try std.testing.expect(!try k.tryExpand(stream, a));
+    }
+    try std.testing.expectEqual(@as(usize, 0), Mock.calls);
+}
+
 test "eligible prompt launch errors propagate without a second launch" {
     var d: cuda.Driver = undefined;
     const k = try Mock.kernels(&d);
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
     Mock.status = cuda.abi.error_not_ready;
-    try std.testing.expectError(error.NotReady, k.tryAbsorb(stream, .{ .input = 16, .weight = 32, .out = 48, .rows = 1, .heads = 32, .inner = 256, .columns = 512 }));
+    try std.testing.expectError(error.NotReady, k.tryAbsorb(stream, .{ .input = 16, .weight = 32, .out = 48, .rows = 2048, .heads = 32, .inner = 256, .columns = 512 }));
     try std.testing.expectEqual(@as(usize, 1), Mock.calls);
 }

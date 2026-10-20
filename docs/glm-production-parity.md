@@ -101,8 +101,9 @@ the exact production BF16 tensor-core absorb/expand kernels and H32 FP8 sparse
 onepass kernel, embedded with their source, license, PTX and provenance under
 `zig/src/families/glm/prompt_aot/`. The default is off. The existing native
 Triton loader owns CUDA launch behavior; serving needs no Python/JIT or new
-runtime asset directory. Generic-R MMA variants support proved prompt rows,
-and unsupported shape/alignment takes the existing operation before launch.
+runtime asset directory. Generic-R MMA artifacts are selected only for full
+2048-row chunks, the shape with demonstrated material timing benefit;
+small/tail transforms and unsupported shape/alignment retain the native path.
 LC and LS both use the FP8 cache base; the kernel adds the scale offset.
 
 Modules owns the kernels and the existing Set borrows them for prompt work.
@@ -122,3 +123,20 @@ Their 77-sparse-call and 88-MMA-pair 16K projections are conditional component
 arithmetic, without a TP2 multiplier. They are not additive measured HTTP
 savings. Exact native-loader replay, prompt continuation/restoration and a
 combined serving comparison remain separate acceptance gates.
+
+The first combined HTTP legs saved1.965seconds(EXL3) and1.992seconds(FP4)
+at16400cold prompt tokens, with five repeats and no retries. Changed prompt
+numerics also changed generated paths and some decode rates fell. The next
+portfolio therefore preserves small/tail native transform arithmetic rather
+than extending the MMA policy to shapes without a material timing proof.
+Its v2 enabled identity explicitly separates that policy from the first batch.
+
+The companion dense-prefix rule follows production's2051-key transition.
+Only AOT-enabled real prompts with scheduled selected attention and an exact
+configured threshold match clip dense output to the prefix that sparse leaves
+untouched. All three owner/local/unowned callers retain original head block,
+key chunks, positions, cache bases and full sparse output coverage. MTP's
+cleared borrow, default-off behavior and nonstandard thresholds retain the
+previous path. A model-free both-rank screen proved full BF16 output equality,
+guards and repeatability; five alternating pairs saved about.334–.353seconds
+over11boundary layers. This conditional work saving is not an HTTP claim.
