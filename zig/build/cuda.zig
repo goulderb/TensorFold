@@ -157,7 +157,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         .target = target,
         .optimize = .ReleaseSafe,
         .link_libc = true,
-        .imports = &.{ .{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core, mods.qwen35) }, .{ .name = "cuda", .module = cuda }, .{ .name = "lanes", .module = mods.lanes }, .{ .name = "core", .module = mods.core } },
+        .imports = &.{ .{ .name = "qwen35_adapter", .module = qwen35AdapterModule(b, target, optimize, mods.lanes) }, .{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core, mods.qwen35) }, .{ .name = "cuda", .module = cuda }, .{ .name = "lanes", .module = mods.lanes }, .{ .name = "core", .module = mods.core } },
     }) });
     qwen_decode_profile.root_module.addOptions("qwen_bench_options", qwen_bench_options);
     b.step("qwen35-decode-profile", "Build only the Qwen35 eager/graph diagnostic; never run it").dependOn(&b.addInstallArtifact(qwen_decode_profile, .{}).step);
@@ -197,6 +197,10 @@ fn lfm2Module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 
 fn qwen35Module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, qwen35: *std.Build.Module) *std.Build.Module {
     return b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/modelopt_cuda.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = core }, .{ .name = "qwen35", .module = qwen35 } } });
+}
+
+fn qwen35AdapterModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, lanes: *std.Build.Module) *std.Build.Module {
+    return b.createModule(.{ .root_source_file = b.path("zig/src/native/qwen35_backend.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
 }
 
 /// RADIO image input (Nemotron Omni checkpoints): the processor, the tower and projector, the prompt rows.
@@ -423,7 +427,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
         .target = host,
         .optimize = .ReleaseSafe,
         .link_libc = true,
-        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "qwen35_cuda", .module = qwen35 }, .{ .name = "core", .module = mods.core } },
+        .imports = &.{ .{ .name = "lanes", .module = mods.lanes }, .{ .name = "qwen35_adapter", .module = qwen35AdapterModule(b, host, .ReleaseSafe, mods.lanes) }, .{ .name = "cuda", .module = cuda }, .{ .name = "qwen35_cuda", .module = qwen35 }, .{ .name = "core", .module = mods.core } },
     });
     b.step("test-qwen35-screens-host", "CPU-only expert and GDN screen admission and layout controls").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen35_screens })).step);
     qwen35_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen35_probe_admission })).step);

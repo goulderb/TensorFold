@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub const Fixture = struct { fixture: []const u8, fixture_sha256: []const u8 };
 pub const Activation = struct { fixture: []const u8, fixture_sha256: []const u8, image: []const u8, image_sha256: []const u8 };
-pub const Screen = union(enum) { terminal_greedy: Fixture, terminal_graph: Fixture, shared_activation: Activation, moe_semantics: Activation, shared_branch: Activation, slice_format: Fixture };
+pub const Screen = union(enum) { terminal_greedy: Fixture, terminal_graph: Fixture, terminal_ownership: Fixture, shared_activation: Activation, moe_semantics: Activation, shared_branch: Activation, full_moe: Activation, slice_format: Fixture };
 
 fn pin(path: []const u8, sha: []const u8) !void {
     if (!std.fs.path.isAbsolute(path) or sha.len != 64) return error.InvalidInput;
@@ -13,18 +13,20 @@ pub fn scope(screen: Screen) []const u8 {
     return switch (screen) {
         .terminal_greedy => "isolated terminal greedy transfer and selection; no model throughput claim",
         .terminal_graph => "isolated matched carrier graph terminal selection; no model throughput claim",
+        .terminal_ownership => "isolated full-logit ownership and native greedy selection; no model throughput claim",
         .shared_activation => "isolated shared activation HF boundary; no model quality or performance claim",
         .moe_semantics => "isolated expert HF arithmetic boundaries; no full-model quality or performance claim",
         .shared_branch => "isolated activation and shared-down HF composition; no full-model quality or performance claim",
         .slice_format => "isolated production expert packing and tagged consumers; no model performance or quality claim",
+        .full_moe => "isolated native-input full-MoE HF composition; no full-model quality or performance claim",
     };
 }
 
 pub fn validateInput(input: anytype) !void {
     const screen = input.boundary_screen orelse return;
     switch (screen) {
-        .terminal_greedy, .terminal_graph, .slice_format => |f| try pin(f.fixture, f.fixture_sha256),
-        .shared_activation, .moe_semantics, .shared_branch => |f| {
+        .terminal_greedy, .terminal_graph, .terminal_ownership, .slice_format => |f| try pin(f.fixture, f.fixture_sha256),
+        .shared_activation, .moe_semantics, .shared_branch, .full_moe => |f| {
             try pin(f.fixture, f.fixture_sha256);
             try pin(f.image, f.image_sha256);
         },
@@ -70,7 +72,7 @@ test "each boundary screen excludes every other diagnostic" {
         router_candidate: bool = false,
     };
     try validateInput(Input{});
-    for ([_]Screen{ .{ .terminal_greedy = .{ .fixture = path, .fixture_sha256 = sha } }, .{ .terminal_graph = .{ .fixture = path, .fixture_sha256 = sha } }, .{ .slice_format = .{ .fixture = path, .fixture_sha256 = sha } }, .{ .shared_activation = .{ .fixture = path, .fixture_sha256 = sha, .image = path, .image_sha256 = sha } }, .{ .moe_semantics = .{ .fixture = path, .fixture_sha256 = sha, .image = path, .image_sha256 = sha } }, .{ .shared_branch = .{ .fixture = path, .fixture_sha256 = sha, .image = path, .image_sha256 = sha } } }) |screen| {
+    for ([_]Screen{ .{ .terminal_ownership = .{ .fixture = path, .fixture_sha256 = sha } }, .{ .full_moe = .{ .fixture = path, .fixture_sha256 = sha, .image = path, .image_sha256 = sha } }, .{ .terminal_greedy = .{ .fixture = path, .fixture_sha256 = sha } }, .{ .terminal_graph = .{ .fixture = path, .fixture_sha256 = sha } }, .{ .slice_format = .{ .fixture = path, .fixture_sha256 = sha } }, .{ .shared_activation = .{ .fixture = path, .fixture_sha256 = sha, .image = path, .image_sha256 = sha } }, .{ .moe_semantics = .{ .fixture = path, .fixture_sha256 = sha, .image = path, .image_sha256 = sha } }, .{ .shared_branch = .{ .fixture = path, .fixture_sha256 = sha, .image = path, .image_sha256 = sha } } }) |screen| {
         try validateInput(Input{ .boundary_screen = screen });
         inline for (.{ "prefill_operator_screen", "prefill_ab", "combined_ab", "expert_n8_screen", "expert_shard_screen", "expert_latency_screen", "gdn_layout_screen", "gdn_layout_ab", "expert_n8_ab", "quant_reuse_screen", "transport_screen", "verify_default_policy", "router_turns", "router_screen", "router_candidate" }) |flag| {
             var input: Input = .{ .boundary_screen = screen };
