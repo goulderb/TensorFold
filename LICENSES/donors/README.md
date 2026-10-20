@@ -444,3 +444,11 @@ adds an explicit split-M consumer with slice-contiguous scalar loads. Scale word
 down packing and arithmetic retain the original implementation. This local tuning
 adaptation imports no new donor kernel. All original and transitive notices above
 remain applicable, and checkpoint provenance and licensing remain separate.
+
+
+## Publication privacy boundary
+
+This source-only publication omits private workstation evidence and run receipts.
+References above to generated vectors, journals and diagnostic snapshots refer
+to the canonical private evidence, not files included in this copy. All original
+credit text and source pins above are retained. See [PUBLICATION.md](../../PUBLICATION.md).

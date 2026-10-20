@@ -21,3 +21,7 @@ zig-out/
 
 # Versioned GUI build resources, generated app engines stay ignored in app/.gitignore.
 !app/build/
+
+# Private workstation qualification receipts are not part of this source publication.
+/docs/plans/qwen35-ornith/evidence/
+/zig/src/families/glm/fixtures/weight-loader-verification.json

@@ -3,7 +3,7 @@ import pathlib
 import subprocess
 
 
-ZIG = 'C:/Users/developer/tools/zig-0.17.0/zig-x86_64-windows-0.17.0/zig.exe'
+ZIG = 'zig'
 BASE = pathlib.Path(__file__).resolve().parents[4]
 
 

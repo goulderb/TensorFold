@@ -3,7 +3,8 @@
 param(
     [ValidateSet('test-qwen35-cuda-host', 'test-qwen35-sampler-turn', 'native', 'fatbins', 'qwen35-probe', 'qwen35-kernels-probe', 'qwen35-head-cost', 'qwen35-sampler-ab', 'qwen35-decode-profile')]
     [string]$Target = 'test-qwen35-cuda-host',
-    [string]$Zig = 'C:/Users/developer/tools/zig-0.17.0/zig-x86_64-windows-0.17.0/zig.exe',
+    [Parameter(Mandatory = $true)]
+    [string]$Zig,
     [string]$CudaRoot = 'C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8',
     [string]$BuildTools = 'C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools',
     [string]$MsvcVersion = '14.44.35207',
