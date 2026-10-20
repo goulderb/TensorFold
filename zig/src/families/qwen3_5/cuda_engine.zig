@@ -12,6 +12,7 @@ const hf = @import("cuda_hf.zig");
 
 pub const Geometry = geometry.Geometry;
 pub const MoeMath = hf.MoeMath;
+pub const AttentionMode = hf.AttentionMode;
 pub const Cache = caches.Cache;
 pub const tap_rows = caches.tap_rows;
 const Seg = caches.Seg;
@@ -39,6 +40,15 @@ pub fn validateMoeMath(admitted: checkpoint.Admitted, math: MoeMath) !void {
 
 fn validateMoeMathShape(configured: MoeMath, requested: MoeMath) !void {
     if (configured != requested) return error.QwenMoeMathShapeMismatch;
+}
+
+pub fn validateAttentionMode(admitted: checkpoint.Admitted, mode: AttentionMode) !void {
+    if (mode == .reference) return;
+    if (admitted.numerics() != .hf_modelopt) return error.UnsupportedQwenAttentionMode;
+}
+
+fn validateAttentionModeShape(configured: AttentionMode, requested: AttentionMode) !void {
+    if (configured != requested) return error.QwenAttentionModeShapeMismatch;
 }
 const hf_part_bytes = 8 << 20;
 pub const ExpertGraphNode = struct {
@@ -413,6 +423,7 @@ pub const Engine = struct {
     expert_up_split_m: bool = false,
     reuse_fp8_quant: bool = false,
     bounded_hf_prefill: bool = false,
+    attention_mode: AttentionMode = .reference,
     terminal: ?struct { module: cuda.Module, kernels: cuda.tree_round.Kernels } = null,
     verify_terminal_graphs: bool = false,
     terminal_graph_roster: std.ArrayList(TerminalGraphRecord) = .empty,
@@ -519,7 +530,7 @@ pub const Engine = struct {
         return initPlaced(gpa, io, ctx, dir, .{ .geometry = g, .encoding = .mlx }, .{ .first = 0, .end = g.layers, .total = g.layers }, kv8);
     }
 
-    pub const InitOptions = struct { expert_up_layout: cuda.experts.Nvfp4UpLayout = .lane_major, terminal_greedy: bool = false, moe_math: MoeMath = .legacy };
+    pub const InitOptions = struct { expert_up_layout: cuda.experts.Nvfp4UpLayout = .lane_major, terminal_greedy: bool = false, moe_math: MoeMath = .legacy, attention_mode: AttentionMode = .reference };
 
     pub fn initPlaced(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, admitted: checkpoint.Admitted, placement: checkpoint.Placement, kv8: bool) !*Engine {
         return initPlacedWithOptions(gpa, io, ctx, dir, admitted, placement, kv8, .{});
@@ -527,6 +538,7 @@ pub const Engine = struct {
 
     pub fn initPlacedWithOptions(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, admitted: checkpoint.Admitted, placement: checkpoint.Placement, kv8: bool, options: InitOptions) !*Engine {
         try validateMoeMath(admitted, options.moe_math);
+        try validateAttentionMode(admitted, options.attention_mode);
         const g = try placement.localGeometry(admitted.geometry);
         if (options.terminal_greedy and admitted.numerics() != .hf_modelopt) return error.UnsupportedQwenTerminalGreedy;
         if (options.expert_up_layout == .slice_major_v1 and (admitted.numerics() != .hf_modelopt or g.hidden != 2048 or g.intermediate != 512 or g.experts != 256)) return error.UnsupportedQwenExpertUpLayout;
@@ -553,6 +565,7 @@ pub const Engine = struct {
         e.expert_up_split_m = options.expert_up_layout == .slice_major_v1;
         e.reuse_fp8_quant = false;
         e.bounded_hf_prefill = false;
+        e.attention_mode = if (e.numerics == .hf_modelopt) options.attention_mode else .reference;
         e.terminal = null;
         e.verify_terminal_graphs = false;
         e.terminal_graph_roster = .empty;
@@ -610,7 +623,15 @@ pub const Engine = struct {
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
         e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
-        if (e.numerics == .hf_modelopt) e.modelopt = try modelopt.Bindings.loadWithOptions(ctx, &e.fns, .{ .up_layout = options.expert_up_layout, .moe_math = options.moe_math });
+        if (e.numerics == .hf_modelopt) {
+            e.modelopt = try modelopt.Bindings.loadWithOptions(ctx, &e.fns, .{ .up_layout = options.expert_up_layout, .moe_math = options.moe_math });
+            // HF bind replaces attn with the serial reference; chunked reuses ordinary qwen35.cu kernels.
+            if (e.attention_mode == .chunked) {
+                const names = hf.attnKernelNames(.chunked);
+                e.fns.attn_partial = try e.mods[4].function(names.partial);
+                e.fns.attn_merge = try e.mods[4].function(names.merge);
+            }
+        }
         errdefer if (e.modelopt) |*m| m.unload();
         e.layers = try gpa.alloc(Layer, g.layers);
         errdefer gpa.free(e.layers);
@@ -936,7 +957,7 @@ pub const Engine = struct {
         const lone = total == 1 and parts.len == 1;
         const bucket: usize = if (lone) 1 else if (total <= 16) 16 else most_verify;
         const windows: usize = if (lone) 1 else max_segs;
-        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant, .expert_up_layout = e.expert_up_layout, .terminal_greedy = e.terminal != null and !record, .moe_math = e.moeMath() };
+        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant, .expert_up_layout = e.expert_up_layout, .terminal_greedy = e.terminal != null and !record, .moe_math = e.moeMath(), .attention_mode = e.attentionMode() };
         e.features = if (images) |im| im.features else 0;
         return shape;
     }
@@ -951,6 +972,7 @@ pub const Engine = struct {
         if (e.observer != null and e.captured) return error.QwenObserverRequiresEager;
         try e.validateUpLayout(shape.expert_up_layout, shape.expert_up_n8, shape.expert_up_split_m, shape.total);
         try validateMoeMathShape(e.moeMath(), shape.moe_math);
+        try validateAttentionModeShape(e.attentionMode(), shape.attention_mode);
         try shape.gdn_layout.validate(e.numerics);
         if (e.verify_gdn_graphs and e.numerics == .hf_modelopt and shape.total > 1) try e.verifyHfChainTables(shape);
         if (shape.prompt and e.numerics == .mlx_sanitized or !e.captured) {
@@ -1629,9 +1651,10 @@ pub const Engine = struct {
         heads_all: bool = false,
         terminal_greedy: bool = false,
         moe_math: MoeMath = .legacy,
+        attention_mode: AttentionMode = .reference,
 
         fn key(s: Shape) u32 {
-            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21 | @as(u32, @intFromBool(s.expert_up_split_m)) << 22 | @as(u32, @intFromBool(s.reuse_fp8_quant)) << 23 | @as(u32, @backingInt(s.expert_up_layout)) << 24 | @as(u32, @intFromBool(s.terminal_greedy)) << 25 | @as(u32, @backingInt(s.moe_math)) << 26;
+            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21 | @as(u32, @intFromBool(s.expert_up_split_m)) << 22 | @as(u32, @intFromBool(s.reuse_fp8_quant)) << 23 | @as(u32, @backingInt(s.expert_up_layout)) << 24 | @as(u32, @intFromBool(s.terminal_greedy)) << 25 | @as(u32, @backingInt(s.moe_math)) << 26 | @as(u32, @backingInt(s.attention_mode)) << 27;
         }
     };
 
@@ -1641,6 +1664,10 @@ pub const Engine = struct {
 
     pub fn moeMath(e: *const Engine) MoeMath {
         return if (e.numerics == .hf_modelopt) if (e.modelopt) |m| m.router.math else .legacy else .legacy;
+    }
+
+    pub fn attentionMode(e: *const Engine) AttentionMode {
+        return if (e.numerics == .hf_modelopt) e.attention_mode else .reference;
     }
 
     /// The launches of a forward of `shape`, from the embedding to the kept rows' logits (captured once a shape).
@@ -1661,6 +1688,8 @@ pub const Engine = struct {
         const group = g.q_heads / g.kv_heads;
         const is_hf = e.numerics == .hf_modelopt;
         const launch: hf.Launches = .{};
+        const attn_mode: AttentionMode = if (is_hf) shape.attention_mode else .chunked;
+        const attn = hf.attnLaunch(attn_mode, g.q_heads, g.kv_heads, total, group, max_chunks);
         const gdn_chain = switch (shape.gdn_layout) {
             .value_key => e.fns.gdn_chain,
             .key_value => e.modelopt.?.gdn_chain_transposed,
@@ -1717,8 +1746,8 @@ pub const Engine = struct {
                     try e.run(e.fns.head_norm, .{ total * g.q_heads, 1, 1 }, .{ if (is_hf) launch.head_norm else 64, 1, 1 }, .{ e.qraw, m.q_norm, e.qn, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), g.eps, t_params });
                     try e.run(e.fns.head_norm, .{ total * g.kv_heads, 1, 1 }, .{ if (is_hf) launch.head_norm else 64, 1, 1 }, .{ e.kraw, m.k_norm, e.kn, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(g.kv_heads * head_dim)), @as(c_int, head_dim), g.eps, t_params });
                     try e.run(if (e.kv8) e.fp8.rope else e.fns.rope, .{ total, 1, 1 }, .{ head_dim, 1, 1 }, .{ geo, e.qn, e.kn, e.vraw, t_segs, t_rows, t_anc, ai, t_params, mpos });
-                    try e.run(if (e.kv8) e.fp8.attn_partial else e.fns.attn_partial, .{ if (is_hf) 1 else max_chunks, if (is_hf) g.q_heads else g.kv_heads, total }, if (is_hf) launch.attn_partial else .{ 32 * group, 1, 1 }, .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po });
-                    try e.run(e.fns.attn_merge, .{ g.q_heads, total, 1 }, .{ if (is_hf) launch.attn_merge else 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
+                    try e.run(if (e.kv8) e.fp8.attn_partial else e.fns.attn_partial, attn.partial_grid, attn.partial_block, .{ geo, e.qn, t_segs, t_rows, t_anc, ai, t_params, @as(f32, 1.0 / 16.0), e.pm, e.pl, e.po });
+                    try e.run(e.fns.attn_merge, .{ g.q_heads, total, 1 }, .{ attn.merge_block, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
                     try e.run(e.fns.attn_gate, .{ (total * aw + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ geo, e.y, e.qraw, e.mix, @as(c_int, @intCast(total)), t_params });
                     try e.mark(.attention);
                     try e.proj(m.o, e.mix, e.r, total, prompt);
@@ -2303,6 +2332,30 @@ test "MoE math bindings and shape agree and own only graph bit 26" {
     for ([_]MoeMath{ .legacy, .bf16_boundaries }) |configured| for ([_]MoeMath{ .legacy, .bf16_boundaries }) |requested| {
         if (configured == requested) try validateMoeMathShape(configured, requested) else try std.testing.expectError(error.QwenMoeMathShapeMismatch, validateMoeMathShape(configured, requested));
     };
+}
+
+test "attention mode owns graph bit 27 and rejects Engine/Shape disagreement" {
+    try std.testing.expectEqual(AttentionMode.reference, (Engine.InitOptions{}).attention_mode);
+    const baseline: Engine.Shape = .{ .total = 1, .nseg = 1, .record = false, .prompt = true, .taps = false };
+    var candidate = baseline;
+    candidate.attention_mode = .chunked;
+    try std.testing.expectEqual(@as(u32, 1 << 27), baseline.key() ^ candidate.key());
+    candidate.moe_math = .bf16_boundaries;
+    try std.testing.expectEqual(@as(u32, (1 << 27) | (1 << 26)), baseline.key() ^ candidate.key());
+    for ([_]AttentionMode{ .reference, .chunked }) |configured| for ([_]AttentionMode{ .reference, .chunked }) |requested| {
+        if (configured == requested) try validateAttentionModeShape(configured, requested) else try std.testing.expectError(error.QwenAttentionModeShapeMismatch, validateAttentionModeShape(configured, requested));
+    };
+    var admitted: checkpoint.Admitted = .{ .geometry = undefined, .encoding = .{ .modelopt = undefined } };
+    try validateAttentionMode(admitted, .reference);
+    try validateAttentionMode(admitted, .chunked);
+    admitted.encoding = .mlx;
+    try validateAttentionMode(admitted, .reference);
+    try std.testing.expectError(error.UnsupportedQwenAttentionMode, validateAttentionMode(admitted, .chunked));
+    const ref = hf.attnLaunch(.reference, 16, 2, 4, 8, max_chunks);
+    const ch = hf.attnLaunch(.chunked, 16, 2, 4, 8, max_chunks);
+    try std.testing.expect(ref.partial_grid[0] != ch.partial_grid[0] or ref.partial_grid[1] != ch.partial_grid[1]);
+    try std.testing.expectEqual(@as(usize, 256), ref.merge_block);
+    try std.testing.expectEqual(@as(usize, 32), ch.merge_block);
 }
 
 test "bounded HF chain views retain every state binding and reject field corruption" {

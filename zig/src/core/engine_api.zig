@@ -253,6 +253,9 @@ pub const Family = struct { model_type: []const u8, formats: []const []const u8 
 /// The math an NVFP4 checkpoint runs: its own (FP4 rows into NVFP4 layers, FP8 into FP8 ones), or bf16 rows throughout.
 pub const Precision = enum { checkpoint, full };
 
+/// Qwen ModelOpt attention: HF serial reference, or upstream chunked BF16 kernels.
+pub const QwenAttention = enum { reference, chunked };
+
 /// What a server asks of the engine it opens: the checkpoint, and the serve flags an engine reads.
 pub const Open = struct {
     dir: []const u8,
@@ -290,6 +293,8 @@ pub const Open = struct {
     segments: ?u32 = null,
     /// --prefill-rows (Qwen CUDA ModelOpt): prompt tokens per true engine step; null: 1 (legacy).
     prefill_rows: ?u32 = null,
+    /// --qwen-attention (Qwen CUDA ModelOpt): HF serial reference or upstream chunked; null: chunked serving.
+    qwen_attention: ?QwenAttention = null,
     /// --precision (CUDA): an NVFP4 checkpoint's math, NVIDIA's own or full precision; null: the family's default.
     precision: ?Precision = null,
     /// TENSORFOLD_MAX_QUEUED, as the engine's ``Info.max_queued``; null: no cap.

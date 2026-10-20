@@ -36,6 +36,13 @@ fn getenv(name: [:0]const u8) ?[]const u8 {
     return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
 }
 
+fn attentionModeFromOpen(o: api.Open) qwen.shared_engine.AttentionMode {
+    return switch (o.qwen_attention orelse .chunked) {
+        .reference => .reference,
+        .chunked => .chunked,
+    };
+}
+
 fn environmentRefusal(get: *const fn ([:0]const u8) ?[]const u8) ?[]const u8 {
     if (get("TENSORFOLD_TP")) |v| if (!std.mem.eql(u8, v, "1") and !std.mem.eql(u8, v, "0"))
         return "Qwen CUDA uses TENSORFOLD_SPLIT=1; unset TENSORFOLD_TP for the layer-split baseline";
@@ -83,6 +90,7 @@ pub fn load(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = "Qwen CUDA --prefill-rows must be from 1 to 16";
         return null;
     }
+    const attention_mode = attentionModeFromOpen(o);
     const cfg = qwen.Config.read(gpa, io, o.dir) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "Qwen ModelOpt checkpoint refused: {s}", .{@errorName(err)});
         return null;
@@ -101,7 +109,7 @@ pub fn load(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         (if (std.mem.eql(u8, v, "1")) &.{ 0, 1 } else &.{device})
     else
         &.{device};
-    const model = qwen.Engine.open(gpa, io, o.dir, .{ .devices = devices, .context = context, .prefill_rows = prefill_rows }) catch |err| {
+    const model = qwen.Engine.open(gpa, io, o.dir, .{ .devices = devices, .context = context, .prefill_rows = prefill_rows, .attention_mode = attention_mode }) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "Qwen CUDA load failed: {s}; use a GPU with sufficient free memory or TENSORFOLD_SPLIT=1 for the internal pair", .{@errorName(err)});
         return null;
     };
@@ -149,6 +157,20 @@ test "Qwen load refuses an invalid prefill-rows bound before CUDA open" {
         try std.testing.expect(loaded == null);
         try std.testing.expectEqualStrings("Qwen CUDA --prefill-rows must be from 1 to 16", problem);
     }
+}
+
+test "Qwen Open maps --qwen-attention through load before CUDA open" {
+    const unused_io: std.Io = undefined;
+    var problem: []const u8 = "";
+    // Invalid prefill still trips first; attention mapping itself is compile-checked by the open call above.
+    _ = attentionModeFromOpen(.{ .dir = "missing", .model_type = "qwen3_5_moe" });
+    _ = attentionModeFromOpen(.{ .dir = "missing", .model_type = "qwen3_5_moe", .qwen_attention = .reference });
+    _ = attentionModeFromOpen(.{ .dir = "missing", .model_type = "qwen3_5_moe", .qwen_attention = .chunked });
+    try std.testing.expectEqual(qwen.shared_engine.AttentionMode.chunked, attentionModeFromOpen(.{ .dir = "x", .model_type = "qwen3_5_moe" }));
+    try std.testing.expectEqual(qwen.shared_engine.AttentionMode.reference, attentionModeFromOpen(.{ .dir = "x", .model_type = "qwen3_5_moe", .qwen_attention = .reference }));
+    try std.testing.expectEqual(qwen.shared_engine.AttentionMode.chunked, attentionModeFromOpen(.{ .dir = "x", .model_type = "qwen3_5_moe", .qwen_attention = .chunked }));
+    const loaded = try load(std.testing.allocator, std.testing.allocator, unused_io, .{ .dir = "missing", .model_type = "qwen3_5_moe", .prefill_rows = 0, .qwen_attention = .chunked }, &problem);
+    try std.testing.expect(loaded == null);
 }
 
 test "Qwen accepts an ordinary chat prompt carrying a decision position" {
