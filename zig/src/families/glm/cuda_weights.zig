@@ -222,6 +222,9 @@ pub const Loader = struct {
             const qa = try L.packFinish(.dsa, "layers.{d}.dsa.qa", .{i}, try L.get("layers.{d}.self_attn.q_a_proj.weight", .{i}), &.{.{ .lo = 0, .hi = c.q_lora }}, .{ .lo = 0, .hi = c.hidden });
             const kva = try L.packFinish(.dsa, "layers.{d}.dsa.kva", .{i}, try L.get("layers.{d}.self_attn.kv_a_proj_with_mqa.weight", .{i}), &.{.{ .lo = 0, .hi = c.kv_lora }}, .{ .lo = 0, .hi = c.hidden });
             break :blk .{ .separate = .{ .qa = qa, .kva = kva } };
+        } else if (L.tools.precision.dense.get(.dsa) == .q4) blk: {
+            inline for (.{ "q_a_proj", "kv_a_proj_with_mqa" }) |x| try L.whole(try L.get("layers.{d}.self_attn." ++ x ++ ".weight", .{i}), .bf16);
+            break :blk .{ .combined = try projections.finish(L, .dsa, "layers.{d}.dsa.proj", .{i}, c.q_lora + c.kv_lora, c.hidden) };
         } else if (L.tools.precision.dense.get(.dsa) != .bf16) blk: {
             try L.whole(try L.get("layers.{d}.self_attn.q_a_proj.weight", .{i}), .bf16);
             const qa = try projections.finish(L, .dsa, "layers.{d}.dsa.qa", .{i}, c.q_lora, c.hidden);

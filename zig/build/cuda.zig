@@ -427,7 +427,9 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);
     // Upstream's DFlash loader, packed-linear and ring-cache roots exercise a different GLM family. The retained
     // family has its own DFlash/MCG4/spill tests in this module, not those upstream implementations.
-    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm })).step);
+    const glm_host_run = b.addRunArtifact(b.addTest(.{ .root_module = glm }));
+    step.dependOn(&glm_host_run.step);
+    b.step("test-glm-cuda-host", "GLM CUDA family host tests without a GPU").dependOn(&glm_host_run.step);
     const binding_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"padded native sequence capacity"} }));
     b.step("test-glm-vision-binding", "Padded native sequence versus logical vision context (CPU only)").dependOn(&binding_run.step);
     const codec_headers = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/vision_headers/image_codec_headers.zig"), .target = host, .optimize = .debug });

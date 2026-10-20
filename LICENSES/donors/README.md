@@ -189,6 +189,20 @@ lifecycle, paired failure handling and eager/segmented/replay probes are local
 integration changes. Arithmetic, output parity, graph memory, cache/spill/vision
 and full-model performance require their own device qualification.
 
+## GLM production DSA projection layout (2026-10-20)
+
+The combined Q4 QA and KVA input follows `families/glm5_next/cuda/weights.py`
+from production image
+`sha256:d7e14f8799ad21f7e93ba95ea78826426c98ab27d5fbfdf81bed876a2e09ce6e`.
+The exact file SHA256 is
+`7c1070e1d83b2a1eeccb7cfa5cd39069a2d1f779005eda77deeea49b800ed013`.
+This layout adaptation uses the retained native quantizer and projection APIs.
+Local changes add the combined quantized weight representation, strided norm
+dispatch, loaded-format receipts, and a distinct numerical identity. Existing
+Ash Hart/TensorFold, MiaAI-Lab, wojo, and transitive credits remain unchanged.
+The production-lineage notices above apply; this is not a new authorship claim
+for the quantizer, arithmetic, or model weights.
+
 ## The shared spill tier and Nemotron adapters
 
 `zig/src/core/spill.zig` and `docs/spill-tier.md` identify the GLM spill tier

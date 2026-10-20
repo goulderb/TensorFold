@@ -287,6 +287,21 @@ pub const Engine = struct {
         e.w = loaded.?;
         loaded = null;
         errdefer e.w.deinit();
+        for (e.w.layers) |layer| switch (layer.mixer) {
+            .kda => {},
+            .mla => |l| std.log.info("GLM loaded DSA rank={d} layer={d} input={s} qa={d} kva={d} hidden={d} qb={s} out={s} index_kw={s} index_qb={s} absorb=bf16 norms=bf16", .{
+                rank,                         layer.index,
+                switch (l.input) {
+                    .combined_bf16 => "combined/bf16",
+                    .combined => |p| projectionFormat(p),
+                    .separate => "separate",
+                },
+                l.q_lora,                     l.lw,
+                l.dims,                       projectionFormat(l.q_b),
+                projectionFormat(l.o),        projectionFormat(l.index.kw),
+                projectionFormat(l.index.qb),
+            }),
+        };
         if (settings.weight_dense.native()) {
             inline for (@import("cuda_weight_precision.zig").groups) |group| {
                 std.log.info("GLM native dense rank={d} family={s} mode={s} matrices={d}", .{ rank, @tagName(group), @tagName(settings.weight_dense.get(group)), e.w.native_conversions[@backingInt(group)] });
@@ -1213,6 +1228,14 @@ pub const Engine = struct {
         try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, e.stream.handle), "cuMemcpyDtoDAsync");
     }
 };
+
+fn projectionFormat(p: @import("cuda_b16.zig").Proj) []const u8 {
+    return switch (p) {
+        .b16 => "bf16",
+        .source => "source",
+        .q => |q| @tagName(q),
+    };
+}
 
 test "prompt snapshot estimates follow the requested mark and MTP setting" {
     var seq: Seq = undefined;

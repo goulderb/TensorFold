@@ -16,6 +16,7 @@ pub const Index = struct { kw: b16.Proj, gate: u64, ln_w: u64, ln_b: u64, ape: u
 
 pub const InputProjection = union(enum) {
     combined_bf16: u64,
+    combined: b16.Proj,
     separate: struct { qa: b16.Proj, kva: b16.Proj },
 };
 
@@ -145,6 +146,16 @@ fn attendLocal(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
 
 /// The block's row-by-row part for a shared window: projections, norms, q_b, indexer, absorbed query, `qi`'s query.
 pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool) !void {
+    try prepareInput(set, stream, l, s, x, x_stride, rows);
+    try b16.proj(set, stream, s.qr, l.q_lora, l.q_b, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
+    const ix = l.index;
+    try b16.proj(set, stream, x, x_stride, ix.kw, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
+    try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
+    try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk, l.lw);
+    if (qi) try b16.proj(set, stream, s.qr, l.q_lora, ix.qb, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
+}
+
+fn prepareInput(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize) !void {
     const width = l.q_lora + l.lw;
     switch (l.input) {
         .separate => |pair| {
@@ -159,13 +170,71 @@ pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
             try glue.rmsnorm(set, stream, s.dp, width, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
             try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
         },
+        .combined => |proj| {
+            try b16.proj(set, stream, x, x_stride, proj, s.dp, s.mm_part, rows, width, l.dims, false);
+            try glue.rmsnorm(set, stream, s.dp, width, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
+            try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
+        },
     }
-    try b16.proj(set, stream, s.qr, l.q_lora, l.q_b, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
-    const ix = l.index;
-    try b16.proj(set, stream, x, x_stride, ix.kw, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
-    try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
-    try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk, l.lw);
-    if (qi) try b16.proj(set, stream, s.qr, l.q_lora, ix.qb, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
+}
+
+test "combined Q4 DSA input projects once and normalizes strided QA and KV rows" {
+    const Trace = struct {
+        const Norm = struct { x: u64, stride: i64, out: u64, out_stride: i64, rows: u32 };
+        var norms: [2]Norm = undefined;
+        var count: usize = 0;
+        var projections: usize = 0;
+        fn value(comptime T: type, args: [*]?*anyopaque, i: usize) T {
+            return @as(*align(1) const T, @ptrCast(args[i].?)).*;
+        }
+        fn launch(f: cuda.abi.Function, gx: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, raw: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            const id = @intFromPtr(f.?);
+            const args = raw.?;
+            if (id == 3 or id == 4) {
+                norms[count] = .{ .x = value(u64, args, 0), .stride = value(i64, args, 1), .out = value(u64, args, 3), .out_stride = value(i64, args, 4), .rows = gx };
+                count += 1;
+            } else if (id == 2 or id == 5) projections += 1;
+            return 0;
+        }
+    };
+    var driver: cuda.Driver = .{ .lib = undefined, .api = undefined };
+    driver.api.cuLaunchKernel = Trace.launch;
+    const fun = struct {
+        fn of(d: *const cuda.Driver, id: usize) cuda.Function {
+            return .{ .d = d, .handle = @ptrFromInt(id) };
+        }
+    }.of;
+    var kernels: glue.Kernels = undefined;
+    kernels.group_sums = fun(&driver, 1);
+    kernels.rmsnorm_1536 = fun(&driver, 3);
+    kernels.rmsnorm_512 = fun(&driver, 4);
+    const affine: cuda.qlinear.Affine4Kernels = .{ .group_fn = undefined, .gemv_fn = fun(&driver, 2), .split_fn = undefined, .prefill_fn = fun(&driver, 5), .words_fn = undefined, .scales_fn = undefined, .gemv_blocks = 64, .split = null, .pdl = false };
+    const set: glue.Set = .{ .glue = &kernels, .linear = .{ .affine4 = &affine } };
+    const stream: cuda.Stream = .{ .d = &driver, .handle = @ptrFromInt(17) };
+    var layer: Layer = undefined;
+    layer.input = .{ .combined = .{ .q = .{ .affine4 = .{ .w = 100, .s = 200, .b = 300, .n = 2048, .k = 4096, .npad = 2048 } } } };
+    layer.q_lora = 1536;
+    layer.lw = 512;
+    layer.dims = 4096;
+    layer.q_norm = 400;
+    layer.kv_norm = 500;
+    layer.eps = 1e-6;
+    var scratch: Scratch = undefined;
+    scratch.dp = 8192;
+    scratch.qr = 16384;
+    scratch.lat = 32768;
+    scratch.mm_part = 65536;
+    scratch.xs_qr = 131072;
+    scratch.xs_lat = 262144;
+    for ([_]usize{ 1, 8, 16, 128, 2048 }) |rows| {
+        Trace.count = 0;
+        Trace.projections = 0;
+        try prepareInput(set, stream, layer, scratch, 4096, 4096, rows);
+        try std.testing.expectEqual(@as(usize, 1), Trace.projections);
+        try std.testing.expectEqual(@as(usize, 2), Trace.count);
+        try std.testing.expectEqual(Trace.Norm{ .x = scratch.dp, .stride = 2048, .out = scratch.qr, .out_stride = 1536, .rows = @intCast(rows) }, Trace.norms[0]);
+        try std.testing.expectEqual(Trace.Norm{ .x = scratch.dp + 1536 * 2, .stride = 2048, .out = scratch.lat, .out_stride = 512, .rows = @intCast(rows) }, Trace.norms[1]);
+    }
 }
 
 /// One sequence's rows r0..r0 + rows at pos: latent and index keys written, dense then sparse attention into s.ol.
