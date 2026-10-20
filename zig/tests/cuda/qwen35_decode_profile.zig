@@ -888,7 +888,12 @@ fn terminalModelArm(init: std.process.Init, dir: []const u8, input: Input, j: Jo
             if (node.enabled != (candidate and rank == 1) or node.owns_head != (rank == 1) or node.head_rows != 1 or node.terminal_count != @intFromBool(candidate and rank == 1)) return error.TerminalTrialBindingProof;
             if (rank == 1) {
                 const head = node.head orelse return error.TerminalTrialBindingProof;
-                if (head.actual_function != head.requested_function or node.head_kind == .absent or node.head_output != e.logits) return error.TerminalTrialBindingProof;
+                if (e.head != .linear or e.head.linear != .nvfp4) return error.TerminalTrialBindingProof;
+                const weight = e.head.linear.nvfp4;
+                if (head.actual_function != head.requested_function or node.head_kind != .nvfp4_lane or node.head_image != .qmmf or node.head_output != e.logits or
+                    node.head_weight != weight.codes or node.head_scales != weight.scales or node.head_scales == 0 or node.head_scale != weight.scale or
+                    head.argument_count != 13 or head.argument_bytes_len != 72 or !std.mem.eql(u32, &head.grid, &.{ 3880, 1, 1 }) or
+                    !std.mem.eql(u32, &head.block, &.{ 128, 1, 1 }) or head.shared_bytes != 17408) return error.TerminalTrialBindingProof;
                 if (candidate) {
                     const terminal = node.terminal orelse return error.TerminalTrialBindingProof;
                     if (terminal.actual_function != terminal.requested_function or terminal.predecessor != head.node or terminal.argument_count != 4 or !std.mem.eql(u32, &terminal.grid, &.{ 1, 1, 1 }) or !std.mem.eql(u32, &terminal.block, &.{ 256, 1, 1 }) or terminal.shared_bytes != 0) return error.TerminalTrialBindingProof;

@@ -1280,14 +1280,14 @@ pub const Engine = struct {
         requested_function: usize,
         actual_function: usize,
         requested_symbol: []const u8,
-        actual_symbol: [96]u8 = @splat(0),
+        actual_symbol: [128]u8 = @splat(0),
         actual_symbol_len: usize,
         grid: [3]u32,
         block: [3]u32,
         shared_bytes: u32,
         argument_count: usize,
-        argument_sizes: [10]usize = @splat(0),
-        argument_bytes: [80]u8 = @splat(0),
+        argument_sizes: [16]usize = @splat(0),
+        argument_bytes: [128]u8 = @splat(0),
         argument_bytes_len: usize = 0,
         argument_sha256: [32]u8,
 
@@ -1295,7 +1295,7 @@ pub const Engine = struct {
             if (got.extra != null) return error.QwenTerminalGraphArgumentMismatch;
             if (!std.mem.eql(u8, symbol, actual_symbol)) return error.QwenTerminalGraphSymbolMismatch;
             try want.check(got);
-            if (actual_symbol.len > 96 or want.args.count > 10) return error.QwenTerminalGraphRosterOverflow;
+            if (actual_symbol.len > 128 or want.args.count > 16) return error.QwenTerminalGraphRosterOverflow;
             var result: TerminalGraphKernel = .{
                 .node = @intFromPtr(node),
                 .predecessor = @intFromPtr(predecessor),
@@ -1332,10 +1332,13 @@ pub const Engine = struct {
         enabled: bool,
         owns_head: bool,
         head_rows: usize,
-        head_kind: enum { absent, lane, reduce } = .absent,
+        head_kind: enum { absent, lane, reduce, nvfp4_lane } = .absent,
+        head_image: enum { absent, ck, qmmf } = .absent,
         head_input: u64 = 0,
         head_output: u64 = 0,
         head_weight: u64 = 0,
+        head_scales: u64 = 0,
+        head_scale: f32 = 0,
         head: ?TerminalGraphKernel = null,
         terminal: ?TerminalGraphKernel = null,
     };
@@ -1389,23 +1392,60 @@ pub const Engine = struct {
             result.terminal = try TerminalGraphKernel.read(nodes[nodes.len - 1], nodes[nodes.len - 2], p, &expected, strict_symbol, try readback.symbol(e.d, p.func));
         }
         if (result.owns_head) {
-            if (e.numerics != .hf_modelopt or e.modelopt == null or e.head != .linear or e.head.linear != .fp8 or e.head.linear.fp8.act == 0) return error.QwenTerminalGraphHeadUnsupported;
-            const head: CkProjection = .{ .weight = e.head.linear.fp8, .x = e.x + (shape.total - heads) * e.g.hidden * 2, .out = e.logits, .rows = heads, .quant = true };
-            const sk = cuda.qmmf.splitK(head.weight.n, head.weight.k);
-            const cluster = sk > 1 and sk <= 8 and e.modelopt.?.ck.clusters;
-            const reduce = sk > 1 and !cluster;
-            const expected = e.ckNode(head, if (reduce) .reduce else .lane);
-            const symbol: []const u8 = if (reduce) "tf_ck8_reduce" else if (cluster) "tf_ck8_16c" else "tf_ck8_16";
+            if (e.numerics != .hf_modelopt or e.modelopt == null or e.head != .linear) return error.QwenTerminalGraphHeadUnsupported;
+            const weight = switch (e.head.linear) {
+                .fp8 => |w| if (w.act != 0) w else return error.QwenTerminalGraphHeadUnsupported,
+                .nvfp4 => |w| w,
+                else => return error.QwenTerminalGraphHeadUnsupported,
+            };
+            const head: CkProjection = .{ .weight = weight, .x = e.x + (shape.total - heads) * e.g.hidden * 2, .out = e.logits, .rows = heads, .quant = true };
+            var expected: CkNode = undefined;
+            var symbol: []const u8 = undefined;
+            if (e.head.linear == .nvfp4) {
+                const plan = cuda.qmmf.plan(heads, weight.n, weight.k, e.modelopt.?.lane.clusters);
+                if (weight.mode != .fp4 or weight.act != 0 or weight.codes == 0 or weight.scales == 0 or !(weight.scale > 0) or !std.math.isFinite(weight.scale) or
+                    weight.n != e.g.vocab or weight.k != e.g.hidden or weight.npad != cuda.nvfp4.padded(weight.n) or weight.k % cuda.qmmf.group != 0 or
+                    plan.sk != 1 or plan.fused or plan.cluster or plan.reduce) return error.QwenTerminalGraphHeadUnsupported;
+                const tile: usize = if (plan.bm == 16) 0 else if (plan.bm == 32) 1 else 2;
+                const symbols = [_][]const u8{
+                    "_ZN7tf_qmmf11qmmf_kernelILi0ELi16ELi64ELi1ELi4ELi4ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii",
+                    "_ZN7tf_qmmf11qmmf_kernelILi0ELi32ELi64ELi1ELi4ELi4ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii",
+                    "_ZN7tf_qmmf11qmmf_kernelILi0ELi64ELi64ELi1ELi4ELi4ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii",
+                };
+                const row_tiles = (heads + plan.bm - 1) / plan.bm;
+                const band = @max(1, @min(row_tiles, (12 << 20) / (@as(usize, plan.bm) * weight.k * 2)));
+                expected = .{ .function = e.modelopt.?.lane.fns[0][tile * 2].handle, .grid = .{ row_tiles * ((weight.n + 63) / 64), 1, plan.sk }, .shared = cuda.qmmf.sharedBytes(.fp4, plan.bm) };
+                // qmmf.Lane.matmulOut's BF16-output ABI, qualified here only for its unsplit lane.
+                expected.args.add(head.x);
+                expected.args.add(weight.codes);
+                expected.args.add(weight.scales);
+                expected.args.add(weight.scale);
+                expected.args.add(head.out);
+                expected.args.add(@as(u64, 0));
+                for ([_]usize{ heads, weight.n, weight.k, plan.sk, weight.npad, weight.k, band }) |v| expected.args.add(@as(i32, @intCast(v)));
+                symbol = symbols[tile];
+                result.head_kind = .nvfp4_lane;
+                result.head_image = .qmmf;
+            } else {
+                const sk = cuda.qmmf.splitK(weight.n, weight.k);
+                const cluster = sk > 1 and sk <= 8 and e.modelopt.?.ck.clusters;
+                const reduce = sk > 1 and !cluster;
+                expected = e.ckNode(head, if (reduce) .reduce else .lane);
+                symbol = if (reduce) "tf_ck8_reduce" else if (cluster) "tf_ck8_16c" else "tf_ck8_16";
+                result.head_kind = if (reduce) .reduce else .lane;
+                result.head_image = .ck;
+            }
             const suffix: usize = @intFromBool(shape.terminal_greedy);
             if (nodes.len <= suffix) return error.QwenTerminalGraphOrderMismatch;
             const index = nodes.len - suffix - 1;
             var p: cuda.abi.KernelNodeParams = undefined;
             try e.d.check(e.d.api.cuGraphKernelNodeGetParams_v2(nodes[index], &p), "cuGraphKernelNodeGetParams");
             result.head = try TerminalGraphKernel.read(nodes[index], if (index == 0) null else nodes[index - 1], p, &expected, symbol, try readback.symbol(e.d, p.func));
-            result.head_kind = if (reduce) .reduce else .lane;
             result.head_input = head.x;
             result.head_output = head.out;
             result.head_weight = head.weight.codes;
+            result.head_scales = head.weight.scales;
+            result.head_scale = head.weight.scale;
         }
         return result;
     }
@@ -1726,7 +1766,7 @@ pub const Engine = struct {
     }
 };
 
-test "terminal capture readback checks full ABI, final head producer, ordering and absent arms" {
+test "terminal capture readback checks FP8 and real NVFP4 ABI, final head producer, ordering and absent arms" {
     const Fake = struct {
         var params: [4]cuda.abi.KernelNodeParams = undefined;
         var count: usize = 3;
@@ -1735,6 +1775,20 @@ test "terminal capture readback checks full ABI, final head producer, ordering a
         var wrong_name = false;
         var instantiate_fail = false;
         var instantiate_count: usize = 0;
+        var lane_args: cuda.Args = .{};
+
+        fn launch(f: cuda.abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, by: c_uint, bz: c_uint, shared: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, extra: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            lane_args = .{};
+            inline for (0..13) |i| {
+                if (i == 0 or i == 1 or i == 2 or i == 4 or i == 5) {
+                    lane_args.add(@as(*const u64, @ptrCast(@alignCast(args.?[i].?))).*);
+                } else {
+                    lane_args.add(@as(*const u32, @ptrCast(@alignCast(args.?[i].?))).*);
+                }
+            }
+            params[1] = .{ .func = f, .grid_x = gx, .grid_y = gy, .grid_z = gz, .block_x = bx, .block_y = by, .block_z = bz, .shared_bytes = shared, .params = lane_args.pointers(), .extra = extra };
+            return cuda.abi.success;
+        }
 
         fn nodes(_: cuda.abi.Graph, out: ?[*]cuda.graph.Node, n: *usize) callconv(.c) cuda.abi.Result {
             if (out) |dst| for (0..@min(n.*, count)) |i| {
@@ -1761,6 +1815,9 @@ test "terminal capture readback checks full ABI, final head producer, ordering a
                 20 => "tf_ck8_16",
                 21 => "tf_ck8_16c",
                 22 => "tf_ck8_reduce",
+                40 => "_ZN7tf_qmmf11qmmf_kernelILi0ELi16ELi64ELi1ELi4ELi4ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii",
+                42 => "_ZN7tf_qmmf11qmmf_kernelILi0ELi32ELi64ELi1ELi4ELi4ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii",
+                44 => "_ZN7tf_qmmf11qmmf_kernelILi0ELi64ELi64ELi1ELi4ELi4ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii",
                 else => "body",
             };
             return cuda.abi.success;
@@ -1915,6 +1972,100 @@ test "terminal capture readback checks full ABI, final head producer, ordering a
         const nonhead = try e.verifyTerminalGraph(graph, shape, 1, readback);
         try std.testing.expect(nonhead.head == null);
         try std.testing.expectEqual(0, nonhead.terminal_count);
+        e.placement.end = 1;
+    };
+    const fixture = try std.json.parseFromSlice(std.json.Value, e.gpa, @embedFile("fixtures/ornith_nvfp4/config.json"), .{});
+    defer fixture.deinit();
+    const quant = fixture.value.object.get("quantization_config").?.object.get("quantized_layers").?.object.get("lm_head").?;
+    try std.testing.expectEqualStrings("W4A16_NVFP4", quant.object.get("quant_algo").?.string);
+    driver.api.cuLaunchKernel = Fake.launch;
+    e.modelopt.?.lane.clusters = true;
+    for (0..7) |i| e.modelopt.?.lane.fns[0][i] = .{ .d = &driver, .handle = @ptrFromInt(40 + i) };
+    e.g.vocab = 248320;
+    e.head = .{ .linear = .{ .nvfp4 = cuda.nvfp4.weight(65536, 131072, 0.125, e.g.vocab, e.g.hidden) } };
+    try std.testing.expectEqual(@as(f32, 0), e.head.linear.nvfp4.act);
+    const linear: cuda.qlinear.Linear = .{ .lane = &e.modelopt.?.lane };
+    for ([_]usize{ 1, 16, 32, 64 }) |rows| for ([_]bool{ false, true }) |all| {
+        const heads: usize = if (all) rows else 1;
+        const output = TerminalOutput.init(heads, e.g.vocab);
+        var terminal: Engine.CkNode = .{ .function = @ptrFromInt(10), .grid = .{ 1, 1, 1 }, .threads = 256 };
+        terminal.args.add(e.logits + (heads - 1) * e.g.vocab * 2);
+        terminal.args.add(e.logits + output.pick_at);
+        terminal.args.add(@as(u32, @intCast(e.g.vocab)));
+        terminal.args.add(@as(u32, @intCast(e.g.vocab)));
+        var body: Engine.CkNode = .{ .function = @ptrFromInt(30), .grid = .{ 1, 1, 1 } };
+        Fake.params = .{ Fake.from(&body), undefined, Fake.from(&terminal), Fake.from(&body) };
+        Fake.count = 3;
+        Fake.predecessors = .{ 0, 1, 2, 3 };
+        const x = e.x + (rows - heads) * e.g.hidden * 2;
+        try linear.decode(.{ .d = &driver, .handle = null }, e.head.linear, .{ .x = x, .part = e.modelopt.?.part }, e.logits, heads);
+        var shape: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .heads_all = all, .terminal_greedy = true };
+        const record = try e.verifyTerminalGraph(graph, shape, 3, readback);
+        try std.testing.expectEqual(13, record.head.?.argument_count);
+        try std.testing.expectEqual(72, record.head.?.argument_bytes_len);
+        try std.testing.expectEqualSlices(usize, &.{ 8, 8, 8, 4, 8, 8, 4, 4, 4, 4, 4, 4, 4 }, record.head.?.argument_sizes[0..record.head.?.argument_count]);
+        try std.testing.expectEqual(x, record.head_input);
+        try std.testing.expectEqual(e.logits, record.head_output);
+        try std.testing.expectEqual(e.head.linear.nvfp4.codes, record.head_weight);
+        try std.testing.expectEqual(.nvfp4_lane, record.head_kind);
+        try std.testing.expectEqual(.qmmf, record.head_image);
+        try std.testing.expectEqual(e.head.linear.nvfp4.scales, record.head_scales);
+        try std.testing.expectEqual(e.head.linear.nvfp4.scale, record.head_scale);
+        try std.testing.expectEqual(2, record.terminal.?.predecessor);
+        var head_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(record.head.?.argument_bytes[0..record.head.?.argument_bytes_len], &head_hash, .{});
+        try std.testing.expectEqualSlices(u8, &head_hash, &record.head.?.argument_sha256);
+        for (0..13) |arg| {
+            Fake.lane_args.storage[Fake.lane_args.offsets[arg]] ^= 1;
+            try std.testing.expectError(error.QwenQuantGraphArgumentMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+            Fake.lane_args.storage[Fake.lane_args.offsets[arg]] ^= 1;
+        }
+        inline for (.{ "grid_x", "grid_y", "grid_z", "block_x", "block_y", "block_z", "shared_bytes" }) |field| {
+            @field(Fake.params[1], field) += 1;
+            try std.testing.expectError(error.QwenQuantGraphKernelMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+            @field(Fake.params[1], field) -= 1;
+        }
+        const saved_function = Fake.params[1].func;
+        Fake.params[1].func = @ptrFromInt(30);
+        try std.testing.expectError(error.QwenTerminalGraphSymbolMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+        Fake.params[1].func = saved_function;
+        const tile: usize = if (heads <= 16) 0 else if (heads <= 32) 1 else 2;
+        const saved_binding = e.modelopt.?.lane.fns[0][tile * 2].handle;
+        e.modelopt.?.lane.fns[0][tile * 2].handle = @ptrFromInt(99);
+        try std.testing.expectError(error.QwenQuantGraphKernelMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+        e.modelopt.?.lane.fns[0][tile * 2].handle = saved_binding;
+        Fake.params[1].extra = Fake.lane_args.pointers();
+        try std.testing.expectError(error.QwenTerminalGraphArgumentMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+        Fake.params[1].extra = null;
+        const saved_weight = e.head.linear.nvfp4;
+        inline for (.{ "codes", "scales", "scale" }) |field| {
+            @field(e.head.linear.nvfp4, field) = 0;
+            try std.testing.expectError(error.QwenTerminalGraphHeadUnsupported, e.verifyTerminalGraph(graph, shape, 3, readback));
+            e.head.linear.nvfp4 = saved_weight;
+        }
+        e.head.linear.nvfp4.scale = std.math.nan(f32);
+        try std.testing.expectError(error.QwenTerminalGraphHeadUnsupported, e.verifyTerminalGraph(graph, shape, 3, readback));
+        e.head.linear.nvfp4 = saved_weight;
+        e.head.linear.nvfp4.act = 0.5;
+        try std.testing.expectError(error.QwenTerminalGraphHeadUnsupported, e.verifyTerminalGraph(graph, shape, 3, readback));
+        e.head.linear.nvfp4 = saved_weight;
+        e.g.vocab = 64;
+        e.head.linear.nvfp4 = cuda.nvfp4.weight(saved_weight.codes, saved_weight.scales, saved_weight.scale, 64, e.g.hidden);
+        shape.terminal_greedy = false;
+        Fake.count = 2;
+        try std.testing.expectError(error.QwenTerminalGraphHeadUnsupported, e.verifyTerminalGraph(graph, shape, 2, readback));
+        e.g.vocab = 248320;
+        e.head.linear.nvfp4 = saved_weight;
+        Fake.count = 3;
+        shape.terminal_greedy = false;
+        try std.testing.expectError(error.QwenTerminalGraphWorkCountMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+        Fake.count = 2;
+        const baseline = try e.verifyTerminalGraph(graph, shape, 2, readback);
+        try std.testing.expect(baseline.head != null and baseline.terminal == null);
+        e.placement.end = 0;
+        Fake.count = 1;
+        const nonhead = try e.verifyTerminalGraph(graph, shape, 1, readback);
+        try std.testing.expect(nonhead.head == null and nonhead.terminal == null);
         e.placement.end = 1;
     };
 }
