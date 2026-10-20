@@ -518,7 +518,6 @@ pub const Lanes = struct {
         var keeps: [engine.max_shared]?usize = undefined;
         var seen: [engine.max_shared]bool = @splat(false);
         for (requests, 0..) |r, i| {
-            if (r.stream.isCancelled()) return error.Cancelled;
             const l = self.lanes.getPtr(r.stream) orelse return error.UnknownStream;
             if (l.slot >= engine.max_shared or seen[l.slot]) return error.BadDraftSlot;
             seen[l.slot] = true;
@@ -795,6 +794,46 @@ test "DFlash draft preflight distinguishes accepted rows already committed by th
     try std.testing.expectEqual(@as(?usize, 2), uncommitted.keep);
     try std.testing.expectError(error.NoDraftWindow, backend.preflightDraft(&committed, request, 101));
     try std.testing.expectError(error.NoDraftWindow, backend.preflightDraft(&pending_window, request, 102));
+}
+
+test "late cancellation in a draft cohort does not fail its neighboring lane" {
+    const Cancel = struct {
+        fn check(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var marker: u8 = 0;
+    var e: engine.Engine = undefined;
+    e.settings = .{};
+    e.gpa = std.testing.allocator;
+    e.c = .{};
+    e.mtp = false;
+    e.dflash = @ptrFromInt(256);
+    e.seqs = .empty;
+    defer e.seqs.deinit(std.testing.allocator);
+    var first_seq: @TypeOf(e.cur.*) = undefined;
+    first_seq.st.pos = 10;
+    var second_seq: @TypeOf(e.cur.*) = undefined;
+    second_seq.st.pos = 20;
+    try e.seqs.append(std.testing.allocator, &first_seq);
+    try e.seqs.append(std.testing.allocator, &second_seq);
+    var link: follow.Link = undefined;
+    var backend: Lanes = .{ .x = .{ .e = &e, .link = &link } };
+    defer backend.deinit();
+    var first: lanes.Stream = undefined;
+    first.cancel_check = .{ .ptr = &marker, .check = Cancel.check };
+    var second: lanes.Stream = undefined;
+    second.cancel_check = null;
+    try backend.lanes.put(std.testing.allocator, &first, .{ .slot = 0, .held_n = 2 });
+    try backend.lanes.put(std.testing.allocator, &second, .{ .slot = 1, .held_n = 1 });
+    const requests = [_]be.DraftRequest{
+        .{ .stream = &first, .follow = &.{}, .first = .{ .value = 1 }, .rows = null, .start = 10, .position = 11, .depth = 0 },
+        .{ .stream = &second, .follow = &.{}, .first = .{ .value = 2 }, .rows = null, .start = 20, .position = 21, .depth = 0 },
+    };
+    try backend.backend().draft(&requests);
+    try std.testing.expectEqual(@as(usize, 0), backend.lanes.getPtr(&second).?.held_n);
+    try std.testing.expectEqual(@as(usize, 10), first_seq.st.pos);
+    try std.testing.expectEqual(@as(usize, 20), second_seq.st.pos);
 }
 
 test "a later invalid mixed draft request refuses before any bind or paired command" {
