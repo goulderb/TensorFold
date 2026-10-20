@@ -542,7 +542,6 @@ pub const Engine = struct {
         const g = try placement.localGeometry(admitted.geometry);
         if (options.terminal_greedy and admitted.numerics() != .hf_modelopt) return error.UnsupportedQwenTerminalGreedy;
         if (options.expert_up_layout == .slice_major_v1 and (admitted.numerics() != .hf_modelopt or g.hidden != 2048 or g.intermediate != 512 or g.experts != 256)) return error.UnsupportedQwenExpertUpLayout;
-        if (admitted.numerics() == .hf_modelopt and kv8) return error.UnsupportedQwenKv;
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var ck = try core.Checkpoint.openModel(gpa, io, dir);
         defer ck.close();

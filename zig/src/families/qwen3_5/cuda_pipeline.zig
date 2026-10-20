@@ -19,6 +19,7 @@ pub const Options = struct {
     terminal_greedy: bool = false,
     moe_math: engine.MoeMath = .legacy,
     attention_mode: engine.AttentionMode = .chunked,
+    kv8: bool = false,
 };
 
 fn validatePrefillRows(rows: usize) !void {
@@ -108,7 +109,7 @@ pub const Chain = struct {
         };
         for (c.partitions, placements[0..c.partitions.len]) |*p, placement| {
             try p.context.makeCurrent();
-            p.engine = try engine.Engine.initPlacedWithOptions(gpa, io, &p.context, dir, admitted, placement, false, .{ .expert_up_layout = options.expert_up_layout, .terminal_greedy = options.terminal_greedy, .moe_math = options.moe_math, .attention_mode = options.attention_mode });
+            p.engine = try engine.Engine.initPlacedWithOptions(gpa, io, &p.context, dir, admitted, placement, options.kv8, .{ .expert_up_layout = options.expert_up_layout, .terminal_greedy = options.terminal_greedy, .moe_math = options.moe_math, .attention_mode = options.attention_mode });
             engines += 1;
             p.engine.captured = options.captured;
             p.engine.bounded_hf_prefill = options.prefill_rows > 1;
@@ -332,18 +333,29 @@ pub const Session = struct {
 
     /// Overlap GPU1 of `a` with GPU0 of `b` on a two-partition chain.
     pub fn pipelineRows(a: *Session, a_tokens: []const u32, b: *Session, b_tokens: []const u32, keep: engine.Keep) !void {
-        if (a.chain != b.chain) return error.InvalidPartition;
-        if (a.chain.partitions.len < 2) {
-            try a.stepRows(a_tokens, keep);
-            try b.stepRows(b_tokens, keep);
+        var sessions = [_]*Session{ a, b };
+        const tokens = [_][]const u32{ a_tokens, b_tokens };
+        return pipelineMany(&sessions, &tokens, keep);
+    }
+
+    /// GPU0 of each later session overlaps GPU1 of the previous one.
+    pub fn pipelineMany(sessions: []const *Session, tokens: []const []const u32, keep: engine.Keep) !void {
+        if (sessions.len == 0 or sessions.len != tokens.len) return error.InvalidPartition;
+        const chain = sessions[0].chain;
+        if (chain.partitions.len < 2) {
+            for (sessions, tokens) |s, t| try s.stepRows(t, keep);
             return;
         }
-        try a.runHead(a_tokens, keep);
-        try a.launchTail();
-        try b.runHead(b_tokens, keep);
-        try a.waitTail();
-        try b.launchTail();
-        try b.waitTail();
+        for (sessions) |s| if (s.chain != chain) return error.InvalidPartition;
+        try sessions[0].runHead(tokens[0], keep);
+        var i: usize = 1;
+        while (i < sessions.len) : (i += 1) {
+            try sessions[i - 1].launchTail();
+            try sessions[i].runHead(tokens[i], keep);
+            try sessions[i - 1].waitTail();
+        }
+        try sessions[sessions.len - 1].launchTail();
+        try sessions[sessions.len - 1].waitTail();
     }
 
     pub fn copyLogits(s: *const Session, out: []f32) !void {

@@ -217,29 +217,36 @@ pub fn Adapter(comptime Session: type) type {
         }
 
         fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
-            if (windows.len != out.len or windows.len == 0 or windows.len > 2) return error.UnsupportedWindow;
+            if (windows.len != out.len or windows.len == 0 or windows.len > 3) return error.UnsupportedWindow;
             for (windows, out) |w, o| if (!plainWindow(w, o)) return error.UnsupportedWindow;
             const self = of(ptr);
             while (!self.lock.tryLock()) std.Thread.yield() catch {};
             defer self.lock.unlock();
-            if (windows.len == 1 or comptime !@hasDecl(Session, "pipelineRows")) {
+            if (windows.len == 1 or comptime !@hasDecl(Session, "pipelineMany")) {
                 for (windows, out) |w, *o| {
                     o.sampled[0] = @intCast(try self.queueLocked(ptr, w.stream, .{ .value = w.pending }, w.positions[0]));
                 }
                 return;
             }
-            const a = try self.sessionOf(windows[0].stream);
-            const b = try self.sessionOf(windows[1].stream);
-            if (a.position + 1 != windows[0].positions[0] or b.position + 1 != windows[1].positions[0])
-                return error.PositionMismatch;
-            try Session.pipelineRows(a, &.{windows[0].pending}, b, &.{windows[1].pending}, .last);
-            out[0].sampled[0] = @intCast(try self.draw(windows[0].stream, windows[0].positions[0]));
-            out[1].sampled[0] = @intCast(try self.draw(windows[1].stream, windows[1].positions[0]));
+            var one: [3][1]u32 = undefined;
+            var views: [3][]const u32 = undefined;
+            var ptrs: [3]*Session = undefined;
+            for (windows, 0..) |w, i| {
+                const session = try self.sessionOf(w.stream);
+                if (session.position + 1 != w.positions[0]) return error.PositionMismatch;
+                one[i][0] = w.pending;
+                views[i] = one[i][0..1];
+                ptrs[i] = session;
+            }
+            try Session.pipelineMany(ptrs[0..windows.len], views[0..windows.len], .last);
+            for (windows, out) |w, *o| {
+                o.sampled[0] = @intCast(try self.draw(w.stream, w.positions[0]));
+            }
         }
 
         fn prefillBatch(ptr: *anyopaque, streams: []const *lanes.Stream, out: []be.PrefillOutcome) anyerror!void {
-            if (streams.len != 2 or out.len != 2) return;
-            if (comptime !@hasDecl(Session, "pipelineRows")) return;
+            if (streams.len != out.len or streams.len < 2 or streams.len > 3) return;
+            if (comptime !@hasDecl(Session, "pipelineMany")) return;
             const self = of(ptr);
             while (!self.lock.tryLock()) std.Thread.yield() catch {};
             defer self.lock.unlock();
@@ -247,33 +254,30 @@ pub fn Adapter(comptime Session: type) type {
                 if (s.isCancelled()) return error.Cancelled;
                 if (self.indexOf(s) == null) try self.begin(s);
             }
-            const ia = self.indexOf(streams[0]) orelse return error.PositionMismatch;
-            const ib = self.indexOf(streams[1]) orelse return error.PositionMismatch;
+            var idx: [3]usize = undefined;
+            for (streams, 0..) |s, i| idx[i] = self.indexOf(s) orelse return error.PositionMismatch;
             if (self.prefill_rows == 0) return error.InvalidSession;
-            while (self.prompt_at[ia] < streams[0].prompt_len or self.prompt_at[ib] < streams[1].prompt_len) {
-                if (streams[0].isCancelled() or streams[1].isCancelled()) return error.Cancelled;
-                const na = @min(self.prefill_rows, streams[0].prompt_len -| self.prompt_at[ia]);
-                const nb = @min(self.prefill_rows, streams[1].prompt_len -| self.prompt_at[ib]);
-                if (na > 0 and nb > 0) {
-                    try Session.pipelineRows(
-                        &self.sessions[ia],
-                        streams[0].context.items[self.prompt_at[ia]..][0..na],
-                        &self.sessions[ib],
-                        streams[1].context.items[self.prompt_at[ib]..][0..nb],
-                        .last,
-                    );
-                    self.advanceFill(streams[0], ia, na);
-                    self.advanceFill(streams[1], ib, nb);
-                } else if (na > 0) {
-                    try self.sessions[ia].append(streams[0].context.items[self.prompt_at[ia]..][0..na]);
-                    self.advanceFill(streams[0], ia, na);
-                } else if (nb > 0) {
-                    try self.sessions[ib].append(streams[1].context.items[self.prompt_at[ib]..][0..nb]);
-                    self.advanceFill(streams[1], ib, nb);
-                } else break;
+            while (true) {
+                var nlive: usize = 0;
+                var ptrs: [3]*Session = undefined;
+                var views: [3][]const u32 = undefined;
+                var counts: [3]usize = undefined;
+                var which: [3]usize = undefined;
+                for (streams, 0..) |s, i| {
+                    if (s.isCancelled()) return error.Cancelled;
+                    const n = @min(self.prefill_rows, s.prompt_len -| self.prompt_at[idx[i]]);
+                    if (n == 0) continue;
+                    ptrs[nlive] = &self.sessions[idx[i]];
+                    views[nlive] = s.context.items[self.prompt_at[idx[i]]..][0..n];
+                    counts[nlive] = n;
+                    which[nlive] = i;
+                    nlive += 1;
+                }
+                if (nlive == 0) break;
+                if (nlive == 1) try ptrs[0].append(views[0]) else try Session.pipelineMany(ptrs[0..nlive], views[0..nlive], .last);
+                for (0..nlive) |j| self.advanceFill(streams[which[j]], idx[which[j]], counts[j]);
             }
-            out[0] = .complete;
-            out[1] = .complete;
+            for (out) |*row| row.* = .complete;
         }
 
         fn advanceFill(self: *Self, s: *lanes.Stream, i: usize, n: usize) void {
@@ -288,7 +292,7 @@ pub fn Adapter(comptime Session: type) type {
 
         fn keep(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
             const self = of(ptr);
-            if (windows.len != paths.len or windows.len == 0 or windows.len > 2) return error.UnsupportedRollback;
+            if (windows.len != paths.len or windows.len == 0 or windows.len > 3) return error.UnsupportedRollback;
             for (windows, paths) |w, path| {
                 if (path.len != 1 or path[0] != 0 or w.rows() != 1 or self.indexOf(w.stream) == null)
                     return error.UnsupportedRollback;

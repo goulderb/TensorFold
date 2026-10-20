@@ -365,7 +365,10 @@ pub const Store = struct {
 
     /// Whether a state at `at` may start or end a prompt pass: anywhere, or a chunk start for planned families.
     fn usable(s: *const Store, at: u32, starts: []const u32) bool {
-        return at > 0 and (!s.rules.planned or s.startAt(starts, at) == at);
+        if (at == 0) return false;
+        if (!s.rules.planned or s.startAt(starts, at) == at) return true;
+        // A short chat history sits before the first grid point. The saved KV is a full prefix.
+        return s.rules.grid > 0 and starts.len == 0 and at < s.rules.grid;
     }
 
     /// The chunk start at or before `at`: the request's, else the family's grid (0 when none).
@@ -596,7 +599,8 @@ pub const Store = struct {
             }
         }
         for (want.items, 0..) |w, k| {
-            const at = if (s.rules.planned) s.startAt(starts, w) else w;
+            var at = if (s.rules.planned) s.startAt(starts, w) else w;
+            if (at == 0 and k == 0 and w > 0 and s.rules.planned and s.rules.grid > 0 and starts.len == 0 and w < s.rules.grid) at = w;
             if (at <= from or at + s.rules.lookahead > prompt.len or at >= prompt.len or !s.usable(at, starts)) continue;
             const is_rewind = rewind > 0 and k == 1 and at == rewind;
             if (!is_rewind and !(k == 0 and warm_pass) and at - from < s.rules.min_gap and (k > 0 or (from > 0 and s.rules.warm == .on))) continue; // near the resume point

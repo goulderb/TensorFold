@@ -134,6 +134,24 @@ test "Qwen ModelOpt rules keep the 2048-token grid cut on a raw 2064-token compl
     try std.testing.expectEqual(fresh(t2), f.pass(&s, t2, p2));
 }
 
+test "a short planned history before the first grid point is kept and resumed" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .planned = true, .grid = 2048, .min_prompt = 0, .lookahead = 0 }, 1 << 20);
+    defer s.deinit();
+    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    const p1 = try s.begin(a, &t1, 12, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqualSlices(u32, &.{12}, p1.marks);
+    _ = f.pass(&s, &t1, p1);
+    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 20, 21, 22, 23 };
+    const p2 = try s.begin(a, &t2, 20, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 12), p2.from);
+    try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, p2));
+}
+
 test "a planned family with named starts and no history still keeps the first start on a raw completion" {
     const gpa = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(gpa);

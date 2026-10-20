@@ -12,14 +12,13 @@ pub fn claims(gpa: Allocator, io: std.Io, dir: []const u8) !bool {
 }
 
 pub fn refusal(o: api.Open) ?[]const u8 {
-    if (o.lanes_fixed and (o.lanes < 1 or o.lanes > 2)) return "the Qwen CUDA baseline serves one or two requests at a time; use --parallel 1 or 2";
+    if (o.lanes_fixed and (o.lanes < 1 or o.lanes > 3)) return "the Qwen CUDA baseline serves one to three requests at a time; use --parallel 1, 2 or 3";
     if (o.tp != 1) return "the Qwen CUDA baseline uses a layer split, with no tensor-parallel collectives";
     if (o.vision != null) return "the Qwen CUDA baseline serves text; its vision tower is not ported";
     if (o.drafter != null or o.mtp_drafts != null or o.mtp_confidence != null) return "the Qwen CUDA baseline has no drafter or MTP execution";
     if (o.slide or o.recall or o.learn != null or o.learn_conversations or o.record != null) return "the Qwen CUDA baseline has no learning, recording or persistent cache";
     if (o.keep != null) return "the Qwen CUDA baseline has no --checkpoint-slots keep store";
-    if (o.kv8) return "the Qwen ModelOpt baseline supports BF16 KV only; omit --kv-cache fp8";
-    if (o.precision != null or o.policy.len > 0) return "the Qwen CUDA baseline uses the checkpoint's FP8 activations, W4A16 experts and BF16 KV";
+    if (o.precision != null or o.policy.len > 0) return "the Qwen CUDA baseline uses the checkpoint's FP8 activations and W4A16 experts";
     if (o.segments != null and o.segments.? != 1) return "the Qwen CUDA baseline prefills one token per engine step; use --segments 1";
     return null;
 }
@@ -138,14 +137,14 @@ pub fn load(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         (if (std.mem.eql(u8, v, "1")) &.{ 0, 1 } else &.{device})
     else
         &.{device};
-    const model = qwen.Engine.open(gpa, io, o.dir, .{ .devices = devices, .context = context, .prefill_rows = prefill_rows, .attention_mode = attention_mode }) catch |err| {
+    const model = qwen.Engine.open(gpa, io, o.dir, .{ .devices = devices, .context = context, .prefill_rows = prefill_rows, .attention_mode = attention_mode, .kv8 = o.kv8 }) catch |err| {
         problem.* = try std.fmt.allocPrint(a, "Qwen CUDA load failed: {s}; use a GPU with sufficient free memory or TENSORFOLD_SPLIT=1 for the internal pair", .{@errorName(err)});
         return null;
     };
     errdefer model.deinit();
     const lanes_n: u32 = if (o.lanes_fixed) o.lanes else 1;
-    if (lanes_n < 1 or lanes_n > 2) {
-        problem.* = "the Qwen CUDA baseline serves one or two requests at a time; use --parallel 1 or 2";
+    if (lanes_n < 1 or lanes_n > 3) {
+        problem.* = "the Qwen CUDA baseline serves one to three requests at a time; use --parallel 1, 2 or 3";
         return null;
     }
     const owner = try gpa.create(Owner);
@@ -179,13 +178,15 @@ test "unsupported Qwen capabilities refuse before loading CUDA" {
     o.lanes = 2;
     try std.testing.expect(refusal(o) == null);
     o.lanes = 3;
+    try std.testing.expect(refusal(o) == null);
+    o.lanes = 4;
     try std.testing.expect(refusal(o) != null);
     o.lanes = 1;
     o.learn_conversations = true;
     try std.testing.expect(refusal(o) != null);
     o = base;
     o.kv8 = true;
-    try std.testing.expect(refusal(o) != null);
+    try std.testing.expect(refusal(o) == null);
     o = base;
     o.segments = 2;
     try std.testing.expect(refusal(o) != null);
