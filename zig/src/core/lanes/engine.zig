@@ -450,10 +450,20 @@ pub const Engine = struct {
                 if (r.lanes != null) r.stream.next = .{ .count = @intCast(l.parents.len), .parents = try e.gpa.dupe(i32, l.parents) };
                 r.stream.lanes = l;
                 lone = null;
+            } else if (e.backend.deferred_draft_shape) {
+                r.stream.draft_shape_pending = r.depth > 0;
             } else if (e.backend.vtable.tree) |tree| {
                 if (try tree(e.backend.ptr, r.stream, e.gpa)) |held| r.stream.next = held;
             }
         }
+    }
+
+    pub fn resolveDraftShape(e: *Engine, s: *Stream, provisional: sm.Held) !sm.Held {
+        if (!s.draft_shape_pending) return provisional;
+        const tree = e.backend.vtable.tree orelse return error.DeferredDraftShapeUnsupported;
+        const held = try tree(e.backend.ptr, s, e.gpa);
+        s.draft_shape_pending = false;
+        return held orelse provisional;
     }
 
     /// The rows the context's matches and Recall's would graft this round, and the share it keeps (null: none).
@@ -574,3 +584,85 @@ pub const Engine = struct {
         e.backend.release(s);
     }
 };
+
+test "deferred draft shape waits after host round work and publishes actual count before planning" {
+    const Fake = @import("fake.zig").Fake;
+    const Trace = struct {
+        var host_finished = false;
+        var waits: usize = 0;
+        fn tree(ptr: *anyopaque, _: *Stream, _: Allocator) anyerror!?sm.Held {
+            _ = ptr;
+            if (!host_finished) return error.WaitBeforeHostWork;
+            waits += 1;
+            return .{ .count = 1 };
+        }
+    };
+    const gpa = std.testing.allocator;
+    var cfg = try Config.init(gpa, .{ .exact_width = 4, .mtp = true, .speculate = true, .drafts = 3, .fixed_drafts = true }, 4, 3);
+    defer cfg.deinit(gpa);
+    var target: Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var backend = target.backend();
+    var vtable = backend.vtable.*;
+    vtable.tree = Trace.tree;
+    backend.vtable = &vtable;
+    backend.deferred_draft_shape = true;
+    const clock: be.Clock = undefined;
+    var e = Engine.init(gpa, &cfg, backend, clock);
+    defer e.deinit();
+    var s = try sm.Stream.init(gpa, .{ .id = "deferred", .prompt = &.{ 2, 5 }, .max_new = 4, .drafts = true, .eos = &.{} });
+    defer s.deinit(gpa);
+    const first = try backend.opening(gpa, &s);
+    s.pending = first;
+    s.cache_len = s.context.items.len;
+    var copied = try sm.Stream.init(gpa, .{ .id = "copy-winner", .prompt = &.{ 2, 5 }, .max_new = 4, .drafts = true, .eos = &.{} });
+    defer copied.deinit(gpa);
+    const copied_first = try backend.opening(gpa, &copied);
+    copied.pending = copied_first;
+    copied.cache_len = copied.context.items.len;
+    try e.askDrafts(&.{
+        .{ .stream = &s, .follow = &.{first}, .rows = null, .start = 2, .position = 3, .depth = 3 },
+        .{ .stream = &copied, .follow = &.{copied_first}, .rows = null, .start = 2, .position = 3, .depth = 0 },
+    });
+    try std.testing.expect(s.draft_shape_pending);
+    Trace.host_finished = true;
+    defer Trace.host_finished = false;
+    const p = try win.plan(&e, &s, null);
+    try std.testing.expectEqual(@as(usize, 1), p.count());
+    try std.testing.expectEqual(@as(usize, 1), Trace.waits);
+    try std.testing.expect(!s.draft_shape_pending);
+}
+
+test "deferred draft shape stays unresolved when a copy wins" {
+    const Fake = @import("fake.zig").Fake;
+    const Trace = struct {
+        var waits: usize = 0;
+        fn tree(_: *anyopaque, _: *Stream, _: Allocator) anyerror!?sm.Held {
+            waits += 1;
+            return .{ .count = 1 };
+        }
+    };
+    const gpa = std.testing.allocator;
+    var cfg = try Config.init(gpa, .{ .exact_width = 4, .mtp = true, .speculate = true, .drafts = 3, .fixed_drafts = true }, 4, 3);
+    defer cfg.deinit(gpa);
+    var target: Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var backend = target.backend();
+    var vtable = backend.vtable.*;
+    vtable.tree = Trace.tree;
+    backend.vtable = &vtable;
+    backend.deferred_draft_shape = true;
+    const clock: be.Clock = undefined;
+    var e = Engine.init(gpa, &cfg, backend, clock);
+    defer e.deinit();
+    var s = try sm.Stream.init(gpa, .{ .id = "copy", .prompt = &.{ 2, 5 }, .max_new = 4, .drafts = true, .eos = &.{} });
+    defer s.deinit(gpa);
+    const first = try backend.opening(gpa, &s);
+    s.pending = first;
+    s.cache_len = s.context.items.len;
+    try e.askDrafts(&.{.{ .stream = &s, .follow = &.{first}, .rows = null, .start = 2, .position = 3, .depth = 3 }});
+    const p = try win.plan(&e, &s, .{ .tokens = &.{ 7, 8 } });
+    try std.testing.expectEqual(win.Kind.copy, p.kind);
+    try std.testing.expectEqual(@as(usize, 0), Trace.waits);
+    try std.testing.expect(!s.draft_shape_pending);
+}

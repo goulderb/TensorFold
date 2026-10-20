@@ -40,6 +40,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             var s = b.kda;
             s.p = b.kproj;
             if (!b.prefill) try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
+            try f.prefetchSite(l.index, .o, rows);
             for (r.segs) |g| {
                 const st = g.st;
                 const cur = st.cur[li];
@@ -80,6 +81,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             var sparse_any = false;
             for (r.segs) |g| sparse_any = sparse_any or dsa_block.sparseRows(a, g.st.pos, g.rows);
             try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, sparse_any);
+            try f.prefetchSite(l.index, .o, rows);
             for (r.segs) |g| {
                 const nch = @min(latent.chunksFor(g.st.pos + g.rows), b.nch);
                 try dsa_block.attend(f.dsaKernels(r), f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);

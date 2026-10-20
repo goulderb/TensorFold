@@ -203,6 +203,30 @@ Ash Hart/TensorFold, MiaAI-Lab, wojo, and transitive credits remain unchanged.
 The production-lineage notices above apply; this is not a new authorship claim
 for the quantizer, arithmetic, or model weights.
 
+## GLM production scheduling, transport and L2 prefetch (2026-10-20)
+
+The deferred DFlash launch follows the pinned production image above, including
+its ordered batch and copy-first scheduling. Native code retains Ash Hart and
+TensorFold's lane engine and adapts the existing Mia DFlash implementation.
+The local changes defer host readback, preserve slot generations, pair launch
+commands, and resolve selected shape before allocating verification rows.
+
+The L2 planner, runtime, and `glm_l2pf.cu` adapt the retained Mia native donor
+at Git import `f013e1aec57dbee167f43cccb66186da5bacc37f`, from MiaAI-Lab
+revision `f1ee79a6bf5319775079412c727f5f6b0ebb1e19`. Its legal files remain
+unmodified in `mia-f1ee79a6/`. The production planner credits
+`jayleaton/glm53-tensorfold-spark`, patch `0460`, Apache-2.0, Copyright 2026
+Jay Leaton. Preserve that original and transitive credit. Local changes use
+current typed weight formats and allocation bounds, combine Q4 DSA and dense
+MLP inputs, own graph-lived stream events, and keep prompt paths distinct.
+The production planner's SHA256 is recorded with the build receipts.
+
+Transport reuses the fork's existing `cuda.roce` and `roce_gather.cu`, which
+retain b12x's RoCEnante attribution (`local-inference-lab/b12x`, Apache-2.0).
+Local changes borrow the existing NCCL communicator and connect GLM's target,
+DFlash, and owner attention gathers. The side-stream prompt protocol retains
+NCCL. No new transport implementation or new authorship is claimed.
+
 ## The shared spill tier and Nemotron adapters
 
 `zig/src/core/spill.zig` and `docs/spill-tier.md` identify the GLM spill tier

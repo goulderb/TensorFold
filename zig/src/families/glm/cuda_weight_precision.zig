@@ -60,6 +60,7 @@ pub const DensePolicy = struct {
         }
         if (p.native()) h.update(@import("cuda").ck.numerical_identity);
         if (p.get(.dsa) == .q4) h.update("glm-dsa-combined-q4-v1\x00");
+        if (p.get(.mlp) == .q4) h.update("glm-mlp-combined-q4-v1\x00");
     }
 
     pub fn digest(p: DensePolicy) [32]u8 {

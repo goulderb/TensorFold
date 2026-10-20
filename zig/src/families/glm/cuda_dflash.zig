@@ -16,6 +16,25 @@ const Sampling = @import("cuda_sampler.zig").Sampling;
 pub const BatchRequest = batch.Request;
 pub const BatchResult = batch.Result;
 
+const BlockKey = struct {
+    const Item = struct { slot: usize, end: usize, pending: u32, generation: u64 };
+    items: [batch.max_lanes]Item = undefined,
+    count: usize = 0,
+
+    fn matches(a: BlockKey, b: BlockKey) bool {
+        if (a.count != b.count) return false;
+        for (a.items[0..a.count], b.items[0..b.count]) |left, right| {
+            if (left.slot != right.slot or left.end != right.end or left.pending != right.pending or left.generation != right.generation) return false;
+        }
+        return true;
+    }
+};
+
+const PendingBlock = union(enum) {
+    idle,
+    queued: struct { key: BlockKey, plan: batch.Plan },
+};
+
 const WidthHistogram = struct {
     bins: [batch.max_lanes]u64 = @splat(0),
     total: u64 = 0,
@@ -51,7 +70,31 @@ pub const Dependencies = struct {
     world: usize,
     kernels_dir: ?[]const u8 = null,
     verify_plan: verify.Plan = .baseline,
+    tp_group: ?*const cuda.tp_group.Group = null,
 };
+
+test "deferred block identity preserves cohort order and slot generations" {
+    const key: BlockKey = .{
+        .count = 2,
+        .items = .{
+            .{ .slot = 5, .end = 40, .pending = 11, .generation = 7 },
+            .{ .slot = 1, .end = 400, .pending = 22, .generation = 3 },
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+        },
+    };
+    var same = key;
+    try std.testing.expect(key.matches(same));
+    same.items[1].generation += 1;
+    try std.testing.expect(!key.matches(same));
+    same = key;
+    std.mem.swap(BlockKey.Item, &same.items[0], &same.items[1]);
+    try std.testing.expect(!key.matches(same));
+}
 
 pub const DFlash = struct {
     gpa: std.mem.Allocator,
@@ -66,6 +109,9 @@ pub const DFlash = struct {
     capacity: usize,
     verify_plan: verify.Plan = .baseline,
     lanes: [8]state.Lane = @splat(.{}),
+    generations: [8]u64 = @splat(0),
+    pending_block: PendingBlock = .idle,
+    prelaunch_stats: struct { launched: u64 = 0, used: u64 = 0, discarded: u64 = 0 } = .{},
     pending: [8]cuda.DeviceBuffer,
     max_packed_width: usize = 0,
     width_histogram: WidthHistogram = .{},
@@ -87,6 +133,9 @@ pub const DFlash = struct {
         p.capacity = capacity;
         p.verify_plan = deps.verify_plan;
         p.lanes = @splat(.{});
+        p.generations = @splat(0);
+        p.pending_block = .idle;
+        p.prelaunch_stats = .{};
         p.max_packed_width = 0;
         p.width_histogram = .{};
         p.loader = .{ .gpa = gpa, .driver = deps.driver, .target = &target, .draft = &draft, .rank = rank };
@@ -108,7 +157,7 @@ pub const DFlash = struct {
         try pinned_aot.validate(gpa, io, kernels_dir);
         p.aot = try cuda.aot.Set.load(gpa, io, deps.driver, deps.context.device, kernels_dir);
         errdefer p.aot.deinit();
-        p.forward = try Forward.init(gpa, deps.driver, deps.stream, cfg, rank, streams, w, deps.embed, .{ .set = &p.aot, .s = deps.stream }, p.ops.on(deps.stream), &p.entries, .{ .lib = deps.lib.?, .comm = deps.comm, .rank = deps.rank, .world = deps.world }, &p.lt);
+        p.forward = try Forward.init(gpa, deps.driver, deps.stream, cfg, rank, streams, w, deps.embed, .{ .set = &p.aot, .s = deps.stream }, p.ops.on(deps.stream), &p.entries, .{ .lib = deps.lib.?, .comm = deps.comm, .rank = deps.rank, .world = deps.world, .tp_group = deps.tp_group }, &p.lt);
         errdefer p.forward.deinit();
         var allocated: usize = 0;
         errdefer for (p.pending[0..allocated]) |*b| b.free();
@@ -122,8 +171,12 @@ pub const DFlash = struct {
     pub fn prepare(d: *DFlash) !void {
         try d.forward.capture();
     }
+    pub fn asyncAvailable(d: *const DFlash) bool {
+        return d.forward.asyncOk() and d.forward.stager.ready();
+    }
     pub fn deinit(d: *DFlash) void {
-        d.forward.stream.synchronize() catch {};
+        d.settlePending() catch {};
+        d.synchronize() catch {};
         d.flushWidths();
         for (&d.pending) |*b| b.free();
         d.forward.deinit();
@@ -140,8 +193,43 @@ pub const DFlash = struct {
         if (slot >= 8) return error.BadDraftSlot;
         return &d.lanes[slot];
     }
+    fn blockKey(d: *const DFlash, plan: batch.Plan) BlockKey {
+        var key: BlockKey = .{ .count = plan.count };
+        for (plan.requests[0..plan.count], 0..) |r, i| key.items[i] = .{ .slot = r.slot, .end = r.end, .pending = r.pending, .generation = d.generations[r.slot] };
+        return key;
+    }
+    fn synchronize(d: *const DFlash) !void {
+        try d.forward.stream.synchronize();
+        if (d.forward.comm) |comm| if (comm.tp_group) |group| try group.check();
+    }
+    fn settlePending(d: *DFlash) !void {
+        switch (d.pending_block) {
+            .idle => return,
+            .queued => |queued| {
+                d.prelaunch_stats.discarded += 1;
+                d.synchronize() catch |err| {
+                    for (queued.plan.requests[0..queued.plan.count]) |r| d.lanes[r.slot].healthy = false;
+                    d.pending_block = .idle;
+                    return err;
+                };
+                d.forward.settle(true) catch |err| {
+                    for (queued.plan.requests[0..queued.plan.count]) |r| d.lanes[r.slot].healthy = false;
+                    d.pending_block = .idle;
+                    return err;
+                };
+            },
+        }
+        d.pending_block = .idle;
+    }
+    fn invalidateContext(d: *DFlash, slot: usize) !void {
+        if (slot >= d.generations.len) return error.BadDraftSlot;
+        if (d.generations[slot] == std.math.maxInt(u64)) return error.DraftGenerationExhausted;
+        try d.settlePending();
+        d.generations[slot] += 1;
+    }
     pub fn reset(d: *DFlash, slot: usize) !void {
         const l = try d.lane(slot);
+        try d.invalidateContext(slot);
         l.healthy = false;
         const bytes = config.Config.ring * 256;
         for (0..5) |layer| for (0..d.forward.rank.kv) |head| {
@@ -149,11 +237,13 @@ pub const DFlash = struct {
             try d.forward.th.base.fill32(d.forward.kc[layer] + offset, 0, bytes / 4);
             try d.forward.th.base.fill32(d.forward.vc[layer] + offset, 0, bytes / 4);
         };
-        try d.forward.stream.synchronize();
+        try d.synchronize();
         l.* = .{};
     }
     pub fn release(d: *DFlash, slot: usize) void {
         if (slot < 8) {
+            d.settlePending() catch |err| std.log.err("draining DFlash prelaunch on release of slot {d}: {s}", .{ slot, @errorName(err) });
+            if (d.generations[slot] != std.math.maxInt(u64)) d.generations[slot] += 1;
             d.lanes[slot] = .{ .healthy = false };
             d.flushWidths();
         }
@@ -214,6 +304,7 @@ pub const DFlash = struct {
     pub fn accept(d: *DFlash, slot: usize, kept: usize, target_end: usize) !void {
         const l = try d.lane(slot);
         try l.validateAccept(kept, target_end);
+        try d.invalidateContext(slot);
         errdefer l.healthy = false;
         try d.absorb(slot, d.pending[slot].ptr, kept, l.end);
         l.end = target_end;
@@ -223,6 +314,7 @@ pub const DFlash = struct {
         const l = try d.lane(slot);
         if (!l.healthy) return error.DraftFailed;
         if (l.pending != null or l.end != start or start > d.capacity or rows > d.capacity - start) return error.BadDraftCommit;
+        try d.invalidateContext(slot);
         try validateView(plane_rows, 0, rows);
         errdefer l.healthy = false;
         var at: usize = 0;
@@ -238,11 +330,38 @@ pub const DFlash = struct {
         _ = try batch.Plan.buildWithPlan(&d.lanes, d.capacity, requests, d.verify_plan);
     }
     pub fn proposeBatch(d: *DFlash, requests: []const BatchRequest, out: []BatchResult) !void {
-        if (out.len != requests.len) return error.BadDraftBatch;
-        const plan = try batch.Plan.buildWithPlan(&d.lanes, d.capacity, requests, d.verify_plan);
-        var results: [batch.max_lanes]BatchResult = @splat(.{});
+        return d.finishBatch(requests, out);
+    }
+    fn account(d: *DFlash, plan: batch.Plan) void {
+        d.width_histogram.record(plan.count);
+        if (d.width_histogram.due()) d.flushWidths();
+        if (plan.count > d.max_packed_width) {
+            d.max_packed_width = plan.count;
+            if (d.forward.rank.rank == 0) std.log.info("DFlash packed proposal width: active_count={d} requested_count={d}", .{ plan.count, plan.total });
+        }
+    }
+    fn readAndSelect(d: *DFlash, plan: batch.Plan, out: []BatchResult) !void {
+        var candidates: [4 * batch.max_lanes * 7 * 32]f32 = undefined;
+        var projection: [batch.max_lanes * 7 * 256]f32 = undefined;
+        const candidate_slice = candidates[0 .. d.forward.rank.world * plan.count * 7 * 32];
+        const projection_slice = projection[0 .. plan.count * 7 * 256];
+        if (d.forward.asyncOk()) {
+            try d.forward.queueProposal(plan.count);
+            try d.synchronize();
+            try d.forward.settle(true);
+            @memcpy(candidate_slice, d.forward.candidatesHost(plan.count));
+            @memcpy(projection_slice, d.forward.projectionHost(plan.count));
+        } else {
+            try d.forward.check();
+            try d.forward.read(d.forward.candidates, std.mem.sliceAsBytes(candidate_slice));
+            try d.forward.read(d.forward.projection, std.mem.sliceAsBytes(projection_slice));
+        }
+        d.account(plan);
+        try batch.select(plan, candidate_slice, projection_slice, d.forward.rank.world, .{ .pred = d.pred, .succ = d.succ }, out);
+    }
+    fn computeBatch(d: *DFlash, plan: batch.Plan, out: []BatchResult) !void {
         if (plan.count == 0) {
-            @memcpy(out, results[0..requests.len]);
+            @memset(out, .{});
             return;
         }
         errdefer {
@@ -255,29 +374,71 @@ pub const DFlash = struct {
         try d.forward.stage(d.forward.bpos, std.mem.sliceAsBytes(meta.begins[0..plan.count]));
         try d.forward.stage(d.forward.bslots, std.mem.sliceAsBytes(meta.block_slots[0..plan.count]));
         try d.forward.block(plan.count);
-        var candidates: [4 * batch.max_lanes * 7 * 32]f32 = undefined;
-        var projection: [batch.max_lanes * 7 * 256]f32 = undefined;
-        const candidate_slice = candidates[0 .. d.forward.rank.world * plan.count * 7 * 32];
-        const projection_slice = projection[0 .. plan.count * 7 * 256];
-        if (d.forward.asyncOk()) {
-            try d.forward.queueProposal(plan.count);
-            try d.forward.stream.synchronize();
-            try d.forward.settle(true);
-            @memcpy(candidate_slice, d.forward.candidatesHost(plan.count));
-            @memcpy(projection_slice, d.forward.projectionHost(plan.count));
-        } else {
-            try d.forward.check();
-            try d.forward.read(d.forward.candidates, std.mem.sliceAsBytes(candidate_slice));
-            try d.forward.read(d.forward.projection, std.mem.sliceAsBytes(projection_slice));
+        try d.readAndSelect(plan, out);
+    }
+    pub fn prelaunchBatch(d: *DFlash, requests: []const BatchRequest) !void {
+        const plan = try batch.Plan.buildWithPlan(&d.lanes, d.capacity, requests, d.verify_plan);
+        if (plan.count == 0) {
+            try d.settlePending();
+            return;
         }
-        d.width_histogram.record(plan.count);
-        if (d.width_histogram.due()) d.flushWidths();
-        if (plan.count > d.max_packed_width) {
-            d.max_packed_width = plan.count;
-            if (d.forward.rank.rank == 0) std.log.info("DFlash packed proposal width: active_count={d} requested_count={d}", .{ plan.count, requests.len });
+        const key = d.blockKey(plan);
+        switch (d.pending_block) {
+            .queued => |pending| if (pending.key.matches(key)) return,
+            .idle => {},
         }
-        try batch.select(plan, candidate_slice, projection_slice, d.forward.rank.world, .{ .pred = d.pred, .succ = d.succ }, results[0..requests.len]);
+        try d.settlePending();
+        if (!d.asyncAvailable()) return error.AsyncReadbackUnavailable;
+        errdefer {
+            for (plan.requests[0..plan.count]) |r| d.lanes[r.slot].healthy = false;
+        }
+        const meta = plan.metadata(d.forward.cfg.mask);
+        try d.forward.stage(d.forward.ids, std.mem.sliceAsBytes(meta.ids[0 .. plan.count * 8]));
+        try d.forward.stage(d.forward.rowpos, std.mem.sliceAsBytes(meta.positions[0 .. plan.count * 8]));
+        try d.forward.stage(d.forward.rowslots, std.mem.sliceAsBytes(meta.row_slots[0 .. plan.count * 8]));
+        try d.forward.stage(d.forward.bpos, std.mem.sliceAsBytes(meta.begins[0..plan.count]));
+        try d.forward.stage(d.forward.bslots, std.mem.sliceAsBytes(meta.block_slots[0..plan.count]));
+        try d.forward.block(plan.count);
+        try d.forward.queueProposal(plan.count);
+        d.pending_block = .{ .queued = .{ .key = key, .plan = plan } };
+        d.prelaunch_stats.launched += 1;
+        if (d.forward.rank.rank == 0 and (d.prelaunch_stats.launched == 1 or d.prelaunch_stats.launched % 64 == 0)) {
+            std.log.info("GLM DFlash prelaunch launched={d} used={d} discarded={d}", .{ d.prelaunch_stats.launched, d.prelaunch_stats.used, d.prelaunch_stats.discarded });
+        }
+    }
+    pub fn finishBatch(d: *DFlash, requests: []const BatchRequest, out: []BatchResult) !void {
+        if (out.len != requests.len) return error.BadDraftBatch;
+        var results: [batch.max_lanes]BatchResult = @splat(.{});
+        try d.finishBatchInto(requests, results[0..requests.len]);
         @memcpy(out, results[0..requests.len]);
+    }
+    fn finishBatchInto(d: *DFlash, requests: []const BatchRequest, out: []BatchResult) !void {
+        const plan = try batch.Plan.buildWithPlan(&d.lanes, d.capacity, requests, d.verify_plan);
+        if (plan.count == 0) {
+            try d.settlePending();
+            @memset(out, .{});
+            return;
+        }
+        const key = d.blockKey(plan);
+        switch (d.pending_block) {
+            .queued => |pending| if (pending.key.matches(key)) {
+                d.prelaunch_stats.used += 1;
+                d.pending_block = .idle;
+                errdefer {
+                    for (plan.requests[0..plan.count]) |r| d.lanes[r.slot].healthy = false;
+                }
+                try d.synchronize();
+                try d.forward.settle(true);
+                const candidate_slice = d.forward.candidatesHost(plan.count);
+                const projection_slice = d.forward.projectionHost(plan.count);
+                d.account(plan);
+                try batch.select(plan, candidate_slice, projection_slice, d.forward.rank.world, .{ .pred = d.pred, .succ = d.succ }, out);
+                return;
+            },
+            .idle => {},
+        }
+        try d.settlePending();
+        try d.computeBatch(plan, out);
     }
     pub fn propose(d: *DFlash, slot: usize, pending: u32, sampling: ?Sampling, out: []u32) !usize {
         if (out.len > batch.max_depth) return error.BadDraftRequest;
@@ -308,16 +469,18 @@ pub const DFlash = struct {
             try d.forward.th.base.copy(if (restore_) ptr else buffer + at, if (restore_) buffer + at else ptr, bytes);
             at += bytes;
         };
-        try d.forward.stream.synchronize();
+        try d.synchronize();
     }
     pub fn save(d: *DFlash, slot: usize, destination: u64) !void {
         const l = try d.lane(slot);
         if (!l.ready(l.end)) return error.DraftSnapshotNotReady;
+        try d.settlePending();
         try d.transfer(slot, destination, false);
     }
     pub fn restore(d: *DFlash, slot: usize, source: u64, end: usize) !void {
         const l = try d.lane(slot);
         if (end > d.capacity) return error.BadDraftCapacity;
+        try d.invalidateContext(slot);
         l.healthy = false;
         l.pending = null;
         try d.transfer(slot, source, true);
@@ -344,9 +507,13 @@ fn testPackage(driver: *const cuda.Driver) DFlash {
     d.capacity = 8192;
     d.verify_plan = .baseline;
     d.lanes = @splat(.{});
+    d.generations = @splat(0);
+    d.pending_block = .idle;
+    d.prelaunch_stats = .{};
     d.max_packed_width = 0;
     d.width_histogram = .{};
     d.forward.d = driver;
+    d.forward.comm = null;
     d.forward.stream = stream;
     d.forward.th = .{ .ops = undefined, .s = stream, .base = .{ .f = undefined, .s = stream } };
     d.forward.rank = config.Rank.init(2, 0) catch unreachable;
@@ -481,6 +648,7 @@ test "completed readbacks count once before CPU selection and failed GPU work ne
         var premature: bool = false;
         var launches: usize = 0;
         var reads: usize = 0;
+        var syncs: usize = 0;
         var download: @TypeOf(driver.api.cuMemcpyDtoH_v2) = undefined;
         fn observe() void {
             premature = premature or histogram.total != baseline;
@@ -497,6 +665,7 @@ test "completed readbacks count once before CPU selection and failed GPU work ne
         }
         fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
             observe();
+            syncs += 1;
             return if (failure == .sync and launches != 0) cuda.abi.error_not_ready else 0;
         }
         fn read(dst: ?*anyopaque, src: u64, n: usize) callconv(.c) cuda.abi.Result {
@@ -523,6 +692,8 @@ test "completed readbacks count once before CPU selection and failed GPU work ne
     defer scratch.free();
     const host = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(16), 96 * 1024);
     defer std.testing.allocator.free(host);
+    const staging = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(16), 16 * 1024);
+    defer std.testing.allocator.free(staging);
     const codes: [256]f32 = @splat(0);
     for ([_]bool{ false, true }) |async_read| {
         for (std.enums.values(Mock.Failure)) |failure| {
@@ -532,6 +703,7 @@ test "completed readbacks count once before CPU selection and failed GPU work ne
             d.forward.cfg = .{};
             d.forward.streams = 8;
             d.forward.stager = .{};
+            if (async_read) d.forward.stager = .{ .stream = d.forward.stream, .host = .{ .d = &driver, .bytes = staging } };
             d.forward.pin = if (async_read) .{ .d = &driver, .bytes = host } else null;
             d.forward.tap_pending = false;
             d.forward.blocks = @splat(null);
@@ -552,6 +724,7 @@ test "completed readbacks count once before CPU selection and failed GPU work ne
             Mock.premature = false;
             Mock.launches = 0;
             Mock.reads = 0;
+            Mock.syncs = 0;
             Mock.failure = failure;
             d.lanes[0].end = 10;
             d.lanes[3].end = 20;
@@ -585,6 +758,27 @@ test "completed readbacks count once before CPU selection and failed GPU work ne
             try std.testing.expectEqual(Mock.baseline, d.width_histogram.total);
             try std.testing.expectEqual(launches, Mock.launches);
             try std.testing.expectEqual(reads, Mock.reads);
+            if (async_read and failure == .none) {
+                const before_syncs = Mock.syncs;
+                try d.prelaunchBatch(&requests);
+                try std.testing.expectEqual(before_syncs, Mock.syncs);
+                try std.testing.expectEqual(launches + 1, Mock.launches);
+                try d.prelaunchBatch(&requests);
+                try std.testing.expectEqual(launches + 1, Mock.launches);
+                try d.finishBatch(&requests, &results);
+                try std.testing.expectEqual(before_syncs + 1, Mock.syncs);
+                try std.testing.expectEqual(launches + 1, Mock.launches);
+                try std.testing.expectEqual(@as(usize, 1), results[0].count);
+                try std.testing.expectEqual(@as(usize, 0), results[2].count);
+                try std.testing.expectEqual(@as(u64, 1), d.prelaunch_stats.used);
+                Mock.baseline = d.width_histogram.total;
+                try d.prelaunchBatch(&requests);
+                d.release(0);
+                try std.testing.expectEqual(@as(u64, 1), d.prelaunch_stats.discarded);
+                try std.testing.expectEqual(PendingBlock.idle, d.pending_block);
+                try std.testing.expect(!d.lanes[0].healthy);
+                try std.testing.expectEqual(@as(u64, 1), d.generations[0]);
+            }
         }
     }
 }

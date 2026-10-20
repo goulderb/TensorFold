@@ -9,9 +9,11 @@ const mia = @import("cuda_experts_mia.zig");
 const verify = @import("cuda_verify_plan.zig");
 const profile = @import("cuda_draft_profile.zig");
 const route_trace = @import("cuda_route_trace.zig");
+const l2pf = @import("cuda_l2pf_plan.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const Drafter = enum(u8) { off, mtp, dflash2 };
 pub const TargetGraphs = enum(u8) { off, ffn, full };
+pub const Communication = enum(u8) { nccl, roce };
 
 pub fn effectiveDraft(mode: Drafter, enabled: bool) !Drafter {
     if (mode == .dflash2 and !enabled) return error.DFlashNeedsDrafts;
@@ -37,6 +39,10 @@ pub const Settings = struct {
     split: bool = true, // TF_GLM_PREFILL_REDUCE: split (each rank glues its own rows) or gather
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE: 1 (decode windows on KDA's three-kernel chain) or 0
     target_graphs: TargetGraphs = .off,
+    communication: Communication = .nccl,
+    roce_max_bytes: u32 = 512 * 1024,
+    prefetch: l2pf.Settings = .{},
+    draft_prelaunch: bool = false,
     pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole).
     heat: ?heat.Bands = null, // TF_HEAT_HIGH and TF_HEAT_LOW (upstream's names): a prompt chunk waits on every rank's hottest zone
     layers: u32 = 0, // TF_GLM_LAYERS: the first this many layers only, a thin model for one-GPU checks (0: all)
@@ -46,6 +52,7 @@ pub const Settings = struct {
         digest.update("glm-numerics-mia-f1ee79a6-v1\x00");
         s.weight_dense.hash(digest);
         s.draft_profile.hash(digest);
+        if (s.prefetch.mode != null) digest.update(&s.prefetch.digest());
         digest.update(@tagName(s.draft));
         digest.update("\x00");
         digest.update(&s.draft_checkpoint);
@@ -69,6 +76,30 @@ pub const Settings = struct {
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
         var s: Settings = .{};
+        if (get("TF_GLM_DRAFT_PRELAUNCH")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.draft_prelaunch = true else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_DRAFT_PRELAUNCH: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        s.prefetch = l2pf.Settings.parse(get) catch {
+            problem.* = "invalid TF_GLM_L2PF settings";
+            return error.BadSetting;
+        };
+        if (get("TF_GLM_COMM")) |v| {
+            s.communication = std.meta.stringToEnum(Communication, v) orelse {
+                problem.* = "TF_GLM_COMM: nccl or roce";
+                return error.BadSetting;
+            };
+        }
+        if (get("TF_ROCE_MAX_KB")) |v| {
+            const kb = std.fmt.parseInt(u32, v, 10) catch 0;
+            if (kb == 0 or kb > 16384) {
+                problem.* = "TF_ROCE_MAX_KB: 1 to 16384";
+                return error.BadSetting;
+            }
+            s.roce_max_bytes = kb * 1024;
+        }
         if (get("TF_GLM_TARGET_GRAPHS")) |v| {
             s.target_graphs = std.meta.stringToEnum(TargetGraphs, v) orelse {
                 problem.* = "TF_GLM_TARGET_GRAPHS: off, ffn or full";
@@ -215,12 +246,16 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 17,
+    layout: u32 = 18,
     world: u32,
     rank: u32,
     split: u32,
     kda_wide: u32,
     target_graphs: u32 = 0,
+    communication: u32 = 0,
+    roce_max_bytes: u32 = 0,
+    prefetch: [32]u8 = @splat(0),
+    draft_prelaunch: u32 = 0,
     pieces: u32,
     layers: u32, // TF_GLM_LAYERS (0: all)
     kv: u32,
@@ -244,12 +279,16 @@ pub const Fingerprint = extern struct {
     program: [32]u8, // sha256 of this executable
     checkpoint: [64]u8, // the checkpoint folder's last name (the snapshot's revision), zero padded
 
-    pub const Field = enum { layout, rank, world, split, kda_wide, target_graphs, pieces, layers, kv, attn_fp8load, weight_dense, weight_head, exl3_decode, exl3_routed, draft, dflash_verify, draft_profile, draft_checkpoint, vision, kv_pool_tokens, kv_shard, spill, capacity, heat_high, heat_low, config, program, checkpoint };
+    pub const Field = enum { layout, rank, world, split, kda_wide, target_graphs, communication, roce_max_bytes, prefetch, draft_prelaunch, pieces, layers, kv, attn_fp8load, weight_dense, weight_head, exl3_decode, exl3_routed, draft, dflash_verify, draft_profile, draft_checkpoint, vision, kv_pool_tokens, kv_shard, spill, capacity, heat_high, heat_low, config, program, checkpoint };
 
     pub fn of(world: usize, rank: usize, s: Settings, capacity: usize, config: [32]u8, program: [32]u8, checkpoint_dir: []const u8) Fingerprint {
         var f: Fingerprint = .{ .world = @intCast(world), .rank = @intCast(rank), .split = @intFromBool(s.split), .kda_wide = @intFromBool(s.kda_wide), .pieces = s.pieces, .layers = s.layers, .kv = @backingInt(s.kv), .kv_pool_tokens = s.kv_pool_tokens, .kv_shard = @intFromBool(s.kv_shard), .capacity = capacity, .heat_high = if (s.heat) |b| b.high_c else 0, .heat_low = if (s.heat) |b| b.low_c else 0, .config = config, .program = program, .checkpoint = @splat(0) };
         f.attn_fp8load = @intFromBool(s.attn_fp8load);
         f.target_graphs = @backingInt(s.target_graphs);
+        f.communication = @backingInt(s.communication);
+        f.roce_max_bytes = s.roce_max_bytes;
+        f.prefetch = s.prefetch.digest();
+        f.draft_prelaunch = @intFromBool(s.draft_prelaunch);
         f.spill = s.spill;
         f.weight_dense = s.weight_dense.digest();
         f.weight_head = @backingInt(s.weight_head);
@@ -274,7 +313,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
     for (all, 0..) |f, r| {
         if (f.layout != all[0].layout) return .{ .field = .layout, .rank = r };
         if (f.rank != r) return .{ .field = .rank, .rank = r };
-        inline for (.{ "world", "split", "kda_wide", "target_graphs", "pieces", "layers", "kv", "attn_fp8load", "weight_dense", "weight_head", "exl3_decode", "exl3_routed", "draft", "dflash_verify", "draft_profile", "draft_checkpoint", "vision", "kv_pool_tokens", "kv_shard", "spill", "capacity", "heat_high", "heat_low", "config", "program", "checkpoint" }) |name| {
+        inline for (.{ "world", "split", "kda_wide", "target_graphs", "communication", "roce_max_bytes", "prefetch", "draft_prelaunch", "pieces", "layers", "kv", "attn_fp8load", "weight_dense", "weight_head", "exl3_decode", "exl3_routed", "draft", "dflash_verify", "draft_profile", "draft_checkpoint", "vision", "kv_pool_tokens", "kv_shard", "spill", "capacity", "heat_high", "heat_low", "config", "program", "checkpoint" }) |name| {
             if (!std.mem.eql(u8, std.mem.asBytes(&@field(f, name)), std.mem.asBytes(&@field(all[0], name))))
                 return .{ .field = @field(Fingerprint.Field, name), .rank = r };
         }
@@ -319,6 +358,34 @@ pub fn hashDraftCheckpoint(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) 
         h.update(&size);
     }
     return h.finalResult();
+}
+
+test "communication and cap are validated before ranks choose a transport" {
+    const Env = struct {
+        fn selected(name: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "TF_GLM_COMM")) return "roce";
+            if (std.mem.eql(u8, name, "TF_ROCE_MAX_KB")) return "512";
+            return null;
+        }
+        fn badMode(name: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, name, "TF_GLM_COMM")) "auto" else null;
+        }
+        fn badCap(name: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, name, "TF_ROCE_MAX_KB")) "0" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    const s = try Settings.read(Env.selected, &problem);
+    try std.testing.expectEqual(Communication.roce, s.communication);
+    try std.testing.expectEqual(@as(u32, 512 * 1024), s.roce_max_bytes);
+    try std.testing.expectError(error.BadSetting, Settings.read(Env.badMode, &problem));
+    try std.testing.expectError(error.BadSetting, Settings.read(Env.badCap, &problem));
+    const h: [32]u8 = @splat(0);
+    var all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, h, h, "target"), Fingerprint.of(2, 1, s, 8192, h, h, "target") };
+    try std.testing.expectEqual(Fingerprint.Field.communication, mismatch(&all).?.field);
+    all[0] = Fingerprint.of(2, 0, s, 8192, h, h, "target");
+    all[1].roce_max_bytes /= 2;
+    try std.testing.expectEqual(Fingerprint.Field.roce_max_bytes, mismatch(&all).?.field);
 }
 
 test "DFlash requires an explicit checkpoint and speculative backend" {
@@ -439,7 +506,7 @@ test "target graph modes separate rank and numerical identities only when enable
     try std.testing.expect(!std.mem.eql(u8, &ffn_digest, &full_digest));
     const h: [32]u8 = @splat(0);
     var all = [_]Fingerprint{ Fingerprint.of(2, 0, unset, 8192, h, h, "target"), Fingerprint.of(2, 1, off, 8192, h, h, "target") };
-    try std.testing.expectEqual(@as(u32, 17), all[0].layout);
+    try std.testing.expectEqual(@as(u32, 18), all[0].layout);
     try std.testing.expectEqual(@as(u32, @backingInt(TargetGraphs.off)), all[0].target_graphs);
     try std.testing.expect(mismatch(&all) == null);
     all[1] = Fingerprint.of(2, 1, ffn, 8192, h, h, "target");
@@ -498,6 +565,10 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .split => "TF_GLM_PREFILL_REDUCE",
         .kda_wide => "TF_GLM_KDA_DECODE_WIDE",
         .target_graphs => "TF_GLM_TARGET_GRAPHS (off, partial FFN or full target)",
+        .communication => "TF_GLM_COMM",
+        .roce_max_bytes => "TF_ROCE_MAX_KB",
+        .prefetch => "TF_GLM_L2PF settings",
+        .draft_prelaunch => "TF_GLM_DRAFT_PRELAUNCH",
         .pieces => "TF_GLM_OVERLAP_PIECES",
         .layers => "TF_GLM_LAYERS",
         .kv => "TF_GLM_KV",

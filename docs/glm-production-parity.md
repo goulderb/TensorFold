@@ -23,6 +23,11 @@ BF16 recovery layout. Q4 input layout has a new numerical identity so saved
 states from the earlier two-projection implementation cannot be reused silently.
 Startup receipts report the loaded projection formats rather than only flags.
 
+The production loader also combines dense MLP gate and up projections. Native
+Q4 uses that representation and projects directly into the interleaved gate-up
+rows, avoiding the separate output copies. Other formats retain their separate
+input representation. Its numerical identity includes the combined layout.
+
 L2 prefetch follows the production attention, FFN, and output sites, including
 shared-expert computation before routed experts on the enabled decode path.
 The planner owns immutable bounded weight spans. Its side stream and events

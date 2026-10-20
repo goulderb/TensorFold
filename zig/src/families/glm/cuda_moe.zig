@@ -50,6 +50,13 @@ pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_st
     try fill(k, stream, l, s, x, x_stride, 0, rows, prompt, out);
 }
 
+pub fn blockSharedFirst(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool, out: u64) !void {
+    if (prompt) return block(k, stream, l, s, x, x_stride, rows, true, out);
+    try shared(k, stream, l, s, x, x_stride, 0, rows);
+    try body(k, stream, l, s, x, x_stride, rows, false);
+    try finish(k, stream, l, s, 0, rows, false, out);
+}
+
 /// The block up to its fill: the router, the top-k pick, the plan and the routed experts into the slot rows.
 pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool) !void {
     const d = l.routed.dims;
@@ -68,10 +75,13 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
 
 /// moe_block's fill of rows lo..hi: shared expert into the last slot, slot sum into out fp32 (any range, same bits).
 pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize, prompt: bool, out: u64) !void {
+    try shared(k, stream, l, s, x, x_stride, lo, hi);
+    try finish(k, stream, l, s, lo, hi, prompt, out);
+}
+
+pub fn shared(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize) !void {
     const d = l.routed.dims;
-    const slots = l.top_k + 1;
     const n = hi - lo;
-    const eb: usize = if (prompt) 2 else 4; // the slot rows: bf16 in a prompt chunk
     const gu = s.sgu + lo * 2 * l.shared * 2;
     if (l.shared_gate) |g| {
         // EXL3: gate and up apart, each through s.sact into its half of the [gate | up] rows
@@ -82,6 +92,13 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     } else try b16.proj(k.set, stream, x + lo * x_stride * 2, x_stride, l.shared_gu, gu, s.mm_part, n, 2 * l.shared, d, false);
     try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
     try b16.proj(k.set, stream, s.sact + lo * l.shared * 2, l.shared, l.shared_down, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
+}
+
+pub fn finish(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi: usize, prompt: bool, out: u64) !void {
+    const d = l.routed.dims;
+    const slots = l.top_k + 1;
+    const n = hi - lo;
+    const eb: usize = if (prompt) 2 else 4;
     var a: cuda.Args = .{};
     a.add(s.sy + lo * d * 4);
     a.add(s.ey + lo * slots * d * eb);

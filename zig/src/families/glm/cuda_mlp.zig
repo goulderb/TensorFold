@@ -6,7 +6,8 @@ const glue = @import("cuda_glue.zig");
 const b16 = @import("cuda_b16.zig");
 
 /// One dense layer on a rank: gate and up [width][dims] and down [dims][width], NVFP4 (Fp4Linear's) or EXL3.
-pub const Layer = struct { gate: b16.Proj, up: b16.Proj, down: b16.Proj, width: usize, dims: usize, limit: f32 };
+pub const Input = union(enum) { combined: b16.Proj, separate: struct { gate: b16.Proj, up: b16.Proj } };
+pub const Layer = struct { input: Input, down: b16.Proj, width: usize, dims: usize, limit: f32 };
 
 /// The block's scratch for up to `rows` rows: one projection's rows, the [gate | up] rows, the activation and its sums.
 pub const Scratch = struct { tmp: u64, gu: u64, act: u64, xs_act: u64, part: u64 };
@@ -43,17 +44,54 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi
 /// The block up to its down projection: [gate | up] and SwiGLU into s.act.
 pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool) !void {
     const w = l.width;
-    for ([_]b16.Proj{ l.gate, l.up }, 0..) |proj, j| {
-        // Fp4Linear(out=a column slice): the rows computed contiguous, then copied into their half of each row
-        try mm(k, stream, proj, x, x_stride, rows, s.tmp, s.part, l.width, l.dims, false, prompt);
-        var a: cuda.Args = .{};
-        a.add(s.tmp);
-        a.add(@as(c_longlong, @intCast(w * 2)));
-        a.add(s.gu + j * w * 2);
-        a.add(@as(c_longlong, @intCast(2 * w * 2)));
-        a.add(@as(c_int, @intCast(rows)));
-        a.add(@as(c_int, @intCast(w * 2)));
-        try cuda.launch.launch(k.copy_rows, .{ .grid = .{ .x = @intCast((rows * w * 2 + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
+    switch (l.input) {
+        .combined => |proj| try mm(k, stream, proj, x, x_stride, rows, s.gu, s.part, 2 * w, l.dims, false, prompt),
+        .separate => |pair| for ([_]b16.Proj{ pair.gate, pair.up }, 0..) |proj, j| {
+            // Fp4Linear(out=a column slice): the rows computed contiguous, then copied into their half of each row
+            try mm(k, stream, proj, x, x_stride, rows, s.tmp, s.part, l.width, l.dims, false, prompt);
+            var a: cuda.Args = .{};
+            a.add(s.tmp);
+            a.add(@as(c_longlong, @intCast(w * 2)));
+            a.add(s.gu + j * w * 2);
+            a.add(@as(c_longlong, @intCast(2 * w * 2)));
+            a.add(@as(c_int, @intCast(rows)));
+            a.add(@as(c_int, @intCast(w * 2)));
+            try cuda.launch.launch(k.copy_rows, .{ .grid = .{ .x = @intCast((rows * w * 2 + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
+        },
     }
     try glue.swiglu(k.set, stream, s.gu, s.act, s.xs_act, l.limit, rows, w);
+}
+
+test "combined Q4 MLP writes gate-up rows directly before SwiGLU" {
+    const Trace = struct {
+        var calls: [8]usize = undefined;
+        var count: usize = 0;
+        fn launch(f: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            calls[count] = @intFromPtr(f.?);
+            count += 1;
+            return 0;
+        }
+    };
+    Trace.count = 0;
+    var d: cuda.Driver = .{ .lib = undefined, .api = undefined };
+    d.api.cuLaunchKernel = Trace.launch;
+    const Fn = struct {
+        fn of(driver: *const cuda.Driver, id: usize) cuda.Function {
+            return .{ .d = driver, .handle = @ptrFromInt(id) };
+        }
+    };
+    var g: glue.Kernels = undefined;
+    g.group_sums = Fn.of(&d, 1);
+    g.swiglu_512 = Fn.of(&d, 3);
+    const affine: cuda.qlinear.Affine4Kernels = .{ .group_fn = Fn.of(&d, 2), .gemv_fn = undefined, .split_fn = undefined, .prefill_fn = Fn.of(&d, 2), .words_fn = undefined, .scales_fn = undefined, .gemv_blocks = 64, .split = null, .pdl = false };
+    const linear: cuda.qlinear.Linear = .{ .affine4 = &affine };
+    const kernels: Kernels = .{ .set = .{ .glue = &g, .linear = linear }, .linear = linear, .copy_rows = Fn.of(&d, 9) };
+    const layer: Layer = .{ .input = .{ .combined = .{ .q = .{ .affine4 = .{ .w = 100, .s = 200, .b = 300, .n = 12288, .k = 4096, .npad = 12288 } } } }, .down = undefined, .width = 6144, .dims = 4096, .limit = 0 };
+    const scratch: Scratch = .{ .tmp = 0, .gu = 8192, .act = 16384, .xs_act = 32768, .part = 65536 };
+    const stream: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(17) };
+    for ([_]bool{ false, true }) |prompt| {
+        Trace.count = 0;
+        try body(kernels, stream, layer, scratch, 4096, 4096, 8, prompt);
+        try std.testing.expectEqualSlices(usize, if (prompt) &.{ 2, 3 } else &.{ 1, 2, 3 }, Trace.calls[0..Trace.count]);
+    }
 }

@@ -249,6 +249,8 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const cuda = runtime(b, host, .debug, &.{});
     @import("h3_host.zig").targets(b, cuda, step);
     const mods = family(b, host, .debug, cuda, draft_ids);
+    const deferred_run = b.addRunArtifact(b.addTest(.{ .root_module = mods.lanes, .filters = &.{"deferred draft shape"} }));
+    b.step("test-deferred-draft-host", "Deferred head selection after host work and copy precedence").dependOn(&deferred_run.step);
     const contract_glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);
     const contract_host = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = contract_glm } } });
     const contract_run = b.addRunArtifact(b.addTest(.{ .root_module = contract_host }));

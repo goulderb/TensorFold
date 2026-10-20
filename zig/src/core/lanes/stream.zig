@@ -218,6 +218,7 @@ pub const Stream = struct {
     depth: ?State = null,
     mode: ?Mode = null,
     next: ?Held = null,
+    draft_shape_pending: bool = false,
     inflight: ?u64 = null,
     served: ?u64 = null,
     granted: ?u32 = null,
@@ -292,6 +293,7 @@ pub const Stream = struct {
             if (h.parents) |p| gpa.free(p);
         }
         s.next = null;
+        s.draft_shape_pending = false;
         if (s.lanes) |l| l.deinit(gpa);
         s.lanes = null;
     }

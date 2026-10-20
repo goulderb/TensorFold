@@ -57,7 +57,7 @@ fn lanePartBytes(rows: usize, n: usize, k: usize) usize {
 
 pub const Shape = struct { group: precision.Group, n: usize, k: usize };
 
-pub fn projectionShapes(w: *const weights.Weights) [16]Shape {
+pub fn projectionShapes(w: *const weights.Weights) [17]Shape {
     const c = &w.config;
     const s = &w.share;
     const n = s.kda.len() * c.kda_dim;
@@ -78,6 +78,7 @@ pub fn projectionShapes(w: *const weights.Weights) [16]Shape {
         .{ .group = .mtp_eh, .n = c.hidden, .k = 2 * c.hidden },
         .{ .group = .kda, .n = 2 * c.kda_dim + s.kda.len(), .k = c.hidden },
         .{ .group = .mlp, .n = s.dense.len(), .k = c.hidden },
+        .{ .group = .mlp, .n = 2 * s.dense.len(), .k = c.hidden },
         .{ .group = .mlp, .n = c.hidden, .k = s.dense.len() },
     };
 }
@@ -246,8 +247,8 @@ pub const Buffers = struct {
             rows * D * 2, rows * D * 2, rows * 2 * D * 2, rows * D * 2, // hin, me, mcat, mx
             rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
             if (w.quantizedAttention()) rows * 3 * n * 2 else 4, // the KDA projection's staging (EXL3)
-            if (owned) part_rows * HL * lw * 2 else 0,
-            if (owned) part_rows * HL * lw * 2 else 0,
+            if (owned) 2 * part_rows * HL * lw * 2 else 0,
+            if (owned) 4 * part_rows * HL * lw * 2 else 0,
         };
         var p: [sizes.len]u64 = undefined;
         const a = try arena(d, &sizes, &p);
@@ -470,7 +471,7 @@ test "TP2 mixed scratch covers every projection and subrow count" {
     const share = try @import("cuda_shard.zig").Share.of(&c, 0, 2);
     const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = share };
     const shapes = projectionShapes(&w);
-    try std.testing.expectEqual(@as(usize, 16), shapes.len);
+    try std.testing.expectEqual(@as(usize, 17), shapes.len);
     try std.testing.expectEqual(Shape{ .group = .dsa, .n = 1536, .k = 4096 }, shapes[4]);
     try std.testing.expectEqual(Shape{ .group = .dsa, .n = 512, .k = 4096 }, shapes[5]);
     try std.testing.expectEqual(Shape{ .group = .shared, .n = 4096, .k = 1024 }, shapes[11]);

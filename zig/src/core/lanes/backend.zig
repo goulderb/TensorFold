@@ -72,6 +72,7 @@ pub const Committed = struct { ptr: *anyopaque, call: *const fn (*anyopaque) voi
 
 pub const Backend = struct {
     first_before_draft: bool = false,
+    deferred_draft_shape: bool = false,
     ptr: *anyopaque,
     vtable: *const VTable,
 

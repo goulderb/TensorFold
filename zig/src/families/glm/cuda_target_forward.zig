@@ -33,6 +33,7 @@ pub const Runtime = struct {
     sharded: bool,
     rank: usize,
     world: usize,
+    tp_group: ?*const cuda.tp_group.Group = null,
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, kda_module: cuda.Module, format: cache.Format, capacity: usize, sharded: bool) !Runtime {
         if (capacity == 0 or w.share.world == 0 or w.share.world > 2 or w.share.rank >= w.share.world) return error.BadTargetGraphShape;
@@ -133,31 +134,44 @@ pub const Runtime = struct {
         try r.bank.run(f.stream, .{ .buffer = f.target_buffer, .layer = 0, .rows = ids.len }, &call, Call.compute);
     }
 
-    pub fn kda(r: *Runtime, set: glue.Set, stream: cuda.Stream, b: *state.Buffers, layer: kda_block.Layer, index: usize, rows: usize, out: u64, wide: bool) !void {
+    pub fn kda(r: *Runtime, set: glue.Set, stream: cuda.Stream, b: *state.Buffers, layer: kda_block.Layer, index: usize, rows: usize, out: u64, wide: bool, output_prefetch: ?@import("cuda_l2pf.zig").Hook) !void {
         var scratch = b.kda;
         scratch.p = r.projected.ptr;
-        try kda_target.run(set, &r.kda_kernels, stream, layer, scratch, b.normed, layer.dims, rows, r.tables.rows.ptr, r.tables.kdaLayer(index), out, wide);
+        try kda_target.run(set, &r.kda_kernels, stream, layer, scratch, b.normed, layer.dims, rows, r.tables.rows.ptr, r.tables.kdaLayer(index), out, wide, output_prefetch);
     }
 
-    pub fn dsa(r: *Runtime, set: glue.Set, stream: cuda.Stream, exchange: anytype, b: *state.Buffers, layer: dsa_block.Layer, index: usize, rows: usize, out: u64) !void {
+    pub fn dsa(r: *Runtime, set: glue.Set, stream: cuda.Stream, exchange: anytype, b: *state.Buffers, layer: dsa_block.Layer, index: usize, rows: usize, out: u64, output_prefetch: ?@import("cuda_l2pf.zig").Hook) !void {
         var scratch = b.dsa;
         scratch.partials = .{ .po = r.partial_out.ptr, .pm = r.partial_max.ptr, .pl = r.partial_sum.ptr };
         scratch.select.scores = r.scores.ptr;
         const table = r.tables.dsaLayer(index);
         try dsa_target.prepare(set, stream, layer, scratch, b.normed, layer.dims, rows);
+        if (output_prefetch) |hook| try hook.fire(stream);
         try dsa_target.update(&r.dsa_kernels, set, stream, layer, scratch, rows, table, r.format, r.capacity);
         if (r.sharded) {
+            if (r.tp_group) |group| if (group.world != r.world or group.rank != r.rank) return error.TransportIdentityMismatch;
             const nccl = switch (exchange) {
                 .nccl => |n| n,
-                .local => return error.TargetGraphShardNeedsNccl,
+                .local => null,
             };
+            if (nccl == null and r.tp_group == null) return error.TargetGraphShardNeedsNccl;
             const elements = rows * layer.heads * layer.lw;
             const per_head = elements * 2;
             // Every replay performs the same collectives, regardless of sequence placement or ownership.
-            try nccl.lib.check(nccl.lib.api.ncclAllGather(scratch.qa, r.queries.ptr, elements, .bf16, nccl.comm, stream.handle), "ncclAllGather target queries");
+            if (r.tp_group) |group| {
+                try group.allGather(stream, scratch.qa, r.queries.ptr, per_head);
+            } else {
+                const n = nccl.?;
+                try n.lib.check(n.lib.api.ncclAllGather(scratch.qa, r.queries.ptr, elements, .bf16, n.comm, stream.handle), "ncclAllGather target queries");
+            }
             for (0..2) |head_rank| try dsa_target.attention(&r.dsa_kernels, set, stream, layer, scratch, rows, table, r.queries.ptr + head_rank * per_head, r.local_results.ptr + head_rank * per_head, r.rank, r.format, r.capacity);
             try dsa_target.packPeer(&r.dsa_kernels, stream, r.local_results.ptr, r.rank, rows, layer.heads, layer.lw, r.peer_results.ptr);
-            try nccl.lib.check(nccl.lib.api.ncclAllGather(r.peer_results.ptr, r.gathered_results.ptr, elements, .bf16, nccl.comm, stream.handle), "ncclAllGather target owner results");
+            if (r.tp_group) |group| {
+                try group.allGather(stream, r.peer_results.ptr, r.gathered_results.ptr, per_head);
+            } else {
+                const n = nccl.?;
+                try n.lib.check(n.lib.api.ncclAllGather(r.peer_results.ptr, r.gathered_results.ptr, elements, .bf16, n.comm, stream.handle), "ncclAllGather target owner results");
+            }
             // Only the peer's head slice crosses the link; selection preserves the owner's result bits.
             try dsa_target.ownerSelect(&r.dsa_kernels, stream, table, r.local_results.ptr + r.rank * per_head, r.gathered_results.ptr, r.rank, rows, layer.heads, layer.lw, scratch.ol);
         } else try dsa_target.attention(&r.dsa_kernels, set, stream, layer, scratch, rows, table, scratch.qa, scratch.ol, r.rank, r.format, r.capacity);

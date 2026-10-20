@@ -32,7 +32,7 @@ fn windowRows(rows: usize) !u32 {
 
 /// The runtime supplies stable max-window scratch (including s.p), a row map and this layer's eight segment records.
 /// Only the records contain sequence addresses. Staging, partial keep/replay and convolution commits stay outside capture.
-pub fn run(set: glue.Set, ks: *const Kernels, stream: cuda.Stream, layer: kda_block.Layer, scratch: kda_block.Scratch, normed: u64, hidden: usize, rows: usize, row_map: u64, segments: u64, out: u64, wide: bool) !void {
+pub fn run(set: glue.Set, ks: *const Kernels, stream: cuda.Stream, layer: kda_block.Layer, scratch: kda_block.Scratch, normed: u64, hidden: usize, rows: usize, row_map: u64, segments: u64, out: u64, wide: bool, output_prefetch: ?@import("cuda_l2pf.zig").Hook) !void {
     const nr = try windowRows(rows);
     if (row_map == 0 or segments == 0) return error.BadTargetGraphMetadata;
     const h: c_int = @intCast(layer.heads);
@@ -41,6 +41,7 @@ pub fn run(set: glue.Set, ks: *const Kernels, stream: cuda.Stream, layer: kda_bl
     const beta: c_int = @intCast(3 * layer.heads * kda.dk + 2 * kda.dk);
     const grid: cuda.launch.Dim3 = .{ .x = nr, .y = @intCast(layer.heads) };
     try kda_block.project(set, stream, layer, scratch, normed, hidden, rows);
+    if (output_prefetch) |hook| try hook.fire(stream);
 
     var scatter: cuda.Args = .{};
     inline for (.{ row_map, segments, scratch.p, width }) |v| scatter.add(v);

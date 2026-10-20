@@ -50,6 +50,11 @@ const Lane = struct {
     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
 };
 
+const PendingDraftBatch = struct {
+    parts: [engine.max_shared]engine.DraftPart = undefined,
+    count: usize = 0,
+};
+
 pub const Lanes = struct {
     x: follow.Leader,
     vision: ?*vision_runtime.Service = null,
@@ -59,6 +64,7 @@ pub const Lanes = struct {
     batch_prefill: bool = false,
     prefill_batches: u64 = 0,
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
+    pending_drafts: PendingDraftBatch = .{},
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
@@ -68,7 +74,7 @@ pub const Lanes = struct {
     }
 
     pub fn backend(self: *Lanes) be.Backend {
-        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else if (self.batch_prefill) &batch_vt else &steps_vt };
+        return .{ .ptr = self, .deferred_draft_shape = self.x.e.settings.draft_prelaunch and (if (self.x.e.dflash) |d| d.asyncAvailable() else false), .vtable = if (self.whole) &whole_vt else if (self.batch_prefill) &batch_vt else &steps_vt };
     }
 
     const whole_vt: be.Backend.VTable = .{
@@ -323,8 +329,29 @@ pub const Lanes = struct {
     fn draftShapeFn(ptr: *anyopaque, s: *lanes.Stream, _: std.mem.Allocator) anyerror!?lanes.stream.Held {
         const self = of(ptr);
         if (self.x.e.dflash == null) return null;
+        try self.finishPendingDrafts();
         const lane = self.lanes.getPtr(s) orelse return error.UnknownStream;
         return .{ .count = @intCast(lane.held_n) };
+    }
+
+    fn finishPendingDrafts(self: *Lanes) !void {
+        const count = self.pending_drafts.count;
+        if (count == 0) return;
+        defer self.pending_drafts.count = 0;
+        var results: [engine.max_shared]engine.DraftResult = @splat(.{});
+        try self.x.draftBatch(self.pending_drafts.parts[0..count], results[0..count]);
+        for (self.pending_drafts.parts[0..count], results[0..count]) |part, result| {
+            var it = self.lanes.iterator();
+            while (it.next()) |entry| {
+                const stream = entry.key_ptr.*;
+                const lane = entry.value_ptr;
+                if (lane.slot != part.slot or stream.isCancelled()) continue;
+                if (result.count > lane.held.len) return error.BadDraftBatch;
+                @memcpy(lane.held[0..result.count], result.tokens[0..result.count]);
+                lane.held_n = result.count;
+                break;
+            }
+        }
     }
 
     fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
@@ -498,14 +525,23 @@ pub const Lanes = struct {
             original[count] = i;
             count += 1;
         }
-        var results: [engine.max_shared]engine.DraftResult = @splat(.{});
-        if (count > 0) try self.x.draftBatch(parts[0..count], results[0..count]);
         for (lanes_by_request[0..requests.len]) |l| l.held_n = 0;
-        for (results[0..count], original[0..count]) |result, i| {
-            if (requests[i].stream.isCancelled()) continue;
-            const l = lanes_by_request[i];
-            @memcpy(l.held[0..result.count], result.tokens[0..result.count]);
-            l.held_n = result.count;
+        self.pending_drafts.count = 0;
+        if (count > 0) {
+            if (!self.x.e.settings.draft_prelaunch or !self.x.e.dflash.?.asyncAvailable()) {
+                var results: [engine.max_shared]engine.DraftResult = @splat(.{});
+                try self.x.draftBatch(parts[0..count], results[0..count]);
+                for (results[0..count], original[0..count]) |result, i| {
+                    if (requests[i].stream.isCancelled()) continue;
+                    const l = lanes_by_request[i];
+                    @memcpy(l.held[0..result.count], result.tokens[0..result.count]);
+                    l.held_n = result.count;
+                }
+                return;
+            }
+            @memcpy(self.pending_drafts.parts[0..count], parts[0..count]);
+            self.pending_drafts.count = count;
+            try self.x.prelaunchBatch(self.pending_drafts.parts[0..count]);
         }
     }
 
@@ -513,6 +549,7 @@ pub const Lanes = struct {
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         const kv = self.lanes.fetchRemove(s) orelse return;
+        self.finishPendingDrafts() catch |err| std.log.err("draining paired DFlash drafts before release of slot {d}: {s}", .{ kv.value.slot, @errorName(err) });
         self.x.release(kv.value.slot) catch |err| std.log.err("releasing slot {d}: {s}", .{ kv.value.slot, @errorName(err) });
     }
 };

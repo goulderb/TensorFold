@@ -53,7 +53,7 @@ pub const Copy = struct { tokens: []const u32 = &.{}, recalled: bool = false };
 pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
     const a = e.arena.allocator();
     var p: Plan = .{ .stream = s, .position = s.cache_len, .kind = .none };
-    const queued = s.next;
+    var queued = s.next;
     s.next = null;
     defer if (queued) |q| {
         if (q.tokens) |t| e.gpa.free(t);
@@ -75,6 +75,7 @@ pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
             p.recalled = copy.recalled;
             p.tokens = try a.dupe(u32, copy.tokens);
         } else if (s.drafts and queued != null) {
+            if (s.draft_shape_pending) queued = try e.resolveDraftShape(s, queued.?);
             const q = queued.?;
             if (q.tokens) |t| {
                 p.tokens = try a.dupe(u32, t);
@@ -94,6 +95,7 @@ pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
             if (p.count() > 0) p.kind = .head;
         }
     }
+    s.draft_shape_pending = false;
     if (e.cfg.fill_lanes > 0 and s.drafts and p.kind != .forced and (p.parents == null or p.lanes != null)) try fillLanes(e, s, &p);
     try trail.event(e, &.{ f("ev", trail.str("plan")), f("stream", trail.str(s.id)), f("kind", trail.str(@tagName(p.kind))), f("n", trail.int(p.count())), f("tree", .{ .bool = p.parents != null }) });
     return p;

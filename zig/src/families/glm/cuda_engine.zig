@@ -21,6 +21,8 @@ const verify_plan = @import("cuda_verify_plan.zig");
 const route_trace = @import("cuda_route_trace.zig");
 const target_graph = @import("cuda_target_graph.zig");
 const target_forward = @import("cuda_target_forward.zig");
+const l2pf = @import("cuda_l2pf.zig");
+const l2pf_plan = @import("cuda_l2pf_plan.zig");
 pub const persistence = @import("cuda_persistence.zig");
 pub const spill_payload = @import("cuda_spill_payload.zig");
 
@@ -143,6 +145,8 @@ pub const Engine = struct {
     spans: []shard.Span, // every rank's vocabulary span
     lib: *const cuda.nccl.Library,
     comm: cuda.nccl.Comm,
+    tp_group: ?cuda.tp_group.Group = null,
+    prefetch: ?l2pf.Prefetch = null,
     settings: ranks.Settings,
     m: fw.Modules,
     stream: cuda.Stream,
@@ -266,6 +270,13 @@ pub const Engine = struct {
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
         e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .mtp = with_mtp };
+        e.tp_group = try cuda.tp_group.Group.borrow(lib, comm, rank, world);
+        errdefer if (e.tp_group) |*group| group.closeFast();
+        if (settings.communication == .roce) {
+            try e.tp_group.?.openRoce(gpa, io, d, stream, settings.roce_max_bytes);
+            if (e.tp_group.?.fast == null) return error.RequiredRoceUnavailable;
+        }
+        std.log.info("GLM collective rank={d} requested={s} effective={s} cap_bytes={d} prompt_pieces=nccl control=nccl", .{ rank, @tagName(settings.communication), if (e.tp_group.?.fast != null) "roce" else "nccl", if (e.tp_group.?.fast) |fast| fast.max_bytes else 0 });
         var wt = e.m.tools();
         wt.precision = .{ .dense = o.settings.weight_dense, .head = o.settings.weight_head };
         wt.exl3_routed = settings.exl3_routed;
@@ -287,10 +298,31 @@ pub const Engine = struct {
         e.w = loaded.?;
         loaded = null;
         errdefer e.w.deinit();
+        errdefer if (e.prefetch) |*p| p.deinit() catch {};
+        if (settings.prefetch.mode != null) {
+            var prefetch_problem: ?anyerror = null;
+            var builder: ?l2pf_plan.Builder = l2pf_plan.build(gpa, settings.prefetch, &e.w) catch |err| blk: {
+                prefetch_problem = err;
+                break :blk null;
+            };
+            defer if (builder) |*b| b.deinit();
+            if (builder) |*b| {
+                e.prefetch = l2pf.Prefetch.init(gpa, d, b) catch |err| blk: {
+                    prefetch_problem = err;
+                    break :blk null;
+                };
+                for (b.sites.items, 0..) |site, index| if (site) |s| {
+                    std.log.info("GLM L2 plan rank={d} layer={d} site={s} bytes={d} pieces={d} grid={d} mode={s} row_limit={d}", .{ rank, index / 3, @tagName(@as(l2pf_plan.Site, @fromBackingInt(@intCast(index % 3)))), s.bytes, s.count, s.grid, @tagName(settings.prefetch.mode.?), settings.prefetch.max_rows });
+                };
+            }
+            try ranks.gather(u32, d, lib, comm, stream, rank, @intFromBool(prefetch_problem == null), startup);
+            for (startup) |ready| if (ready == 0) return prefetch_problem orelse error.PeerPrefetchRefused;
+        }
         for (e.w.layers) |layer| switch (layer.mixer) {
             .kda => {},
-            .mla => |l| std.log.info("GLM loaded DSA rank={d} layer={d} input={s} qa={d} kva={d} hidden={d} qb={s} out={s} index_kw={s} index_qb={s} absorb=bf16 norms=bf16", .{
+            .mla => |l| std.log.info("GLM loaded DSA rank={d} layer={d} input_layout={s} input={s} qa={d} kva={d} hidden={d} qb={s} out={s} index_kw={s} index_qb={s} absorb=bf16 norms=bf16", .{
                 rank,                         layer.index,
+                @tagName(l.input),
                 switch (l.input) {
                     .combined_bf16 => "combined/bf16",
                     .combined => |p| projectionFormat(p),
@@ -302,6 +334,11 @@ pub const Engine = struct {
                 projectionFormat(l.index.qb),
             }),
         };
+        for (e.w.layers) |layer| switch (layer.ffn) {
+            .dense => |l| std.log.info("GLM loaded MLP rank={d} layer={d} input_layout={s} width={d} hidden={d} down={s}", .{ rank, layer.index, @tagName(l.input), l.width, l.dims, projectionFormat(l.down) }),
+            .moe => {},
+        };
+        std.log.info("GLM loaded head rank={d} format={s} kv={s} prelaunch={}", .{ rank, projectionFormat(e.w.head), @tagName(settings.kv), settings.draft_prelaunch });
         if (settings.weight_dense.native()) {
             inline for (@import("cuda_weight_precision.zig").groups) |group| {
                 std.log.info("GLM native dense rank={d} family={s} mode={s} matrices={d}", .{ rank, @tagName(group), @tagName(settings.weight_dense.get(group)), e.w.native_conversions[@backingInt(group)] });
@@ -349,7 +386,7 @@ pub const Engine = struct {
         errdefer e.shared_buf.free();
         if (settings.draft == .dflash2) {
             var draft_problem: ?anyerror = null;
-            e.dflash = dflash_mod.DFlash.open(gpa, io, checkpoint, settings.draft_dir.?, max_shared, o.capacity, .{ .driver = d, .context = ctx, .stream = stream, .embed = e.w.embed, .lib = lib, .comm = comm, .rank = rank, .world = world, .kernels_dir = o.draft_kernels, .verify_plan = settings.dflash_verify }) catch |err| blk: {
+            e.dflash = dflash_mod.DFlash.open(gpa, io, checkpoint, settings.draft_dir.?, max_shared, o.capacity, .{ .driver = d, .context = ctx, .stream = stream, .embed = e.w.embed, .lib = lib, .comm = comm, .rank = rank, .world = world, .kernels_dir = o.draft_kernels, .verify_plan = settings.dflash_verify, .tp_group = e.collectiveGroup() }) catch |err| blk: {
                 draft_problem = err;
                 break :blk null;
             };
@@ -397,6 +434,7 @@ pub const Engine = struct {
             }
             if (!try e.pairedReady(graph_problem == null)) return graph_problem orelse error.PeerTargetGraphsRefused;
             std.log.info("GLM complete target graphs rank={d}: embedding, all target layers, taps and head; exact rows 1..{d}", .{ rank, target_graph.max_rows });
+            e.full_graphs.?.tp_group = e.collectiveGroup();
             if (settings.draft_profile.enabled) {
                 e.prepareTargetGraphs() catch |err| {
                     e.pair_failure(err);
@@ -407,7 +445,7 @@ pub const Engine = struct {
                 } else |err| std.log.warn("GLM complete target graph settled memory rank={d}: unavailable ({s})", .{ rank, @errorName(err) });
             } else std.log.info("GLM complete target graphs rank={d}: nonproduction profile, lazy first-use capture", .{rank});
         }
-        e.stream.synchronize() catch |err| {
+        e.synchronize() catch |err| {
             if (e.ffn_graphs != null or e.full_graphs != null) e.pair_failure(err);
             return err;
         };
@@ -435,7 +473,7 @@ pub const Engine = struct {
                 row0 += n;
             }
             var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..window.count] }};
-            const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .full_target = runtime, .target_buffer = .shared, .target_failure = e.pair_failure };
+            const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .pieces = null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .full_target = runtime, .target_buffer = .shared, .target_failure = e.pair_failure };
             try f.run(ids[0..rows]);
         }
         for (1..profile.target_rows + 1) |rows| {
@@ -445,7 +483,7 @@ pub const Engine = struct {
             try f.run(ids[0..rows]);
         }
         try e.resetTargetWarmSlots();
-        try e.stream.synchronize();
+        try e.synchronize();
         e.release(1);
         e.release(0);
         const captures = runtime.bank.stats.site_captures - before;
@@ -484,7 +522,7 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         if (e.disk) |p| p.close(p.ctx);
-        e.stream.synchronize() catch |err| {
+        e.synchronize() catch |err| {
             if (e.ffn_graphs != null or e.full_graphs != null) {
                 e.pair_failure(err);
                 return;
@@ -506,6 +544,10 @@ pub const Engine = struct {
         e.snaps.deinit(e.gpa);
         e.dropped.deinit(e.gpa);
         if (e.dflash) |drafter| drafter.deinit();
+        if (e.prefetch) |*p| p.deinit() catch |err| {
+            e.pair_failure(err);
+            return;
+        };
         e.shared_buf.free();
         e.smp.deinit();
         e.pairs.free();
@@ -519,6 +561,7 @@ pub const Engine = struct {
         e.w.deinit();
         e.pieces.deinit();
         e.m.deinit();
+        if (e.tp_group) |*group| group.closeFast();
         e.stream.deinit();
         e.gpa.free(e.spans);
         const gpa = e.gpa;
@@ -527,6 +570,19 @@ pub const Engine = struct {
 
     fn exchange(e: *const Engine) fw.Exchange {
         return .{ .nccl = .{ .lib = e.lib, .comm = e.comm } };
+    }
+
+    fn collectiveGroup(e: *const Engine) ?*const cuda.tp_group.Group {
+        return if (e.tp_group) |*group| group else null;
+    }
+
+    fn prefetchRuntime(e: *Engine) ?*l2pf.Prefetch {
+        return if (e.prefetch) |*p| p else null;
+    }
+
+    fn synchronize(e: *const Engine) !void {
+        try e.stream.synchronize();
+        if (e.tp_group) |*group| try group.check();
     }
 
     fn graphBank(e: *Engine) ?*target_graph.Bank {
@@ -546,7 +602,7 @@ pub const Engine = struct {
 
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .target_graphs = if (b == &e.bd) e.graphBank() else null, .full_target = if (b == &e.bd) e.fullGraph() else null, .target_buffer = .lone, .target_failure = e.pair_failure, .vision = if (b == &e.bp) if (e.cur.vision) |*vision| .{ .owner = vision.table(), .generation = vision.table().generation } else null else null };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .target_graphs = if (b == &e.bd) e.graphBank() else null, .full_target = if (b == &e.bd) e.fullGraph() else null, .target_buffer = .lone, .target_failure = e.pair_failure, .vision = if (b == &e.bp) if (e.cur.vision) |*vision| .{ .owner = vision.table(), .generation = vision.table().generation } else null else null };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -615,7 +671,7 @@ pub const Engine = struct {
         if (e.dflash) |drafter| drafter.release(slot);
         if (e.pool) |*p| p.regions.release(slot);
         if (e.settings.vision and slot < e.seqs.items.len) {
-            e.stream.synchronize() catch {};
+            e.synchronize() catch {};
             e.clearVision(slot);
         }
         if (slot != 0 and slot < e.seqs.items.len) e.free(slot);
@@ -625,7 +681,7 @@ pub const Engine = struct {
 
     fn free(e: *Engine, slot: usize) void {
         const q = e.seqs.items[slot] orelse return;
-        e.stream.synchronize() catch {};
+        e.synchronize() catch {};
         if (e.settings.vision) e.clearVision(slot);
         q.st.deinit();
         if (q.retained) |*rows| rows.free();
@@ -777,7 +833,7 @@ pub const Engine = struct {
         }
         try e.gate(null);
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = &e.bp, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load };
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load };
         try f.run(@ptrCast(ids[0..rows]));
         for (parts, segs[0..parts.len], 0..) |p, g, i| {
             try e.bind(p.slot);
@@ -818,7 +874,7 @@ pub const Engine = struct {
         host.meta_len = meta.len;
         host.bytes = try e.gpa.alloc(u8, saved.buf.len);
         errdefer e.gpa.free(host.bytes);
-        try e.stream.synchronize();
+        try e.synchronize();
         try saved.buf.download(0, host.bytes);
         return host;
     }
@@ -912,7 +968,7 @@ pub const Engine = struct {
         var it = plan.rangesFor(resident);
         while (it.next()) |r| try e.copy(buf.ptr + r.saved, st.address(r), r.bytes);
         if (e.dflash) |drafter| try drafter.save(e.slot, buf.ptr + std.mem.alignForward(usize, target_bytes, 256));
-        try e.stream.synchronize();
+        try e.synchronize();
         const cur = try e.gpa.dupe(u1, e.cur.st.cur);
         errdefer e.gpa.free(cur);
         try e.snaps.put(e.gpa, id, .{ .buf = buf, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .owner = owner });
@@ -960,14 +1016,14 @@ pub const Engine = struct {
             }
         }
         if (e.dflash) |drafter| try drafter.restore(e.slot, saved.buf.ptr + std.mem.alignForward(usize, plan.?.bytesFor(source_resident), 256), saved.pos);
-        try e.stream.synchronize();
+        try e.synchronize();
         try st.restoreHost(e.stream, saved.pos, saved.mtp_len, saved.cur);
         e.cur.in_head = 0;
-        try e.stream.synchronize();
+        try e.synchronize();
     }
 
     fn ownerTransport(e: *const Engine) owner_kv.Transport {
-        return .{ .d = e.d, .lib = e.lib, .comm = e.comm, .rank = e.share.rank, .failure = e.pair_failure };
+        return .{ .d = e.d, .lib = e.lib, .comm = e.comm, .rank = e.share.rank, .tp_group = e.collectiveGroup(), .failure = e.pair_failure };
     }
 
     pub fn holds(e: *const Engine, id: u64) bool {
@@ -992,7 +1048,7 @@ pub const Engine = struct {
         var x = v;
         try e.shared_buf.uploadAsync(0, std.mem.asBytes(&x), e.stream.handle);
         try e.lib.check(e.lib.api.ncclAllReduce(e.shared_buf.ptr, e.shared_buf.ptr, 1, .f64, .max, e.comm, e.stream.handle), "ncclAllReduce");
-        try e.stream.synchronize();
+        try e.synchronize();
         try e.shared_buf.download(0, std.mem.asBytes(&x));
         return x;
     }
@@ -1069,7 +1125,7 @@ pub const Engine = struct {
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
         const trace = if (e.route_trace) |*t| t.begin(rows) else null;
         errdefer if (trace) |t| t.abort(e.stream);
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .route_trace = trace, .target_graphs = e.graphBank(), .full_target = e.fullGraph(), .target_buffer = .shared, .target_failure = e.pair_failure };
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .pieces = null, .split = e.settings.split, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .route_trace = trace, .target_graphs = e.graphBank(), .full_target = e.fullGraph(), .target_buffer = .shared, .target_failure = e.pair_failure };
         try f.run(@ptrCast(ids[0..rows]));
         if (trace) |t| try t.finish(e.stream);
         for (parts, segs[0..parts.len]) |p, g| {
@@ -1138,6 +1194,16 @@ pub const Engine = struct {
         try e.resolveDraftBatch(parts, &resolved);
     }
 
+    pub fn prelaunchDraftBatch(e: *Engine, parts: []const DraftPart) !void {
+        var resolved: [max_shared]dflash_mod.BatchRequest = undefined;
+        var problem: ?anyerror = null;
+        e.resolveDraftBatch(parts, &resolved) catch |err| {
+            problem = err;
+        };
+        if (!try e.pairedReady(problem == null)) return problem orelse error.PeerDraftBatchRefused;
+        try e.dflash.?.prelaunchBatch(resolved[0..parts.len]);
+    }
+
     pub fn draftBatch(e: *Engine, parts: []const DraftPart, out: []DraftResult) !void {
         if (out.len != parts.len) return error.BadDraftBatch;
         var resolved: [max_shared]dflash_mod.BatchRequest = undefined;
@@ -1180,7 +1246,11 @@ pub const Engine = struct {
 
     /// `rows` logits rows of this rank's vocabulary -> the tokens at positions first, first + 1, ...
     fn draw(e: *Engine, logits: u64, rows: usize, first: u64, out: []u32) !void {
-        if (e.cur.sampling) |s| return e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
+        if (e.cur.sampling) |s| {
+            try e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
+            if (e.tp_group) |*group| try group.check();
+            return;
+        }
         for (0..rows) |r| out[r] = try e.greedy(logits + r * e.share.vocab.len() * 2);
     }
 
@@ -1194,6 +1264,7 @@ pub const Engine = struct {
     fn drawMasked(e: *Engine, logits: u64, rows: usize, first: u64, out: []u32) !void {
         const rule: ?sampler.Rule = if (e.cur.sampling) |s| sampler.rule(s) else null;
         try e.smp.masked(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, rule, e.m.glue.top1, out);
+        if (e.tp_group) |*group| try group.check();
     }
 
     /// decode.sample_rows' greedy pick: per-rank top-1 (tf_glm_top1), all-gathered, largest value then lowest id.
@@ -1206,7 +1277,7 @@ pub const Engine = struct {
         a.add(e.pairs.ptr + e.share.rank * 8);
         try cuda.launch.launch(e.m.glue.top1, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, e.stream, &a);
         try e.lib.check(e.lib.api.ncclAllGather(e.pairs.ptr + e.share.rank * 8, e.pairs.ptr, 2, .u32, e.comm, e.stream.handle), "ncclAllGather");
-        try e.stream.synchronize();
+        try e.synchronize();
         var all: [ranks.max_world][2]u32 = undefined; // Engine.init refuses a larger world
         try e.d.check(e.d.api.cuMemcpyDtoH_v2(&all, e.pairs.ptr, world * 8), "cuMemcpyDtoH");
         var pick = all[0];
@@ -1243,6 +1314,7 @@ test "prompt snapshot estimates follow the requested mark and MTP setting" {
     seq.st.pos = 0;
     seq.st.mtp_len = 0;
     var e: Engine = undefined;
+    e.tp_group = null;
     e.dflash = null;
     e.cur = &seq;
     e.mtp = true;
@@ -1264,6 +1336,7 @@ test "snapshot capture refuses uncommitted windows and mismatched MTP marks befo
     seq.st.mtp_len = 2048;
     seq.in_head = 0;
     var e: Engine = undefined;
+    e.tp_group = null;
     e.dflash = null;
     e.snaps = .empty;
     e.cur = &seq;
@@ -1284,6 +1357,7 @@ test "prompt resume refuses a saved position that differs from its requested mar
     seq.st.capacity = 8192;
     seq.st.layout = try @import("cuda_layout.zig").Layout.init(.{ 4, 0, 0, 0, 0, 0, 0, 0 }, 8192, fw.prefill_rows, 0, .bf16, 512, 128);
     var e: Engine = undefined;
+    e.tp_group = null;
     e.dflash = null;
     e.cur = &seq;
     e.snaps = .empty;
@@ -1358,6 +1432,7 @@ test "engine snapshot save and restore preserve visible state through reused sto
         try seq.st.setPos(stream, 2115);
         try seq.st.setMtpLen(stream, if (mtp) 2115 else 0);
         var e: Engine = undefined;
+        e.tp_group = null;
         e.dflash = null;
         e.d = &d;
         e.gpa = std.testing.allocator;
@@ -1399,6 +1474,7 @@ test "spill snapshot roundtrip checks metadata and discards failed imports witho
         var cur = [_]u1{1};
         seq.st.cur = &cur;
         var e: Engine = undefined;
+        e.tp_group = null;
         e.dflash = null;
         e.gpa = std.testing.allocator;
         e.d = &d;
@@ -1564,6 +1640,7 @@ test "owner-only snapshots carry main and MTP prefixes to a new owner and refuse
             f.seq.st.mtp_pos_dev = f.seq.st.arena.buf.ptr + layout.mtp_pos;
             f.seq.st.pending = 0;
             f.e = undefined;
+            f.e.tp_group = null;
             f.e.dflash = null;
             f.e.d = d;
             f.e.lib = lib;
@@ -1681,6 +1758,7 @@ test "owner-only snapshots carry main and MTP prefixes to a new owner and refuse
 
 test "pooled engine refuses out-of-range slots before reading state or metadata" {
     var e: Engine = undefined;
+    e.tp_group = null;
     e.dflash = null;
     e.settings = .{ .kv_pool_tokens = 8192 };
     e.pool = @as(cache_pool.Pool, undefined);
@@ -1694,6 +1772,7 @@ test "MTP hidden rows survive other sequences reusing prompt and verify scratch"
     const M = @import("cuda_test_driver.zig").Memory;
     var d = M.driver();
     var e: Engine = undefined;
+    e.tp_group = null;
     e.dflash = null;
     e.d = &d;
     e.stream = .{ .d = &d, .handle = null };

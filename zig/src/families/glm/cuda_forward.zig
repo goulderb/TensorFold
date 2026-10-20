@@ -24,6 +24,8 @@ const mia = @import("cuda_experts_mia.zig");
 const route_trace = @import("cuda_route_trace.zig");
 const target_graph = @import("cuda_target_graph.zig");
 const target_forward = @import("cuda_target_forward.zig");
+const l2pf = @import("cuda_l2pf.zig");
+const l2pf_plan = @import("cuda_l2pf_plan.zig");
 
 test {
     _ = taps;
@@ -212,6 +214,8 @@ pub const Forward = struct {
     stream: cuda.Stream,
     ranks: []const Rank, // every rank of a local check, or this process's one
     exchange: Exchange,
+    tp_group: ?*const cuda.tp_group.Group = null,
+    prefetch: ?*l2pf.Prefetch = null,
     attn_fp8load: bool = false,
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE (the Python family's default): decode windows on KDA's three-kernel chain
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
@@ -245,7 +249,10 @@ pub const Forward = struct {
             .nccl => |n| {
                 const r = f.ranks[0];
                 const count = rows * c.hidden;
-                try n.lib.check(n.lib.api.ncclAllGather(r.b.gathered + r.w.share.rank * bytes, r.b.gathered, count, .f32, n.comm, f.stream.handle), "ncclAllGather");
+                if (f.tp_group) |group| {
+                    if (group.world != r.w.share.world or group.rank != r.w.share.rank) return error.TransportIdentityMismatch;
+                    try group.allGather(f.stream, r.b.gathered + r.w.share.rank * bytes, r.b.gathered, bytes);
+                } else try n.lib.check(n.lib.api.ncclAllGather(r.b.gathered + r.w.share.rank * bytes, r.b.gathered, count, .f32, n.comm, f.stream.handle), "ncclAllGather");
             },
         }
     }
@@ -292,14 +299,20 @@ pub const Forward = struct {
                     s.saves.b = st.save_b + li * window_rows * st.heads * 4;
                 }
                 const conv = st.conv + li * 3 * st.conv_c * 2;
-                try kda_block.body(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill);
+                try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
+                try f.prefetchSite(l.index, .o, rows);
+                try kda_block.chainRows(&f.m.kda, f.stream, k, s, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide);
+                if (b.prefill) try glue.convShift(f.set(), f.stream, conv, s.p, rows, rows * k.width(), k.width(), 1, 3 * k.heads * kda.dk);
                 if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
                 if (b.prefill) st.cur[li] = 1 - cur; // a prompt chunk keeps every row: the layer commits now
             },
             .mla => |a| {
                 var ks = f.dsaKernels(r);
                 ks.slot = di;
-                try dsa_block.body(ks, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows);
+                try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, dsa_block.sparseRows(a, st.pos, rows));
+                try f.prefetchSite(l.index, .o, rows);
+                try dsa_block.attend(ks, f.stream, a, st.caches[di], b.dsa, 0, rows, st.pos_dev, st.pos, nch, b.part_rows);
+                try latent.expandV(f.set(), f.stream, b.dsa.ol, a.wv, b.dsa.vn, rows, a.heads, a.dv, a.lw);
                 if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
             },
         }
@@ -328,8 +341,12 @@ pub const Forward = struct {
                 if (out) |o| try mlp.fill(f.mlpKernels(), f.stream, m, b.dense, 0, rows, b.prefill, o);
             },
             .moe => |m| {
+                const shared_first = if (f.prefetch) |p| !b.prefill and rows <= p.max_rows else false;
+                if (shared_first) try moe.shared(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, 0, rows);
                 try moe.body(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, rows, b.prefill);
-                if (out) |o| try moe.fill(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, 0, rows, b.prefill, o);
+                if (out) |o| {
+                    if (shared_first) try moe.finish(f.moeKernels(), f.stream, m, b.moe, 0, rows, false, o) else try moe.fill(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, 0, rows, b.prefill, o);
+                }
             },
         }
     }
@@ -584,10 +601,11 @@ pub const Forward = struct {
             for (f.ranks) |r| {
                 try f.pre(r, layer.attn_hc, layer.in_norm, rows);
                 switch (layer.mixer) {
-                    .kda => |k| try runtime.kda(f.set(), f.stream, r.b, k, ki, rows, slot(r, rows), f.kda_wide),
-                    .mla => |a| try runtime.dsa(f.set(), f.stream, f.exchange, r.b, a, di, rows, slot(r, rows)),
+                    .kda => |k| try runtime.kda(f.set(), f.stream, r.b, k, ki, rows, slot(r, rows), f.kda_wide, f.outputPrefetch(index, rows)),
+                    .mla => |a| try runtime.dsa(f.set(), f.stream, f.exchange, r.b, a, di, rows, slot(r, rows), f.outputPrefetch(index, rows)),
                 }
             }
+            try f.prefetchSite(index, .a, rows);
             try f.gather(rows);
             try f.ffnSite(index, rows);
             switch (layer.mixer) {
@@ -597,6 +615,7 @@ pub const Forward = struct {
         }
         for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, rows, c.hidden, c.hc);
         try f.finish(rows);
+        try f.joinPrefetch();
     }
 
     /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.
@@ -629,6 +648,7 @@ pub const Forward = struct {
         // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
         if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
         try f.finish(R);
+        try f.joinPrefetch();
     }
 
     /// The unpieced loop over the layers (and the stream mean): each site's partials whole, then the glue.
@@ -642,6 +662,7 @@ pub const Forward = struct {
                 try f.pre(r, l.attn_hc, l.in_norm, R);
                 if (r.segs.len > 0) try shared.mixer(f, r, l, li, di, R, slot(r, R)) else try f.mixer(r, l, li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
             }
+            try f.prefetchSite(j, .a, R);
             try f.gather(R);
             try f.ffnLayer(j, R);
             switch (f.ranks[0].w.layers[j].mixer) {
@@ -678,11 +699,25 @@ pub const Forward = struct {
                 .dense => {},
             };
         }
+        try f.prefetchSite(layer, .f, rows);
         try f.gather(rows);
         for (f.ranks) |r| {
             try f.post(r, rows);
             try f.captureTap(r, layer, 0, rows);
         }
+        if (f.full_target == null) try f.joinPrefetch();
+    }
+
+    pub fn prefetchSite(f: *const Forward, layer: usize, which: l2pf_plan.Site, rows: usize) !void {
+        if (f.prefetch) |p| try p.site(f.stream, layer, which, rows, f.ranks[0].b.prefill);
+    }
+
+    fn outputPrefetch(f: *const Forward, layer: usize, rows: usize) ?l2pf.Hook {
+        return if (f.prefetch) |p| .{ .runtime = p, .layer = layer, .rows = rows, .prompt = f.ranks[0].b.prefill } else null;
+    }
+
+    fn joinPrefetch(f: *const Forward) !void {
+        if (f.prefetch) |p| try p.join(f.stream);
     }
 
     fn captureTap(f: *const Forward, r: Rank, layer: usize, lo: usize, hi: usize) !void {

@@ -350,9 +350,21 @@ pub const Loader = struct {
             const gate = try L.ck.get(weight_name);
             const rec = source.recipe(L.tools.recipes, weight_name[0 .. weight_name.len - 7]);
             const bf16 = if (L.tools.recipes != null) (rec == null or rec.?.algo == .mxfp8 or rec.?.algo == .fp8_pb_wo) else (gate.dtype == .bf16 or gate.dtype == .f32);
+            if (bf16 and L.tools.precision.dense.get(.mlp) == .q4) {
+                inline for (.{ "gate_proj", "up_proj" }) |name| {
+                    const t = try L.get("layers.{d}.mlp." ++ name ++ ".weight", .{i});
+                    try L.rows(t, s.lo, s.hi, t.weight.dim(0), .bf16);
+                }
+                return .{
+                    .input = .{ .combined = try projections.finish(L, .mlp, "layers.{d}.mlp.gu", .{i}, 2 * s.len(), d) },
+                    .down = try L.denseB16(i, "down_proj", 0, d, s.lo, s.hi),
+                    .width = s.len(),
+                    .dims = d,
+                    .limit = c.swiglu_limit,
+                };
+            }
             if (bf16) return .{
-                .gate = try L.denseB16(i, "gate_proj", s.lo, s.hi, 0, d),
-                .up = try L.denseB16(i, "up_proj", s.lo, s.hi, 0, d),
+                .input = .{ .separate = .{ .gate = try L.denseB16(i, "gate_proj", s.lo, s.hi, 0, d), .up = try L.denseB16(i, "up_proj", s.lo, s.hi, 0, d) } },
                 .down = try L.denseB16(i, "down_proj", 0, d, s.lo, s.hi),
                 .width = s.len(),
                 .dims = d,
@@ -360,16 +372,14 @@ pub const Loader = struct {
             };
         }
         if (L.w.exl3) return .{
-            .gate = .{ .q = try x3.layerMatrix(L, "layers.{d}.mlp.gate_proj", i, 0, 0, &.{s}) },
-            .up = .{ .q = try x3.layerMatrix(L, "layers.{d}.mlp.up_proj", i, 0, 0, &.{s}) },
+            .input = .{ .separate = .{ .gate = .{ .q = try x3.layerMatrix(L, "layers.{d}.mlp.gate_proj", i, 0, 0, &.{s}) }, .up = .{ .q = try x3.layerMatrix(L, "layers.{d}.mlp.up_proj", i, 0, 0, &.{s}) } } },
             .down = .{ .q = try x3.layerMatrix(L, "layers.{d}.mlp.down_proj", i, s.lo, s.hi, &.{.{ .lo = 0, .hi = d }}) },
             .width = s.len(),
             .dims = d,
             .limit = c.swiglu_limit,
         };
         return .{
-            .gate = .{ .q = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.gate_proj", i, s.lo, s.hi, 0, d) } },
-            .up = .{ .q = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.up_proj", i, s.lo, s.hi, 0, d) } },
+            .input = .{ .separate = .{ .gate = .{ .q = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.gate_proj", i, s.lo, s.hi, 0, d) } }, .up = .{ .q = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.up_proj", i, s.lo, s.hi, 0, d) } } } },
             .down = .{ .q = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.down_proj", i, 0, d, s.lo, s.hi) } },
             .width = s.len(),
             .dims = d,

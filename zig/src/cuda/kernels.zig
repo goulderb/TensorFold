@@ -59,6 +59,7 @@ pub const modelopt_pack: []const u8 = if (available) &Blob("fatbin_modelopt_pack
 pub const glm_glue: []const u8 = if (available) &Blob("fatbin_glm_glue").bytes else &.{};
 pub const glm_ops: []const u8 = if (available) &Blob("fatbin_glm_ops").bytes else &.{};
 pub const glm_target_dsa: []const u8 = if (available) &Blob("fatbin_glm_target_dsa").bytes else &.{};
+pub const glm_l2pf: []const u8 = if (available) &Blob("fatbin_glm_l2pf").bytes else &.{};
 pub const glm_exl3: []const u8 = if (available) &Blob("fatbin_glm_exl3").bytes else &.{};
 pub const dflash_qmm: []const u8 = if (available) &Blob("fatbin_dflash_qmm").bytes else &.{};
 pub const dflash_ops: []const u8 = if (available) &Blob("fatbin_dflash_ops").bytes else &.{};

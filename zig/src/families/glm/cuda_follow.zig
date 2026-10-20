@@ -12,7 +12,7 @@ test {
     _ = @import("cuda_spill_order_test.zig");
 }
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve, spill_write, spill_read, spill_forget, vision, redraw_masked, verify_masked, draft_batch, prefill_shared };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve, spill_write, spill_read, spill_forget, vision, redraw_masked, verify_masked, draft_batch, prefill_shared, prelaunch_batch };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -345,6 +345,15 @@ pub const Leader = struct {
         try x.complete(x.e.draftBatch(parts, out));
     }
 
+    pub fn prelaunchBatch(x: Leader, parts: []const engine.DraftPart) !void {
+        try x.complete(x.e.validateDraftBatch(parts));
+        var words: [engine.max_shared * 5]u32 = undefined;
+        const payload = try encodeDraftBatch(parts, &words);
+        try x.flush();
+        try x.send(.{ .kind = @backingInt(Kind.prelaunch_batch), .depth = @intCast(parts.len) }, payload);
+        try x.complete(x.e.prelaunchDraftBatch(parts));
+    }
+
     /// The other ranks leave their loops.
     pub fn end(x: Leader) !void {
         try x.send(.{ .kind = @backingInt(Kind.end) }, &.{});
@@ -449,6 +458,15 @@ pub fn follow(e: *Engine, link: *Link) !void {
             try e.draftBatch(parts, results[0..parts.len]);
             continue;
         }
+        if (kind == .prelaunch_batch) {
+            var parts_buf: [engine.max_shared]engine.DraftPart = undefined;
+            const parts = decodeDraftBatch(step.ids, h.depth, &parts_buf) catch |err| {
+                _ = try e.pairedReady(false);
+                return err;
+            };
+            try e.prelaunchDraftBatch(parts);
+            continue;
+        }
         if (kind != .end and kind != .drop and kind != .shared and kind != .prefill_shared and kind != .release) try e.bind(h.slot);
         switch (kind) {
             .begin => try e.begin(if (h.flags & 1 != 0) .{ .seed = h.seed, .temperature = h.temperature, .top_p = h.top_p, .min_p = h.min_p, .top_k = h.top_k } else null),
@@ -479,7 +497,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 try link.grammarBits(&e.smp, step.ids.len);
                 try e.verifyMasked(step.ids, sampled[0..step.ids.len]);
             },
-            .reserve, .spill_write, .spill_read, .spill_forget, .vision, .draft_batch => unreachable,
+            .reserve, .spill_write, .spill_read, .spill_forget, .vision, .draft_batch, .prelaunch_batch => unreachable,
             .shared => {
                 const k = h.depth;
                 if (k == 0 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadStep;
