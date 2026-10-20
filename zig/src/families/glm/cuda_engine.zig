@@ -9,6 +9,7 @@ const weights = @import("cuda_weights.zig");
 const fw = @import("cuda_forward.zig");
 const ranks = @import("cuda_ranks.zig");
 const sampler = @import("cuda_sampler.zig");
+const greedy_mod = @import("cuda_greedy.zig");
 const heat = @import("heat");
 const owner_kv = @import("cuda_kv_owner.zig");
 const cache_pool = @import("cuda_kv_pool.zig");
@@ -163,7 +164,7 @@ pub const Engine = struct {
     full_graphs: ?target_forward.Runtime = null,
     /// Proof tools may compare eager/replay at drained boundaries; serving leaves this enabled when configured.
     target_graphs_active: bool = true,
-    pairs: cuda.DeviceBuffer, // every rank's (value, id) of a greedy draw
+    greedy_rows: greedy_mod.Greedy,
     smp: sampler.Sampler,
     seqs: std.ArrayList(?*Seq) = .empty, // every stream's sequence by slot (the lane backend's), slot 0 made at init
     cur: *Seq = undefined, // the bound slot's: every step below runs on it
@@ -270,7 +271,7 @@ pub const Engine = struct {
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .pairs = undefined, .smp = undefined, .mtp = with_mtp };
+        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .greedy_rows = undefined, .smp = undefined, .mtp = with_mtp };
         errdefer e.replicas.deinit();
         e.tp_group = try cuda.tp_group.Group.borrow(lib, comm, rank, world);
         errdefer if (e.tp_group) |*group| group.closeFast();
@@ -380,8 +381,8 @@ pub const Engine = struct {
             try e.bm.enableMia(d, &e.w);
             if (e.bs) |*b| try b.enableMia(d, &e.w);
         }
-        e.pairs = try cuda.DeviceBuffer.alloc(d, 8 * world);
-        errdefer e.pairs.free();
+        e.greedy_rows = try greedy_mod.Greedy.init(gpa, d, world, @max(fw.window_rows, shared_rows));
+        errdefer e.greedy_rows.deinit();
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
         errdefer e.smp.deinit();
         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
@@ -556,7 +557,7 @@ pub const Engine = struct {
         };
         e.shared_buf.free();
         e.smp.deinit();
-        e.pairs.free();
+        e.greedy_rows.deinit();
         if (e.bs) |*b| b.deinit();
         e.bm.deinit();
         e.bd.deinit();
@@ -1123,10 +1124,13 @@ pub const Engine = struct {
         var segs: [max_shared]fw.Seg = undefined;
         var ids: [shared_rows]u32 = undefined;
         var rows: usize = 0;
+        var all_greedy = true;
         for (parts, 0..) |p, i| {
             if (p.ids.len == 0 or p.ids.len > e.targetRows() or rows + p.ids.len > @min(b.rows, e.sharedLimit())) return error.WindowTooWide;
             for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
             try e.bind(p.slot);
+            all_greedy = all_greedy and e.cur.sampling == null;
+            if (p.out.len < p.ids.len) return error.BadVerifyOutput;
             segs[i] = .{ .st = &e.cur.st, .row0 = rows, .rows = p.ids.len };
             @memcpy(ids[rows..][0..p.ids.len], p.ids);
             rows += p.ids.len;
@@ -1141,7 +1145,12 @@ pub const Engine = struct {
             try e.bind(p.slot);
             e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
             if (e.dflash) |drafter| try drafter.stageWindow(p.slot, b.taps.?.ptr, b.rows, g.row0, g.rows, g.st.pos);
-            try e.draw(b.logits + g.row0 * e.share.vocab.len() * 2, g.rows, g.st.pos + 1, p.out);
+            if (!all_greedy) try e.draw(b.logits + g.row0 * e.share.vocab.len() * 2, g.rows, g.st.pos + 1, p.out);
+        }
+        if (all_greedy) {
+            var tokens: [shared_rows]u32 = undefined;
+            try e.drawGreedy(b.logits, rows, tokens[0..rows]);
+            for (parts, segs[0..parts.len]) |p, g| @memcpy(p.out[0..g.rows], tokens[g.row0..][0..g.rows]);
         }
         e.verify_widths[rows] += 1;
     }
@@ -1260,7 +1269,7 @@ pub const Engine = struct {
             if (e.tp_group) |*group| try group.check();
             return;
         }
-        for (0..rows) |r| out[r] = try e.greedy(logits + r * e.share.vocab.len() * 2);
+        try e.drawGreedy(logits, rows, out);
     }
 
     /// The prompt's target logits survive MTP absorption; redraw them once the lane supplies its first mask.
@@ -1278,24 +1287,14 @@ pub const Engine = struct {
 
     /// decode.sample_rows' greedy pick: per-rank top-1 (tf_glm_top1), all-gathered, largest value then lowest id.
     fn greedy(e: *Engine, logits: u64) !u32 {
-        const world = e.share.world;
-        var a: cuda.Args = .{};
-        a.add(logits);
-        a.add(@as(i64, @intCast(e.share.vocab.len())));
-        a.add(@as(u32, @intCast(e.share.vocab.lo)));
-        a.add(e.pairs.ptr + e.share.rank * 8);
-        try cuda.launch.launch(e.m.glue.top1, .{ .grid = .{ .x = 1 }, .block = .{ .x = 1024 } }, e.stream, &a);
-        try e.lib.check(e.lib.api.ncclAllGather(e.pairs.ptr + e.share.rank * 8, e.pairs.ptr, 2, .u32, e.comm, e.stream.handle), "ncclAllGather");
-        try e.synchronize();
-        var all: [ranks.max_world][2]u32 = undefined; // Engine.init refuses a larger world
-        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&all, e.pairs.ptr, world * 8), "cuMemcpyDtoH");
-        var pick = all[0];
-        for (all[1..world]) |p| {
-            const v: f32 = @bitCast(p[0]);
-            const b: f32 = @bitCast(pick[0]);
-            if (v > b or (v == b and p[1] < pick[1])) pick = p;
-        }
-        return pick[1];
+        var token: [1]u32 = undefined;
+        try e.drawGreedy(logits, 1, &token);
+        return token[0];
+    }
+
+    fn drawGreedy(e: *Engine, logits: u64, rows: usize, out: []u32) !void {
+        errdefer e.pair_failure(error.PairedGreedyDrawFailed);
+        try e.greedy_rows.draw(e.stream, .{ .rank = e.share.rank, .vocab = e.share.vocab, .top1 = e.m.glue.top1, .exchange = e.exchange(), .group = e.collectiveGroup() }, logits, rows, out);
     }
 
     fn heatRoot() []const u8 {

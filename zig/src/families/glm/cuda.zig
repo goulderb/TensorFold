@@ -28,6 +28,7 @@ pub const target_graph = @import("cuda_target_graph.zig");
 pub const target_meta = @import("cuda_target_meta.zig");
 pub const target_forward = @import("cuda_target_forward.zig");
 pub const sampler = @import("cuda_sampler.zig");
+pub const greedy = @import("cuda_greedy.zig");
 pub const engine = @import("cuda_engine.zig");
 pub const follow = @import("cuda_follow.zig");
 pub const lanes = @import("cuda_lanes.zig");
