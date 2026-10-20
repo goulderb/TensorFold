@@ -374,6 +374,17 @@ pub const Draw = struct { rule: ?cuda.sample.Rule, position: u64 };
 pub const Phase = enum { begin, embedding, input_norm, mixer_inputs, gdn_pre, conv_commit, gdn_chain, gdn_post, attention, mixer_output, post_norm, route, expert_plan, expert_up, expert_down, shared, combine, dense, head };
 pub const Observer = struct { ptr: *anyopaque, mark: *const fn (*anyopaque, Phase, usize) anyerror!void };
 
+test "terminal capture verification is opt in" {
+    const info = @typeInfo(Engine).@"struct";
+    inline for (info.field_names, info.field_types, info.field_attrs) |name, Field, attrs| {
+        if (comptime std.mem.eql(u8, name, "verify_terminal_graphs")) {
+            try std.testing.expect(!attrs.defaultValue(Field).?);
+            return;
+        }
+    }
+    @compileError("terminal verifier flag missing");
+}
+
 pub const Engine = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -390,6 +401,8 @@ pub const Engine = struct {
     reuse_fp8_quant: bool = false,
     bounded_hf_prefill: bool = false,
     terminal: ?struct { module: cuda.Module, kernels: cuda.tree_round.Kernels } = null,
+    verify_terminal_graphs: bool = false,
+    terminal_graph_roster: std.ArrayList(TerminalGraphRecord) = .empty,
     verify_expert_graphs: bool = false,
     expert_graph_nodes_baseline: usize = 0,
     expert_graph_nodes_n8: usize = 0,
@@ -527,6 +540,8 @@ pub const Engine = struct {
         e.reuse_fp8_quant = false;
         e.bounded_hf_prefill = false;
         e.terminal = null;
+        e.verify_terminal_graphs = false;
+        e.terminal_graph_roster = .empty;
         e.verify_expert_graphs = false;
         e.expert_graph_nodes_baseline = 0;
         e.expert_graph_nodes_n8 = 0;
@@ -619,6 +634,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        e.terminal_graph_roster.deinit(e.gpa);
         e.expert_graph_roster.deinit(e.gpa);
         var it = e.graphs.valueIterator();
         while (it.next()) |x| x.deinit();
@@ -942,7 +958,10 @@ pub const Engine = struct {
                 const gdn_nodes = if (e.verify_gdn_graphs) try e.verifyGdnGraph(captured, shape, nodes) else 0;
                 const expert_nodes = if (e.verify_expert_graphs) try e.verifyExpertGraph(captured, shape, nodes) else 0;
                 const quant_nodes = if (e.verify_expert_graphs) try e.verifyQuantGraph(captured, shape, nodes) else 0;
-                gop.value_ptr.* = try captured.instantiate();
+                if (e.verify_terminal_graphs) {
+                    const readback = try TerminalReadback.load(e.d);
+                    gop.value_ptr.* = try e.instantiateTerminalGraph(captured, shape, nodes, readback);
+                } else gop.value_ptr.* = try captured.instantiate();
                 if (e.verify_expert_graphs) {
                     e.quant_graphs_verified += 1;
                     if (shape.reuse_fp8_quant) e.quant_graph_nodes_reuse += quant_nodes else e.quant_graph_nodes_baseline += quant_nodes;
@@ -1185,14 +1204,20 @@ pub const Engine = struct {
         return node;
     }
 
+    const GetDependencies = *const fn (cuda.abi.GraphNode, ?[*]cuda.abi.GraphNode, *usize) callconv(.c) cuda.abi.Result;
+
     fn orderedGraphNodes(e: *const Engine, graph: cuda.graph.Graph, node_count: usize) ![]cuda.graph.Node {
+        var lib = e.d.lib;
+        const get = lib.lookup(GetDependencies, "cuGraphNodeGetDependencies") orelse return error.MissingSymbol;
+        return e.orderedGraphNodesWith(graph, node_count, get);
+    }
+
+    fn orderedGraphNodesWith(e: *const Engine, graph: cuda.graph.Graph, node_count: usize, get: GetDependencies) ![]cuda.graph.Node {
         const nodes = try e.gpa.alloc(cuda.graph.Node, node_count);
         defer e.gpa.free(nodes);
         if ((try graph.nodes(nodes)).len != node_count) return error.QwenQuantGraphWorkCountMismatch;
         const previous = try e.gpa.alloc(cuda.graph.Node, node_count);
         defer e.gpa.free(previous);
-        var lib = e.d.lib;
-        const get = lib.lookup(*const fn (cuda.abi.GraphNode, ?[*]cuda.abi.GraphNode, *usize) callconv(.c) cuda.abi.Result, "cuGraphNodeGetDependencies") orelse return error.MissingSymbol;
         for (nodes, previous) |node, *pred| {
             var deps: [2]cuda.graph.Node = .{ null, null };
             var count: usize = deps.len;
@@ -1213,6 +1238,161 @@ pub const Engine = struct {
             prior = out.*;
         }
         return ordered;
+    }
+
+    const TerminalReadback = struct {
+        dependencies: GetDependencies,
+        name: *const fn (*?[*:0]const u8, cuda.abi.Function) callconv(.c) cuda.abi.Result,
+
+        fn load(d: *const cuda.Driver) !TerminalReadback {
+            var lib = d.lib;
+            return .{
+                .dependencies = lib.lookup(GetDependencies, "cuGraphNodeGetDependencies") orelse return error.MissingSymbol,
+                .name = lib.lookup(@FieldType(TerminalReadback, "name"), "cuFuncGetName") orelse return error.MissingSymbol,
+            };
+        }
+
+        fn symbol(r: TerminalReadback, d: *const cuda.Driver, function: cuda.abi.Function) ![]const u8 {
+            var value: ?[*:0]const u8 = null;
+            try d.check(r.name(&value, function), "cuFuncGetName");
+            return std.mem.span(value orelse return error.QwenTerminalGraphSymbolMissing);
+        }
+    };
+
+    pub const TerminalGraphKernel = struct {
+        node: usize,
+        predecessor: usize,
+        requested_function: usize,
+        actual_function: usize,
+        requested_symbol: []const u8,
+        actual_symbol: [96]u8 = @splat(0),
+        actual_symbol_len: usize,
+        grid: [3]u32,
+        block: [3]u32,
+        shared_bytes: u32,
+        argument_count: usize,
+        argument_sizes: [10]usize = @splat(0),
+        argument_bytes: [80]u8 = @splat(0),
+        argument_bytes_len: usize = 0,
+        argument_sha256: [32]u8,
+
+        fn read(node: cuda.graph.Node, predecessor: cuda.graph.Node, got: cuda.abi.KernelNodeParams, want: *const CkNode, symbol: []const u8, actual_symbol: []const u8) !TerminalGraphKernel {
+            if (got.extra != null) return error.QwenTerminalGraphArgumentMismatch;
+            if (!std.mem.eql(u8, symbol, actual_symbol)) return error.QwenTerminalGraphSymbolMismatch;
+            try want.check(got);
+            if (actual_symbol.len > 96 or want.args.count > 10) return error.QwenTerminalGraphRosterOverflow;
+            var result: TerminalGraphKernel = .{
+                .node = @intFromPtr(node),
+                .predecessor = @intFromPtr(predecessor),
+                .requested_function = @intFromPtr(want.function),
+                .actual_function = @intFromPtr(got.func),
+                .requested_symbol = symbol,
+                .actual_symbol_len = actual_symbol.len,
+                .grid = .{ got.grid_x, got.grid_y, got.grid_z },
+                .block = .{ got.block_x, got.block_y, got.block_z },
+                .shared_bytes = got.shared_bytes,
+                .argument_count = want.args.count,
+                .argument_sha256 = undefined,
+            };
+            @memcpy(result.actual_symbol[0..actual_symbol.len], actual_symbol);
+            for (0..want.args.count) |i| {
+                const size = want.args.sizes[i];
+                if (result.argument_bytes_len + size > result.argument_bytes.len) return error.QwenTerminalGraphRosterOverflow;
+                result.argument_sizes[i] = size;
+                const actual: [*]const u8 = @ptrCast(got.params.?[i].?);
+                @memcpy(result.argument_bytes[result.argument_bytes_len..][0..size], actual[0..size]);
+                result.argument_bytes_len += size;
+            }
+            std.crypto.hash.sha2.Sha256.hash(result.argument_bytes[0..result.argument_bytes_len], &result.argument_sha256, .{});
+            return result;
+        }
+    };
+
+    /// One successful capture per shape key; failed verification/instantiation never publishes a record.
+    pub const TerminalGraphRecord = struct {
+        shape_key: u32,
+        captured_graph: usize,
+        node_count: usize,
+        terminal_count: usize = 0,
+        enabled: bool,
+        owns_head: bool,
+        head_rows: usize,
+        head_kind: enum { absent, lane, reduce } = .absent,
+        head_input: u64 = 0,
+        head_output: u64 = 0,
+        head_weight: u64 = 0,
+        head: ?TerminalGraphKernel = null,
+        terminal: ?TerminalGraphKernel = null,
+    };
+
+    fn instantiateTerminalGraph(e: *Engine, graph: cuda.graph.Graph, shape: Shape, node_count: usize, readback: TerminalReadback) !cuda.graph.Exec {
+        const start = e.terminal_graph_roster.items.len;
+        errdefer e.terminal_graph_roster.items.len = start;
+        try e.terminal_graph_roster.append(e.gpa, try e.verifyTerminalGraph(graph, shape, node_count, readback));
+        return graph.instantiate();
+    }
+
+    fn verifyTerminalGraph(e: *const Engine, graph: cuda.graph.Graph, shape: Shape, node_count: usize, readback: TerminalReadback) !TerminalGraphRecord {
+        const nodes = try e.orderedGraphNodesWith(graph, node_count, readback.dependencies);
+        defer e.gpa.free(nodes);
+        const heads: usize = if (shape.record or shape.heads_all) shape.total else 1;
+        var result: TerminalGraphRecord = .{
+            .shape_key = shape.key(),
+            .captured_graph = @intFromPtr(graph.handle),
+            .node_count = node_count,
+            .enabled = shape.terminal_greedy,
+            .owns_head = e.placement.ownsHead(),
+            .head_rows = heads,
+        };
+        const strict_symbol = "tf_round_bf16_argmax";
+        const strict_function = if (e.terminal) |t| t.kernels.argmax_fn.handle else null;
+        var terminal_index: ?usize = null;
+        for (nodes, 0..) |node, i| {
+            var p: cuda.abi.KernelNodeParams = undefined;
+            try e.d.check(e.d.api.cuGraphKernelNodeGetParams_v2(node, &p), "cuGraphKernelNodeGetParams");
+            const name = try readback.symbol(e.d, p.func);
+            if ((strict_function != null and p.func == strict_function) or std.mem.eql(u8, name, strict_symbol)) {
+                result.terminal_count += 1;
+                terminal_index = i;
+                if (strict_function == null or p.func != strict_function or !std.mem.eql(u8, name, strict_symbol)) return error.QwenTerminalGraphFunctionMismatch;
+            }
+        }
+        if (!shape.terminal_greedy) {
+            if (result.terminal_count != 0) return error.QwenTerminalGraphWorkCountMismatch;
+        } else {
+            if (e.numerics != .hf_modelopt or !result.owns_head or e.terminal == null or shape.record or !shape.prompt) return error.UnsupportedQwenTerminalGreedy;
+            if (result.terminal_count != 1) return error.QwenTerminalGraphWorkCountMismatch;
+            if (nodes.len < 2 or terminal_index.? != nodes.len - 1) return error.QwenTerminalGraphOrderMismatch;
+            const output = TerminalOutput.init(heads, e.g.vocab);
+            var expected: CkNode = .{ .function = strict_function, .grid = .{ 1, 1, 1 }, .threads = 256 };
+            expected.args.add(e.logits + (heads - 1) * e.g.vocab * 2);
+            expected.args.add(e.logits + output.pick_at);
+            expected.args.add(@as(u32, @intCast(e.g.vocab)));
+            expected.args.add(@as(u32, @intCast(e.g.vocab)));
+            var p: cuda.abi.KernelNodeParams = undefined;
+            try e.d.check(e.d.api.cuGraphKernelNodeGetParams_v2(nodes[nodes.len - 1], &p), "cuGraphKernelNodeGetParams");
+            result.terminal = try TerminalGraphKernel.read(nodes[nodes.len - 1], nodes[nodes.len - 2], p, &expected, strict_symbol, try readback.symbol(e.d, p.func));
+        }
+        if (result.owns_head) {
+            if (e.numerics != .hf_modelopt or e.modelopt == null or e.head != .linear or e.head.linear != .fp8 or e.head.linear.fp8.act == 0) return error.QwenTerminalGraphHeadUnsupported;
+            const head: CkProjection = .{ .weight = e.head.linear.fp8, .x = e.x + (shape.total - heads) * e.g.hidden * 2, .out = e.logits, .rows = heads, .quant = true };
+            const sk = cuda.qmmf.splitK(head.weight.n, head.weight.k);
+            const cluster = sk > 1 and sk <= 8 and e.modelopt.?.ck.clusters;
+            const reduce = sk > 1 and !cluster;
+            const expected = e.ckNode(head, if (reduce) .reduce else .lane);
+            const symbol: []const u8 = if (reduce) "tf_ck8_reduce" else if (cluster) "tf_ck8_16c" else "tf_ck8_16";
+            const suffix: usize = @intFromBool(shape.terminal_greedy);
+            if (nodes.len <= suffix) return error.QwenTerminalGraphOrderMismatch;
+            const index = nodes.len - suffix - 1;
+            var p: cuda.abi.KernelNodeParams = undefined;
+            try e.d.check(e.d.api.cuGraphKernelNodeGetParams_v2(nodes[index], &p), "cuGraphKernelNodeGetParams");
+            result.head = try TerminalGraphKernel.read(nodes[index], if (index == 0) null else nodes[index - 1], p, &expected, symbol, try readback.symbol(e.d, p.func));
+            result.head_kind = if (reduce) .reduce else .lane;
+            result.head_input = head.x;
+            result.head_output = head.out;
+            result.head_weight = head.weight.codes;
+        }
+        return result;
     }
 
     fn verifyQuantGraph(e: *const Engine, graph: cuda.graph.Graph, shape: Shape, node_count: usize) !usize {
@@ -1525,6 +1705,199 @@ pub const Engine = struct {
         return e.host_logits.slice(u16)[i * e.g.vocab ..][0..e.g.vocab];
     }
 };
+
+test "terminal capture readback checks full ABI, final head producer, ordering and absent arms" {
+    const Fake = struct {
+        var params: [4]cuda.abi.KernelNodeParams = undefined;
+        var count: usize = 3;
+        var predecessors: [4]usize = .{ 0, 1, 2, 3 };
+        var branch = false;
+        var wrong_name = false;
+        var instantiate_fail = false;
+        var instantiate_count: usize = 0;
+
+        fn nodes(_: cuda.abi.Graph, out: ?[*]cuda.graph.Node, n: *usize) callconv(.c) cuda.abi.Result {
+            if (out) |dst| for (0..@min(n.*, count)) |i| {
+                dst[i] = @ptrFromInt(count - i);
+            };
+            n.* = count;
+            return cuda.abi.success;
+        }
+        fn get(node: cuda.graph.Node, out: *cuda.abi.KernelNodeParams) callconv(.c) cuda.abi.Result {
+            out.* = params[@intFromPtr(node) - 1];
+            return cuda.abi.success;
+        }
+        fn dependencies(node: cuda.graph.Node, out: ?[*]cuda.graph.Node, n: *usize) callconv(.c) cuda.abi.Result {
+            const pred = predecessors[@intFromPtr(node) - 1];
+            n.* = if (branch) 2 else if (pred == 0) 0 else 1;
+            if (out) |dst| if (pred != 0) {
+                dst[0] = @ptrFromInt(pred);
+            };
+            return cuda.abi.success;
+        }
+        fn name(out: *?[*:0]const u8, f: cuda.abi.Function) callconv(.c) cuda.abi.Result {
+            out.* = switch (@intFromPtr(f)) {
+                10, 99 => if (wrong_name) "wrong_argmax" else "tf_round_bf16_argmax",
+                20 => "tf_ck8_16",
+                21 => "tf_ck8_16c",
+                22 => "tf_ck8_reduce",
+                else => "body",
+            };
+            return cuda.abi.success;
+        }
+        fn from(want: *Engine.CkNode) cuda.abi.KernelNodeParams {
+            return .{ .func = want.function, .grid_x = @intCast(want.grid[0]), .grid_y = @intCast(want.grid[1]), .grid_z = @intCast(want.grid[2]), .block_x = @intCast(want.threads), .block_y = 1, .block_z = 1, .shared_bytes = @intCast(want.shared), .params = want.args.pointers(), .extra = null };
+        }
+        fn instantiate(out: *cuda.abi.GraphExec, _: cuda.abi.Graph, _: c_ulonglong) callconv(.c) cuda.abi.Result {
+            instantiate_count += 1;
+            if (instantiate_fail) return cuda.abi.error_not_ready;
+            out.* = @ptrFromInt(200);
+            return cuda.abi.success;
+        }
+    };
+    var driver: cuda.Driver = undefined;
+    driver.api.cuGraphGetNodes = Fake.nodes;
+    driver.api.cuGraphKernelNodeGetParams_v2 = Fake.get;
+    driver.api.cuGraphInstantiateWithFlags = Fake.instantiate;
+    var e: Engine = undefined;
+    e.d = &driver;
+    e.gpa = std.testing.allocator;
+    e.terminal_graph_roster = .empty;
+    defer e.terminal_graph_roster.deinit(e.gpa);
+    e.numerics = .hf_modelopt;
+    e.placement = .{ .first = 0, .end = 1, .total = 1 };
+    e.g = undefined;
+    e.g.hidden = 2048;
+    e.g.vocab = 248320;
+    e.x = 4096;
+    e.logits = 8192;
+    e.modelopt = @as(modelopt.Bindings, undefined);
+    e.modelopt.?.rows = 16384;
+    e.modelopt.?.part = 32768;
+    e.modelopt.?.ck.lane[0] = .{ .d = &driver, .handle = @ptrFromInt(20) };
+    e.modelopt.?.ck.lane[1] = .{ .d = &driver, .handle = @ptrFromInt(21) };
+    e.modelopt.?.ck.reduce = .{ .d = &driver, .handle = @ptrFromInt(22) };
+    e.terminal = .{ .module = undefined, .kernels = undefined };
+    e.terminal.?.kernels.argmax_fn = .{ .d = &driver, .handle = @ptrFromInt(10) };
+    const graph: cuda.graph.Graph = .{ .d = &driver, .handle = @ptrFromInt(100) };
+    const readback: Engine.TerminalReadback = .{ .dependencies = Fake.dependencies, .name = Fake.name };
+    for ([_]usize{ 1, 16 }) |rows| for ([_]bool{ false, true }) |all| for ([_]usize{ 248320, 64 }) |width| for ([_]bool{ false, true }) |cluster_enabled| {
+        e.modelopt.?.ck.clusters = cluster_enabled;
+        e.g.vocab = width;
+        e.head = .{ .linear = .{ .fp8 = .{ .mode = .fp8, .codes = 65536, .scales = 0, .act = 0.5, .n = @intCast(width), .npad = @intCast(width), .k = 2048 } } };
+        const heads: usize = if (all) rows else 1;
+        const output = TerminalOutput.init(heads, width);
+        const projection: Engine.CkProjection = .{ .weight = e.head.linear.fp8, .x = e.x + (rows - heads) * e.g.hidden * 2, .out = e.logits, .rows = heads, .quant = true };
+        const sk = cuda.qmmf.splitK(width, 2048);
+        var head = e.ckNode(projection, if (sk > 1 and !cluster_enabled) .reduce else .lane);
+        var terminal: Engine.CkNode = .{ .function = @ptrFromInt(10), .grid = .{ 1, 1, 1 }, .threads = 256 };
+        terminal.args.add(e.logits + (heads - 1) * width * 2);
+        terminal.args.add(e.logits + output.pick_at);
+        terminal.args.add(@as(u32, @intCast(width)));
+        terminal.args.add(@as(u32, @intCast(width)));
+        var body: Engine.CkNode = .{ .function = @ptrFromInt(30), .grid = .{ 1, 1, 1 } };
+        Fake.params = .{ Fake.from(&body), Fake.from(&head), Fake.from(&terminal), Fake.from(&body) };
+        Fake.count = 3;
+        Fake.predecessors = .{ 0, 1, 2, 3 };
+        Fake.branch = false;
+        Fake.wrong_name = false;
+        var shape: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .heads_all = all, .terminal_greedy = true };
+        const record = try e.verifyTerminalGraph(graph, shape, 3, readback);
+        e.terminal_graph_roster.clearRetainingCapacity();
+        Fake.instantiate_count = 0;
+        Fake.instantiate_fail = true;
+        try std.testing.expectError(error.NotReady, e.instantiateTerminalGraph(graph, shape, 3, readback));
+        try std.testing.expectEqual(0, e.terminal_graph_roster.items.len);
+        Fake.instantiate_fail = false;
+        const exec = try e.instantiateTerminalGraph(graph, shape, 3, readback);
+        try std.testing.expectEqual(@as(usize, 200), @intFromPtr(exec.handle));
+        try std.testing.expectEqual(1, e.terminal_graph_roster.items.len);
+        try std.testing.expectEqual(2, Fake.instantiate_count);
+        Fake.wrong_name = true;
+        try std.testing.expectError(error.QwenTerminalGraphFunctionMismatch, e.instantiateTerminalGraph(graph, shape, 3, readback));
+        try std.testing.expectEqual(1, e.terminal_graph_roster.items.len);
+        try std.testing.expectEqual(2, Fake.instantiate_count);
+        Fake.wrong_name = false;
+        try std.testing.expectEqual(shape.key(), record.shape_key);
+        try std.testing.expectEqual(100, record.captured_graph);
+        try std.testing.expectEqual(1, record.terminal_count);
+        try std.testing.expectEqual(2, record.terminal.?.predecessor);
+        try std.testing.expectEqual(2, record.head.?.node);
+        try std.testing.expectEqual(heads, record.head_rows);
+        try std.testing.expectEqual(4, record.terminal.?.argument_count);
+        try std.testing.expectEqual(24, record.terminal.?.argument_bytes_len);
+        try std.testing.expectEqualSlices(usize, &.{ 8, 8, 4, 4 }, record.terminal.?.argument_sizes[0..4]);
+        try std.testing.expectEqualStrings("tf_round_bf16_argmax", record.terminal.?.requested_symbol);
+        try std.testing.expectEqualStrings(record.terminal.?.requested_symbol, record.terminal.?.actual_symbol[0..record.terminal.?.actual_symbol_len]);
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(record.terminal.?.argument_bytes[0..24], &hash, .{});
+        try std.testing.expectEqualSlices(u8, &hash, &record.terminal.?.argument_sha256);
+
+        for (0..4) |arg| {
+            terminal.args.storage[terminal.args.offsets[arg]] ^= 1;
+            try std.testing.expectError(error.QwenQuantGraphArgumentMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+            terminal.args.storage[terminal.args.offsets[arg]] ^= 1;
+        }
+        for (0..head.args.count) |arg| {
+            head.args.storage[head.args.offsets[arg]] ^= 1;
+            try std.testing.expectError(error.QwenQuantGraphArgumentMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+            head.args.storage[head.args.offsets[arg]] ^= 1;
+        }
+        inline for (.{ "grid_x", "grid_y", "grid_z", "block_x", "block_y", "block_z", "shared_bytes" }) |field| {
+            @field(Fake.params[2], field) += 1;
+            try std.testing.expectError(error.QwenQuantGraphKernelMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+            @field(Fake.params[2], field) -= 1;
+        }
+        Fake.params[2].params = null;
+        try std.testing.expectError(error.QwenQuantGraphArgumentMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+        Fake.params[2] = Fake.from(&terminal);
+        Fake.params[2].extra = terminal.args.pointers();
+        try std.testing.expectError(error.QwenTerminalGraphArgumentMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+        Fake.params[2] = Fake.from(&terminal);
+        Fake.params[2].func = @ptrFromInt(99);
+        try std.testing.expectError(error.QwenTerminalGraphFunctionMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+        Fake.params[2].func = @ptrFromInt(10);
+        Fake.wrong_name = true;
+        try std.testing.expectError(error.QwenTerminalGraphFunctionMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+        Fake.wrong_name = false;
+        Fake.params[0] = Fake.from(&terminal);
+        try std.testing.expectError(error.QwenTerminalGraphWorkCountMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+        Fake.params[0] = Fake.from(&body);
+        Fake.count = 2;
+        try std.testing.expectError(error.QwenTerminalGraphWorkCountMismatch, e.verifyTerminalGraph(graph, shape, 2, readback));
+        Fake.count = 4;
+        try std.testing.expectError(error.QwenTerminalGraphOrderMismatch, e.verifyTerminalGraph(graph, shape, 4, readback));
+        Fake.count = 3;
+        Fake.params[1] = Fake.from(&body);
+        try std.testing.expectError(error.QwenTerminalGraphSymbolMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+        Fake.params[1] = Fake.from(&head);
+        Fake.predecessors[2] = 1;
+        try std.testing.expectError(error.QwenQuantGraphDependencyMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+        Fake.predecessors[2] = 2;
+        Fake.branch = true;
+        try std.testing.expectError(error.QwenQuantGraphDependencyMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+        Fake.branch = false;
+        shape.terminal_greedy = false;
+        try std.testing.expectError(error.QwenTerminalGraphWorkCountMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+        Fake.count = 2;
+        const baseline = try e.verifyTerminalGraph(graph, shape, 2, readback);
+        try std.testing.expectEqual(0, baseline.terminal_count);
+        try std.testing.expect(baseline.terminal == null);
+        try std.testing.expect(baseline.head != null);
+        const saved_terminal = e.terminal;
+        e.terminal = null;
+        _ = try e.verifyTerminalGraph(graph, shape, 2, readback);
+        Fake.count = 3;
+        try std.testing.expectError(error.QwenTerminalGraphFunctionMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
+        e.terminal = saved_terminal;
+        e.placement.end = 0;
+        Fake.count = 1;
+        const nonhead = try e.verifyTerminalGraph(graph, shape, 1, readback);
+        try std.testing.expect(nonhead.head == null);
+        try std.testing.expectEqual(0, nonhead.terminal_count);
+        e.placement.end = 1;
+    };
+}
 
 test "expert graph verification rejects opposite arms, wrong arguments, duplicates and missing work" {
     const Fake = struct {
