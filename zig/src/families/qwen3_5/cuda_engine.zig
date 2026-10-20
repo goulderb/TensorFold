@@ -42,9 +42,13 @@ fn validateMoeMathShape(configured: MoeMath, requested: MoeMath) !void {
     if (configured != requested) return error.QwenMoeMathShapeMismatch;
 }
 
-pub fn validateAttentionMode(admitted: checkpoint.Admitted, mode: AttentionMode) !void {
-    if (mode == .reference) return;
-    if (admitted.numerics() != .hf_modelopt) return error.UnsupportedQwenAttentionMode;
+/// ModelOpt's serial reference attention reads BF16 rows only; e4m3 rows take the chunked partial.
+pub fn validateAttentionMode(admitted: checkpoint.Admitted, mode: AttentionMode, kv8: bool) !void {
+    if (admitted.numerics() != .hf_modelopt) {
+        if (mode != .reference) return error.UnsupportedQwenAttentionMode;
+        return;
+    }
+    if (mode == .reference and kv8) return error.QwenReferenceAttentionNeedsBf16Kv;
 }
 
 fn validateAttentionModeShape(configured: AttentionMode, requested: AttentionMode) !void {
@@ -538,7 +542,7 @@ pub const Engine = struct {
 
     pub fn initPlacedWithOptions(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, admitted: checkpoint.Admitted, placement: checkpoint.Placement, kv8: bool, options: InitOptions) !*Engine {
         try validateMoeMath(admitted, options.moe_math);
-        try validateAttentionMode(admitted, options.attention_mode);
+        try validateAttentionMode(admitted, options.attention_mode, kv8);
         const g = try placement.localGeometry(admitted.geometry);
         if (options.terminal_greedy and admitted.numerics() != .hf_modelopt) return error.UnsupportedQwenTerminalGreedy;
         if (options.expert_up_layout == .slice_major_v1 and (admitted.numerics() != .hf_modelopt or g.hidden != 2048 or g.intermediate != 512 or g.experts != 256)) return error.UnsupportedQwenExpertUpLayout;
@@ -624,11 +628,12 @@ pub const Engine = struct {
         e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
         if (e.numerics == .hf_modelopt) {
             e.modelopt = try modelopt.Bindings.loadWithOptions(ctx, &e.fns, .{ .up_layout = options.expert_up_layout, .moe_math = options.moe_math });
-            // HF bind replaces attn with the serial reference; chunked reuses ordinary qwen35.cu kernels.
+            // HF bind installs the serial reference; chunked takes the HF image's chunk-grid kernels (same per-key math).
             if (e.attention_mode == .chunked) {
                 const names = hf.attnKernelNames(.chunked);
-                e.fns.attn_partial = try e.mods[4].function(names.partial);
-                e.fns.attn_merge = try e.mods[4].function(names.merge);
+                e.fns.attn_partial = try e.modelopt.?.image.function(names.partial);
+                e.fns.attn_merge = try e.modelopt.?.image.function(names.merge);
+                e.fp8.attn_partial = try e.modelopt.?.image.function(hf.attn_partial8_chunked);
             }
         }
         errdefer if (e.modelopt) |*m| m.unload();
@@ -2345,11 +2350,14 @@ test "attention mode owns graph bit 27 and rejects Engine/Shape disagreement" {
         if (configured == requested) try validateAttentionModeShape(configured, requested) else try std.testing.expectError(error.QwenAttentionModeShapeMismatch, validateAttentionModeShape(configured, requested));
     };
     var admitted: checkpoint.Admitted = .{ .geometry = undefined, .encoding = .{ .modelopt = undefined } };
-    try validateAttentionMode(admitted, .reference);
-    try validateAttentionMode(admitted, .chunked);
+    try validateAttentionMode(admitted, .reference, false);
+    try validateAttentionMode(admitted, .chunked, false);
+    try validateAttentionMode(admitted, .chunked, true);
+    try std.testing.expectError(error.QwenReferenceAttentionNeedsBf16Kv, validateAttentionMode(admitted, .reference, true));
     admitted.encoding = .mlx;
-    try validateAttentionMode(admitted, .reference);
-    try std.testing.expectError(error.UnsupportedQwenAttentionMode, validateAttentionMode(admitted, .chunked));
+    try validateAttentionMode(admitted, .reference, false);
+    try validateAttentionMode(admitted, .reference, true);
+    try std.testing.expectError(error.UnsupportedQwenAttentionMode, validateAttentionMode(admitted, .chunked, false));
     const ref = hf.attnLaunch(.reference, 16, 2, 4, 8, max_chunks);
     const ch = hf.attnLaunch(.chunked, 16, 2, 4, 8, max_chunks);
     try std.testing.expect(ref.partial_grid[0] != ch.partial_grid[0] or ref.partial_grid[1] != ch.partial_grid[1]);
