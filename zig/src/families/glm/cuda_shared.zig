@@ -86,9 +86,11 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                 try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, sparse_any);
             }
             try f.prefetchSite(l.index, .o, rows);
+            var kernels = f.dsaKernels(r);
+            kernels.slot = di;
             for (r.segs) |g| {
                 const nch = @min(latent.chunksFor(g.st.pos + g.rows), b.nch);
-                try dsa_block.attend(f.dsaKernels(r), f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);
+                try dsa_block.attend(kernels, f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);
             }
             if (b.prefill) {
                 for (r.segs) |g| {

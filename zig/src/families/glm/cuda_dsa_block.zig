@@ -75,6 +75,8 @@ pub const Kernels = struct {
     ops: cuda.Module,
     owner: ?@import("cuda_kv_owner.zig").Transport = null,
     slot: usize = 0,
+    replicas: ?*Replicas = null,
+    prefill: bool = false,
 };
 
 /// forward.dsa_block (latent path) of `rows` rows at pos to an fp32 partial; `nch`: 512-key chunks, `part_rows`: block.
@@ -104,9 +106,65 @@ pub fn sparseRows(l: Layer, host_pos: usize, rows: usize) bool {
 const replica_slots = 16;
 const replica_floor_rows: usize = 262144;
 
-const Replica = struct { buf: ?cuda.DeviceBuffer = null };
+const Replica = struct {
+    buf: ?cuda.DeviceBuffer = null,
+    source: u64 = 0,
+    owner: u32 = 0,
+    valid_end: ?usize = null,
 
-var replicas: [replica_slots]Replica = @splat(.{});
+    fn start(r: Replica, source: u64, owner: u32, host_pos: usize) usize {
+        return if (r.source == source and r.owner == owner and r.valid_end == host_pos) host_pos else 0;
+    }
+};
+
+pub const Replicas = struct {
+    slots: [replica_slots]Replica = @splat(.{}),
+
+    pub fn invalidate(r: *Replicas) void {
+        for (&r.slots) |*slot| slot.valid_end = null;
+    }
+
+    pub fn deinit(r: *Replicas) void {
+        for (&r.slots) |*slot| if (slot.buf) |*buf| buf.free();
+        r.* = .{};
+    }
+};
+
+test "local replica coverage accepts only contiguous rows from the same source and owner" {
+    var replicas: Replicas = .{};
+    const entry = &replicas.slots[0];
+    try std.testing.expectEqual(@as(usize, 0), entry.start(11, 0, 2048));
+    entry.* = .{ .source = 11, .owner = 0, .valid_end = 2048 };
+    try std.testing.expectEqual(@as(usize, 2048), entry.start(11, 0, 2048));
+    try std.testing.expectEqual(@as(usize, 0), entry.start(12, 0, 2048));
+    try std.testing.expectEqual(@as(usize, 0), entry.start(11, 1, 2048));
+    try std.testing.expectEqual(@as(usize, 0), entry.start(11, 0, 1984));
+    try std.testing.expectEqual(@as(usize, 0), entry.start(11, 0, 2112));
+    replicas.invalidate();
+    try std.testing.expectEqual(@as(usize, 0), entry.start(11, 0, 2048));
+    entry.valid_end = 2304;
+    try std.testing.expectEqual(@as(usize, 2304), entry.start(11, 0, 2304));
+    try std.testing.expectEqual(@as(?usize, null), replicas.slots[1].valid_end);
+}
+
+test "an engine replica store preserves grown prefixes and frees its own buffers" {
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    var driver = Memory.driver();
+    const stream: cuda.Stream = .{ .d = &driver, .handle = null };
+    var replicas: Replicas = .{};
+    defer replicas.deinit();
+    const first = try ensureReplica(&replicas, &driver, stream, 0, 32);
+    @memset(Memory.slice(first, 32), 37);
+    const grown = try ensureReplica(&replicas, &driver, stream, 0, 64);
+    for (Memory.slice(grown, 32)) |byte| try std.testing.expectEqual(@as(u8, 37), byte);
+    _ = try ensureReplica(&replicas, &driver, stream, 1, 48);
+    replicas.invalidate();
+    try std.testing.expectEqual(grown, replicas.slots[0].buf.?.ptr);
+    try std.testing.expectError(error.BadPrefillSlot, ensureReplica(&replicas, &driver, stream, replica_slots, 64));
+    replicas.deinit();
+    for (replicas.slots) |slot| try std.testing.expect(slot.buf == null and slot.valid_end == null);
+    try std.testing.expect(Memory.empty());
+}
 
 fn localAttn(rows: usize) bool {
     if (rows < latent.prompt_rows) return false;
@@ -114,9 +172,9 @@ fn localAttn(rows: usize) bool {
     return std.mem.eql(u8, std.mem.span(v), "1");
 }
 
-fn ensureReplica(d: *const cuda.Driver, stream: cuda.Stream, slot: usize, bytes: usize) !u64 {
+fn ensureReplica(replicas: *Replicas, d: *const cuda.Driver, stream: cuda.Stream, slot: usize, bytes: usize) !u64 {
     if (slot >= replica_slots) return error.BadPrefillSlot;
-    var slot_buf = &replicas[slot];
+    var slot_buf = &replicas.slots[slot];
     if (slot_buf.buf) |*old| {
         if (old.len >= bytes) return old.ptr;
         var neu = try cuda.DeviceBuffer.alloc(d, bytes);
@@ -132,12 +190,21 @@ fn ensureReplica(d: *const cuda.Driver, stream: cuda.Stream, slot: usize, bytes:
 
 fn attendLocal(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, owner: u32, pos: u64, host_pos: usize, rows: usize, nch: usize, part_rows: usize, scale: f32, sparse_any: bool) !void {
     const transport = k.owner orelse return error.NoKvOwnerTransport;
+    errdefer transport.failure(error.PairedTransferFailed);
+    const replicas = k.replicas orelse return error.NoKvReplicaStore;
+    if (k.slot >= replica_slots or c.index.keys == 0) return error.BadPrefillSlot;
     const stride = cache.Format.rowBytes(c.lc.format, l.lw);
-    const need = @max((host_pos + rows) * stride, replica_floor_rows * stride);
-    const off = host_pos * stride;
-    const n = rows * stride;
-    const base = if (transport.rank == owner) c.lc.ptr else try ensureReplica(transport.d, stream, k.slot, need);
+    const end = try std.math.add(usize, host_pos, rows);
+    const need = try std.math.mul(usize, @max(end, replica_floor_rows), stride);
+    const entry = &replicas.slots[k.slot];
+    const start = entry.start(c.index.keys, owner, host_pos);
+    const off = try std.math.mul(usize, start, stride);
+    const n = try std.math.mul(usize, end - start, stride);
+    const base = if (transport.rank == owner) c.lc.ptr else try ensureReplica(replicas, transport.d, stream, k.slot, need);
     try transport.carry(stream, owner, 1 - owner, base + off, base + off, n);
+    entry.source = c.index.keys;
+    entry.owner = owner;
+    entry.valid_end = end;
     var caches = c;
     caches.lc.ptr = base;
     if (host_pos < l.dense_limit) try denseAttention(k, stream, l, caches, s, pos, rows, nch, part_rows, scale, latent.headBlock(rows));
@@ -270,7 +337,7 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
     const sparse_any = sparseRows(l, host_pos, rows);
     if (sparse_any) try sparse.selectTokens(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts);
     if (c.owner) |owner| {
-        if (localAttn(rows)) {
+        if (k.prefill and localAttn(rows)) {
             try attendLocal(k, stream, l, c, v, owner, pos, host_pos, rows, nch, part_rows, scale, sparse_any);
         } else {
             const transport = k.owner orelse return error.NoKvOwnerTransport;

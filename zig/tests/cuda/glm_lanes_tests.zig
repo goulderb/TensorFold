@@ -28,6 +28,14 @@ const DcKind = struct { kind: []const u8, prompt: []const i32, want: []const i32
 
 /// Small real-forward proof: packed prompt states and subsequent logits equal their serial twins.
 pub fn prefillSharedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
+    return prefillSharedProof(gpu, checkpoint, rank, world, id_path, false);
+}
+
+pub fn localAttentionRestoreCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
+    return prefillSharedProof(gpu, checkpoint, rank, world, id_path, true);
+}
+
+fn prefillSharedProof(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, id_path: []const u8, restore: bool) !void {
     const glm = @import("glm_cuda");
     var arena = std.heap.ArenaAllocator.init(gpu.gpa);
     defer arena.deinit();
@@ -39,6 +47,7 @@ pub fn prefillSharedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: 
     var problem: []const u8 = "";
     var settings = try glm.ranks.Settings.read(&glm.ranks.environment, &problem);
     settings.draft = .off;
+    if (restore and (!settings.kv_shard or settings.kv_pool_tokens < 65536)) return error.ProofNeedsShardedPool;
     const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = 4096, .mtp = false, .settings = settings });
     defer e.deinit();
     var link = try glm.follow.Link.init(gpu.gpa, gpu.d, &lib, comm, e.stream, 4096);
@@ -61,6 +70,7 @@ pub fn prefillSharedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: 
         parts[i] = .{ .slot = @intCast(i), .ids = ids };
         for ([_]u32{ @intCast(i), @intCast(i + lengths.len) }) |slot| {
             try x.bind(slot);
+            try x.reserve(4096);
             try x.begin(null);
         }
     }
@@ -122,6 +132,114 @@ pub fn prefillSharedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: 
         }
     }
     check.pass("TP={d}: eight cold prompts ({d}..{d} rows), every state byte, first token and three following decode logits equal serial twins", .{ world, lengths[0], lengths[lengths.len - 1] });
+    if (restore) {
+        for (0..2 * lengths.len) |slot| try x.release(@intCast(slot));
+        try localAttentionRestore(gpu, e, x, a);
+    }
+}
+
+fn localAttentionRestore(gpu: Gpu, e: *@import("glm_cuda").engine.Engine, x: @import("glm_cuda").follow.Leader, a: std.mem.Allocator) !void {
+    const Capture = struct {
+        engine: *@import("glm_cuda").engine.Engine,
+        id: ?u64 = null,
+        failure: ?anyerror = null,
+
+        fn at(ptr: *anyopaque, pos: u32) void {
+            const c: *@This() = @ptrCast(@alignCast(ptr));
+            if (pos != 2048) {
+                c.failure = error.BadProofMark;
+                return;
+            }
+            c.id = c.engine.keepState() catch |err| {
+                c.failure = err;
+                return;
+            };
+        }
+    };
+    const ids = try a.alloc(u32, 2304);
+    const other = try a.alloc(u32, 2048);
+    for (ids, 0..) |*id, i| id.* = @intCast(20 + (i * 17) % 7000);
+    for (other, 0..) |*id, i| id.* = @intCast(8000 + (i * 31) % 7000);
+    var capture: Capture = .{ .engine = e };
+    try x.bind(0);
+    try x.reserve(4096);
+    try x.begin(null);
+    const pool = if (e.pool) |*p| p else return error.ProofNeedsShardedPool;
+    const reference_region = pool.regions.slots[0].?;
+    for (e.cur.st.caches) |cache| try check.expect(cache.owner != null, "restore proof enters owner-sharded attention", .{});
+    const first = try x.prefill(ids, null, null, .{ .at = &.{2048}, .ctx = &capture, .call = Capture.at });
+    if (capture.failure) |err| return err;
+    const saved = capture.id orelse return error.MissingProofSnapshot;
+    defer e.dropState(saved);
+    try e.stream.synchronize();
+    const hidden = try a.alloc(u16, 256 * e.c.hidden);
+    try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(hidden.ptr, e.bp.fnormed, hidden.len * 2), "cuMemcpyDtoH");
+    const st = &e.cur.st;
+    const plan = try st.layout.snapshot(.{ .main = st.pos, .mtp = 0 });
+    const resident = !st.layout.external_planes or st.mtp_caches.owner == null or st.mtp_caches.owner.? == e.share.rank;
+    const state = try a.alloc(u8, plan.bytesFor(resident));
+    @memset(state, 0);
+    var ranges = plan.rangesFor(resident);
+    while (ranges.next()) |r| try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(state[r.saved..].ptr, st.address(r), r.bytes), "cuMemcpyDtoH");
+    const parity = try a.dupe(u1, st.cur);
+    const vocab = e.share.vocab.len();
+    const logits = try a.alloc(u16, 3 * vocab);
+    var tokens: [3]u32 = undefined;
+    for (0..3) |round| {
+        try x.verify(&.{@intCast(177 + round * 19)}, tokens[round..][0..1]);
+        try e.stream.synchronize();
+        try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(logits[round * vocab ..].ptr, e.bd.logits, vocab * 2), "cuMemcpyDtoH");
+        try x.keep(1);
+    }
+    const got_hidden = try a.alloc(u16, hidden.len);
+    const got_state = try a.alloc(u8, state.len);
+    @memset(got_state, 0);
+    const got_logits = try a.alloc(u16, vocab);
+    var hidden_hash: [32]u8 = undefined;
+    var state_hash: [32]u8 = undefined;
+    var logits_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(hidden), &hidden_hash, .{});
+    std.crypto.hash.sha2.Sha256.hash(state, &state_hash, .{});
+    std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &logits_hash, .{});
+    std.debug.print("LOCAL_ATTN_ORACLE first={d} hidden={s} state={s} logits={s} decode={any}\n", .{
+        first,                                   std.fmt.bytesToHex(hidden_hash, .lower), std.fmt.bytesToHex(state_hash, .lower),
+        std.fmt.bytesToHex(logits_hash, .lower), tokens,
+    });
+    try x.bind(2);
+    try x.reserve(4096);
+    try check.expect(pool.regions.owner(pool.regions.slots[2].?) != pool.regions.owner(reference_region), "dummy reservation balances the opposite owner", .{});
+    for ([_]bool{ true, false }) |reuse| {
+        try x.bind(1);
+        try x.reserve(4096);
+        try x.begin(null);
+        _ = try x.prefill(other, null, null, null);
+        if (reuse) {
+            try x.release(1);
+            try x.bind(1);
+            try x.reserve(4096);
+            try x.begin(null);
+        }
+        const destination_region = pool.regions.slots[1].?;
+        try check.expect(pool.regions.owner(reference_region) == pool.regions.owner(destination_region) and
+            (reference_region.base + reference_region.rows <= destination_region.base or destination_region.base + destination_region.rows <= reference_region.base), "reference and restore use disjoint extents with the same physical owner", .{});
+        const got_first = try x.prefill(ids, .{ .id = saved, .at = 2048 }, null, null);
+        try e.stream.synchronize();
+        try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(got_hidden.ptr, e.bp.fnormed, got_hidden.len * 2), "cuMemcpyDtoH");
+        try check.expect(got_first == first and std.mem.eql(u16, hidden, got_hidden), "local attention restore (release/reuse={}): first token and all suffix hidden rows equal cold reference (first diff {?d})", .{ reuse, std.mem.indexOfDiff(u16, hidden, got_hidden) });
+        const got = &e.cur.st;
+        var got_ranges = plan.rangesFor(resident);
+        while (got_ranges.next()) |r| try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(got_state[r.saved..].ptr, got.address(r), r.bytes), "cuMemcpyDtoH");
+        try check.expect(got.pos == ids.len and got.pending == 0 and std.mem.eql(u1, got.cur, parity) and std.mem.eql(u8, state, got_state), "local attention restore (release/reuse={}): every visible state byte and KDA parity equal cold reference (first diff {?d})", .{ reuse, std.mem.indexOfDiff(u8, state, got_state) });
+        for (0..3) |round| {
+            var token: [1]u32 = undefined;
+            try x.verify(&.{@intCast(177 + round * 19)}, &token);
+            try e.stream.synchronize();
+            try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(got_logits.ptr, e.bd.logits, vocab * 2), "cuMemcpyDtoH");
+            try check.expect(token[0] == tokens[round] and std.mem.eql(u16, logits[round * vocab ..][0..vocab], got_logits), "local attention restore (release/reuse={}): decode round {d} logits and token equal cold reference", .{ reuse, round });
+            try x.keep(1);
+        }
+    }
+    check.pass("TP={d}: first restored suffix after unrelated prefill, released slot reuse and same-slot restore equal cold reference", .{e.share.world});
 }
 
 /// `glm-lanes-cover`: CONTRIBUTING's single-stream contracts on one Engine: drafts, cancel, discard, eos, prompt cache.

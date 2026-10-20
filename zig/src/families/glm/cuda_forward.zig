@@ -216,6 +216,7 @@ pub const Forward = struct {
     exchange: Exchange,
     tp_group: ?*const cuda.tp_group.Group = null,
     prefetch: ?*l2pf.Prefetch = null,
+    replicas: ?*dsa_block.Replicas = null,
     attn_fp8load: bool = false,
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE (the Python family's default): decode windows on KDA's three-kernel chain
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
@@ -274,7 +275,7 @@ pub const Forward = struct {
     }
 
     pub fn dsaKernels(f: *const Forward, r: Rank) dsa_block.Kernels {
-        return .{ .set = f.set(), .ops = f.m.ops(), .owner = switch (f.exchange) {
+        return .{ .set = f.set(), .ops = f.m.ops(), .replicas = f.replicas, .prefill = r.b.prefill, .owner = switch (f.exchange) {
             .local => null,
             .nccl => |n| .{ .d = f.d, .lib = n.lib, .comm = n.comm, .rank = r.w.share.rank, .tp_group = f.tp_group },
         } };
