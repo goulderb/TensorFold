@@ -169,6 +169,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         .imports = &.{.{ .name = "qwen35_cuda", .module = qwen35Module(b, target, optimize, cuda, mods.core, mods.qwen35) }},
     }) });
     b.step("qwen35-margins", "Build only the Qwen35 BF16/FP8 KV teacher-forced margin diagnostic; never run it").dependOn(&b.addInstallArtifact(qwen_margins, .{}).step);
+    const qwen_attn_compare = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/qwen35_attn_compare.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{.{ .name = "cuda", .module = cuda }} });
+    const attn_compare_step = b.step("qwen35-attn-compare", "Build only the Qwen35 reference-vs-chunked attention fp64 accuracy check; never run it");
+    attn_compare_step.dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-qwen35-attn-compare", .root_module = qwen_attn_compare }), .{}).step);
+    attn_compare_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen_attn_compare })).step);
     return server_exe;
 }
 
