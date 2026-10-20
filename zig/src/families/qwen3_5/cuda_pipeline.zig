@@ -4,6 +4,7 @@ const core = @import("core");
 const checkpoint = @import("cuda_checkpoint.zig");
 const weights = @import("cuda_weights.zig");
 const engine = @import("cuda_engine.zig");
+const reuse = @import("cuda_reuse.zig");
 
 pub const floor_bytes = 1536 << 20;
 pub const MoeMath = engine.MoeMath;
@@ -135,6 +136,12 @@ pub const Chain = struct {
         c.gpa.destroy(c);
     }
 
+    pub fn keptBytes(c: *const Chain, at: u32) u64 {
+        var n: u64 = 0;
+        for (c.partitions) |p| n += reuse.hostBytes(p.engine, at);
+        return n;
+    }
+
     pub fn createSession(c: *Chain) !Session {
         return c.createSessionWithLayout(.key_value);
     }
@@ -263,6 +270,52 @@ pub const Session = struct {
 
     fn invalidateGreedy(s: *Session) void {
         for (s.caches[0..s.chain.partitions.len]) |*cache| cache.terminal_greedy = null;
+    }
+
+    pub const Kept = struct {
+        parts: [2]?*reuse.Copy = .{ null, null },
+        n: usize = 0,
+        at: usize = 0,
+    };
+
+    pub fn saveKept(s: *Session, at: u32) !*anyopaque {
+        if (s.poisoned or s.position != at) return error.NotAtMark;
+        const kept = try s.chain.gpa.create(Kept);
+        errdefer s.chain.gpa.destroy(kept);
+        kept.* = .{ .n = s.chain.partitions.len, .at = at };
+        var made: usize = 0;
+        errdefer {
+            for (kept.parts[0..made], s.chain.partitions[0..made]) |copy, *p| {
+                p.context.makeCurrent() catch {};
+                if (copy) |c| reuse.dropCopy(p.engine, c);
+            }
+        }
+        for (s.chain.partitions, 0..) |*p, i| {
+            try p.context.makeCurrent();
+            kept.parts[i] = try reuse.saveCache(p.engine, &s.caches[i], at, &.{});
+            made += 1;
+        }
+        return kept;
+    }
+
+    pub fn restoreKept(s: *Session, saved: *anyopaque) !void {
+        const kept: *Kept = @ptrCast(@alignCast(saved));
+        if (kept.n != s.chain.partitions.len or kept.at == 0) return error.BadReuse;
+        for (s.chain.partitions, 0..) |*p, i| {
+            try p.context.makeCurrent();
+            try reuse.restoreCache(p.engine, &s.caches[i], @ptrCast(kept.parts[i] orelse return error.BadReuse), &.{});
+        }
+        s.position = kept.at;
+        @memcpy(s.logits, s.caches[s.chain.partitions.len - 1].logits);
+    }
+
+    pub fn dropKept(s: *Session, saved: *anyopaque) void {
+        const kept: *Kept = @ptrCast(@alignCast(saved));
+        for (s.chain.partitions[0..kept.n], 0..) |*p, i| {
+            p.context.makeCurrent() catch {};
+            if (kept.parts[i]) |copy| reuse.dropCopy(p.engine, copy);
+        }
+        s.chain.gpa.destroy(kept);
     }
 
     pub fn cachedGreedy(s: *const Session, position: u64) !?u32 {

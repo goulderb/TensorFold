@@ -344,10 +344,28 @@ fn openQwen(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         .served = .{ .backend = loaded.backend, .facts = qwen_modelopt.facts, .stream_bytes = 0 },
         .request_refusal = qwen_modelopt.requestRefusal,
     };
-    try h.serve(io, qwen_modelopt.facts, 1, .{
+    if (o.prompt_cache_gib) |cache_gib| {
+        const cache_bytes: u64 = @intFromFloat(cache_gib * gib);
+        if (cache_bytes > 0) {
+            const pc = api.prompt_cache;
+            const store = try gpa.create(pc.Store);
+            errdefer gpa.destroy(store);
+            const copies: pc.Snapshots = .{ .ptr = loaded.ctx, .vtable = &snaps.Snaps(qwen_modelopt, null).vtable };
+            store.* = pc.Store.init(gpa, copies, snaps.cacheRules(qwen_modelopt), cache_bytes);
+            h.store = store;
+            errdefer {
+                store.deinit();
+                gpa.destroy(store);
+                h.store = null;
+            }
+        }
+    }
+    var served_facts = qwen_modelopt.facts;
+    served_facts.max_streams = loaded.lanes;
+    try h.serve(io, served_facts, 1, .{
         .name = "qwen35-cuda-lanes",
         .call_gates = true,
-        .lanes = 1,
+        .lanes = loaded.lanes,
         .context_window = @intCast(loaded.context),
         .max_queued = o.max_queued orelse 8,
         .plain_only = true,

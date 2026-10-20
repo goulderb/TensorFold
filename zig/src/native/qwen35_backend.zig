@@ -18,26 +18,41 @@ pub fn Adapter(comptime Session: type) type {
         const Self = @This();
         gpa: Allocator,
         session: *Session,
+        sessions: []Session,
+        bound: []?*lanes.Stream,
+        prompt_at: []usize,
         capacity: usize,
         /// Prompt tokens per true session.append; default 1 matches FakeSession and legacy Chain.
         prefill_rows: usize = 1,
         active: ?*lanes.Stream = null,
-        prompt_at: usize = 0,
         values: []f64,
         ids: []u64,
+        lock: std.atomic.Mutex = .unlocked,
 
         pub fn init(gpa: Allocator, session: *Session, capacity: usize) !Self {
-            if (session.logits.len == 0 or capacity == 0) return error.InvalidSession;
-            const values = try gpa.alloc(f64, session.logits.len);
+            return initSessions(gpa, @as(*[1]Session, session), capacity);
+        }
+
+        pub fn initSessions(gpa: Allocator, sessions: []Session, capacity: usize) !Self {
+            if (sessions.len == 0 or sessions[0].logits.len == 0 or capacity == 0) return error.InvalidSession;
+            const values = try gpa.alloc(f64, sessions[0].logits.len);
             errdefer gpa.free(values);
-            const ids = try gpa.alloc(u64, session.logits.len);
+            const ids = try gpa.alloc(u64, sessions[0].logits.len);
+            errdefer gpa.free(ids);
             for (ids, 0..) |*id, i| id.* = i;
-            return .{ .gpa = gpa, .session = session, .capacity = capacity, .values = values, .ids = ids };
+            const bound = try gpa.alloc(?*lanes.Stream, sessions.len);
+            errdefer gpa.free(bound);
+            @memset(bound, null);
+            const prompt_at = try gpa.alloc(usize, sessions.len);
+            @memset(prompt_at, 0);
+            return .{ .gpa = gpa, .session = &sessions[0], .sessions = sessions, .bound = bound, .prompt_at = prompt_at, .capacity = capacity, .values = values, .ids = ids };
         }
 
         pub fn deinit(self: *Self) void {
             self.gpa.free(self.values);
             self.gpa.free(self.ids);
+            self.gpa.free(self.bound);
+            self.gpa.free(self.prompt_at);
         }
 
         pub fn backend(self: *Self) be.Backend {
@@ -61,29 +76,81 @@ pub fn Adapter(comptime Session: type) type {
             return @ptrCast(@alignCast(ptr));
         }
 
+        pub fn boundIndex(self: *const Self, s: *lanes.Stream) ?usize {
+            for (self.bound, 0..) |b, i| if (b == s) return i;
+            if (self.active == s) return 0;
+            return null;
+        }
+
+        fn indexOf(self: *Self, s: *lanes.Stream) ?usize {
+            return self.boundIndex(s);
+        }
+
+        fn sessionOf(self: *Self, s: *lanes.Stream) !*Session {
+            const i = self.indexOf(s) orelse return error.PositionMismatch;
+            return &self.sessions[i];
+        }
+
+        fn acquire(self: *Self, s: *lanes.Stream) !usize {
+            if (self.indexOf(s)) |i| return i;
+            for (self.bound, 0..) |*b, i| if (b.* == null) {
+                b.* = s;
+                self.prompt_at[i] = 0;
+                if (i == 0) self.active = s;
+                return i;
+            };
+            return error.LaneMemory;
+        }
+
         fn draw(self: *Self, s: *lanes.Stream, position: u64) !u64 {
-            if (self.active != s or self.session.position != position) return error.PositionMismatch;
+            const session = try self.sessionOf(s);
+            if (session.position != position) return error.PositionMismatch;
             const sampling: lanes.Sampling = s.sampling orelse .{ .seed = 0, .temperature = 0 };
             if (sampling.temperature <= 0) {
-                if (try self.session.cachedGreedy(position)) |token| return token;
+                if (try session.cachedGreedy(position)) |token| return token;
             }
-            for (self.values, self.session.logits) |*value, bits|
+            for (self.values, session.logits) |*value, bits|
                 value.* = @as(f32, @bitCast(@as(u32, bits) << 16));
             return lanes.sampling.choose(self.gpa, self.values, self.ids, position, sampling);
         }
 
         fn begin(self: *Self, s: *lanes.Stream) !void {
-            if (self.active != null) return error.LaneMemory;
+            if (self.indexOf(s) != null) return;
             if (s.prompt_len == 0 or s.prompt_len > self.capacity or s.max_new > self.capacity - s.prompt_len)
                 return error.ContextFull;
             if (s.vision != null or s.images.len > 0 or s.grammar != null or
                 s.logprobs != null or s.prompt_logprobs != null or s.think_budget != 0 or
-                s.decode_spans.len > 0 or s.reuse.saved != null or s.reuse.at != 0)
+                s.decode_spans.len > 0)
                 return error.UnsupportedRequest;
             for (s.context.items[0..s.prompt_len]) |id| if (id >= self.ids.len) return error.InvalidToken;
-            try self.session.reset();
-            self.prompt_at = 0;
-            self.active = s;
+            const i = try self.acquire(s);
+            const session = &self.sessions[i];
+            if (s.reuse.saved) |saved| {
+                if (s.reuse.at == 0 or s.reuse.at >= s.prompt_len) {
+                    s.reuse_failed = true;
+                    try session.reset();
+                    self.prompt_at[i] = 0;
+                    s.cached = 0;
+                } else if (comptime @hasDecl(Session, "restoreKept")) {
+                    if (session.restoreKept(saved)) {
+                        self.prompt_at[i] = s.reuse.at;
+                        s.cached = s.reuse.at;
+                    } else |_| {
+                        s.reuse_failed = true;
+                        try session.reset();
+                        self.prompt_at[i] = 0;
+                        s.cached = 0;
+                    }
+                } else {
+                    session.position = s.reuse.at;
+                    self.prompt_at[i] = s.reuse.at;
+                    s.cached = s.reuse.at;
+                }
+            } else {
+                try session.reset();
+                self.prompt_at[i] = 0;
+                s.cached = 0;
+            }
         }
 
         fn prefill(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
@@ -92,32 +159,45 @@ pub fn Adapter(comptime Session: type) type {
 
         fn prefillStep(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
             const self = of(ptr);
+            while (!self.lock.tryLock()) std.Thread.yield() catch {};
+            defer self.lock.unlock();
             if (s.isCancelled()) return error.Cancelled;
-            if (self.active != s) try self.begin(s);
+            if (self.indexOf(s) == null) try self.begin(s);
+            const i = self.indexOf(s) orelse return error.PositionMismatch;
+            const session = &self.sessions[i];
             if (self.prefill_rows == 0) return error.InvalidSession;
-            if (self.prompt_at < s.prompt_len) {
-                const first_chunk = self.prompt_at == 0;
-                const n = @min(self.prefill_rows, s.prompt_len - self.prompt_at);
-                try self.session.append(s.context.items[self.prompt_at..][0..n]);
-                self.prompt_at += n;
-                s.fill_at.store(@intCast(self.prompt_at), .monotonic);
-                if (first_chunk) std.log.info("qwen prefill first chunk rows={d} position={d}", .{ n, self.session.position });
+            if (self.prompt_at[i] < s.prompt_len) {
+                const first_chunk = self.prompt_at[i] == 0;
+                const n = @min(self.prefill_rows, s.prompt_len - self.prompt_at[i]);
+                try session.append(s.context.items[self.prompt_at[i]..][0..n]);
+                self.prompt_at[i] += n;
+                s.fill_at.store(@intCast(self.prompt_at[i]), .monotonic);
+                if (first_chunk) std.log.info("qwen prefill first chunk rows={d} position={d}", .{ n, session.position });
+                if (self.prompt_at[i] < s.prompt_len and std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(self.prompt_at[i])) != null) {
+                    if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(self.prompt_at[i]));
+                }
             }
-            return self.prompt_at == s.prompt_len;
+            return self.prompt_at[i] == s.prompt_len;
         }
 
         fn first(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
-            return of(ptr).draw(s, position);
+            const self = of(ptr);
+            while (!self.lock.tryLock()) std.Thread.yield() catch {};
+            defer self.lock.unlock();
+            return self.draw(s, position);
         }
 
         fn queue(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
             const self = of(ptr);
-            if (self.active != s or self.session.position + 1 != position) return error.PositionMismatch;
+            while (!self.lock.tryLock()) std.Thread.yield() catch {};
+            defer self.lock.unlock();
+            const session = try self.sessionOf(s);
+            if (session.position + 1 != position) return error.PositionMismatch;
             const token = switch (feed) {
                 .value => |t| t,
                 .handle => |h| try read(ptr, h),
             };
-            try self.session.append(&.{token});
+            try session.append(&.{token});
             return self.draw(s, position);
         }
 
@@ -136,18 +216,24 @@ pub fn Adapter(comptime Session: type) type {
         }
 
         fn keep(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
+            const self = of(ptr);
             if (windows.len != 1 or paths.len != 1 or paths[0].len != 1 or paths[0][0] != 0 or
-                windows[0].rows() != 1 or of(ptr).active != windows[0].stream)
+                windows[0].rows() != 1 or self.indexOf(windows[0].stream) == null)
                 return error.UnsupportedRollback;
         }
 
         fn draft(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
-            for (requests) |r| if (r.depth != 0 or r.early or r.lanes != null or r.ranks or of(ptr).active != r.stream)
+            const self = of(ptr);
+            for (requests) |r| if (r.depth != 0 or r.early or r.lanes != null or r.ranks or self.indexOf(r.stream) == null)
                 return error.DraftsUnsupported;
         }
 
         fn release(ptr: *anyopaque, s: *lanes.Stream) void {
             const self = of(ptr);
+            if (self.indexOf(s)) |i| {
+                self.bound[i] = null;
+                self.prompt_at[i] = 0;
+            }
             if (self.active == s) self.active = null;
         }
     };
@@ -505,4 +591,28 @@ test "Qwen bounded prefill cancels between chunks and rejects a zero bound" {
     try std.testing.expectError(error.InvalidSession, zero_adapter.backend().prefill(&bad));
     try std.testing.expectEqual(@as(usize, 1), zero_session.resets);
     try std.testing.expectEqual(@as(usize, 0), zero_session.position);
+}
+
+test "Qwen adapter binds two sessions and refuses a third" {
+    const gpa = std.testing.allocator;
+    var sessions: [2]FakeSession = .{ .{}, .{} };
+    var adapter = try Adapter(FakeSession).initSessions(gpa, &sessions, 32);
+    defer adapter.deinit();
+    const backend = adapter.backend();
+    var a = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &.{1}, .max_new = 1 });
+    defer a.deinit(gpa);
+    var b = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &.{2}, .max_new = 1 });
+    defer b.deinit(gpa);
+    var c = try lanes.Stream.init(gpa, .{ .id = "c", .prompt = &.{3}, .max_new = 1 });
+    defer c.deinit(gpa);
+    try backend.prefill(&a);
+    try backend.prefill(&b);
+    try std.testing.expectEqual(@as(usize, 1), sessions[0].resets);
+    try std.testing.expectEqual(@as(usize, 1), sessions[1].resets);
+    try std.testing.expectError(error.LaneMemory, backend.prefill(&c));
+    backend.release(&a);
+    try backend.prefill(&c);
+    try std.testing.expectEqual(@as(usize, 2), sessions[0].resets);
+    backend.release(&b);
+    backend.release(&c);
 }

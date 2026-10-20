@@ -12,12 +12,12 @@ pub fn claims(gpa: Allocator, io: std.Io, dir: []const u8) !bool {
 }
 
 pub fn refusal(o: api.Open) ?[]const u8 {
-    if (o.lanes_fixed and o.lanes != 1) return "the Qwen CUDA correctness baseline serves one request at a time; use --parallel 1";
+    if (o.lanes_fixed and (o.lanes < 1 or o.lanes > 2)) return "the Qwen CUDA baseline serves one or two requests at a time; use --parallel 1 or 2";
     if (o.tp != 1) return "the Qwen CUDA baseline uses a layer split, with no tensor-parallel collectives";
     if (o.vision != null) return "the Qwen CUDA baseline serves text; its vision tower is not ported";
     if (o.drafter != null or o.mtp_drafts != null or o.mtp_confidence != null) return "the Qwen CUDA baseline has no drafter or MTP execution";
     if (o.slide or o.recall or o.learn != null or o.learn_conversations or o.record != null) return "the Qwen CUDA baseline has no learning, recording or persistent cache";
-    if (o.keep != null or o.prompt_cache_gib != null) return "the Qwen CUDA baseline keeps independent request state with no prefix cache";
+    if (o.keep != null) return "the Qwen CUDA baseline has no --checkpoint-slots keep store";
     if (o.kv8) return "the Qwen ModelOpt baseline supports BF16 KV only; omit --kv-cache fp8";
     if (o.precision != null or o.policy.len > 0) return "the Qwen CUDA baseline uses the checkpoint's FP8 activations, W4A16 experts and BF16 KV";
     if (o.segments != null and o.segments.? != 1) return "the Qwen CUDA baseline prefills one token per engine step; use --segments 1";
@@ -61,24 +61,53 @@ pub const Loaded = struct {
     release: *const fn (*anyopaque) void,
     backend: lanes.backend.Backend,
     context: usize,
+    lanes: u32,
 };
 
 pub const facts = lane.facts;
+pub const snap_host = true;
+pub const snap_lookahead: u32 = 0;
+pub const snap_grid: u32 = 2048;
 
 const Owner = struct {
     gpa: Allocator,
     model: *qwen.Engine,
-    session: qwen.Session,
+    sessions: []qwen.Session,
     adapter: lane.Adapter(qwen.Session),
 
     fn release(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.adapter.deinit();
-        self.session.deinit();
+        for (self.sessions) |*session| session.deinit();
+        self.gpa.free(self.sessions);
         self.model.deinit();
         self.gpa.destroy(self);
     }
 };
+
+pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
+    const self: *Owner = @ptrCast(@alignCast(ptr));
+    return self.model.keptBytes(at);
+}
+
+pub fn snap_save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
+    const self: *Owner = @ptrCast(@alignCast(ptr));
+    const stream: *lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
+    const i = self.adapter.boundIndex(stream) orelse return error.UnknownStream;
+    return self.sessions[i].saveKept(at);
+}
+
+pub fn snap_restore(ptr: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!void {
+    const self: *Owner = @ptrCast(@alignCast(ptr));
+    const stream: *lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
+    const i = self.adapter.boundIndex(stream) orelse return error.UnknownStream;
+    return self.sessions[i].restoreKept(saved);
+}
+
+pub fn snap_drop(ptr: *anyopaque, saved: *anyopaque) void {
+    const self: *Owner = @ptrCast(@alignCast(ptr));
+    self.sessions[0].dropKept(saved);
+}
 
 pub fn load(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?Loaded {
     if (refusal(o) orelse environmentRefusal(getenv)) |why| {
@@ -114,14 +143,26 @@ pub fn load(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         return null;
     };
     errdefer model.deinit();
+    const lanes_n: u32 = if (o.lanes_fixed) o.lanes else 1;
+    if (lanes_n < 1 or lanes_n > 2) {
+        problem.* = "the Qwen CUDA baseline serves one or two requests at a time; use --parallel 1 or 2";
+        return null;
+    }
     const owner = try gpa.create(Owner);
     errdefer gpa.destroy(owner);
-    owner.* = .{ .gpa = gpa, .model = model, .session = try model.createSession(), .adapter = undefined };
-    errdefer owner.session.deinit();
-    owner.adapter = try lane.Adapter(qwen.Session).init(gpa, &owner.session, context);
-    // one bound: the live Chain value, not a second copy of the Open field
-    owner.adapter.prefill_rows = owner.session.chain.prefill_rows;
-    return .{ .ctx = owner, .release = Owner.release, .backend = owner.adapter.backend(), .context = context };
+    const sessions = try gpa.alloc(qwen.Session, lanes_n);
+    errdefer gpa.free(sessions);
+    var made: usize = 0;
+    errdefer {
+        for (sessions[0..made]) |*session| session.deinit();
+    }
+    while (made < lanes_n) : (made += 1) {
+        sessions[made] = try model.createSession();
+    }
+    owner.* = .{ .gpa = gpa, .model = model, .sessions = sessions, .adapter = undefined };
+    owner.adapter = try lane.Adapter(qwen.Session).initSessions(gpa, owner.sessions, context);
+    owner.adapter.prefill_rows = owner.sessions[0].chain.prefill_rows;
+    return .{ .ctx = owner, .release = Owner.release, .backend = owner.adapter.backend(), .context = context, .lanes = lanes_n };
 }
 
 test "unsupported Qwen capabilities refuse before loading CUDA" {
@@ -135,6 +176,11 @@ test "unsupported Qwen capabilities refuse before loading CUDA" {
     try std.testing.expect(refusal(o) != null);
     o.lanes = 1;
     try std.testing.expect(refusal(o) == null);
+    o.lanes = 2;
+    try std.testing.expect(refusal(o) == null);
+    o.lanes = 3;
+    try std.testing.expect(refusal(o) != null);
+    o.lanes = 1;
     o.learn_conversations = true;
     try std.testing.expect(refusal(o) != null);
     o = base;
@@ -145,6 +191,9 @@ test "unsupported Qwen capabilities refuse before loading CUDA" {
     try std.testing.expect(refusal(o) != null);
     o = base;
     o.prefill_rows = 16;
+    try std.testing.expect(refusal(o) == null);
+    o = base;
+    o.prompt_cache_gib = 4;
     try std.testing.expect(refusal(o) == null);
 }
 

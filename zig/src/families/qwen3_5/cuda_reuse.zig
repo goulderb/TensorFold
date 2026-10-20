@@ -104,7 +104,11 @@ pub fn sameImages(kept: []const Seen, request: []const Seen, at: usize) bool {
 /// Host bytes a save at `at` takes.
 pub fn bytes(ptr: *anyopaque, at: u32) u64 {
     const t: *Target = @ptrCast(@alignCast(ptr));
-    return (Layout{ .g = t.e.g, .format = formatOf(t.e), .cap = 0, .at = at }).total();
+    return hostBytes(t.e, at);
+}
+
+pub fn hostBytes(e: *const Engine, at: u32) u64 {
+    return (Layout{ .g = e.g, .format = formatOf(e), .cap = 0, .at = at }).total();
 }
 
 /// Copy the stream's state after `at` prompt tokens; its prompt pass stands there.
