@@ -213,8 +213,16 @@ fn attendLocal(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch,
 
 /// The block's row-by-row part for a shared window: projections, norms, q_b, indexer, absorbed query, `qi`'s query.
 pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool) !void {
+    try front(set, stream, l, s, x, x_stride, rows);
+    try prepareRest(set, stream, l, s, x, x_stride, rows, qi);
+}
+
+pub fn front(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize) !void {
     try prepareInput(set, stream, l, s, x, x_stride, rows);
     try b16.proj(set, stream, s.qr, l.q_lora, l.q_b, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
+}
+
+pub fn prepareRest(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool) !void {
     const ix = l.index;
     try b16.proj(set, stream, x, x_stride, ix.kw, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
     try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);

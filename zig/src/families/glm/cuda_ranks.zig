@@ -10,6 +10,7 @@ const verify = @import("cuda_verify_plan.zig");
 const profile = @import("cuda_draft_profile.zig");
 const route_trace = @import("cuda_route_trace.zig");
 const l2pf = @import("cuda_l2pf_plan.zig");
+const kda = @import("cuda_kda.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const Drafter = enum(u8) { off, mtp, dflash2 };
 pub const TargetGraphs = enum(u8) { off, ffn, full };
@@ -37,12 +38,15 @@ pub const Settings = struct {
     kv_pool_tokens: u32 = 0,
     kv_shard: bool = false,
     split: bool = true, // TF_GLM_PREFILL_REDUCE: split (each rank glues its own rows) or gather
+    kda_prompt: kda.PromptAlgorithm = .serial,
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE: 1 (decode windows on KDA's three-kernel chain) or 0
     target_graphs: TargetGraphs = .off,
     communication: Communication = .nccl,
     roce_max_bytes: u32 = 512 * 1024,
     prefetch: l2pf.Settings = .{},
     draft_prelaunch: bool = false,
+    prefill_overlap: u8 = 0,
+    prefill_pieces: u32 = 2,
     pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole).
     heat: ?heat.Bands = null, // TF_HEAT_HIGH and TF_HEAT_LOW (upstream's names): a prompt chunk waits on every rank's hottest zone
     layers: u32 = 0, // TF_GLM_LAYERS: the first this many layers only, a thin model for one-GPU checks (0: all)
@@ -50,6 +54,15 @@ pub const Settings = struct {
 
     pub fn hashNumerics(s: Settings, digest: *Sha256) void {
         digest.update("glm-numerics-mia-f1ee79a6-v1\x00");
+        digest.update("glm-affine4-prefill-explicit-v1\x00");
+        if (s.kda_prompt == .wy32) digest.update("glm-kda-wy32-production-v1\x00");
+        if (s.prefill_overlap != 0) {
+            digest.update("glm-prompt-global-half-v1\x00");
+            digest.update(&.{s.prefill_overlap});
+            var pieces_bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &pieces_bytes, s.prefill_pieces, .little);
+            digest.update(&pieces_bytes);
+        }
         s.weight_dense.hash(digest);
         s.draft_profile.hash(digest);
         if (s.prefetch.mode != null) digest.update(&s.prefetch.digest());
@@ -76,6 +89,25 @@ pub const Settings = struct {
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
         var s: Settings = .{};
+        if (get("TF_GLM_PREFILL_OVERLAP")) |v| {
+            if (std.mem.eql(u8, v, "0")) s.prefill_overlap = 0 else if (std.mem.eql(u8, v, "1")) s.prefill_overlap = 1 else if (std.mem.eql(u8, v, "2")) s.prefill_overlap = 2 else {
+                problem.* = "TF_GLM_PREFILL_OVERLAP: 0, 1 or 2";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_PREFILL_OVERLAP_PIECES")) |v| {
+            s.prefill_pieces = std.fmt.parseInt(u32, v, 10) catch 0;
+            if (s.prefill_pieces < 1 or s.prefill_pieces > 8) {
+                problem.* = "TF_GLM_PREFILL_OVERLAP_PIECES: 1 to 8";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_KDA_CHUNKED")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.kda_prompt = .wy32 else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_KDA_CHUNKED: 0 or 1";
+                return error.BadSetting;
+            }
+        }
         if (get("TF_GLM_DRAFT_PRELAUNCH")) |v| {
             if (std.mem.eql(u8, v, "1")) s.draft_prelaunch = true else if (!std.mem.eql(u8, v, "0")) {
                 problem.* = "TF_GLM_DRAFT_PRELAUNCH: 0 or 1";
@@ -232,6 +264,10 @@ pub const Settings = struct {
             problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
             return error.BadSetting;
         };
+        if (s.prefill_overlap != 0 and !s.split) {
+            problem.* = "TF_GLM_PREFILL_OVERLAP requires TF_GLM_PREFILL_REDUCE=split";
+            return error.BadSetting;
+        }
         return s;
     }
 };
@@ -246,17 +282,20 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 18,
+    layout: u32 = 20,
     world: u32,
     rank: u32,
     split: u32,
     kda_wide: u32,
+    kda_prompt: u32,
     target_graphs: u32 = 0,
     communication: u32 = 0,
     roce_max_bytes: u32 = 0,
     prefetch: [32]u8 = @splat(0),
     draft_prelaunch: u32 = 0,
     pieces: u32,
+    prefill_overlap: u32,
+    prefill_pieces: u32,
     layers: u32, // TF_GLM_LAYERS (0: all)
     kv: u32,
     attn_fp8load: u32 = 0,
@@ -279,10 +318,10 @@ pub const Fingerprint = extern struct {
     program: [32]u8, // sha256 of this executable
     checkpoint: [64]u8, // the checkpoint folder's last name (the snapshot's revision), zero padded
 
-    pub const Field = enum { layout, rank, world, split, kda_wide, target_graphs, communication, roce_max_bytes, prefetch, draft_prelaunch, pieces, layers, kv, attn_fp8load, weight_dense, weight_head, exl3_decode, exl3_routed, draft, dflash_verify, draft_profile, draft_checkpoint, vision, kv_pool_tokens, kv_shard, spill, capacity, heat_high, heat_low, config, program, checkpoint };
+    pub const Field = enum { layout, rank, world, split, kda_wide, kda_prompt, target_graphs, communication, roce_max_bytes, prefetch, draft_prelaunch, pieces, prefill_overlap, prefill_pieces, layers, kv, attn_fp8load, weight_dense, weight_head, exl3_decode, exl3_routed, draft, dflash_verify, draft_profile, draft_checkpoint, vision, kv_pool_tokens, kv_shard, spill, capacity, heat_high, heat_low, config, program, checkpoint };
 
     pub fn of(world: usize, rank: usize, s: Settings, capacity: usize, config: [32]u8, program: [32]u8, checkpoint_dir: []const u8) Fingerprint {
-        var f: Fingerprint = .{ .world = @intCast(world), .rank = @intCast(rank), .split = @intFromBool(s.split), .kda_wide = @intFromBool(s.kda_wide), .pieces = s.pieces, .layers = s.layers, .kv = @backingInt(s.kv), .kv_pool_tokens = s.kv_pool_tokens, .kv_shard = @intFromBool(s.kv_shard), .capacity = capacity, .heat_high = if (s.heat) |b| b.high_c else 0, .heat_low = if (s.heat) |b| b.low_c else 0, .config = config, .program = program, .checkpoint = @splat(0) };
+        var f: Fingerprint = .{ .world = @intCast(world), .rank = @intCast(rank), .split = @intFromBool(s.split), .kda_wide = @intFromBool(s.kda_wide), .kda_prompt = @backingInt(s.kda_prompt), .pieces = s.pieces, .prefill_overlap = s.prefill_overlap, .prefill_pieces = s.prefill_pieces, .layers = s.layers, .kv = @backingInt(s.kv), .kv_pool_tokens = s.kv_pool_tokens, .kv_shard = @intFromBool(s.kv_shard), .capacity = capacity, .heat_high = if (s.heat) |b| b.high_c else 0, .heat_low = if (s.heat) |b| b.low_c else 0, .config = config, .program = program, .checkpoint = @splat(0) };
         f.attn_fp8load = @intFromBool(s.attn_fp8load);
         f.target_graphs = @backingInt(s.target_graphs);
         f.communication = @backingInt(s.communication);
@@ -313,7 +352,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
     for (all, 0..) |f, r| {
         if (f.layout != all[0].layout) return .{ .field = .layout, .rank = r };
         if (f.rank != r) return .{ .field = .rank, .rank = r };
-        inline for (.{ "world", "split", "kda_wide", "target_graphs", "communication", "roce_max_bytes", "prefetch", "draft_prelaunch", "pieces", "layers", "kv", "attn_fp8load", "weight_dense", "weight_head", "exl3_decode", "exl3_routed", "draft", "dflash_verify", "draft_profile", "draft_checkpoint", "vision", "kv_pool_tokens", "kv_shard", "spill", "capacity", "heat_high", "heat_low", "config", "program", "checkpoint" }) |name| {
+        inline for (.{ "world", "split", "kda_wide", "kda_prompt", "target_graphs", "communication", "roce_max_bytes", "prefetch", "draft_prelaunch", "pieces", "prefill_overlap", "prefill_pieces", "layers", "kv", "attn_fp8load", "weight_dense", "weight_head", "exl3_decode", "exl3_routed", "draft", "dflash_verify", "draft_profile", "draft_checkpoint", "vision", "kv_pool_tokens", "kv_shard", "spill", "capacity", "heat_high", "heat_low", "config", "program", "checkpoint" }) |name| {
             if (!std.mem.eql(u8, std.mem.asBytes(&@field(f, name)), std.mem.asBytes(&@field(all[0], name))))
                 return .{ .field = @field(Fingerprint.Field, name), .rank = r };
         }
@@ -496,7 +535,7 @@ test "target graph modes separate rank and numerical identities only when enable
     off.hashNumerics(&off_hash);
     ffn.hashNumerics(&ffn_hash);
     const original = default_hash.finalResult();
-    try std.testing.expectEqualStrings("c8e26984040663197aee5a4c90311516e82f0a34430a683c599c56546a28eb78", &std.fmt.bytesToHex(original, .lower));
+    try std.testing.expectEqualStrings("1a54fef2db1a686d756960222c37f77cf252435d19f96faae70394ff44993767", &std.fmt.bytesToHex(original, .lower));
     try std.testing.expectEqualSlices(u8, &original, &unset_hash.finalResult());
     try std.testing.expectEqualSlices(u8, &original, &off_hash.finalResult());
     const ffn_digest = ffn_hash.finalResult();
@@ -506,7 +545,7 @@ test "target graph modes separate rank and numerical identities only when enable
     try std.testing.expect(!std.mem.eql(u8, &ffn_digest, &full_digest));
     const h: [32]u8 = @splat(0);
     var all = [_]Fingerprint{ Fingerprint.of(2, 0, unset, 8192, h, h, "target"), Fingerprint.of(2, 1, off, 8192, h, h, "target") };
-    try std.testing.expectEqual(@as(u32, 18), all[0].layout);
+    try std.testing.expectEqual(@as(u32, 20), all[0].layout);
     try std.testing.expectEqual(@as(u32, @backingInt(TargetGraphs.off)), all[0].target_graphs);
     try std.testing.expect(mismatch(&all) == null);
     all[1] = Fingerprint.of(2, 1, ffn, 8192, h, h, "target");
@@ -564,12 +603,15 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .world => "the ranks were started with different world sizes",
         .split => "TF_GLM_PREFILL_REDUCE",
         .kda_wide => "TF_GLM_KDA_DECODE_WIDE",
+        .kda_prompt => "TF_GLM_KDA_CHUNKED",
         .target_graphs => "TF_GLM_TARGET_GRAPHS (off, partial FFN or full target)",
         .communication => "TF_GLM_COMM",
         .roce_max_bytes => "TF_ROCE_MAX_KB",
         .prefetch => "TF_GLM_L2PF settings",
         .draft_prelaunch => "TF_GLM_DRAFT_PRELAUNCH",
         .pieces => "TF_GLM_OVERLAP_PIECES",
+        .prefill_overlap => "TF_GLM_PREFILL_OVERLAP",
+        .prefill_pieces => "TF_GLM_PREFILL_OVERLAP_PIECES",
         .layers => "TF_GLM_LAYERS",
         .kv => "TF_GLM_KV",
         .attn_fp8load => "TF_GLM_ATTN_FP8LOAD",
@@ -596,4 +638,68 @@ fn explain(f: Fingerprint.Field) []const u8 {
 
 test {
     _ = @import("cuda_ranks_test.zig");
+}
+
+test "WY prompt selection validates the environment and separates ranks and persisted numerics" {
+    const Env = struct {
+        fn off(name: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, name, "TF_GLM_KDA_CHUNKED")) "0" else null;
+        }
+        fn on(name: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, name, "TF_GLM_KDA_CHUNKED")) "1" else null;
+        }
+        fn invalid(name: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, name, "TF_GLM_KDA_CHUNKED")) "true" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    const off = try Settings.read(Env.off, &problem);
+    const on = try Settings.read(Env.on, &problem);
+    try std.testing.expectEqual(kda.PromptAlgorithm.serial, (Settings{}).kda_prompt);
+    try std.testing.expectEqual(kda.PromptAlgorithm.serial, off.kda_prompt);
+    try std.testing.expectEqual(kda.PromptAlgorithm.wy32, on.kda_prompt);
+    try std.testing.expectError(error.BadSetting, Settings.read(Env.invalid, &problem));
+    try std.testing.expectEqualStrings("TF_GLM_KDA_CHUNKED: 0 or 1", problem);
+    const h: [32]u8 = @splat(0);
+    const all = [_]Fingerprint{ Fingerprint.of(2, 0, off, 8192, h, h, "target"), Fingerprint.of(2, 1, on, 8192, h, h, "target") };
+    try std.testing.expectEqual(Fingerprint.Field.kda_prompt, mismatch(&all).?.field);
+    var a = Sha256.init(.{});
+    var b = Sha256.init(.{});
+    var c = Sha256.init(.{});
+    off.hashNumerics(&a);
+    on.hashNumerics(&b);
+    (Settings{}).hashNumerics(&c);
+    const serial = a.finalResult();
+    const wy = b.finalResult();
+    const defaults = c.finalResult();
+    try std.testing.expectEqualSlices(u8, &serial, &defaults);
+    try std.testing.expect(!std.mem.eql(u8, &serial, &wy));
+}
+
+test "prompt overlap levels and their separate piece count are strict and rank agreed" {
+    const Env = struct {
+        fn on(name: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, name, "TF_GLM_PREFILL_OVERLAP")) "2" else null;
+        }
+        fn bad(name: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, name, "TF_GLM_PREFILL_OVERLAP")) "3" else null;
+        }
+        fn badPieces(name: [:0]const u8) ?[]const u8 {
+            return if (std.mem.eql(u8, name, "TF_GLM_PREFILL_OVERLAP_PIECES")) "0" else null;
+        }
+    };
+    var problem: []const u8 = "";
+    const on = try Settings.read(Env.on, &problem);
+    try std.testing.expectEqual(@as(u8, 0), (Settings{}).prefill_overlap);
+    try std.testing.expectEqual(@as(u8, 2), on.prefill_overlap);
+    try std.testing.expectEqual(@as(u32, 2), on.prefill_pieces);
+    try std.testing.expectEqual(@as(u32, 3), on.pieces);
+    try std.testing.expectError(error.BadSetting, Settings.read(Env.bad, &problem));
+    try std.testing.expectError(error.BadSetting, Settings.read(Env.badPieces, &problem));
+    const h: [32]u8 = @splat(0);
+    var all = [_]Fingerprint{ Fingerprint.of(2, 0, .{}, 8192, h, h, "target"), Fingerprint.of(2, 1, on, 8192, h, h, "target") };
+    try std.testing.expectEqual(Fingerprint.Field.prefill_overlap, mismatch(&all).?.field);
+    all[0] = Fingerprint.of(2, 0, on, 8192, h, h, "target");
+    all[1].prefill_pieces = 3;
+    try std.testing.expectEqual(Fingerprint.Field.prefill_pieces, mismatch(&all).?.field);
 }

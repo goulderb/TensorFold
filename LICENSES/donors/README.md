@@ -227,6 +227,35 @@ Local changes borrow the existing NCCL communicator and connect GLM's target,
 DFlash, and owner attention gathers. The side-stream prompt protocol retains
 NCCL. No new transport implementation or new authorship is claimed.
 
+## GLM chunked KDA prompt recurrence (2026-10-20)
+
+`zig/kernels/cuda/glm_kda_chunk.cu` reuses the native extraction retained from
+MiaAI-Lab's `zig-engine` revision `f1ee79a6bf5319775079412c727f5f6b0ebb1e19`
+and import `f013e1aec57dbee167f43cccb66186da5bacc37f`, identified above. Its
+header credits Ash Hart and the TensorFold contributors for the original
+`families/glm5_next/cuda/kda_chunk.cu` arithmetic. The device body was also
+compared against the production image pinned by wojo recipe revision
+`7fac72b346eb85549edc0d1783b6bbb3d998a5af`, image
+`sha256:d7e14f8799ad21f7e93ba95ea78826426c98ab27d5fbfdf81bed876a2e09ce6e`.
+The captured production file has SHA256
+`aa6530d28d3adbc847654b939b30e58fb7b06235b88cd95561236953c800a29c`;
+the compared device body differs only in trailing whitespace.
+
+Local changes adapt its launch to the current typed KDA inputs, own the CUDA
+module, and separate prompt output/state from serial verification replay
+saves. They add absolute prompt position, rank agreement and numerical cache
+identity. They do not claim new authorship of the WY algorithm or device
+arithmetic. Retained upstream, MiaAI-Lab and wojo notices continue to apply.
+
+The prompt split planner and front scheduling also adapt that same donor's
+`cuda_prefill_split.zig` and `cuda_prefill.zig`, and the pinned production
+`hcsplit.py`/`forward.py` behavior. The local port retains the current engine,
+streams, typed projections and state ownership. It uses contiguous rank halves,
+queues row-independent fronts during normed-row swaps, preserves rank-ordered
+partial sums, and carries prompt arithmetic through short Q4 row ranges.
+These are adaptations of the credited production and donor components, not a
+new prefill engine or a new attribution claim for their algorithms.
+
 ## The shared spill tier and Nemotron adapters
 
 `zig/src/core/spill.zig` and `docs/spill-tier.md` identify the GLM spill tier

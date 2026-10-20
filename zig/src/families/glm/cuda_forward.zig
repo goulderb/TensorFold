@@ -18,6 +18,7 @@ const quant = @import("cuda_quant.zig");
 const q4 = @import("cuda_q4.zig");
 const state = @import("cuda_state.zig");
 const shared = @import("cuda_shared.zig");
+const prompt_split = @import("cuda_prefill_split.zig");
 const vision_binding = @import("cuda_vision_binding.zig");
 const taps = @import("cuda_taps.zig");
 const mia = @import("cuda_experts_mia.zig");
@@ -41,6 +42,7 @@ pub const Modules = struct {
     glue: glue.Kernels,
     mods: [9]cuda.Module,
     kda: kda.Kernels,
+    chunk_mod: cuda.Module,
     lane: cuda.qmmf.Lane, // the NVFP4 linears' decode rows (qlinear)
     prompt: cuda.nvfp4.Prompt, // and their prompt rows
     modelopt: cuda.modelopt.Packer,
@@ -84,6 +86,9 @@ pub const Modules = struct {
         m.exl3 = try cuda.exl3_linear.Kernels.resolve(d, m.exl3_mod, 16384);
         errdefer m.exl3.deinit();
         m.kda = try kda.Kernels.load(m.mods[0]);
+        m.chunk_mod = try cuda.Module.load(d, k.glm_kda_chunk);
+        errdefer m.chunk_mod.unload();
+        try m.kda.loadChunk(m.chunk_mod);
         m.experts = try experts.Kernels.load(d, m.mods[2], @intCast(try ctx.attribute(.multiprocessor_count)));
         errdefer m.experts.unload();
         m.copy_rows = try m.mods[1].function("tf_glm_copy_rows");
@@ -128,6 +133,7 @@ pub const Modules = struct {
         if (m.source_mods) |*mods| for (mods) |*x| x.unload();
         if (m.ck) |*c| c.unload();
         if (m.mia) |*k| k.unload();
+        m.chunk_mod.unload();
         for (&m.mods) |*x| x.unload();
         m.affine4.deinit();
         m.lane.unload();
@@ -218,7 +224,10 @@ pub const Forward = struct {
     prefetch: ?*l2pf.Prefetch = null,
     replicas: ?*dsa_block.Replicas = null,
     attn_fp8load: bool = false,
+    kda_prompt: kda.PromptAlgorithm = .serial,
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE (the Python family's default): decode windows on KDA's three-kernel chain
+    prefill_overlap: u8 = 0,
+    prefill_pieces: u32 = 2,
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
     vision: ?@import("cuda_vision_binding.zig").Binding = null,
@@ -229,7 +238,7 @@ pub const Forward = struct {
     target_failure: *const fn (anyerror) void = @import("cuda_kv_owner.zig").failPair,
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue, .linear = f.linear(), .copy_rows = f.m.copy_rows, .exlr8_dense = if (f.m.source_dense) |*d| d else null, .source_upcast = f.m.source_upcast, .attn_fp8load = f.attn_fp8load };
+        return .{ .glue = &f.m.glue, .linear = f.linear(), .copy_rows = f.m.copy_rows, .exlr8_dense = if (f.m.source_dense) |*d| d else null, .source_upcast = f.m.source_upcast, .attn_fp8load = f.attn_fp8load, .prompt = f.ranks[0].b.prefill };
     }
 
     /// qlinear over every format a GLM checkpoint brings: NVFP4 (lane and prompt GEMM) and EXL3.
@@ -283,6 +292,10 @@ pub const Forward = struct {
 
     /// forward._mixer: the layer's KDA or DSA block on b.normed; `li`/`di`: its index among loaded KDA / DSA layers.
     fn mixer(f: *const Forward, r: Rank, l: weights.Layer, li: usize, di: usize, rows: usize, nch: usize, out: ?u64) !void {
+        return f.mixerPrepared(r, l, li, di, rows, nch, out, null);
+    }
+
+    fn mixerPrepared(f: *const Forward, r: Rank, l: weights.Layer, li: usize, di: usize, rows: usize, nch: usize, out: ?u64, done: ?prompt_split.Range) !void {
         const c = &r.w.config;
         const b = r.b;
         const st = r.st;
@@ -300,9 +313,13 @@ pub const Forward = struct {
                     s.saves.b = st.save_b + li * window_rows * st.heads * 4;
                 }
                 const conv = st.conv + li * 3 * st.conv_c * 2;
-                try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
+                if (b.prefill and done != null) {
+                    try f.frontRemainder(r, l, .mixer, rows, done);
+                } else try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
                 try f.prefetchSite(l.index, .o, rows);
-                try kda_block.chainRows(&f.m.kda, f.stream, k, s, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide);
+                if (b.prefill) {
+                    try kda_block.promptRows(&f.m.kda, f.stream, k, s, rows, conv, st.recAt(cur, li), st.pos, f.kda_prompt);
+                } else try kda_block.chainRows(&f.m.kda, f.stream, k, s, rows, conv, st.recAt(cur, li), f.kda_wide);
                 if (b.prefill) try glue.convShift(f.set(), f.stream, conv, s.p, rows, rows * k.width(), k.width(), 1, 3 * k.heads * kda.dk);
                 if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
                 if (b.prefill) st.cur[li] = 1 - cur; // a prompt chunk keeps every row: the layer commits now
@@ -310,7 +327,10 @@ pub const Forward = struct {
             .mla => |a| {
                 var ks = f.dsaKernels(r);
                 ks.slot = di;
-                try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, dsa_block.sparseRows(a, st.pos, rows));
+                if (b.prefill and done != null) {
+                    try f.frontRemainder(r, l, .mixer, rows, done);
+                    try dsa_block.prepareRest(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, dsa_block.sparseRows(a, st.pos, rows));
+                } else try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, dsa_block.sparseRows(a, st.pos, rows));
                 try f.prefetchSite(l.index, .o, rows);
                 try dsa_block.attend(ks, f.stream, a, st.caches[di], b.dsa, 0, rows, st.pos_dev, st.pos, nch, b.part_rows);
                 try latent.expandV(f.set(), f.stream, b.dsa.ol, a.wv, b.dsa.vn, rows, a.heads, a.dv, a.lw);
@@ -556,6 +576,192 @@ pub const Forward = struct {
         }
     }
 
+    fn frontRows(f: *const Forward, r: Rank, l: weights.Layer, site: Site, lo: usize, hi: usize) !void {
+        if (hi <= lo) return;
+        const b = r.b;
+        const D = r.w.config.hidden;
+        const n = hi - lo;
+        switch (site) {
+            .mixer => switch (l.mixer) {
+                .kda => |k| {
+                    var v = b.kda;
+                    v.p = b.kproj + lo * k.width() * 2;
+                    v.ka += lo * k.heads * kda.dk * 2;
+                    v.kg += lo * k.heads * kda.dk * 2;
+                    try kda_block.project(f.set(), f.stream, k, v, b.normed + lo * D * 2, D, n);
+                },
+                .mla => |a| {
+                    var v = b.dsa;
+                    v.qr += lo * a.q_lora * 2;
+                    v.xs_qr += lo * (a.q_lora / 64) * 4;
+                    v.lat += lo * a.lw * 2;
+                    v.xs_lat += lo * (a.lw / 64) * 4;
+                    v.q += lo * a.heads * a.qk * 2;
+                    try dsa_block.front(f.set(), f.stream, a, v, b.normed + lo * D * 2, D, n);
+                },
+            },
+            .ffn => switch (l.ffn) {
+                .dense => |m| {
+                    var v = b.dense;
+                    v.gu += lo * 2 * m.width * 2;
+                    v.act += lo * m.width * 2;
+                    v.xs_act += lo * (m.width / 64) * 4;
+                    try mlp.body(f.mlpKernels(), f.stream, m, v, b.normed + lo * D * 2, D, n, true);
+                },
+                .moe => |m| try moe.shared(f.moeKernels(), f.stream, m, b.moe, b.normed, D, lo, hi),
+            },
+        }
+    }
+
+    fn frontRemainder(f: *const Forward, r: Rank, l: weights.Layer, site: Site, rows: usize, done: ?prompt_split.Range) !void {
+        if (done) |range| {
+            try f.frontRows(r, l, site, 0, @min(range.lo, rows));
+            try f.frontRows(r, l, site, @min(range.hi, rows), rows);
+        } else try f.frontRows(r, l, site, 0, rows);
+    }
+
+    fn promptFfn(f: *const Forward, r: Rank, l: weights.Layer, rows: usize, done: ?prompt_split.Range) !void {
+        if (l.ffn == .moe) try moe.body(f.moeKernels(), f.stream, l.ffn.moe, r.b.moe, r.b.normed, r.w.config.hidden, rows, true);
+        try f.frontRemainder(r, l, .ffn, rows, done);
+    }
+
+    fn promptFill(f: *const Forward, r: Rank, l: weights.Layer, site: Site, lo: usize, hi: usize) !void {
+        if (hi <= lo) return;
+        const out = r.b.part + lo * r.w.config.hidden * 4;
+        if (site == .ffn and l.ffn == .moe) {
+            try moe.finish(f.moeKernels(), f.stream, l.ffn.moe, r.b.moe, lo, hi, true, out);
+        } else try f.fillRows(r, l, site, lo, hi, out);
+    }
+
+    fn promptPlan(f: *const Forward, r: Rank, rows: usize) !prompt_split.Plan {
+        return prompt_split.Plan.init(rows, r.b.rows, r.w.share.rank, f.prefill_pieces);
+    }
+
+    fn exchangePrompt(f: *const Forward, p: *const Pieces, j: usize, site: Site, rows: usize) !void {
+        const first = try f.promptPlan(f.ranks[0], rows);
+        const D = f.ranks[0].w.config.hidden;
+        for (first.pieces[0..first.count], 0..) |piece, q| {
+            for (f.ranks) |r| {
+                const plan = try f.promptPlan(r, rows);
+                const lo = plan.peer + piece.off;
+                try f.promptFill(r, r.w.layers[j], site, @min(lo, rows), @min(lo + piece.rows, rows));
+            }
+            try p.filled[q].record(f.stream);
+            try p.side.wait(p.filled[q]);
+            const bytes = piece.rows * D * 4;
+            switch (f.exchange) {
+                .local => for (f.ranks) |from| {
+                    const plan = try f.promptPlan(from, rows);
+                    for (f.ranks) |to| if (to.w.share.rank != from.w.share.rank) {
+                        try f.copy(p.side, room(to, piece.off) + from.w.share.rank * bytes, from.b.part + (plan.peer + piece.off) * D * 4, bytes);
+                    };
+                },
+                .nccl => |x| {
+                    const r = f.ranks[0];
+                    const plan = try f.promptPlan(r, rows);
+                    const peer = 1 - r.w.share.rank;
+                    try x.lib.check(x.lib.api.ncclGroupStart(), "ncclGroupStart");
+                    try x.lib.check(x.lib.api.ncclSend(r.b.part + (plan.peer + piece.off) * D * 4, piece.rows * D, .f32, @intCast(peer), x.comm, p.side.handle), "ncclSend");
+                    try x.lib.check(x.lib.api.ncclRecv(room(r, piece.off) + peer * bytes, piece.rows * D, .f32, @intCast(peer), x.comm, p.side.handle), "ncclRecv");
+                    try x.lib.check(x.lib.api.ncclGroupEnd(), "ncclGroupEnd");
+                },
+            }
+            try p.gathered[q].record(p.side);
+        }
+        for (f.ranks) |r| {
+            const own = (try f.promptPlan(r, rows)).owned();
+            try f.promptFill(r, r.w.layers[j], site, own.lo, own.hi);
+        }
+    }
+
+    fn gluePrompt(f: *const Forward, p: *const Pieces, j: usize, site: Site, rows: usize) !void {
+        const first = try f.promptPlan(f.ranks[0], rows);
+        const D = f.ranks[0].w.config.hidden;
+        const last = site == .ffn and j + 1 == f.ranks[0].w.layers.len;
+        for (first.pieces[0..first.count], 0..) |piece, q| {
+            try f.stream.wait(p.gathered[q]);
+            for (f.ranks) |r| {
+                const plan = try f.promptPlan(r, rows);
+                const lo = plan.mine + piece.off;
+                const bytes = piece.rows * D * 4;
+                const base = room(r, piece.off);
+                try f.copy(f.stream, base + r.w.share.rank * bytes, r.b.part + lo * D * 4, bytes);
+                try f.glueRows(r, j, site, lo, lo + piece.rows, base);
+            }
+            try p.glues[q].record(f.stream);
+            try p.side.wait(p.glues[q]);
+            switch (f.exchange) {
+                .local => for (f.ranks) |from| {
+                    const plan = try f.promptPlan(from, rows);
+                    const at = (plan.mine + piece.off) * D * 2;
+                    const bytes = piece.rows * D * 2;
+                    for (f.ranks) |to| if (to.w.share.rank != from.w.share.rank) {
+                        try f.copy(p.side, (if (last) to.b.hidden else to.b.normed) + at, (if (last) from.b.hidden else from.b.normed) + at, bytes);
+                        if (site == .ffn) if (taps.index(j)) |plane| if (from.b.taps) |src| {
+                            const dst = to.b.taps orelse return error.BadTapView;
+                            try f.copy(p.side, dst.ptr + plane * to.b.rows * D * 2 + at, src.ptr + plane * from.b.rows * D * 2 + at, bytes);
+                        };
+                    };
+                },
+                .nccl => |x| {
+                    const r = f.ranks[0];
+                    const plan = try f.promptPlan(r, rows);
+                    const mine = plan.mine + piece.off;
+                    const peer_at = plan.peer + piece.off;
+                    const peer = 1 - r.w.share.rank;
+                    const buffer = if (last) r.b.hidden else r.b.normed;
+                    try x.lib.check(x.lib.api.ncclGroupStart(), "ncclGroupStart");
+                    try x.lib.check(x.lib.api.ncclSend(buffer + mine * D * 2, piece.rows * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclSend");
+                    try x.lib.check(x.lib.api.ncclRecv(buffer + peer_at * D * 2, piece.rows * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclRecv");
+                    if (site == .ffn) if (taps.index(j)) |plane| if (r.b.taps) |storage| {
+                        const base = storage.ptr + plane * r.b.rows * D * 2;
+                        try x.lib.check(x.lib.api.ncclSend(base + mine * D * 2, piece.rows * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclSend tap");
+                        try x.lib.check(x.lib.api.ncclRecv(base + peer_at * D * 2, piece.rows * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclRecv tap");
+                    };
+                    try x.lib.check(x.lib.api.ncclGroupEnd(), "ncclGroupEnd");
+                },
+            }
+            try p.shared[q].record(p.side);
+            if (f.prefill_overlap == 2 and !last) for (f.ranks) |r| {
+                const plan = try f.promptPlan(r, rows);
+                const lo = plan.mine + piece.off;
+                const next = if (site == .mixer) j else j + 1;
+                try f.frontRows(r, r.w.layers[next], if (site == .mixer) .ffn else .mixer, @min(lo, rows), @min(lo + piece.rows, rows));
+            };
+        }
+        for (0..first.count) |q| try f.stream.wait(p.shared[q]);
+    }
+
+    fn productionPrompt(f: *const Forward, p: *const Pieces, rows: usize) !void {
+        errdefer f.target_failure(error.PromptOverlapFailed);
+        const layers = f.ranks[0].w.layers;
+        for (f.ranks) |r| {
+            const plan = try f.promptPlan(r, rows);
+            if (plan.padded != rows) {
+                try f.d.check(f.d.api.cuMemsetD8Async(r.b.x + rows * r.w.config.hc * r.w.config.hidden * 2, 0, r.w.config.hc * r.w.config.hidden * 2, f.stream.handle), "cuMemsetD8Async");
+                try f.d.check(f.d.api.cuMemsetD8Async(r.b.part + rows * r.w.config.hidden * 4, 0, r.w.config.hidden * 4, f.stream.handle), "cuMemsetD8Async");
+            }
+            try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, plan.padded);
+        }
+        var li: usize = 0;
+        var di: usize = 0;
+        for (layers, 0..) |_, j| {
+            for (f.ranks) |r| {
+                const done: ?prompt_split.Range = if (f.prefill_overlap == 2 and j > 0) (try f.promptPlan(r, rows)).owned() else null;
+                try f.mixerPrepared(r, r.w.layers[j], li, di, rows, @min(latent.chunksFor(r.st.pos + rows), r.b.nch), null, done);
+            }
+            try f.exchangePrompt(p, j, .mixer, rows);
+            try f.gluePrompt(p, j, .mixer, rows);
+            for (f.ranks) |r| try f.promptFfn(r, r.w.layers[j], rows, if (f.prefill_overlap == 2) (try f.promptPlan(r, rows)).owned() else null);
+            try f.exchangePrompt(p, j, .ffn, rows);
+            try f.gluePrompt(p, j, .ffn, rows);
+            switch (layers[j].mixer) {
+                .kda => li += 1,
+                .mla => di += 1,
+            }
+        }
+    }
+
     fn beginRows(f: *const Forward, rows: usize) !void {
         for (f.ranks) |r| {
             if (rows == 0 or rows > r.b.rows) return error.BadWindow;
@@ -647,7 +853,8 @@ pub const Forward = struct {
         var cut: [max_pieces][2]usize = undefined;
         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill and f.ranks[0].segs.len == 0) ranges(R, p.count, &cut) else 0) else 0;
         // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
-        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
+        const exact_prompt = f.ranks[0].b.prefill and f.ranks[0].segs.len == 0 and f.pieces != null and prompt_split.applies(f.prefill_overlap, f.ranks[0].w.share.world, R, f.ranks[0].b.rows);
+        if (exact_prompt) try f.productionPrompt(f.pieces.?, R) else if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
         try f.finish(R);
         try f.joinPrefetch();
     }
@@ -814,3 +1021,7 @@ pub const Forward = struct {
         }
     }
 };
+
+test {
+    _ = prompt_split;
+}

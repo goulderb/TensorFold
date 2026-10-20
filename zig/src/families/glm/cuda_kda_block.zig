@@ -13,7 +13,8 @@ pub const Layer = struct {
     fb: b16.Proj,
     gb: b16.Proj,
     o: b16.Proj,
-    conv_w: u64,
+    conv_w: u64, // fp32 taps for the serial chain and replay-compatible decode
+    prompt_conv_w: ?u64 = null, // bf16 taps for the production WY prompt kernel
     a_log: u64,
     dt_bias: u64,
     norm_w: u64,
@@ -68,8 +69,20 @@ pub fn project(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
 
 /// The chain over `rows` projected rows (s.p, s.ka, s.kg) on one sequence's conv window and recurrent state.
 pub fn chainRows(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, rows: usize, conv_state: u64, state_in: u64, wide: bool) !void {
+    const c = chainInput(l, s, conv_state, state_in);
+    try kda.chain(ks, stream, c, rows, s.saves, if (wide or rows >= kda.wide_rows) s.wide else null);
+}
+
+/// Prompt recurrence commits every row; WY deliberately has no replay-save outputs.
+pub fn promptRows(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, rows: usize, conv_state: u64, state_in: u64, pos: usize, algorithm: kda.PromptAlgorithm) !void {
+    if (algorithm == .serial) return chainRows(ks, stream, l, s, rows, conv_state, state_in, false);
+    var c = chainInput(l, s, conv_state, state_in);
+    c.conv_w = l.prompt_conv_w orelse return error.MissingKdaPromptConv;
+    try kda.chunk(ks, stream, c, rows, pos, s.saves.out, s.saves.state_out);
+}
+
+fn chainInput(l: Layer, s: Scratch, conv_state: u64, state_in: u64) kda.Chain {
     const n = l.heads * kda.dk;
     const fa = 3 * n;
-    const c: kda.Chain = .{ .p = s.p, .p_stride = l.width(), .b_off = fa + 2 * kda.dk, .a = s.ka, .a_stride = n, .g = s.kg, .g_stride = n, .conv_state = conv_state, .conv_w = l.conv_w, .state_in = state_in, .a_log = l.a_log, .dt_bias = l.dt_bias, .norm_w = l.norm_w, .eps = l.eps, .lower = l.lower, .heads = l.heads };
-    try kda.chain(ks, stream, c, rows, s.saves, if (wide or rows >= kda.wide_rows) s.wide else null);
+    return .{ .p = s.p, .p_stride = l.width(), .b_off = fa + 2 * kda.dk, .a = s.ka, .a_stride = n, .g = s.kg, .g_stride = n, .conv_state = conv_state, .conv_w = l.conv_w, .state_in = state_in, .a_log = l.a_log, .dt_bias = l.dt_bias, .norm_w = l.norm_w, .eps = l.eps, .lower = l.lower, .heads = l.heads };
 }

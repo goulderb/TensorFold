@@ -205,6 +205,8 @@ pub fn kda(L: *W.Loader, i: u32) !@import("cuda_kda_block.zig").Layer {
     const conv = try L.get("layers.{d}.self_attn.conv1d.weight", .{i});
     for (0..3) |j| try L.rows(conv, j * all + lo, j * all + hi, 3 * all, .f32);
     const conv_w = try L.put("layers.{d}.kda.conv", .{i});
+    for (0..3) |j| try L.rows(conv, j * all + lo, j * all + hi, 3 * all, .bf16);
+    const prompt_conv = try L.put("layers.{d}.kda.prompt_conv", .{i});
     try L.rows(try L.get("layers.{d}.self_attn.A_log", .{i}), h.lo, h.hi, c.kda_heads, .f32);
     const a_log = try L.put("layers.{d}.kda.a_log", .{i});
     try L.rows(try L.get("layers.{d}.self_attn.dt_bias", .{i}), lo, hi, all, .f32);
@@ -212,7 +214,7 @@ pub fn kda(L: *W.Loader, i: u32) !@import("cuda_kda_block.zig").Layer {
     try L.whole(try L.get("layers.{d}.self_attn.o_norm.weight", .{i}), .bf16);
     const norm = try L.put("layers.{d}.kda.norm", .{i});
     const o = try layerMatrix(L, "layers.{d}.self_attn.o_proj", i, lo, hi, &.{.{ .lo = 0, .hi = c.hidden }});
-    return .{ .proj = .{ .b16 = proj }, .qkv = qkv, .fb = .{ .b16 = fb }, .gb = .{ .b16 = gb }, .o = .{ .q = o }, .conv_w = conv_w, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
+    return .{ .proj = .{ .b16 = proj }, .qkv = qkv, .fb = .{ .b16 = fb }, .gb = .{ .b16 = gb }, .o = .{ .q = o }, .conv_w = conv_w, .prompt_conv_w = prompt_conv, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
 }
 
 /// Loader.moeLayer on EXL3: experts as exl3_experts stacks, gate and up by the rank's columns, down by its inputs.

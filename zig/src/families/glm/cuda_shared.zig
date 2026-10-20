@@ -68,7 +68,9 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                 const conv = st.conv + li * 3 * st.conv_c * 2;
                 // Q4 prompt/decode projection kernels round differently across row thresholds.
                 if (b.prefill) try kda_block.project(f.set(), f.stream, k, v, b.normed + g.row0 * c.hidden * 2, c.hidden, g.rows);
-                try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide);
+                if (b.prefill) {
+                    try kda_block.promptRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), st.pos, f.kda_prompt);
+                } else try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), f.kda_wide);
                 if (b.prefill) {
                     try glue.convShift(f.set(), f.stream, conv, v.p, g.rows, g.rows * w, w, 1, st.conv_c);
                     st.cur[li] = 1 - cur;

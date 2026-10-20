@@ -7,6 +7,9 @@ pub const dk = 128;
 pub const dv = 128;
 /// Windows of this many rows or more (prefill chunks) take the three-kernel chain (kda.WIDE_ROWS).
 pub const wide_rows = 64;
+pub const PromptAlgorithm = enum(u8) { serial, wy32 };
+pub const chunk_rows = 32;
+pub const chunk_shared = 98560;
 
 /// glm_kda.cu's entries.
 pub const Kernels = struct {
@@ -16,11 +19,19 @@ pub const Kernels = struct {
     prep: cuda.Function,
     step: cuda.Function,
     out: cuda.Function,
+    chunk: ?cuda.Function = null,
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
+        k.chunk = null;
         inline for (.{ "chain", "replay", "replay_layers", "prep", "step", "out" }) |name| @field(k, name) = try m.function("tf_glm_kda_" ++ name);
         return k;
+    }
+
+    pub fn loadChunk(k: *Kernels, m: cuda.Module) !void {
+        const f = try m.function("_ZN16tf_glm_kda_chunk12chunk_kernelEiPK13__nv_bfloat16iiS2_iS2_iS2_S2_PKfS4_S4_S2_ffiiPS0_Pf");
+        try f.allowDynamicShared(chunk_shared);
+        k.chunk = f;
     }
 };
 
@@ -98,6 +109,30 @@ pub fn chain(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, s: 
     a.add(@as(c_int, @intCast(rows)));
     for ([_]u64{ s.out, s.state_out, s.k, s.v, s.g, s.b }) |v| a.add(v);
     try cuda.launch.launch(ks.chain, .{ .grid = .{ .x = @intCast(c.heads) }, .block = .{ .x = 1024 } }, stream, &a);
+}
+
+/// Prompt-only WY writes no serial replay saves. Absolute position fixes its 32-row sub-chunks.
+/// c.conv_w holds BF16 taps here; chain uses its separate FP32 copy.
+pub fn chunk(ks: *const Kernels, stream: cuda.Stream, c: Chain, rows: usize, pos: usize, out: u64, state_out: u64) !void {
+    const kernel = ks.chunk orelse return error.MissingKdaChunkKernel;
+    if (rows == 0 or c.heads == 0) return error.BadKdaChunk;
+    var a: cuda.Args = .{};
+    a.add(@as(c_int, @intCast(c.heads)));
+    a.add(c.p);
+    a.add(@as(c_int, @intCast(c.p_stride)));
+    a.add(@as(c_int, @intCast(c.b_off)));
+    a.add(c.a);
+    a.add(@as(c_int, @intCast(c.a_stride)));
+    a.add(c.g);
+    a.add(@as(c_int, @intCast(c.g_stride)));
+    for ([_]u64{ c.conv_state, c.conv_w, c.state_in, c.a_log, c.dt_bias, c.norm_w }) |v| a.add(v);
+    a.add(c.eps);
+    a.add(c.lower);
+    a.add(@as(c_int, @intCast(rows)));
+    a.add(@as(c_int, @intCast(pos % chunk_rows)));
+    a.add(out);
+    a.add(state_out);
+    try cuda.launch.launch(kernel, .{ .grid = .{ .x = @intCast(c.heads) }, .block = .{ .x = 256 }, .shared = chunk_shared }, stream, &a);
 }
 
 /// kda.replay: the state after the first `rows` saved rows, from state_in.

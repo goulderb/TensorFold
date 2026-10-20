@@ -67,6 +67,7 @@ pub const glm_quant: []const u8 = if (available) &Blob("fatbin_glm_quant").bytes
 pub const glm_vision: []const u8 = if (available) &Blob("fatbin_glm_vision").bytes else &.{};
 pub const glm_mm: []const u8 = if (available) &Blob("fatbin_glm_mm").bytes else &.{};
 pub const glm_dflash: []const u8 = if (available) &Blob("fatbin_glm_dflash").bytes else &.{};
+pub const glm_kda_chunk: []const u8 = if (available) &Blob("fatbin_glm_kda_chunk").bytes else &.{};
 pub const glm_kda: []const u8 = if (available) &Blob("fatbin_glm_kda").bytes else &.{};
 pub const glm_vision_ops: []const u8 = if (available) &Blob("fatbin_glm_vision_ops").bytes else &.{};
 pub const exl3_linear: []const u8 = if (available) &Blob("fatbin_exl3_linear").bytes else &.{};

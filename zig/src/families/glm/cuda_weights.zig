@@ -160,6 +160,8 @@ pub const Loader = struct {
         const gb = try projections.finish(L, .kda, "layers.{d}.kda.gb", .{i}, h.len() * dk, dk);
         inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_conv1d.weight", .{i}), h.lo * dk, h.hi * dk, all, .f32);
         const conv = try L.put("layers.{d}.kda.conv", .{i});
+        inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_conv1d.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
+        const prompt_conv = try L.put("layers.{d}.kda.prompt_conv", .{i});
         try L.rows(try L.get("layers.{d}.self_attn.A_log", .{i}), h.lo, h.hi, c.kda_heads, .f32);
         const a_log = try L.put("layers.{d}.kda.a_log", .{i});
         try L.rows(try L.get("layers.{d}.self_attn.dt_bias", .{i}), h.lo * dk, h.hi * dk, all, .f32);
@@ -168,7 +170,7 @@ pub const Loader = struct {
         const norm = try L.put("layers.{d}.kda.norm", .{i});
         try L.cols(try L.get("layers.{d}.self_attn.o_proj.weight", .{i}), h.lo * dk, h.hi * dk, .bf16);
         const o = try projections.finish(L, .kda, "layers.{d}.kda.o", .{i}, c.hidden, h.len() * dk);
-        return .{ .proj = proj, .fb = fb, .gb = gb, .o = o, .conv_w = conv, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
+        return .{ .proj = proj, .fb = fb, .gb = gb, .o = o, .conv_w = conv, .prompt_conv_w = prompt_conv, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
     }
 
     fn kdaSource(L: *Loader, i: u32) !kda_block.Layer {
@@ -199,6 +201,8 @@ pub const Loader = struct {
         const gb = try L.packFinish(.kda, "layers.{d}.kda.gb", .{i}, try L.get("layers.{d}.self_attn.g_b_proj.weight", .{i}), &.{qkv}, .{ .lo = 0, .hi = dk });
         inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_conv1d.weight", .{i}), h.lo * dk, h.hi * dk, all, .f32);
         const conv = try L.put("layers.{d}.kda.conv", .{i});
+        inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_conv1d.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
+        const prompt_conv = try L.put("layers.{d}.kda.prompt_conv", .{i});
         try L.rows(try L.get("layers.{d}.self_attn.A_log", .{i}), h.lo, h.hi, c.kda_heads, .f32);
         const a_log = try L.put("layers.{d}.kda.a_log", .{i});
         try L.rows(try L.get("layers.{d}.self_attn.dt_bias", .{i}), h.lo * dk, h.hi * dk, all, .f32);
@@ -206,7 +210,7 @@ pub const Loader = struct {
         try L.whole(try L.get("layers.{d}.self_attn.o_norm.weight", .{i}), .bf16);
         const norm = try L.put("layers.{d}.kda.norm", .{i});
         const o = try L.packFinish(.kda, "layers.{d}.kda.o", .{i}, try L.get("layers.{d}.self_attn.o_proj.weight", .{i}), &.{.{ .lo = 0, .hi = c.hidden }}, qkv);
-        return .{ .proj = proj, .fb = fb, .gb = gb, .o = o, .conv_w = conv, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
+        return .{ .proj = proj, .fb = fb, .gb = gb, .o = o, .conv_w = conv, .prompt_conv_w = prompt_conv, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
     }
 
     /// weights.load's dsa(i) (latent): [q_a | kv_a], norms, q_b by heads, kv_b as wk/wv (AbsorbW), o by cols, indexer.

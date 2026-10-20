@@ -96,20 +96,87 @@ pub const Source = struct { weights: u64, jobs: u64, groups: u64, groups_n: u32,
 /// A projection: BF16 (bmm), a quantized qlinear weight, or a source-dense EXLR8 job.
 pub const Proj = union(enum) { b16: u64, q: cuda.qlinear.Weight, source: Source };
 
-/// matmul for either kind: a quantized weight takes qlinear's decode rows under rows_from rows, its prompt rows above.
+/// Affine Q4 prompt rows keep prompt arithmetic, including short segments and the last-row head.
 pub fn proj(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, p: Proj, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
     switch (p) {
         .b16 => |w| return matmul(set, stream, x, x_stride, w, out, part, m, n, k, wide),
         .source => |s| return sourceMatmul(set, stream, x, x_stride, s, out, part, m, n, k, wide),
         .q => |w| {
             if (w.outputs() != n or w.inputs() != k) return error.ShapeMismatch;
-            if (w == .affine4 and m < rows_from) try groupSums(set, stream, x, x_stride, part, m, k);
+            const prompt = m >= rows_from or (set.prompt and w == .affine4);
+            if (w == .affine4 and !prompt) try groupSums(set, stream, x, x_stride, part, m, k);
             const in: cuda.qlinear.Rows = .{ .x = x, .ldx = x_stride, .sums = part, .part = part, .native = .{ .ptr = part, .bytes = try w.nativeWorkspaceBytes(m) } };
             const l = set.linear;
-            if (m >= rows_from) return if (wide) l.promptF32(stream, w, in, out, m) else l.prompt(stream, w, in, out, m);
+            if (prompt) return if (wide) l.promptF32(stream, w, in, out, m) else l.prompt(stream, w, in, out, m);
             return if (wide) l.decodeF32(stream, w, in, out, m) else l.decode(stream, w, in, out, m);
         },
     }
+}
+
+test "short affine Q4 prompts launch prompt arithmetic while decode and other weights retain their paths" {
+    const Trace = struct {
+        var calls: [4]usize = undefined;
+        var len: usize = 0;
+        fn launch(f: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            calls[len] = @intFromPtr(f.?);
+            len += 1;
+            return 0;
+        }
+    };
+    var driver: cuda.Driver = .{ .lib = undefined, .api = undefined };
+    driver.api.cuLaunchKernel = Trace.launch;
+    const fun = struct {
+        fn of(d: *const cuda.Driver, id: usize) cuda.Function {
+            return .{ .d = d, .handle = @ptrFromInt(id) };
+        }
+    }.of;
+    var kernels: glue.Kernels = undefined;
+    kernels.group_sums = fun(&driver, 1);
+    kernels.bmm_d32s2 = fun(&driver, 11);
+    kernels.bmm_tile1 = fun(&driver, 12);
+    const affine: cuda.qlinear.Affine4Kernels = .{
+        .group_fn = fun(&driver, 2),
+        .group_f32 = fun(&driver, 4),
+        .prefill_fn = fun(&driver, 5),
+        .prefill_f32 = fun(&driver, 6),
+        .gemv_fn = undefined,
+        .split_fn = undefined,
+        .words_fn = undefined,
+        .scales_fn = undefined,
+        .gemv_blocks = 64,
+        .split = null,
+        .pdl = false,
+    };
+    var lane: cuda.qmmf.Lane = .{ .mod = undefined, .fns = undefined, .f32_fns = undefined, .reduce = undefined, .clusters = false };
+    for (&lane.fns, &lane.f32_fns) |*narrow, *wide| {
+        @memset(narrow, fun(&driver, 20));
+        @memset(wide, fun(&driver, 21));
+    }
+    const affine_weight: Proj = .{ .q = .{ .affine4 = .{ .w = 100, .s = 200, .b = 300, .n = 12576, .k = 4096, .npad = 12672 } } };
+    const native_weight: Proj = .{ .q = .{ .nvfp4 = .{ .mode = .fp4, .codes = 100, .scales = 200, .n = 12576, .k = 4096, .npad = 12672 } } };
+    const stream: cuda.Stream = .{ .d = &driver, .handle = null };
+    for ([_]usize{ 1, 8, 31, 64, 127, 128 }) |rows| for ([_]bool{ false, true }) |prompt| {
+        const set: glue.Set = .{ .glue = &kernels, .linear = .{ .affine4 = &affine, .lane = &lane }, .prompt = prompt };
+        for ([_]bool{ false, true }) |wide| {
+            Trace.len = 0;
+            try proj(set, stream, 4096, 4096, affine_weight, 8192, 16384, rows, 12576, 4096, wide);
+            const expected: []const usize = if (prompt or rows >= 128)
+                (if (wide) &.{6} else &.{5})
+            else if (wide)
+                &.{ 1, 4 }
+            else
+                &.{ 1, 2 };
+            try std.testing.expectEqualSlices(usize, expected, Trace.calls[0..Trace.len]);
+            if (rows < 128) {
+                Trace.len = 0;
+                try proj(set, stream, 4096, 4096, native_weight, 8192, 16384, rows, 12576, 4096, wide);
+                try std.testing.expectEqualSlices(usize, if (wide) &.{21} else &.{20}, Trace.calls[0..Trace.len]);
+            }
+        }
+        Trace.len = 0;
+        try proj(set, stream, 4096, 128, .{ .b16 = 16384 }, 32768, 65536, rows, 4096, 128, false);
+        try std.testing.expectEqualSlices(usize, if (rows >= 128) &.{12} else &.{11}, Trace.calls[0..Trace.len]);
+    };
 }
 
 pub fn sourcePartBytes(rows: usize, k: usize) usize {
