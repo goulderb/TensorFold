@@ -78,3 +78,20 @@ production-only isolated serial/WY A/B at 2048 rows measured 4.177 versus
 not a measured whole-model gain; the native serial launch differs and overlap
 has a separate correctness/performance gate. Passing a source build or a
 component proof does not establish production parity or authorize promotion.
+
+The Q4 prompt path also has an explicit GLM-only production tile policy.
+`TF_GLM_PROMPT_TILE=1` selects production tile 9 for K at least 1024 and
+at least 96 logical 128-by-128 output blocks, otherwise tile 3. The default
+retains tile 0. Both BF16 and FP32 prompt outputs use the policy, including
+direct MLP callers. Tile selection owns the matching block dimensions,
+shared-memory allowance and launch grouping. Other families and decode keep
+their existing dispatch. Rank agreement and persisted numerical identity
+include the setting.
+
+Before this port, a model-free screen of the pinned production image compared
+tile 0 with the selected production tile on twelve GLM projection shapes and
+both output types. All 24 comparisons matched output bytes, and five
+alternating samples showed lower component time on each tested shape.
+Those measurements do not establish an HTTP prefill speedup. A separate
+60-case screen of production's forced decode split-K table mostly increased
+component time, so that table was not adopted as a performance change.

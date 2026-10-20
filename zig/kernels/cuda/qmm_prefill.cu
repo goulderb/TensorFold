@@ -155,3 +155,19 @@ template __global__ void tf_qmm_prefill::prefill_kernel<64, 128, 128, 2, 4, 3, f
 template __global__ void tf_qmm_prefill::prefill_kernel<64, 128, 128, 2, 4, 3, true>(
     const __nv_bfloat16* __restrict__, const uint32_t* __restrict__, const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, void* __restrict__, int, int, int,
     int, int, int);
+
+template __global__ void tf_qmm_prefill::prefill_kernel<64, 64, 64, 1, 4, 4, false>(
+    const __nv_bfloat16* __restrict__, const uint32_t* __restrict__, const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, void* __restrict__, int, int, int,
+    int, int, int);
+
+template __global__ void tf_qmm_prefill::prefill_kernel<64, 64, 64, 1, 4, 4, true>(
+    const __nv_bfloat16* __restrict__, const uint32_t* __restrict__, const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, void* __restrict__, int, int, int,
+    int, int, int);
+
+template __global__ void tf_qmm_prefill::prefill_kernel<64, 128, 128, 2, 2, 2, false>(
+    const __nv_bfloat16* __restrict__, const uint32_t* __restrict__, const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, void* __restrict__, int, int, int,
+    int, int, int);
+
+template __global__ void tf_qmm_prefill::prefill_kernel<64, 128, 128, 2, 2, 2, true>(
+    const __nv_bfloat16* __restrict__, const uint32_t* __restrict__, const __nv_bfloat16* __restrict__, const __nv_bfloat16* __restrict__, void* __restrict__, int, int, int,
+    int, int, int);

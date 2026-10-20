@@ -12,6 +12,13 @@ pub fn samples(raw: ?[]const u8) !usize {
     return n;
 }
 
+pub fn participants(raw: ?[]const u8) !usize {
+    const text = raw orelse return 1;
+    const n = std.fmt.parseInt(usize, text, 10) catch return error.BadRouteParticipants;
+    if (n == 0 or n > 8) return error.BadRouteParticipants;
+    return n;
+}
+
 pub const Summary = struct {
     members: [max_experts]u32 = @splat(0),
     active: usize = 0,
@@ -65,6 +72,7 @@ pub const Trace = struct {
     stride: usize,
     max_rows: usize,
     remaining: usize,
+    min_participants: usize = 1,
     sample: usize = 0,
     rows: usize = 0,
     used: usize = 0,
@@ -127,6 +135,8 @@ pub const Trace = struct {
         for (0..t.used) |i| _ = try t.read(i);
         for (t.entries[0..t.used], 0..) |entry, i| {
             const result = try t.read(i);
+            const bytes = t.pin.bytes[i * t.stride ..][0 .. (2 + entry.capacity * 3) * 4];
+            const words = std.mem.bytesAsSlice(i32, @as([]align(4) u8, @alignCast(bytes)));
             const line = try std.json.Stringify.valueAlloc(t.gpa, .{
                 .kind = "layer",
                 .rank = t.rank,
@@ -143,6 +153,8 @@ pub const Trace = struct {
                 .tile32_items = result.tile32_items,
                 .tile64_items = result.tile64_items,
                 .members = result.members[0..entry.experts],
+                .counts = words[0..2],
+                .item_triples = words[2..][0 .. @as(usize, @intCast(words[0])) * 3],
             }, .{});
             defer t.gpa.free(line);
             std.log.info("GLM_ROUTE {s}", .{line});
@@ -169,6 +181,14 @@ test "routing report excludes shared and reconstructs multi-item experts" {
     corrupt = items;
     corrupt[4] = 15;
     try std.testing.expectError(error.BadRoutePlan, summarize(.{ 5, 3 }, &corrupt, 2, 31, 1));
+}
+
+test "routing diagnostic participant bounds" {
+    try std.testing.expectEqual(@as(usize, 1), try participants(null));
+    try std.testing.expectEqual(@as(usize, 8), try participants("8"));
+    try std.testing.expectError(error.BadRouteParticipants, participants("0"));
+    try std.testing.expectError(error.BadRouteParticipants, participants("9"));
+    try std.testing.expectError(error.BadRouteParticipants, participants("all"));
 }
 
 test "routing sample bounds and shared-row selection" {

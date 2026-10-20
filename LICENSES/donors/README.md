@@ -280,6 +280,26 @@ The Python GLM production recipe's later wojo block-store work is a separate
 source series. Its BadAd84 and wojo credits belong to that recipe; this
 addendum does not claim that the native fork implements every later patch.
 
+## GLM production Q4 prompt tile policy (2026-10-20)
+
+The GLM selector and additional tile instantiations adapt production patch
+`0102-glm-prompt-matmul-tile`, credited to
+[BadAd84](https://github.com/BadAd84) in the retained wojo and Mia credits.
+The patch SHA256 in the wojo `7fac72b346eb85549edc0d1783b6bbb3d998a5af`
+input manifest is
+`da03a9c3d2a94ef74fca01cea6976448ad4c758c3af2c1ebbe4c3a36ce7a2676`.
+The compared production image is
+`sha256:d7e14f8799ad21f7e93ba95ea78826426c98ab27d5fbfdf81bed876a2e09ce6e`;
+its `cuda/kernels/qmm_prefill.cu` SHA256 is
+`be112df7a73c47530f998caaf44fd75a8490e59ec1152f89d170d72f10c13f9b`.
+
+The existing Ash Hart/TensorFold prefill arithmetic and fragment helpers are
+retained. Local changes add an opt-in GLM policy, resolve the additional
+BF16/FP32 tile symbols through the existing module owner, match their launch
+geometry, isolate persisted numerical identity, and add guarded device proofs.
+Other families and the decode policy retain their defaults. Original,
+MiaAI-Lab, wojo and transitive notices continue to apply.
+
 ## Retain notices in future changes and releases
 
 Keep original copyright headers, licenses, `NOTICE`, and credit files.

@@ -251,6 +251,7 @@ pub const Engine = struct {
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
         var m = try fw.Modules.load(d, ctx);
         errdefer m.deinit();
+        if (settings.affine_prompt_policy == .glm_production) try m.affine4.enablePromptTiles(m.mods[7]);
         if (settings.weight_dense.source()) {
             var source_problem: ?anyerror = null;
             m.enableSourceDense(d) catch |err| {
@@ -366,9 +367,11 @@ pub const Engine = struct {
         if (with_mtp or settings.draft == .dflash2) e.bs = if (o.settings.kv_shard) try fw.Buffers.initSharedOwned(d, &e.w, verify_rows, o.capacity) else try fw.Buffers.initShared(d, &e.w, verify_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
         const route_samples = try route_trace.samples(ranks.environment("TF_GLM_ROUTE_SAMPLES"));
+        const route_participants = try route_trace.participants(ranks.environment("TF_GLM_ROUTE_PARTICIPANTS"));
         if (route_samples > 0) {
             const b = e.bs orelse return error.RouteTraceNeedsSharedVerify;
             e.route_trace = try route_trace.Trace.init(gpa, d, rank, e.w.layers.len, b.rows, c.experts, c.topk, route_samples);
+            e.route_trace.?.min_participants = route_participants;
             std.log.warn("GLM routing trace rank={d} samples={d}: diagnostic copies perturb timing", .{ rank, route_samples });
         }
         errdefer if (e.route_trace) |*trace| trace.deinit();
@@ -482,7 +485,7 @@ pub const Engine = struct {
                 row0 += n;
             }
             var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..window.count] }};
-            const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .pieces = null, .split = e.settings.split, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .full_target = runtime, .target_buffer = .shared, .target_failure = e.pair_failure };
+            const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .pieces = null, .split = e.settings.split, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .affine_prompt_policy = e.settings.affine_prompt_policy, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .full_target = runtime, .target_buffer = .shared, .target_failure = e.pair_failure };
             try f.run(ids[0..rows]);
         }
         for (1..profile.target_rows + 1) |rows| {
@@ -616,7 +619,7 @@ pub const Engine = struct {
 
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .target_graphs = if (b == &e.bd) e.graphBank() else null, .full_target = if (b == &e.bd) e.fullGraph() else null, .target_buffer = .lone, .target_failure = e.pair_failure, .vision = if (b == &e.bp) if (e.cur.vision) |*vision| .{ .owner = vision.table(), .generation = vision.table().generation } else null else null };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .affine_prompt_policy = e.settings.affine_prompt_policy, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .target_graphs = if (b == &e.bd) e.graphBank() else null, .full_target = if (b == &e.bd) e.fullGraph() else null, .target_buffer = .lone, .target_failure = e.pair_failure, .vision = if (b == &e.bp) if (e.cur.vision) |*vision| .{ .owner = vision.table(), .generation = vision.table().generation } else null else null };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -878,7 +881,7 @@ pub const Engine = struct {
         }
         try e.gate(null);
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = &e.bp, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load };
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .affine_prompt_policy = e.settings.affine_prompt_policy, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load };
         try f.run(@ptrCast(ids[0..rows]));
         for (parts, segs[0..parts.len], 0..) |p, g, i| {
             try e.bind(p.slot);
@@ -1174,9 +1177,28 @@ pub const Engine = struct {
             rows += p.ids.len;
         }
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const trace = if (e.route_trace) |*t| t.begin(rows) else null;
+        const trace = if (e.route_trace) |*t| if (parts.len >= t.min_participants) t.begin(rows) else null else null;
         errdefer if (trace) |t| t.abort(e.stream);
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .pieces = null, .split = e.settings.split, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .route_trace = trace, .target_graphs = e.graphBank(), .full_target = e.fullGraph(), .target_buffer = .shared, .target_failure = e.pair_failure };
+        if (trace) |t| {
+            const Segment = struct { slot: u32, row0: usize, rows: usize, position: usize };
+            var metadata: [max_shared]Segment = undefined;
+            for (parts, segs[0..parts.len], metadata[0..parts.len]) |p, g, *segment| {
+                segment.* = .{ .slot = p.slot, .row0 = g.row0, .rows = g.rows, .position = g.st.pos };
+            }
+            const line = try std.json.Stringify.valueAlloc(e.gpa, .{
+                .kind = "verify",
+                .rank = e.share.rank,
+                .sample = t.sample,
+                .rows = rows,
+                .participants = parts.len,
+                .tokens = ids[0..rows],
+                .segments = metadata[0..parts.len],
+                .expected_routed_layers = e.w.layers.len - @min(e.c.dense_layers, e.w.layers.len),
+            }, .{});
+            defer e.gpa.free(line);
+            std.log.info("GLM_ROUTE {s}", .{line});
+        }
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .pieces = null, .split = e.settings.split, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .affine_prompt_policy = e.settings.affine_prompt_policy, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .route_trace = trace, .target_graphs = e.graphBank(), .full_target = e.fullGraph(), .target_buffer = .shared, .target_failure = e.pair_failure };
         try f.run(@ptrCast(ids[0..rows]));
         if (trace) |t| try t.finish(e.stream);
         for (parts, segs[0..parts.len]) |p, g| {

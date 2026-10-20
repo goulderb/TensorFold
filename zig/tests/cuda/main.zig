@@ -117,6 +117,7 @@ const usage =
     \\  glm-commit-check <config.json> model-free target recurrence commit packing proof
     \\  glm-greedy-check <rank>   model-free TP2 exact greedy sampling and rowwise/packed NCCL/RoCE timings
     \\  glm-kda-chunk-check <dir> model-free WY KDA exact production fixtures and aligned restore/decode proof
+    \\  glm-q4-prompt-check     model-free exact production Q4 prompt tiles and guarded outputs
     \\  rank-sum                  the reduce-scatter's sum kernel alone, 2 to 5 ranks as each rank (one GPU, no NCCL)
     \\  nccl-pair <rank> <world> <idfile>  one rank of a multi-host communicator: send/recv with every peer, all-reduce, all-gather
     \\  gdn-replay <dir>          replay_kernel bits against the Python oracle's fixture
@@ -296,6 +297,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "roce-gather")) return roce_gather_tests.run(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10));
     if (std.mem.eql(u8, cmd, "glm-taps-commit-check")) return @import("glm_taps_commit_check.zig").run(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(usize, try arg(rest, 2), 10));
     if (std.mem.eql(u8, cmd, "glm-commit-check")) return @import("glm_commit_check.zig").run(gpu, try arg(rest, 0));
+    if (std.mem.eql(u8, cmd, "glm-q4-prompt-check")) return @import("glm_q4_prompt_check.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "glm-greedy-check")) return glm_greedy_check.run(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10));
     if (std.mem.eql(u8, cmd, "glm-kda-chunk-check")) return glm_kda_chunk_check.run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "rank-sum")) return rank_scatter_tests.sum(gpu);

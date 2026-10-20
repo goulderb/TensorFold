@@ -110,9 +110,28 @@ pub const Weight = union(enum) {
 /// Rows in: bf16 `x` rows `ldx` apart (0: packed), their 64-group sums, and the lane's slice partials (partBytes).
 pub const Rows = struct { x: u64, ldx: usize = 0, sums: u64 = 0, part: u64 = 0, native: ck.Workspace = .{} };
 
+pub const AffinePromptPolicy = enum(u8) { stock, glm_production };
+pub const AffinePromptTile = enum(u8) { tile0 = 0, tile3 = 3, tile9 = 9 };
+
+pub fn affinePromptTile(policy: AffinePromptPolicy, rows: usize, n: usize, k: usize) AffinePromptTile {
+    if (policy == .stock) return .tile0;
+    return if (k >= 1024 and ((rows + 127) / 128) * ((n + 127) / 128) >= 96) .tile9 else .tile3;
+}
+
+pub const AffinePromptGeometry = struct { bm: usize, bn: usize, threads: u32, shared: u32 };
+
+pub fn affinePromptGeometry(tile: AffinePromptTile) AffinePromptGeometry {
+    return switch (tile) {
+        .tile0 => .{ .bm = 128, .bn = 128, .threads = 256, .shared = 62976 },
+        .tile3 => .{ .bm = 64, .bn = 64, .threads = 128, .shared = 41984 },
+        .tile9 => .{ .bm = 128, .bn = 128, .threads = 128, .shared = 41984 },
+    };
+}
+
 /// The kernels of every format a family loaded; a weight whose format is not loaded is refused.
 pub const Linear = struct {
     affine4: ?*const Affine4Kernels = null,
+    affine_prompt_policy: AffinePromptPolicy = .stock,
     lane: ?*const qmmf.Lane = null, // decode rows of every lane format; fp8g and bf16 prompt rows too
     nvfp4_prompt: ?*const nvfp4.Prompt = null, // the prompt GEMM: nvfp4 and fp8 prompt rows (linear.py's prefill)
     exl3: ?*const exl3_linear.Kernels = null, // decode rows 16 a window; prompt rows on the tensor units
@@ -157,8 +176,7 @@ pub const Linear = struct {
     pub fn prompt(l: Linear, s: Stream, w: Weight, in: Rows, out: u64, rows: usize) !void {
         switch (w) {
             .affine4 => |q| {
-                const a = l.affine4 orelse return error.FormatNotLoaded;
-                return a.promptAs(s, in.x, in.ldx, q, out, rows, false);
+                return l.affinePrompt(s, in, q, out, rows, false);
             },
             .fp8g => |q| return l.onLane(s, q, .fp8g, in, out, rows),
             .mxfp8 => |q| return l.onLane(s, q, .mxfp8, in, out, rows),
@@ -198,7 +216,7 @@ pub const Linear = struct {
     /// Prompt rows as prompt(), out (rows, n) fp32 unrounded (nvfp4, exl3).
     pub fn promptF32(l: Linear, s: Stream, w: Weight, in: Rows, out: u64, rows: usize) !void {
         if (w == .ck8 or w == .ck4) return l.onNative(s, w, in, out, rows, .f32);
-        if (w == .affine4) return (l.affine4 orelse return error.FormatNotLoaded).promptAs(s, in.x, in.ldx, w.affine4, out, rows, true);
+        if (w == .affine4) return l.affinePrompt(s, in, w.affine4, out, rows, true);
         if (w == .fp8g) return l.onLaneAs(s, w.fp8g, .fp8g, in, out, .f32, rows);
         const q = switch (w) {
             .exl3 => |q| return (l.exl3 orelse return error.FormatNotLoaded).prompt(s, in.x, if (in.ldx == 0) q.k else in.ldx, q, out, rows, true),
@@ -211,6 +229,11 @@ pub const Linear = struct {
             else => return error.EpilogueNotBuilt,
         };
         return l.onPromptAs(s, q, .fp4, in, out, .f32, rows);
+    }
+
+    fn affinePrompt(l: Linear, s: Stream, in: Rows, q: Affine4, out: u64, rows: usize, wide: bool) !void {
+        const a = l.affine4 orelse return error.FormatNotLoaded;
+        return a.promptAsTile(s, in.x, in.ldx, q, out, rows, wide, affinePromptTile(l.affine_prompt_policy, rows, q.n, q.k));
     }
 
     fn onNative(l: Linear, s: Stream, w: Weight, in: Rows, out: u64, rows: usize, kind: qmmf.Out) !void {
@@ -339,6 +362,8 @@ pub const Affine4Kernels = struct {
     group_fn: Function,
     group_f32: ?Function = null,
     prefill_f32: ?Function = null,
+    prefill3: [2]?Function = @splat(null),
+    prefill9: [2]?Function = @splat(null),
     gemv_fn: Function,
     split_fn: Function,
     prefill_fn: Function,
@@ -351,6 +376,8 @@ pub const Affine4Kernels = struct {
     /// From loaded qmm_group, qmm_prefill, lane_gemv and affine4_pack modules; GB10 decodes without the split form.
     pub fn resolve(d: *const Driver, group_mod: Module, prefill_mod: Module, gemv_mod: Module, pack_mod: Module, sms: usize, gb10: bool) !Affine4Kernels {
         var a: Affine4Kernels = undefined;
+        a.prefill3 = @splat(null);
+        a.prefill9 = @splat(null);
         a.group_fn = try group_mod.function(symbols.group);
         a.prefill_fn = try prefill_mod.function(symbols.prefill);
         a.group_f32 = try group_mod.function("_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii");
@@ -369,6 +396,21 @@ pub const Affine4Kernels = struct {
         a.pdl = gb10;
         a.split = if (gb10) null else try Split.init(d);
         return a;
+    }
+
+    pub fn enablePromptTiles(a: *Affine4Kernels, prefill_mod: Module) !void {
+        var tile3: [2]?Function = undefined;
+        var tile9: [2]?Function = undefined;
+        inline for (0..2) |epilogue| {
+            const f3 = try prefill_mod.function(std.fmt.comptimePrint("_ZN14tf_qmm_prefill14prefill_kernelILi64ELi64ELi64ELi1ELi4ELi4ELb{d}EEEvPK13__nv_bfloat16PKjS3_S3_Pviiiiii", .{epilogue}));
+            const f9 = try prefill_mod.function(std.fmt.comptimePrint("_ZN14tf_qmm_prefill14prefill_kernelILi64ELi128ELi128ELi2ELi2ELi2ELb{d}EEEvPK13__nv_bfloat16PKjS3_S3_Pviiiiii", .{epilogue}));
+            try f3.allowDynamicShared(41984);
+            try f9.allowDynamicShared(41984);
+            tile3[epilogue] = f3;
+            tile9[epilogue] = f9;
+        }
+        a.prefill3 = tile3;
+        a.prefill9 = tile9;
     }
 
     pub fn deinit(a: *Affine4Kernels) void {
@@ -464,16 +506,26 @@ pub const Affine4Kernels = struct {
     }
 
     pub fn promptAs(a: *const Affine4Kernels, s: Stream, x: u64, ldx: usize, q: Affine4, out: u64, rows: usize, wide: bool) !void {
-        const stride = try affineStride(x, ldx, q.k, rows);
-        const rows_t = (rows + 127) / 128;
-        const band = (12 << 20) / (128 * q.k * 2);
+        return a.promptAsTile(s, x, ldx, q, out, rows, wide, .tile0);
+    }
+
+    pub fn promptAsTile(a: *const Affine4Kernels, s: Stream, x: u64, ldx: usize, q: Affine4, out: u64, rows: usize, wide: bool, tile: AffinePromptTile) !void {
+        const input_stride = try affineStride(x, ldx, q.k, rows);
+        const stride = if (rows == 1 and tile != .tile0) q.k else input_stride;
+        const shape = affinePromptGeometry(tile);
+        const rows_t = (rows + shape.bm - 1) / shape.bm;
+        const band = (12 << 20) / (shape.bm * q.k * 2);
         const group = @max(1, @min(rows_t, band));
         var g: launch_.Args = .{};
         for ([_]u64{ x, q.w, q.s, q.b, out }) |v| g.add(v);
         for ([_]usize{ rows, q.n, q.k, q.npad, stride, group }) |v| g.add(int(v));
-        const grid = rows_t * ((q.n + 127) / 128);
-        const f = if (wide) a.prefill_f32 orelse return error.EpilogueNotBuilt else a.prefill_fn;
-        try launch_.launch(f, .{ .grid = .{ .x = u(grid), .y = 1, .z = 1 }, .block = .{ .x = 256 }, .shared = prefill_smem }, s, &g);
+        const grid = rows_t * ((q.n + shape.bn - 1) / shape.bn);
+        const f = switch (tile) {
+            .tile0 => if (wide) a.prefill_f32 orelse return error.EpilogueNotBuilt else a.prefill_fn,
+            .tile3 => a.prefill3[@intFromBool(wide)] orelse return error.PromptPolicyNotLoaded,
+            .tile9 => a.prefill9[@intFromBool(wide)] orelse return error.PromptPolicyNotLoaded,
+        };
+        try launch_.launch(f, .{ .grid = .{ .x = u(grid), .y = 1, .z = 1 }, .block = .{ .x = shape.threads }, .shared = shape.shared }, s, &g);
     }
 };
 
@@ -709,4 +761,95 @@ test "a lane weight whose mode is not its format's is refused before any launch"
 
 test {
     _ = @import("qlinear_test.zig");
+}
+
+test "GLM affine prompt policy selects exact production thresholds without changing stock" {
+    try std.testing.expectEqual(AffinePromptPolicy.stock, (Linear{}).affine_prompt_policy);
+    for ([_]usize{ 1, 14, 31, 128, 512, 1024, 2048 }) |rows| {
+        try std.testing.expectEqual(AffinePromptTile.tile0, affinePromptTile(.stock, rows, 12576, 4096));
+        try std.testing.expectEqual(AffinePromptTile.tile3, affinePromptTile(.glm_production, rows, 4096, 128));
+    }
+    try std.testing.expectEqual(AffinePromptTile.tile3, affinePromptTile(.glm_production, 128, 12160, 1024));
+    try std.testing.expectEqual(AffinePromptTile.tile9, affinePromptTile(.glm_production, 128, 12288, 1024));
+    try std.testing.expectEqual(AffinePromptTile.tile3, affinePromptTile(.glm_production, 128, 12288, 1023));
+    try std.testing.expectEqual(AffinePromptTile.tile3, affinePromptTile(.glm_production, 512, 2048, 4096));
+    try std.testing.expectEqual(AffinePromptTile.tile9, affinePromptTile(.glm_production, 1024, 2048, 4096));
+    try std.testing.expectEqual(AffinePromptTile.tile9, affinePromptTile(.glm_production, 1, 12576, 4096));
+    try std.testing.expectEqual(AffinePromptGeometry{ .bm = 128, .bn = 128, .threads = 256, .shared = 62976 }, affinePromptGeometry(.tile0));
+    try std.testing.expectEqual(AffinePromptGeometry{ .bm = 64, .bn = 64, .threads = 128, .shared = 41984 }, affinePromptGeometry(.tile3));
+    try std.testing.expectEqual(AffinePromptGeometry{ .bm = 128, .bn = 128, .threads = 128, .shared = 41984 }, affinePromptGeometry(.tile9));
+}
+
+test "Linear prompt policy routes both epilogues with each tile's actual launch geometry" {
+    const abi = @import("abi.zig");
+    const Trace = struct {
+        var id: usize = 0;
+        var grid: u32 = 0;
+        var block: u32 = 0;
+        var shared: u32 = 0;
+        var stride: c_int = 0;
+        var group: c_int = 0;
+        fn value(raw: [*]?*anyopaque, at: usize) c_int {
+            return @as(*align(1) const c_int, @ptrCast(raw[at].?)).*;
+        }
+        fn launch(f: abi.Function, gx: c_uint, _: c_uint, _: c_uint, bx: c_uint, _: c_uint, _: c_uint, bytes: c_uint, _: abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) abi.Result {
+            id = @intFromPtr(f.?);
+            grid = gx;
+            block = bx;
+            shared = bytes;
+            stride = value(args.?, 9);
+            group = value(args.?, 10);
+            return 0;
+        }
+    };
+    var d: Driver = .{ .lib = undefined, .api = undefined };
+    d.api.cuLaunchKernel = Trace.launch;
+    const Fn = struct {
+        fn of(owner: *const Driver, id: usize) Function {
+            return .{ .d = owner, .handle = @ptrFromInt(id) };
+        }
+    };
+    const a: Affine4Kernels = .{
+        .group_fn = undefined,
+        .gemv_fn = undefined,
+        .split_fn = undefined,
+        .prefill_fn = Fn.of(&d, 1),
+        .prefill_f32 = Fn.of(&d, 2),
+        .prefill3 = .{ Fn.of(&d, 3), Fn.of(&d, 4) },
+        .prefill9 = .{ Fn.of(&d, 5), Fn.of(&d, 6) },
+        .words_fn = undefined,
+        .scales_fn = undefined,
+        .gemv_blocks = 0,
+        .split = null,
+        .pdl = false,
+    };
+    const stream: Stream = .{ .d = &d, .handle = null };
+    var q: Affine4 = .{ .w = 256, .s = 512, .b = 768, .n = 2048, .k = 4096, .npad = 2048 };
+    for ([_]bool{ false, true }) |wide| {
+        const stock: Linear = .{ .affine4 = &a };
+        const tuned: Linear = .{ .affine4 = &a, .affine_prompt_policy = .glm_production };
+        const w: Weight = .{ .affine4 = q };
+        if (wide) try stock.promptF32(stream, w, .{ .x = 1024 }, 2048, 512) else try stock.prompt(stream, w, .{ .x = 1024 }, 2048, 512);
+        try std.testing.expectEqual(@as(usize, 1 + @intFromBool(wide)), Trace.id);
+        try std.testing.expectEqual(@as(u32, 64), Trace.grid);
+        try std.testing.expectEqual(@as(u32, 256), Trace.block);
+        try std.testing.expectEqual(@as(u32, 62976), Trace.shared);
+        if (wide) try tuned.promptF32(stream, w, .{ .x = 1024 }, 2048, 512) else try tuned.prompt(stream, w, .{ .x = 1024 }, 2048, 512);
+        try std.testing.expectEqual(@as(usize, 3 + @intFromBool(wide)), Trace.id);
+        try std.testing.expectEqual(@as(u32, 256), Trace.grid);
+        try std.testing.expectEqual(@as(u32, 128), Trace.block);
+        try std.testing.expectEqual(@as(u32, 41984), Trace.shared);
+        try std.testing.expectEqual(@as(c_int, 8), Trace.group);
+        if (wide) try tuned.promptF32(stream, w, .{ .x = 1024 }, 2048, 1024) else try tuned.prompt(stream, w, .{ .x = 1024 }, 2048, 1024);
+        try std.testing.expectEqual(@as(usize, 5 + @intFromBool(wide)), Trace.id);
+        try std.testing.expectEqual(@as(u32, 128), Trace.grid);
+        try std.testing.expectEqual(@as(c_int, 8), Trace.group);
+        q.n = 12576;
+        q.npad = 12672;
+        if (wide) try tuned.promptF32(stream, .{ .affine4 = q }, .{ .x = 1024, .ldx = 8192 }, 2048, 1) else try tuned.prompt(stream, .{ .affine4 = q }, .{ .x = 1024, .ldx = 8192 }, 2048, 1);
+        try std.testing.expectEqual(@as(c_int, 4096), Trace.stride);
+        try std.testing.expectEqual(@as(u32, 99), Trace.grid);
+        q.n = 2048;
+        q.npad = 2048;
+    }
 }

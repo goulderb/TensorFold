@@ -239,6 +239,7 @@ pub const Forward = struct {
     replicas: ?*dsa_block.Replicas = null,
     attn_fp8load: bool = false,
     kda_prompt: kda.PromptAlgorithm = .serial,
+    affine_prompt_policy: cuda.qlinear.AffinePromptPolicy = .stock,
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE (the Python family's default): decode windows on KDA's three-kernel chain
     prefill_overlap: u8 = 0,
     prefill_pieces: u32 = 2,
@@ -257,7 +258,7 @@ pub const Forward = struct {
 
     /// qlinear over every format a GLM checkpoint brings: NVFP4 (lane and prompt GEMM) and EXL3.
     pub fn linear(f: *const Forward) cuda.qlinear.Linear {
-        return .{ .affine4 = &f.m.affine4, .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt, .exl3 = &f.m.exl3, .ck = if (f.m.ck) |*c| c else null };
+        return .{ .affine4 = &f.m.affine4, .affine_prompt_policy = f.affine_prompt_policy, .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt, .exl3 = &f.m.exl3, .ck = if (f.m.ck) |*c| c else null };
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
