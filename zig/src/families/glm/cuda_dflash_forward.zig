@@ -173,9 +173,13 @@ pub const Forward = struct {
         try f.owned.append(f.gpa, b);
         return b.ptr;
     }
+    pub fn synchronize(f: *const Forward) !void {
+        try f.stream.synchronize();
+        if (f.comm) |comm| if (comm.tp_group) |group| try group.check();
+    }
     pub fn stage(f: *Forward, ptr: u64, bytes: []const u8) !void {
         if (f.stager.ready()) return f.stager.put(ptr, bytes);
-        try f.stream.synchronize(); // pageable staging outside capture; no lifetime race with replay
+        try f.synchronize(); // pageable staging outside capture; no lifetime race with replay
         try (cuda.DeviceBuffer{ .d = f.d, .ptr = ptr, .len = bytes.len }).upload(0, bytes);
     }
     pub fn deinit(f: *Forward) void {
@@ -280,7 +284,7 @@ pub const Forward = struct {
         try f.stage(f.bslots, std.mem.sliceAsBytes(&bs));
         for (0..8) |i| {
             try f.tapsCompute((i + 1) * 8);
-            try f.stream.synchronize();
+            try f.synchronize();
             if (f.taps[i] != null) continue;
             try cuda.graph.beginCapture(f.stream, .global);
             f.tapsCompute((i + 1) * 8) catch |err| {
@@ -294,7 +298,7 @@ pub const Forward = struct {
         }
         for (0..f.streams) |i| {
             try f.blockCompute(i + 1);
-            try f.stream.synchronize();
+            try f.synchronize();
             if (f.blocks[i] != null) continue;
             try cuda.graph.beginCapture(f.stream, .global);
             f.blockCompute(i + 1) catch |err| {
@@ -316,7 +320,7 @@ pub const Forward = struct {
         if (f.taps[n / 8 - 1]) |g| try g.launchOn(f.stream) else try f.tapsCompute(n);
     }
     pub fn read(f: *Forward, ptr: u64, bytes: []u8) !void {
-        try f.stream.synchronize();
+        try f.synchronize();
         try (cuda.DeviceBuffer{ .d = f.d, .ptr = ptr, .len = bytes.len }).download(0, bytes);
     }
     /// Pinned readback and staging in use (not the blocking calls).

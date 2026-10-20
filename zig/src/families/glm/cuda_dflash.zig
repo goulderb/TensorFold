@@ -199,8 +199,7 @@ pub const DFlash = struct {
         return key;
     }
     fn synchronize(d: *const DFlash) !void {
-        try d.forward.stream.synchronize();
-        if (d.forward.comm) |comm| if (comm.tp_group) |group| try group.check();
+        try d.forward.synchronize();
     }
     fn settlePending(d: *DFlash) !void {
         switch (d.pending_block) {

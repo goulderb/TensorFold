@@ -200,7 +200,8 @@ test "borrowed-group attention gathers rank-major queries and returns each rank'
         q: [16]u8,
         out: [16]u8 = @splat(0xff),
         stage_q: [32]u8 = undefined,
-        stage_out: [48]u8 = undefined,
+        stage_out: [64]u8 = undefined,
+        canary: [16]u8 = @splat(0xa5),
         failed: ?anyerror = null,
         fn kernel(ptr: *anyopaque, q: u64, out: u64) !void {
             const j: *@This() = @ptrCast(@alignCast(ptr));
@@ -239,6 +240,7 @@ test "borrowed-group attention gathers rank-major queries and returns each rank'
         for (&jobs, 0..) |*job, rank| {
             try std.testing.expectEqual(@as(?anyerror, null), job.failed);
             for (job.out) |value| try std.testing.expectEqual(@as(u8, @intCast(rank + 18)), value);
+            try std.testing.expect(std.mem.allEqual(u8, &job.canary, 0xa5));
         }
         try std.testing.expectEqual(@as(usize, 2), channel.epoch.load(.acquire));
     }

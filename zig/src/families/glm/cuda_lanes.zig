@@ -53,6 +53,16 @@ const Lane = struct {
 const PendingDraftBatch = struct {
     parts: [engine.max_shared]engine.DraftPart = undefined,
     count: usize = 0,
+
+    fn retaining(p: PendingDraftBatch, superseded: []const u32) PendingDraftBatch {
+        var result: PendingDraftBatch = .{};
+        for (p.parts[0..p.count]) |part| {
+            if (std.mem.indexOfScalar(u32, superseded, part.slot) != null) continue;
+            result.parts[result.count] = part;
+            result.count += 1;
+        }
+        return result;
+    }
 };
 
 pub const Lanes = struct {
@@ -335,12 +345,17 @@ pub const Lanes = struct {
     }
 
     fn finishPendingDrafts(self: *Lanes) !void {
-        const count = self.pending_drafts.count;
+        try self.finishPendingDraftsExcept(&.{});
+    }
+
+    fn finishPendingDraftsExcept(self: *Lanes, superseded: []const u32) !void {
+        const pending = self.pending_drafts.retaining(superseded);
+        const count = pending.count;
+        self.pending_drafts.count = 0;
         if (count == 0) return;
-        defer self.pending_drafts.count = 0;
         var results: [engine.max_shared]engine.DraftResult = @splat(.{});
-        try self.x.draftBatch(self.pending_drafts.parts[0..count], results[0..count]);
-        for (self.pending_drafts.parts[0..count], results[0..count]) |part, result| {
+        try self.x.draftBatch(pending.parts[0..count], results[0..count]);
+        for (pending.parts[0..count], results[0..count]) |part, result| {
             var it = self.lanes.iterator();
             while (it.next()) |entry| {
                 const stream = entry.key_ptr.*;
@@ -498,6 +513,7 @@ pub const Lanes = struct {
     fn draftBatch(self: *Lanes, requests: []const be.DraftRequest) !void {
         if (requests.len == 0 or requests.len > engine.max_shared) return error.BadDraftBatch;
         var lanes_by_request: [engine.max_shared]*Lane = undefined;
+        var superseded: [engine.max_shared]u32 = undefined;
         var pending: [engine.max_shared]u32 = undefined;
         var keeps: [engine.max_shared]?usize = undefined;
         var seen: [engine.max_shared]bool = @splat(false);
@@ -511,7 +527,9 @@ pub const Lanes = struct {
             pending[i] = input.pending;
             keeps[i] = input.keep;
             lanes_by_request[i] = l;
+            superseded[i] = l.slot;
         }
+        try self.finishPendingDraftsExcept(superseded[0..requests.len]);
         for (requests, lanes_by_request[0..requests.len], keeps[0..requests.len]) |r, l, keep| {
             _ = try self.bind(r.stream, keep);
             if (try self.x.e.slotPos(l.slot) + 1 != r.position) return error.PositionMismatch;
@@ -549,10 +567,26 @@ pub const Lanes = struct {
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         const kv = self.lanes.fetchRemove(s) orelse return;
-        self.finishPendingDrafts() catch |err| std.log.err("draining paired DFlash drafts before release of slot {d}: {s}", .{ kv.value.slot, @errorName(err) });
+        self.pending_drafts = self.pending_drafts.retaining(&.{kv.value.slot});
         self.x.release(kv.value.slot) catch |err| std.log.err("releasing slot {d}: {s}", .{ kv.value.slot, @errorName(err) });
     }
 };
+
+test "new draft cohorts retain waiting lanes and retire superseded copy or forced lanes" {
+    var p: PendingDraftBatch = .{ .count = 2 };
+    p.parts[0] = .{ .slot = 5, .position = 101, .pending = 11, .depth = 7 };
+    p.parts[1] = .{ .slot = 1, .position = 201, .pending = 22, .depth = 7 };
+    const admitted = p.retaining(&.{3});
+    try std.testing.expectEqual(@as(usize, 2), admitted.count);
+    const next_round = p.retaining(&.{5});
+    try std.testing.expectEqual(@as(usize, 1), next_round.count);
+    try std.testing.expectEqual(@as(u32, 1), next_round.parts[0].slot);
+    try std.testing.expectEqual(@as(u64, 201), next_round.parts[0].position);
+    try std.testing.expectEqual(@as(usize, 0), p.retaining(&.{ 1, 5 }).count);
+    const released = p.retaining(&.{1});
+    try std.testing.expectEqual(@as(usize, 1), released.count);
+    try std.testing.expectEqualDeep(p.parts[0], released.parts[0]);
+}
 
 comptime {
     std.debug.assert(max_rows <= fw.window_rows);

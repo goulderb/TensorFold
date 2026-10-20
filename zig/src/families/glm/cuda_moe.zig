@@ -50,13 +50,6 @@ pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_st
     try fill(k, stream, l, s, x, x_stride, 0, rows, prompt, out);
 }
 
-pub fn blockSharedFirst(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool, out: u64) !void {
-    if (prompt) return block(k, stream, l, s, x, x_stride, rows, true, out);
-    try shared(k, stream, l, s, x, x_stride, 0, rows);
-    try body(k, stream, l, s, x, x_stride, rows, false);
-    try finish(k, stream, l, s, 0, rows, false, out);
-}
-
 /// The block up to its fill: the router, the top-k pick, the plan and the routed experts into the slot rows.
 pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool) !void {
     const d = l.routed.dims;

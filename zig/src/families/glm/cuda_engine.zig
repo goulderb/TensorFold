@@ -338,7 +338,7 @@ pub const Engine = struct {
             .dense => |l| std.log.info("GLM loaded MLP rank={d} layer={d} input_layout={s} width={d} hidden={d} down={s}", .{ rank, layer.index, @tagName(l.input), l.width, l.dims, projectionFormat(l.down) }),
             .moe => {},
         };
-        std.log.info("GLM loaded head rank={d} format={s} kv={s} prelaunch={}", .{ rank, projectionFormat(e.w.head), @tagName(settings.kv), settings.draft_prelaunch });
+        std.log.info("GLM loaded head rank={d} format={s} kv={s} prelaunch_requested={}", .{ rank, projectionFormat(e.w.head), @tagName(settings.kv), settings.draft_prelaunch });
         if (settings.weight_dense.native()) {
             inline for (@import("cuda_weight_precision.zig").groups) |group| {
                 std.log.info("GLM native dense rank={d} family={s} mode={s} matrices={d}", .{ rank, @tagName(group), @tagName(settings.weight_dense.get(group)), e.w.native_conversions[@backingInt(group)] });
@@ -391,11 +391,14 @@ pub const Engine = struct {
                 break :blk null;
             };
             if (!try e.pairedReady(draft_problem == null)) return draft_problem orelse error.PeerDFlashOpen;
+            if (settings.draft_prelaunch and !try e.pairedReady(e.dflash.?.asyncAvailable())) return error.RequiredDraftPrelaunchUnavailable;
             e.dflash.?.prepare() catch |err| {
                 e.pair_failure(err);
                 return err;
             };
         }
+        if (settings.draft_prelaunch and settings.draft != .dflash2) return error.RequiredDraftPrelaunchUnavailable;
+        std.log.info("GLM DFlash prelaunch rank={d} requested={} effective={}", .{ rank, settings.draft_prelaunch, settings.draft_prelaunch and e.dflash != null and e.dflash.?.asyncAvailable() });
         errdefer if (e.pool) |*p| p.deinit();
         if (o.settings.kv_pool_tokens > 0) {
             const shape = try cache_pool.Shape.init(o.settings.kv_pool_tokens, if (o.settings.kv_shard) 2 else 1, e.cur.st.caches.len + 1, o.settings.kv);
