@@ -625,11 +625,14 @@ pub const LaneHost = struct {
         if (h.on_thread) |t| t.run(t.ctx) catch |e| std.log.err("lane host: the engine thread's init failed ({t})", .{e});
         // a family planner: prompt pieces and decode rows in one pass; else whole or `prefill_step` chunked prompts
         if (h.rounds) |rd| return rounds.run(h, rd);
+        var cold_extension_used = false;
         while (true) {
             ends.takeCancels(h);
             rows_host.answer(h);
             learn.refuse(h);
             while (h.admitOne()) {}
+            const cold_fill = h.info_.admit_after_cold_fill and !cold_extension_used and h.lone_job == null and
+                h.core.fills() and h.core.activeCount() == 0 and h.filling.items.len > 0;
             h.fillOne();
             h.core.sweep() catch |err| {
                 ends.failAll(h, @errorName(err));
@@ -650,7 +653,16 @@ pub const LaneHost = struct {
                 ends.closeAll(h);
                 continue;
             }
+            // A fill may finish while arrivals queue. Recheck admission once before its first decode.
+            if (cold_fill and !h.stale and h.lone_job == null and h.core.activeCount() > 0 and h.queued.items.len > 0 and
+                h.admitted.items.len < @min(h.info_.lanes, h.memory_lanes orelse h.info_.lanes))
+            {
+                cold_extension_used = true;
+                h.unlock();
+                continue;
+            }
             if (h.core.activeCount() == 0) {
+                if (h.admitted.items.len == 0 and h.filling.items.len == 0) cold_extension_used = false;
                 if (h.filling.items.len > 0) {
                     h.unlock();
                     continue;
@@ -667,6 +679,7 @@ pub const LaneHost = struct {
                 continue;
             }
             h.unlock();
+            cold_extension_used = false;
             h.core.step() catch |e| {
                 ends.failAll(h, @errorName(e));
                 continue;
@@ -685,4 +698,5 @@ test {
     _ = @import("lane_review_test.zig");
     _ = @import("lane_host_first_test.zig");
     _ = @import("lane_proposers_test.zig");
+    _ = @import("lane_host_cold_test.zig");
 }

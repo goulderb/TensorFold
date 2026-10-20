@@ -660,6 +660,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .prompt_cache = h.store != null,
         .warm_turns = h.store != null and @hasDecl(F, "warm_quiet"),
         .fill_arrival = F == nemotron.native, // agent turns grow: shortest-first starved the longest ones
+        .admit_after_cold_fill = F == glm.native,
         .logprobs = served.backend.vtable.first_row != null,
         .prompt_logprobs = served.backend.vtable.prompt_rows,
         .structures = served.backend.vtable.first_masked != null,

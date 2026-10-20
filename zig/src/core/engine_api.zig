@@ -211,6 +211,8 @@ pub const Info = struct {
     /// Prompts a chunk a call fill in admission order, not the fewest tokens first: a long prompt (a late agent turn)
     /// is never starved by shorter ones that keep arriving, while every other stream still decodes between chunks.
     fill_arrival: bool = false,
+    /// Admit arrivals received during the first cold fill before decoding, with at most one extra fill turn.
+    admit_after_cold_fill: bool = false,
     /// The engine decodes plain whatever a request asks: no drafter loaded, or this chip is faster plain.
     plain_only: bool = false,
     /// The immutable retained-prefix plan applied at startup, not a process memory limit or current cache occupancy.
