@@ -4,18 +4,18 @@ const layers = @import("cuda_layers.zig");
 
 pub const MoeMath = enum(u1) { legacy, bf16_boundaries };
 
-/// ModelOpt attention: HF serial reference, or upstream chunked BF16 kernels.
+/// ModelOpt attention: HF serial reference, or the same per-key arithmetic on qwen35.cu's chunk grid.
 pub const AttentionMode = enum(u1) { reference, chunked };
 
-/// Partial/merge symbol names that match a mode. Reference stays on HF; chunked reuses qwen35.cu.
+/// Partial/merge symbol names in the HF image. Chunked equals reference bit for bit up to 128 keys.
 pub fn attnKernelNames(mode: AttentionMode) struct { partial: [:0]const u8, merge: [:0]const u8 } {
     return switch (mode) {
         .reference => .{ .partial = "tf_q35_hf_attn_partial", .merge = "tf_q35_hf_attn_merge" },
-        .chunked => .{ .partial = "tf_q35_attn_partial", .merge = "tf_q35_attn_merge" },
+        .chunked => .{ .partial = "tf_q35_hf_attn_partial_chunked", .merge = "tf_q35_hf_attn_merge_chunked" },
     };
 }
 
-/// Launch geometry for one attention mode. HF reference is serial; chunked matches ordinary qwen35.cu.
+/// Launch geometry for one attention mode. HF reference is serial; chunked uses qwen35.cu's grid.
 pub const AttnLaunch = struct {
     partial_grid: [3]usize,
     partial_block: [3]usize,
@@ -47,7 +47,7 @@ pub const Launches = struct {
 /// GDN G holds log-decay, exponentiated once by chain. All layer indices are local.
 /// Attention partial launches (1,q_heads,rows) and writes only MAXCH-strided slot zero.
 /// Merge launches (q_heads,rows,1). The ordinary conv_commit and attn_gate remain bound.
-/// Callers that select chunked attention rebind attn_partial/merge from qwen35.cu afterward.
+/// Callers that select chunked attention rebind attn_partial/merge to attnKernelNames(.chunked) afterward.
 pub fn bind(image: cuda.Module, fns: *layers.Fns) !void {
     inline for (.{ "embed", "norm", "gdn_pre", "gdn_chain", "gdn_post", "head_norm", "rope", "attn_partial", "attn_merge", "mlp_act" }) |name| {
         @field(fns, name) = try image.function("tf_q35_hf_" ++ name);
@@ -115,14 +115,14 @@ test "HF combine keeps the legacy ABI and appends actual picks only for BF16 bou
     }
 }
 
-test "attention mode selects HF reference or ordinary chunked kernel names and geometry" {
+test "attention mode selects HF reference or HF chunked kernel names and geometry" {
     const std = @import("std");
     const reference = attnKernelNames(.reference);
     try std.testing.expectEqualStrings("tf_q35_hf_attn_partial", reference.partial);
     try std.testing.expectEqualStrings("tf_q35_hf_attn_merge", reference.merge);
     const chunked = attnKernelNames(.chunked);
-    try std.testing.expectEqualStrings("tf_q35_attn_partial", chunked.partial);
-    try std.testing.expectEqualStrings("tf_q35_attn_merge", chunked.merge);
+    try std.testing.expectEqualStrings("tf_q35_hf_attn_partial_chunked", chunked.partial);
+    try std.testing.expectEqualStrings("tf_q35_hf_attn_merge_chunked", chunked.merge);
     const ref = attnLaunch(.reference, 16, 2, 8, 8, 64);
     try std.testing.expectEqual(@as(usize, 1), ref.partial_grid[0]);
     try std.testing.expectEqual(@as(usize, 16), ref.partial_grid[1]);

@@ -624,11 +624,11 @@ pub const Engine = struct {
         e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
         if (e.numerics == .hf_modelopt) {
             e.modelopt = try modelopt.Bindings.loadWithOptions(ctx, &e.fns, .{ .up_layout = options.expert_up_layout, .moe_math = options.moe_math });
-            // HF bind replaces attn with the serial reference; chunked reuses ordinary qwen35.cu kernels.
+            // HF bind installs the serial reference; chunked takes the HF image's chunk-grid pair (same per-key math).
             if (e.attention_mode == .chunked) {
                 const names = hf.attnKernelNames(.chunked);
-                e.fns.attn_partial = try e.mods[4].function(names.partial);
-                e.fns.attn_merge = try e.mods[4].function(names.merge);
+                e.fns.attn_partial = try e.modelopt.?.image.function(names.partial);
+                e.fns.attn_merge = try e.modelopt.?.image.function(names.merge);
             }
         }
         errdefer if (e.modelopt) |*m| m.unload();

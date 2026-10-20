@@ -16,6 +16,7 @@
 // Local changes adapt qwen35_ops.cu's arithmetic to upstream Geo/Seg tables,
 // read-only convolution tails, head-major KV, and one-slot attention partials.
 // The residual norm retains norms.cu's BF16 vector reduction order.
+// The chunked attention pair keeps the serial partial's per-key arithmetic on qwen35.cu's chunk grid.
 
 #include <cuda_runtime.h>
 #include <math.h>
@@ -243,6 +244,89 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_hf_attn_merge(
     const size_t head = size_t(blockIdx.y) * geo.qh + blockIdx.x;
     const size_t slot = head * MAXCH;
     OUT[head * HD + threadIdx.x] = b(PO[slot * HD + threadIdx.x] / PL[slot]);
+}
+
+// Local change: tf_q35_hf_attn_partial's per-key arithmetic on qwen35.cu's chunk grid, a warp a query head.
+// Lane l holds dims l + 32 i, so sum<HD>'s strides 128, 64, 32 add in registers and 16..1 by shuffle: the
+// same pairwise tree. A row of at most 128 keys is one chunk and equals the serial kernels bit for bit.
+extern "C" __global__ void __launch_bounds__(256) tf_q35_hf_attn_partial_chunked(
+    Geo geo, const B* Q, const Seg* segs, const int* rowseg, const unsigned* rowanc,
+    int layer, const int* P, float scale, float* PM, float* PL, float* PO) {
+    constexpr int DPL = HD / 32;
+    const int lane = threadIdx.x & 31, group = threadIdx.x >> 5;
+    const int chunk = blockIdx.x, kv = blockIdx.y;
+    if (chunk >= MAXCH || past_rows(P, blockIdx.z)) return;
+    const size_t row = blockIdx.z;
+    const int h = kv * (geo.qh / geo.kvh) + group;
+    const Seg sg = segs[rowseg[row]];
+    const unsigned anc = rowanc[row];
+    const int total = sg.len + rows_seen(anc), width = chunk_keys(total);
+    const int first = chunk * width, last = min(first + width, total);
+    const size_t slot = (row * geo.qh + h) * MAXCH + chunk;
+    if (first >= last) {
+        if (lane == 0) {
+            PM[slot] = -INFINITY;
+            PL[slot] = 0.0f;
+        }
+        return;
+    }
+    const B* keys = reinterpret_cast<const B*>(sg.kv) + size_t(layer) * 2 * geo.kvh * sg.cap * HD;
+    const B* values = keys + size_t(geo.kvh) * sg.cap * HD;
+    float query[DPL], result[DPL];
+    for (int i = 0; i < DPL; ++i) {
+        query[i] = bf(Q[(row * geo.qh + h) * HD + i * 32 + lane]);
+        result[i] = 0.0f;
+    }
+    float maximum = -INFINITY, denominator = 0.0f;
+    for (int token = first; token < last; ++token) {
+        const int pos = token < sg.len ? token : sg.len + seen_row(anc, token - sg.len);
+        const size_t off = (size_t(kv) * sg.cap + pos) * HD + lane;
+        float part[DPL];
+        for (int i = 0; i < DPL; ++i) part[i] = __fmul_rn(query[i], bf(keys[off + i * 32]));
+        for (int stride = DPL / 2; stride; stride /= 2)
+            for (int i = 0; i < stride; ++i) part[i] = __fadd_rn(part[i], part[i + stride]);
+        float dot = part[0];
+        for (int m = 16; m; m >>= 1) dot = __fadd_rn(dot, __shfl_down_sync(0xffffffffu, dot, m));
+        const float score = __fmul_rn(__shfl_sync(0xffffffffu, dot, 0), scale);
+        const float next = fmaxf(maximum, score);
+        const float old_weight = expf(__fsub_rn(maximum, next)), weight = expf(__fsub_rn(score, next));
+        for (int i = 0; i < DPL; ++i)
+            result[i] = __fadd_rn(__fmul_rn(result[i], old_weight), __fmul_rn(weight, bf(values[off + i * 32])));
+        denominator = __fadd_rn(__fmul_rn(denominator, old_weight), weight);
+        maximum = next;
+    }
+    if (lane == 0) {
+        PM[slot] = maximum;
+        PL[slot] = denominator;
+    }
+    for (int i = 0; i < DPL; ++i) PO[slot * HD + i * 32 + lane] = result[i];
+}
+
+// Local change: a row's chunk partials into its head's output, grid (qh, rows), a warp each. One chunk
+// reduces to tf_q35_hf_attn_merge's PO / PL exactly (its weight is expf(0) = 1).
+extern "C" __global__ void __launch_bounds__(32) tf_q35_hf_attn_merge_chunked(
+    Geo geo, const float* PM, const float* PL, const float* PO, const Seg* segs,
+    const int* rowseg, const unsigned* rowanc, const int* P, B* OUT) {
+    constexpr int DPL = HD / 32;
+    const int lane = threadIdx.x, h = blockIdx.x;
+    if (past_rows(P, blockIdx.y)) return;
+    const size_t row = blockIdx.y;
+    const int total = segs[rowseg[row]].len + rows_seen(rowanc[row]);
+    const int width = chunk_keys(total), chunks = (total + width - 1) / width;
+    const size_t base = (row * geo.qh + h) * MAXCH;
+    float maximum = -INFINITY;
+    for (int c = 0; c < chunks; ++c)
+        if (PL[base + c] > 0.0f) maximum = fmaxf(maximum, PM[base + c]);
+    float denominator = 0.0f, result[DPL];
+    for (int i = 0; i < DPL; ++i) result[i] = 0.0f;
+    for (int c = 0; c < chunks; ++c) {
+        if (!(PL[base + c] > 0.0f)) continue;
+        const float weight = expf(__fsub_rn(PM[base + c], maximum));
+        denominator = __fadd_rn(denominator, __fmul_rn(PL[base + c], weight));
+        for (int i = 0; i < DPL; ++i)
+            result[i] = __fadd_rn(result[i], __fmul_rn(PO[(base + c) * HD + i * 32 + lane], weight));
+    }
+    for (int i = 0; i < DPL; ++i) OUT[(row * geo.qh + h) * HD + i * 32 + lane] = b(__fdiv_rn(result[i], denominator));
 }
 
 extern "C" __global__ void tf_q35_hf_mlp_act(
