@@ -824,24 +824,24 @@ test "Linear prompt policy routes both epilogues with each tile's actual launch 
         .pdl = false,
     };
     const stream: Stream = .{ .d = &d, .handle = null };
-    var q: Affine4 = .{ .w = 256, .s = 512, .b = 768, .n = 2048, .k = 4096, .npad = 2048 };
     for ([_]bool{ false, true }) |wide| {
+        var q: Affine4 = .{ .w = 256, .s = 512, .b = 768, .n = 2048, .k = 4096, .npad = 2048 };
         const stock: Linear = .{ .affine4 = &a };
         const tuned: Linear = .{ .affine4 = &a, .affine_prompt_policy = .glm_production };
         const w: Weight = .{ .affine4 = q };
         if (wide) try stock.promptF32(stream, w, .{ .x = 1024 }, 2048, 512) else try stock.prompt(stream, w, .{ .x = 1024 }, 2048, 512);
-        try std.testing.expectEqual(@as(usize, 1 + @intFromBool(wide)), Trace.id);
+        try std.testing.expectEqual(1 + @as(usize, @intFromBool(wide)), Trace.id);
         try std.testing.expectEqual(@as(u32, 64), Trace.grid);
         try std.testing.expectEqual(@as(u32, 256), Trace.block);
         try std.testing.expectEqual(@as(u32, 62976), Trace.shared);
         if (wide) try tuned.promptF32(stream, w, .{ .x = 1024 }, 2048, 512) else try tuned.prompt(stream, w, .{ .x = 1024 }, 2048, 512);
-        try std.testing.expectEqual(@as(usize, 3 + @intFromBool(wide)), Trace.id);
+        try std.testing.expectEqual(3 + @as(usize, @intFromBool(wide)), Trace.id);
         try std.testing.expectEqual(@as(u32, 256), Trace.grid);
         try std.testing.expectEqual(@as(u32, 128), Trace.block);
         try std.testing.expectEqual(@as(u32, 41984), Trace.shared);
         try std.testing.expectEqual(@as(c_int, 8), Trace.group);
         if (wide) try tuned.promptF32(stream, w, .{ .x = 1024 }, 2048, 1024) else try tuned.prompt(stream, w, .{ .x = 1024 }, 2048, 1024);
-        try std.testing.expectEqual(@as(usize, 5 + @intFromBool(wide)), Trace.id);
+        try std.testing.expectEqual(5 + @as(usize, @intFromBool(wide)), Trace.id);
         try std.testing.expectEqual(@as(u32, 128), Trace.grid);
         try std.testing.expectEqual(@as(c_int, 8), Trace.group);
         q.n = 12576;
