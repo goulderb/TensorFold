@@ -26,6 +26,10 @@ const slice_format_screen = @import("qwen35_slice_format_screen.zig");
 const layout_ab_input = @import("qwen35_layout_ab_input.zig");
 const full_moe_screen = @import("qwen35_full_moe_screen.zig");
 const terminal_ownership_screen = @import("qwen35_terminal_ownership_screen.zig");
+const terminal_ab_input = @import("qwen35_terminal_ab_input.zig");
+const moe_math_input = @import("qwen35_moe_math_input.zig");
+const lanes = @import("lanes");
+const native = @import("qwen35_adapter");
 
 comptime {
     if (options.engine_optimization != .fast) @compileError("diagnostics require ReleaseFast engine");
@@ -57,6 +61,8 @@ const Input = struct {
     prefill_ab: bool = false,
     combined_ab: bool = false,
     layout_ab: bool = false,
+    terminal_ab: bool = false,
+    moe_math: qwen.engine.MoeMath = .legacy,
     operator_suite: ?operator_suite.Suite = null,
     slice_major_screen: ?slice_major_input.Screen = null,
     boundary_screen: ?boundary_input.Screen = null,
@@ -108,6 +114,8 @@ fn parse(a: std.mem.Allocator, io: std.Io, path: []const u8) !Input {
     try slice_major_input.validateInput(input);
     try boundary_input.validateInput(input);
     try layout_ab_input.validate(input);
+    try terminal_ab_input.validate(input);
+    try moe_math_input.validate(input);
     if ((input.prefill_ab or input.combined_ab) and (input.prompt.len != 64 or input.output_tokens != 128 or input.context != 4096 or input.cut != 20)) return error.InvalidInput;
     if (input.router_screen or input.router_candidate) return error.ArchivedDiagnosticMode;
     if (input.gdn_layout_ab and input.expert_n8_ab) return error.InvalidInput;
@@ -744,6 +752,196 @@ fn layoutModelAB(init: std.process.Init, dir: []const u8, input: Input, j: Journ
     try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "shared Engine immutable expert layout matched C=1 turns", .production_qualification = false, .independent_hf_quality_gate = "unchanged FAIL" });
 }
 
+const TerminalChoice = struct { position: usize, token: u32, cached: ?u32, cache_len: usize, cache_written: usize, conversion_bypassed: bool };
+const TerminalSnapshot = struct {
+    const Graph = struct { key: u32, executable: usize };
+    graphs: [3]Graph,
+    nodes: usize,
+    roster_sha256: [64]u8,
+
+    fn read(a: std.mem.Allocator, e: *qwen.shared_engine.Engine) !TerminalSnapshot {
+        if (e.graphs.count() != 3 or e.terminal_graph_roster.items.len != 2) return error.TerminalTrialGraphRoster;
+        var result: TerminalSnapshot = .{ .graphs = undefined, .nodes = e.graph_nodes, .roster_sha256 = undefined };
+        var it = e.graphs.iterator();
+        var index: usize = 0;
+        while (it.next()) |entry| : (index += 1) result.graphs[index] = .{ .key = entry.key_ptr.*, .executable = @intFromPtr(entry.value_ptr.handle) };
+        std.mem.sort(Graph, &result.graphs, {}, struct {
+            fn less(_: void, lhs: Graph, rhs: Graph) bool {
+                return lhs.key < rhs.key;
+            }
+        }.less);
+        var out: std.Io.Writer.Allocating = .init(a);
+        defer out.deinit();
+        try std.json.Stringify.value(e.terminal_graph_roster.items, .{}, &out.writer);
+        result.roster_sha256 = hash(out.written());
+        return result;
+    }
+};
+const TerminalReference = struct {
+    turn: LayoutReference,
+    qualified_keys: [2][2]u32 = undefined,
+    qualified_nodes: [2][2]usize = undefined,
+    cached_nodes: [2]usize = undefined,
+};
+
+fn terminalRun(init: std.process.Init, s: *qwen.Session, input: Input, tokens: []u32, rows: []u16, choices: ?*[128]TerminalChoice, candidate: bool) !Timing {
+    var lane = try lanes.Stream.init(init.gpa, .{ .id = "terminal-model-ab", .prompt = input.prompt, .max_new = @intCast(tokens.len), .sampling = .{ .seed = 0, .temperature = 0 } });
+    defer lane.deinit(init.gpa);
+    try lane.context.ensureTotalCapacity(init.gpa, input.prompt.len + tokens.len);
+    var adapter = try native.Adapter(qwen.Session).init(init.gpa, s, input.context);
+    defer adapter.deinit();
+    const backend = adapter.backend();
+    defer backend.release(&lane);
+    try s.reset();
+    const start = now(init.io);
+    try s.append(input.prompt);
+    adapter.active = &lane;
+    adapter.prompt_at = input.prompt.len;
+    lane.fill_at.store(@intCast(input.prompt.len), .monotonic);
+    const prefilled = now(init.io);
+    for (tokens, 0..) |*token, i| {
+        if (choices != null) @memset(adapter.values, -123);
+        const selected = if (i == 0) try backend.first(&lane, s.position) else try backend.queue(&lane, .{ .value = tokens[i - 1] }, s.position + 1);
+        token.* = try backend.read(selected);
+        @memcpy(rows[i * s.logits.len ..][0..s.logits.len], s.logits);
+        if (try lane.commit(init.gpa, &.{token.*}, &.{}) != 1) return error.TerminalTrialOutput;
+        if (choices) |provenance| {
+            const cached = try s.cachedGreedy(s.position);
+            const cache = &s.caches[s.chain.partitions.len - 1];
+            var bypassed = true;
+            for (adapter.values) |value| bypassed = bypassed and value == -123;
+            if (candidate) {
+                if (cached == null or cached.? != token.* or !bypassed) return error.TerminalTrialPickProvenance;
+            } else {
+                if (cached != null or bypassed) return error.TerminalTrialPickProvenance;
+                for (adapter.values, s.logits) |value, bits| if (value != @as(f32, @bitCast(@as(u32, bits) << 16))) return error.TerminalTrialHostConversion;
+            }
+            if (token.* != try argmax(s.logits) or cache.len != s.position or cache.written != s.position) return error.TerminalTrialPickProvenance;
+            provenance[i] = .{ .position = s.position, .token = token.*, .cached = cached, .cache_len = cache.len, .cache_written = cache.written, .conversion_bypassed = bypassed };
+        }
+    }
+    const end = now(init.io);
+    if (!std.mem.eql(u32, lane.emitted(), tokens)) return error.TerminalTrialOutput;
+    return .{ .prefill_ns = prefilled - start, .decode_ns = end - prefilled, .elapsed_ns = end - start, .appends = input.prompt.len + tokens.len - 1 };
+}
+
+fn terminalModelArm(init: std.process.Init, dir: []const u8, input: Input, j: Journal, pair: usize, order: usize, reference: *TerminalReference) !void {
+    const candidate = (pair + order) % 2 == 1;
+    const opened = now(init.io);
+    const c = try qwen.Engine.open(init.gpa, init.io, dir, .{ .context = input.context, .cut = input.cut, .captured = true, .prefill_rows = 16, .expert_up_layout = .lane_major, .terminal_greedy = candidate });
+    defer c.deinit();
+    prefillMode(c, 16, true, true);
+    if (c.partitions.len != 2) return error.TerminalTrialTwoRanks;
+    for (c.partitions, 0..) |p, rank| {
+        const e = p.engine;
+        if ((e.terminal != null) != (candidate and rank == 1) or e.placement.ownsHead() != (rank == 1) or e.expert_up_layout != .lane_major or !e.expert_up_split_m or !e.expert_up_n8 or !e.reuse_fp8_quant or !e.bounded_hf_prefill) return error.TerminalTrialSelection;
+        for (e.layers) |layer| if (layer.mlp == .moe and layer.mlp.moe.experts.nvfp4_up_layout != .lane_major) return error.TerminalTrialSelection;
+        e.verify_gdn_graphs = true;
+        e.verify_expert_graphs = true;
+        e.verify_terminal_graphs = true;
+    }
+    var s = try c.createSession();
+    defer s.deinit();
+    if (s.logits.len != 248320) return error.UnsupportedCanonicalVocabulary;
+    for (s.caches[0..c.partitions.len]) |cache| if (cache.gdn_layout != .key_value) return error.TerminalTrialSelection;
+    const rows = try init.gpa.alloc(u16, reference.turn.rows.len);
+    defer init.gpa.free(rows);
+    const tokens = try init.gpa.alloc(u32, reference.turn.tokens.len);
+    defer init.gpa.free(tokens);
+    try j.write(.{ .kind = "terminal_model_arm", .pair = pair, .order = order, .terminal_greedy = candidate, .fresh_chain = true, .one_model_resident = true, .expert_up_layout = "lane_major", .prefill_rows = 16, .split_m = true, .n8_enabled = true, .n8_dispatched = false, .reuse_fp8_quant = true, .gdn_layout = "key_value", .bounded_prompt_via_session_append = true, .adapter_prefill_step_used = false, .adapter_active_assigned_after_bounded_prompt = true, .actual_native_first_queue_read_commit = true, .load_ns = now(init.io) - opened });
+    if (pair == 0) {
+        var peer = try c.createSession();
+        defer peer.deinit();
+        var controls = input;
+        controls.combined_ab = true;
+        try j.write(.{ .kind = "terminal_model_controls_begin", .pair = pair, .order = order, .terminal_greedy = candidate });
+        try prefillSessionControls(init, &s, &peer, controls, j);
+        if (try peer.cachedGreedy(peer.position) != null) return error.TerminalTrialResetPick;
+        try j.write(.{ .kind = "terminal_model_controls_end", .pair = pair, .order = order, .terminal_greedy = candidate, .passed = true });
+        prefillMode(c, 16, true, true);
+    }
+    var choices: [128]TerminalChoice = undefined;
+    _ = try terminalRun(init, &s, input, tokens, rows, &choices, candidate);
+    const qualification = try canonicalState(init.gpa, &s);
+    defer init.gpa.free(qualification);
+    if (reference.turn.state == null) {
+        if (candidate or pair != 0 or order != 0) return error.TerminalTrialReference;
+        @memcpy(reference.turn.rows, rows);
+        @memcpy(reference.turn.tokens, tokens);
+        reference.turn.state = try init.gpa.dupe(u8, qualification);
+    }
+    try prefillFile(j, try std.fmt.allocPrint(j.a, "terminal-pair{d}-order{d}-qualification-logits.bf16", .{ pair, order }), std.mem.sliceAsBytes(rows));
+    try prefillFile(j, try std.fmt.allocPrint(j.a, "terminal-pair{d}-order{d}-qualification-state.bin", .{ pair, order }), qualification);
+    if (!std.mem.eql(u16, rows, reference.turn.rows) or !std.mem.eql(u32, tokens, reference.turn.tokens) or !std.mem.eql(u8, qualification, reference.turn.state.?)) return error.TerminalTrialParity;
+    if (!std.mem.eql(u8, &hash(std.mem.sliceAsBytes(rows)), "b78bb49d36d6abcc509679be4673442594072d65f53b5f0998e1474ce0582839") or !std.mem.eql(u8, &hash(qualification), "7fb71e4f454a6dd058d243337ddbcd4a189032aa44c35e3bc3289ff920acfd89")) return error.TerminalTrialHistoricalAnchor;
+    try j.write(.{ .kind = "terminal_model_native_choices", .pair = pair, .order = order, .terminal_greedy = candidate, .phase = "untimed_qualification", .choices = choices, .host_conversion_sentinel_checked = true, .independent_host_argmax_checked = true });
+    var snapshots: [2]TerminalSnapshot = undefined;
+    for (c.partitions, 0..) |*p, rank| {
+        const e = p.engine;
+        if (e.expert_graph_nodes_split_m == 0 or e.expert_graph_nodes_n8 != 0 or e.expert_graph_nodes_baseline != 0 or e.gdn_graph_nodes_candidate == 0 or e.gdn_graph_nodes_baseline != 0 or e.quant_graph_nodes_reuse == 0 or e.quant_graph_nodes_baseline != 0 or e.quant_graphs_verified != 2) return error.TerminalTrialBindingProof;
+        snapshots[rank] = try TerminalSnapshot.read(init.gpa, e);
+        var keys: [2]u32 = undefined;
+        var nodes: [2]usize = undefined;
+        for (e.terminal_graph_roster.items, 0..) |node, index| {
+            if (node.enabled != (candidate and rank == 1) or node.owns_head != (rank == 1) or node.head_rows != 1 or node.terminal_count != @intFromBool(candidate and rank == 1)) return error.TerminalTrialBindingProof;
+            if (rank == 1) {
+                const head = node.head orelse return error.TerminalTrialBindingProof;
+                if (head.actual_function != head.requested_function or node.head_kind == .absent or node.head_output != e.logits) return error.TerminalTrialBindingProof;
+                if (candidate) {
+                    const terminal = node.terminal orelse return error.TerminalTrialBindingProof;
+                    if (terminal.actual_function != terminal.requested_function or terminal.predecessor != head.node or terminal.argument_count != 4 or !std.mem.eql(u32, &terminal.grid, &.{ 1, 1, 1 }) or !std.mem.eql(u32, &terminal.block, &.{ 256, 1, 1 }) or terminal.shared_bytes != 0) return error.TerminalTrialBindingProof;
+                } else if (node.terminal != null) return error.TerminalTrialBindingProof;
+            } else if (node.head != null or node.terminal != null) return error.TerminalTrialBindingProof;
+            keys[index] = node.shape_key & ~@as(u32, 1 << 25);
+            nodes[index] = node.node_count;
+            try j.write(.{ .kind = "terminal_model_geometry", .pair = pair, .order = order, .rank = rank, .terminal_greedy = candidate, .driver_verified = true, .node = node });
+        }
+        if (keys[0] > keys[1]) {
+            std.mem.swap(u32, &keys[0], &keys[1]);
+            std.mem.swap(usize, &nodes[0], &nodes[1]);
+        }
+        if (!candidate and pair == 0) {
+            reference.qualified_keys[rank] = keys;
+            reference.qualified_nodes[rank] = nodes;
+            reference.cached_nodes[rank] = e.graph_nodes;
+        }
+        if (!std.mem.eql(u32, &keys, &reference.qualified_keys[rank])) return error.TerminalTrialBindingProof;
+        for (nodes, reference.qualified_nodes[rank]) |actual, baseline| if (actual != baseline + @as(usize, @intFromBool(candidate and rank == 1))) return error.TerminalTrialBindingProof;
+        if (e.graph_nodes != reference.cached_nodes[rank] + @as(usize, if (candidate and rank == 1) 3 else 0)) return error.TerminalTrialBindingProof;
+        try j.write(.{ .kind = "terminal_model_bindings", .pair = pair, .order = order, .rank = rank, .terminal_greedy = candidate, .snapshot = snapshots[rank], .qualified_shapes = 2, .unverified_startup_shapes = 1, .split_m_nodes = e.expert_graph_nodes_split_m, .gdn_nodes = e.gdn_graph_nodes_candidate, .quant_reuse_nodes = e.quant_graph_nodes_reuse, .quant_graphs_verified = e.quant_graphs_verified });
+        e.verify_gdn_graphs = false;
+        e.verify_expert_graphs = false;
+        e.verify_terminal_graphs = false;
+    }
+    captured(c, true);
+    const timing = try terminalRun(init, &s, input, tokens, rows, null, candidate);
+    const state = try canonicalState(init.gpa, &s);
+    defer init.gpa.free(state);
+    try prefillFile(j, try std.fmt.allocPrint(j.a, "terminal-pair{d}-order{d}-logits.bf16", .{ pair, order }), std.mem.sliceAsBytes(rows));
+    try prefillFile(j, try std.fmt.allocPrint(j.a, "terminal-pair{d}-order{d}-state.bin", .{ pair, order }), state);
+    if (!std.mem.eql(u16, rows, reference.turn.rows) or !std.mem.eql(u32, tokens, reference.turn.tokens) or !std.mem.eql(u8, state, reference.turn.state.?)) return error.TerminalTrialParity;
+    try prefillMetadata(&s);
+    const final_cached = try s.cachedGreedy(s.position);
+    if (candidate) {
+        if (final_cached == null or final_cached.? != tokens[tokens.len - 1]) return error.TerminalTrialPickProvenance;
+    } else if (final_cached != null) return error.TerminalTrialPickProvenance;
+    for (c.partitions, 0..) |p, rank| {
+        const after = try TerminalSnapshot.read(init.gpa, p.engine);
+        if (!std.meta.eql(snapshots[rank], after) or p.engine.verify_expert_graphs or p.engine.verify_gdn_graphs or p.engine.verify_terminal_graphs) return error.TerminalTrialUnqualifiedGraph;
+    }
+    if (prefillLaunches(c) != 262) return error.PrefillGraphWorkCount;
+    try j.write(.{ .kind = "terminal_model_turn", .pair = pair, .order = order, .warmup = pair == 0, .terminal_greedy = candidate, .times = timing, .body_calls_per_rank = 131, .native_first_calls = 1, .native_queue_calls = 127, .native_read_calls = 128, .stream_commits = 128, .call_counts_request_derived = true, .full_rows_copied_inside_timing = true, .graph_launches = prefillLaunches(c), .validators_enabled = false, .qualified_graph_cache_unchanged = true, .all_consumed_logits_tokens_and_state_exact = true, .logits_sha256 = &hash(std.mem.sliceAsBytes(rows)), .state_sha256 = &hash(state), .final_position = s.position, .final_cached = final_cached, .tokens = tokens });
+}
+
+fn terminalModelAB(init: std.process.Init, dir: []const u8, input: Input, j: Journal) !void {
+    var reference: TerminalReference = .{ .turn = .{ .rows = try init.gpa.alloc(u16, input.output_tokens * 248320), .tokens = try init.gpa.alloc(u32, input.output_tokens) } };
+    defer init.gpa.free(reference.turn.rows);
+    defer init.gpa.free(reference.turn.tokens);
+    defer if (reference.turn.state) |state| init.gpa.free(state);
+    for (0..6) |pair| for (0..2) |order| try terminalModelArm(init, dir, input, j, pair, order, &reference);
+    try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "shared Engine terminal greedy actual native Adapter matched C=1 turns", .production_qualification = false, .independent_hf_quality_gate = "unchanged FAIL" });
+}
+
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
@@ -816,11 +1014,15 @@ fn execute(init: std.process.Init, dir: []const u8, output: []const u8, input: I
         try j.write(.{ .kind = "complete", .correctness_pass = true, .scope = "isolated operator parity and timing screens", .production_qualification = false });
         return;
     }
+    if (input.terminal_ab) {
+        try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = "shared Engine terminal greedy actual native Adapter matched C=1 turns", .prefill_rows = 16, .terminal_ab = true, .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
+        return terminalModelAB(init, dir, input, j);
+    }
     if (input.layout_ab) {
         try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = "shared Engine immutable expert layout matched C=1 turns", .prefill_rows = 16, .layout_ab = true, .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
         return layoutModelAB(init, dir, input, j);
     }
-    const c = try qwen.Engine.open(init.gpa, init.io, dir, .{ .context = input.context, .cut = input.cut, .captured = !input.gdn_layout_ab and !input.expert_n8_ab and !input.verify_default_policy and !input.prefill_ab and !input.combined_ab, .prefill_rows = if (input.prefill_ab or input.combined_ab) 16 else 1 });
+    const c = try qwen.Engine.open(init.gpa, init.io, dir, .{ .context = input.context, .cut = input.cut, .captured = !input.gdn_layout_ab and !input.expert_n8_ab and !input.verify_default_policy and !input.prefill_ab and !input.combined_ab, .prefill_rows = if (input.prefill_ab or input.combined_ab) 16 else 1, .moe_math = input.moe_math });
     defer c.deinit();
     if (input.prefill_ab or input.combined_ab) {
         try j.write(.{ .kind = "start", .source_commit = options.source_commit, .implementation = "shared-qwen-engine", .identities = identities, .scope = if (input.combined_ab) "shared Engine retained-candidate bundle parity and matched C=1 turns" else "shared Engine bounded prefill parity and matched C=1 turns", .prefill_rows = 16, .combined_ab = input.combined_ab, .prompt_tokens = input.prompt.len, .output_tokens = input.output_tokens, .context = input.context, .cut = input.cut });
