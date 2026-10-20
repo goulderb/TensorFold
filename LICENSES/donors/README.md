@@ -320,6 +320,21 @@ also inspected as a semantic reference. Its older Qwen GDN rounding was not
 copied into this implementation. These additions do not establish numerical
 parity with a particular fused implementation or approve a model deployment.
 
+`tf_q35_hf_attn_partial_chunked`, `tf_q35_hf_attn_partial8_chunked` and
+`tf_q35_hf_attn_merge_chunked` in `zig/kernels/cuda/qwen35_hf.cu` (sources
+`349615f8b` and `12ef22ecb`, merged at `6b558f76c`) are local changes. They
+keep the serial HF partial's per-key arithmetic: the pairwise dot order,
+unfused products and `expf`. They run it on upstream TensorFold's chunked
+attention geometry from `zig/kernels/cuda/qwen35.cu` and `qwen35.cuh`:
+`chunk_keys`, `MAXCH` and the partial/merge grid. Upstream commits
+`3c57c1433` and `02d3e2ed1` record BobClawblaw as Git author. The FP8
+partial reads `qwen35_kv8.cu`'s e4m3 row and scale layout (`58b767435`, same
+recorded author, merged as #886). The Qwen/Hugging Face notice and the
+upstream TensorFold notices continue to apply.
+
+`zig/tests/cuda/qwen35_attn_compare.zig` and `qwen35_margins.zig` are
+local diagnostic tools with no external donor.
+
 The four Qwen checkpoint fixtures contain configuration and tensor metadata
 only. Each `source.json` names the producer, immutable model revision and
 header hashes. Checkpoint weights are not included and retain their producers'
