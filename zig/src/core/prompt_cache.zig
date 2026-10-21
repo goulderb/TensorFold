@@ -16,6 +16,18 @@ pub const spill = @import("spill.zig");
 /// A family's copy of one state.
 pub const Saved = *anyopaque;
 
+/// A family-owned restore in progress. A terminal poll consumes its context; cancel is only for a pending poll.
+pub const SpillRead = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    pub const VTable = struct {
+        /// Null means pending. Each call may upload at most one bounded chunk on the owner thread.
+        poll: *const fn (*anyopaque) anyerror!?Saved,
+        /// Stops a pending read without waiting for its worker.
+        cancel: *const fn (*anyopaque) void,
+    };
+};
+
 pub const singleReclaim = imprint.singleReclaim; // the learned-state file helpers, beside the Imprint that owns them
 pub const singleForgetChecked = imprint.singleForgetChecked;
 
@@ -66,6 +78,7 @@ pub const Snapshots = struct {
         /// (spill_resume.zig restores all ranks or none). error.NotStored: some rank's copy is on its way or gone, and
         /// every copy stays; any other error: the state is bad and the store forgets it on every rank.
         spill_read: ?*const fn (ptr: *anyopaque, tier: *spill.Tier, name: spill.Name) anyerror!Saved = null,
+        spill_read_async: ?*const fn (ptr: *anyopaque, tier: *spill.Tier, name: spill.Name) anyerror!SpillRead = null,
         /// `name` left this rank's tier: a peer deletes its own copy (null: one rank).
         spill_forget: ?*const fn (ptr: *anyopaque, name: spill.Name) void = null,
     };
@@ -152,6 +165,23 @@ pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
 /// The borrowed entry a backend restores; the caller must report resumed or release it, even on cancellation.
 pub const Lookup = struct { entry: ?*Entry = null, marks: []const u32 = &.{} };
 
+/// One admitted request's disk candidate. Only the lane owner changes this value or its Store.
+pub const PendingRestore = struct {
+    allocator: Allocator,
+    prompt: []const u32,
+    born: u32,
+    history_len: u32,
+    rewind_at: u32,
+    shared: []const u32,
+    starts: []const u32,
+    spans: []const modes.Span,
+    fallback: ?*Entry,
+    name: spill.Name,
+    tokens: []u32,
+    bytes: u64,
+    reader: ?SpillRead = null,
+};
+
 pub const Store = struct {
     restore_log: ?RestoreLog = null,
     gpa: Allocator,
@@ -160,6 +190,8 @@ pub const Store = struct {
     budget: u64,
     most: usize = std.math.maxInt(usize), // states kept at most: a family's snapshot slots, one a state
     held: u64 = 0,
+    pending_bytes: u64 = 0,
+    pending_count: usize = 0,
     clock: u64 = 0,
     entries: std.ArrayList(*Entry) = .empty,
     counts: Counts = .{},
@@ -257,7 +289,7 @@ pub const Store = struct {
         const bytes = s.family.vtable.bytes(s.family.ptr, name.at);
         if (bytes > s.budget) return have;
         const tokens = s.gpa.dupe(u32, hit.tokens) catch return have; // room-making writes may evict the hit from disk
-        while (s.held + s.spare() + bytes > s.budget) {
+        while (s.held + s.pending_bytes + s.spare() + bytes > s.budget or s.entries.items.len + s.pending_count >= s.most) {
             const v = s.victimBut(have, prompt, @intCast(prompt.len)) orelse {
                 s.gpa.free(tokens);
                 return have;
@@ -298,6 +330,7 @@ pub const Store = struct {
     }
 
     pub fn deinit(s: *Store) void {
+        std.debug.assert(s.pending_count == 0 and s.pending_bytes == 0);
         s.detach();
         for (s.entries.items) |e| s.free(e);
         s.entries.deinit(s.gpa);
@@ -349,7 +382,7 @@ pub const Store = struct {
 
     /// What the budget leaves past the kept states and the spare storage: a family readies storage only inside it.
     pub fn room(s: *const Store) u64 {
-        return s.budget -| s.held -| s.spare();
+        return s.budget -| s.held -| s.pending_bytes -| s.spare();
     }
 
     /// Kept states free their storage, least valuable first and never `restoring`, until `left.fits()` (false: never).
@@ -438,6 +471,129 @@ pub const Store = struct {
             s.active_rewind_at = at; // a state kept under min_gap before it is the rewind state: no new copy
         };
         const e = s.recallSpill(prompt, starts, spans, rows.read.recall(s, prompt, born, starts, spans, s.recall(prompt, born, starts, spans, s.find(prompt, starts, spans))));
+        return s.finishLookup(a, prompt, born, history_len, shared, starts, spans, e, endpoint, endpoint_bytes);
+    }
+
+    /// The lane host's lookup: disk admission may finish on later rounds, with no visible entry until then.
+    pub fn lookupRewindAsync(s: *Store, a: Allocator, prompt: []const u32, born: u32, history_len: u32, rewind_len: u32, shared: []const u32, starts: []const u32, spans: []const modes.Span, pending: *?PendingRestore) !Lookup {
+        std.debug.assert(pending.* == null);
+        if (s.family.vtable.spill_read_async == null or s.tier == null) return s.lookupRewind(a, prompt, born, history_len, rewind_len, shared, starts, spans);
+        s.collectExpired();
+        const endpoint = if (s.rules.planned) s.startAt(starts, history_len) else history_len;
+        const rewind = if (s.rules.planned) s.startAt(starts, rewind_len -| s.rules.lookahead) else rewind_len -| s.rules.lookahead;
+        const endpoint_bytes = if (endpoint > 0 and (endpoint < prompt.len or (s.rules.warm != .off and endpoint == prompt.len)) and endpoint + s.rules.lookahead <= prompt.len) s.family.vtable.bytes(s.family.ptr, endpoint) else 0;
+        const rewind_bytes = if (rewind > 0 and rewind < prompt.len and rewind + s.rules.lookahead <= prompt.len and s.usable(rewind, starts)) s.family.vtable.bytes(s.family.ptr, rewind) else 0;
+        const priority_bytes = if (endpoint_bytes <= s.budget) endpoint_bytes else 0;
+        s.active_rewind_at = if (prompt.len >= s.rules.min_prompt and rewind_bytes > 0 and rewind != endpoint and rewind_bytes <= s.budget - priority_bytes) rewind else 0;
+        if (s.active_rewind_at > 0) {
+            if (s.keptNear(prompt, starts, spans, s.active_rewind_at)) |at| s.active_rewind_at = at;
+        }
+        const have = rows.read.recall(s, prompt, born, starts, spans, s.recall(prompt, born, starts, spans, s.find(prompt, starts, spans)));
+        const t = s.tier.?;
+        const Ctx = struct {
+            store: *const Store,
+            starts: []const u32,
+            spans: []const modes.Span,
+            fn ok(c: *const @This(), at: u32) bool {
+                return c.store.usable(at, c.starts) and modes.equal(&.{}, c.spans, at);
+            }
+        };
+        const ctx: Ctx = .{ .store = s, .starts = starts, .spans = spans };
+        const hit = t.best(prompt, if (have) |e| e.at else 0, &ctx, Ctx.ok) orelse return s.finishLookup(a, prompt, born, history_len, shared, starts, spans, have, endpoint, endpoint_bytes);
+        const bytes = s.family.vtable.bytes(s.family.ptr, hit.name.at);
+        if (bytes > s.budget or s.most == 0) return s.finishLookup(a, prompt, born, history_len, shared, starts, spans, have, endpoint, endpoint_bytes);
+        const tokens = s.gpa.dupe(u32, hit.tokens) catch return s.finishLookup(a, prompt, born, history_len, shared, starts, spans, have, endpoint, endpoint_bytes);
+        while (s.held + s.pending_bytes + s.spare() + bytes > s.budget or s.entries.items.len + s.pending_count >= s.most) {
+            const victim = s.victimBut(have, prompt, @intCast(prompt.len)) orelse {
+                s.gpa.free(tokens);
+                return s.finishLookup(a, prompt, born, history_len, shared, starts, spans, have, endpoint, endpoint_bytes);
+            };
+            s.evict(victim);
+        }
+        if (!t.has(hit.name)) {
+            s.gpa.free(tokens);
+            return s.finishLookup(a, prompt, born, history_len, shared, starts, spans, have, endpoint, endpoint_bytes);
+        }
+        if (have) |e| e.borrowers += 1;
+        s.pending_bytes += bytes;
+        s.pending_count += 1;
+        pending.* = .{ .allocator = a, .prompt = prompt, .born = born, .history_len = history_len, .rewind_at = s.active_rewind_at, .shared = shared, .starts = starts, .spans = spans, .fallback = have, .name = hit.name, .tokens = tokens, .bytes = bytes };
+        return error.RestorePending;
+    }
+
+    /// Advances one bounded family upload, then publishes either the verified state or the original fallback.
+    pub fn pollRestore(s: *Store, p: *PendingRestore) !?Lookup {
+        if (p.reader == null) {
+            p.reader = s.family.vtable.spill_read_async.?(s.family.ptr, s.tier.?, p.name) catch |err| {
+                if (err == error.ReadBusy) return null;
+                return try s.failedRestore(p, err);
+            };
+        }
+        const saved = p.reader.?.vtable.poll(p.reader.?.ptr) catch |err| {
+            p.reader = null; // terminal poll consumed the family context
+            return try s.failedRestore(p, err);
+        } orelse return null;
+        p.reader = null; // terminal poll consumed the family context
+        const e = s.gpa.create(Entry) catch {
+            s.family.vtable.drop(s.family.ptr, saved);
+            return try s.failedRestore(p, error.OutOfMemory);
+        };
+        e.* = .{ .tokens = p.tokens, .at = p.name.at, .saved = saved, .bytes = p.bytes, .born = @intCast(p.prompt.len), .used = s.clock, .last = &.{}, .from_disk = true };
+        p.tokens = &.{};
+        e.last = s.gpa.dupe(u32, p.prompt) catch {
+            s.free(e);
+            return try s.failedRestore(p, error.OutOfMemory);
+        };
+        s.entries.append(s.gpa, e) catch {
+            s.free(e);
+            return try s.failedRestore(p, error.OutOfMemory);
+        };
+        s.held += p.bytes;
+        s.spill_counts.read_back += 1;
+        if (s.tier) |t| t.touch(p.name);
+        return try s.finishRestore(p, e);
+    }
+
+    fn failedRestore(s: *Store, p: *PendingRestore, err: anyerror) !Lookup {
+        if (err == error.NotStored) {
+            s.spill_counts.unavailable += 1;
+        } else {
+            note("reading {d} spilled tokens failed ({s}); prefilled instead", .{ p.name.at, @errorName(err) });
+            s.spill_counts.recall_failed += 1;
+            // The async reader owns generation-guarded local forget. Never erase a replacement here.
+        }
+        return s.finishRestore(p, if (p.fallback) |e| if (!e.expired) e else null else null);
+    }
+
+    fn finishRestore(s: *Store, p: *PendingRestore, candidate: ?*Entry) !Lookup {
+        s.active_rewind_at = p.rewind_at;
+        const fallback = p.fallback;
+        s.pending_bytes -= p.bytes;
+        s.pending_count -= 1;
+        s.gpa.free(p.tokens);
+        p.tokens = &.{};
+        p.fallback = null;
+        if (fallback) |e| {
+            std.debug.assert(e.borrowers > 0);
+            e.borrowers -= 1;
+        }
+        const endpoint = if (s.rules.planned) s.startAt(p.starts, p.history_len) else p.history_len;
+        const endpoint_bytes = if (endpoint > 0 and (endpoint < p.prompt.len or (s.rules.warm != .off and endpoint == p.prompt.len)) and endpoint + s.rules.lookahead <= p.prompt.len) s.family.vtable.bytes(s.family.ptr, endpoint) else 0;
+        return s.finishLookup(p.allocator, p.prompt, p.born, p.history_len, p.shared, p.starts, p.spans, candidate, endpoint, endpoint_bytes);
+    }
+
+    pub fn cancelRestore(s: *Store, p: *PendingRestore) void {
+        if (p.reader) |r| r.vtable.cancel(r.ptr);
+        p.reader = null;
+        s.pending_bytes -= p.bytes;
+        s.pending_count -= 1;
+        s.gpa.free(p.tokens);
+        p.tokens = &.{};
+        if (p.fallback) |e| s.release(e);
+        p.fallback = null;
+    }
+
+    fn finishLookup(s: *Store, a: Allocator, prompt: []const u32, born: u32, history_len: u32, shared: []const u32, starts: []const u32, spans: []const modes.Span, e: ?*Entry, endpoint: u32, endpoint_bytes: u64) !Lookup {
         if (e == null) s.counts.misses += 1;
         const from = if (e) |x| x.at else 0;
         const marks_ = if (s.active_rewind_at == 0)
@@ -465,9 +621,8 @@ pub const Store = struct {
             if (!exists) need += s.family.vtable.bytes(s.family.ptr, at);
             new += @intFromBool(!exists);
         }
-        while (s.held + need > s.budget or s.entries.items.len + @min(new, s.most) > s.most) {
+        while (s.held + s.pending_bytes + need > s.budget or s.entries.items.len + s.pending_count + @min(new, s.most) > s.most) {
             s.evict(s.victimBut(from, prompt, born) orelse return);
-
         }
     }
 
@@ -647,22 +802,22 @@ pub const Store = struct {
         var owns_decoded = true;
         defer if (owns_decoded) s.gpa.free(decoded);
         const bytes = s.family.vtable.bytes(s.family.ptr, at);
-        if (bytes > s.budget or s.most == 0) {
+        if (bytes > s.budget -| s.pending_bytes or s.pending_count >= s.most) {
             s.counts.refused += 1;
             note("kept nothing at {d} tokens: {d} MiB passes the {d} MiB budget", .{ at, bytes >> 20, s.budget >> 20 });
             return false;
         }
         while (s.entries.items.len > 0) { // room: spare storage this save can take, else new storage inside the budget
-            if (s.family.vtable.reuses) |f| if (s.entries.items.len < s.most and f(s.family.ptr, at)) break;
+            if (s.family.vtable.reuses) |f| if (s.entries.items.len + s.pending_count < s.most and f(s.family.ptr, at)) break;
             const free_ = s.spare();
-            if (s.held + free_ + bytes <= s.budget and s.entries.items.len < s.most) break;
+            if (s.held + s.pending_bytes + free_ + bytes <= s.budget and s.entries.items.len + s.pending_count < s.most) break;
             if (free_ > 0) {
-                if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
+                if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| s.pending_bytes -| bytes); // spare that cannot take this state goes before any state
                 if (s.spare() < free_) continue;
             }
             s.evict(s.victimForMark(null, prompt, born) orelse return s.fail(at, error.CacheBorrowed)); // its storage may come back spare and take this state
         }
-        if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
+        if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.pending_bytes -| bytes);
         const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
         const tokens = s.gpa.dupe(u32, prompt[0..n]) catch {
             s.gpa.destroy(e);
@@ -691,7 +846,7 @@ pub const Store = struct {
         if (s.rules.spill_timing == .retention) s.spillOut(e);
         if (shared) learned.learn(s, e, starts);
         if (s.disk) |r| rows.write.queued(r, e, starts);
-        if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
+        if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| s.pending_bytes); // spare storage only inside what the budget leaves
         return true;
     }
 
@@ -702,9 +857,8 @@ pub const Store = struct {
         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
         if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
-        while (bytes <= s.budget and (s.held + s.spare() + bytes > s.budget or s.entries.items.len >= s.most)) {
+        while (bytes <= s.budget -| s.pending_bytes and (s.held + s.pending_bytes + s.spare() + bytes > s.budget or s.entries.items.len + s.pending_count >= s.most)) {
             s.evict(s.victimBut(have, prompt, born) orelse return have);
-
         }
         if (bytes > s.budget) return have;
         const e = s.gpa.create(Entry) catch return have;
@@ -766,6 +920,7 @@ test {
     _ = @import("prompt_cache_lifetime_test.zig");
     _ = @import("learned_fault_test.zig");
     _ = @import("prompt_cache_spill_test.zig");
+    _ = @import("prompt_cache_async_test.zig");
     _ = modes;
     _ = rows;
 }

@@ -12,6 +12,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const fs = @import("spill_fs.zig");
+pub const Read = @import("spill_read.zig").Read;
 
 /// The tier's files on POSIX and on Windows (spill_fs.zig): every file made, read and deleted in a directory checked
 /// private, no link followed, written then renamed.
@@ -357,7 +358,7 @@ pub const Job = struct {
 
 /// A state the tier holds: in memory (`ram`), on disk (`on_disk`, its file renamed in place), or on its way there
 /// (`job`, a write not renamed yet). `bytes` is its file's size, which the disk's cap and floor count.
-const Entry = struct { name: Name, tokens: []u32, bytes: u64, used: u64, job: ?*Job = null, source_id: usize = 0, ram: ?*Ram = null, on_disk: bool = false };
+const Entry = struct { generation: u64 = 0, name: Name, tokens: []u32, bytes: u64, used: u64, job: ?*Job = null, source_id: usize = 0, ram: ?*Ram = null, on_disk: bool = false };
 
 /// Whether `e` can be read now: held in memory, or its file in place.
 fn readable(e: *const Entry) bool {
@@ -393,6 +394,8 @@ pub const Tier = struct {
     /// states written after this clock are not evicted for room (a batch's own writes never evict each other)
     pin: ?u64 = null,
     thread: ?std.Thread = null,
+    reader: ?*Read = null,
+    generation: u64 = 0,
     closing: bool = false,
     stats: Stats = .{},
     hook: ?Hook = null,
@@ -467,6 +470,11 @@ pub const Tier = struct {
         if (t.busy) |j| j.cancel.store(true, .release);
         t.cond.broadcast(t.io);
         t.mutex.unlock(t.io);
+        if (t.reader) |r| {
+            r.cancel();
+            r.destroy();
+            t.reader = null;
+        }
         if (t.thread) |th| th.join();
         t.thread = null;
         // writes never started end here, as failed
@@ -673,6 +681,8 @@ pub const Tier = struct {
         if (t.thread == null) t.thread = try std.Thread.spawn(.{}, run, .{t});
         t.clock += 1;
         e.used = t.clock;
+        t.generation += 1;
+        e.generation = t.generation;
         t.entries.appendAssumeCapacity(e);
         t.queue.appendAssumeCapacity(j);
         t.cond.broadcast(t.io);
@@ -769,6 +779,8 @@ pub const Tier = struct {
         t.ram_bytes += payload.len;
         t.clock += 1;
         e.used = t.clock;
+        t.generation += 1;
+        e.generation = t.generation;
         t.entries.appendAssumeCapacity(e);
         t.stats.ram_adopted += 1;
         // written behind: its file goes to disk now while it stays held (no room: it stays in memory alone)
@@ -884,7 +896,7 @@ pub const Tier = struct {
             return false;
         };
         const e = t.entries.items[i];
-        if (e.ram != null or !e.on_disk or e.job != null) {
+        if (e.generation != r.generation or e.ram != null or !e.on_disk or e.job != null) {
             ram_gpa.free(meta);
             t.gpa.destroy(held);
             return false;
@@ -1091,17 +1103,76 @@ pub const Tier = struct {
         j.release();
     }
 
-    /// Reads stored state `name` back: its header and tokens checked now (the file goes when they fail), its payload
-    /// by `Reading.pump`. A write of it still on its way is error.NotStored (never waited for; see `stored`).
+    /// Owner-thread submission. One bounded reader remains owned until release and worker completion.
+    pub fn readAsync(t: *Tier, name: Name) !*Read {
+        if (t.reader) |r| {
+            if (!r.reapable()) return error.ReadBusy;
+            r.destroy();
+            t.reader = null;
+        }
+        if (t.closing) return error.TierClosed;
+        const r = try Read.start(t, name);
+        t.reader = r;
+        return r;
+    }
+
+    pub fn readGeneration(t: *Tier, name: Name) !u64 {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        const i = t.find(name) orelse return error.NotStored;
+        if (!readable(t.entries.items[i])) return error.NotStored;
+        return t.entries.items[i].generation;
+    }
+
+    pub fn isRam(t: *Tier, name: Name) bool {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        const i = t.find(name) orelse return false;
+        return t.entries.items[i].ram != null;
+    }
+
+    pub fn forgetGeneration(t: *Tier, name: Name, generation: u64) void {
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        const i = t.find(name) orelse return;
+        if (t.entries.items[i].generation != generation) return;
+        t.drop(i);
+        t.stats.forgotten += 1;
+    }
+
+    /// Reads the header and tokens now, then the payload through Reading.pump.
     pub fn read(t: *Tier, name: Name) !Reading {
+        return t.readMode(name, true, null);
+    }
+
+    pub fn readDeferred(t: *Tier, name: Name, generation: u64) !Reading {
+        return t.readMode(name, false, generation);
+    }
+
+    pub fn readFailed(t: *Tier, err: anyerror, started: i96) void {
+        if (err == error.ReadCancelled or err == error.NotStored) return;
+        t.mutex.lockUncancelable(t.io);
+        defer t.mutex.unlock(t.io);
+        t.stats.load_failed += 1;
+        t.stats.load_count += 1;
+        t.stats.load_ns += @intCast(@max(0, t.now() - started));
+        if (err == error.PayloadHash) t.stats.hash_failed += 1;
+    }
+
+    fn readMode(t: *Tier, name: Name, forget_on_failure: bool, expected: ?u64) !Reading {
         t.mutex.lockUncancelable(t.io);
         const i = t.find(name) orelse {
             t.mutex.unlock(t.io);
             return error.NotStored;
         };
         const e = t.entries.items[i];
+        const generation = e.generation;
+        if (expected) |want| if (want != generation) {
+            t.mutex.unlock(t.io);
+            return error.NotStored;
+        };
         if (e.ram) |held| {
-            var r: Reading = .{ .tier = t, .name = name, .t0 = t.now(), .ram = held.retain() };
+            var r: Reading = .{ .tier = t, .name = name, .t0 = t.now(), .ram = held.retain(), .generation = generation, .forget_on_failure = forget_on_failure };
             const tokens = t.gpa.dupe(u32, e.tokens) catch |err| {
                 t.mutex.unlock(t.io);
                 r.close();
@@ -1118,7 +1189,7 @@ pub const Tier = struct {
             return error.NotStored;
         }
         t.mutex.unlock(t.io);
-        var r: Reading = .{ .tier = t, .name = name, .t0 = t.now() };
+        var r: Reading = .{ .tier = t, .name = name, .t0 = t.now(), .generation = generation, .forget_on_failure = forget_on_failure };
         r.begin() catch |err| {
             r.fail();
             r.close();
@@ -1209,7 +1280,8 @@ pub const Tier = struct {
         if (std.hash.XxHash3.hash(0, std.mem.sliceAsBytes(tokens)) != h.tokens_hash) return error.TokensHash;
         if (!Name.of(tokens, h.name.at).eql(name) or h.name.at > tokens.len) return error.OtherName;
         const e = try t.gpa.create(Entry);
-        e.* = .{ .name = name, .tokens = tokens, .bytes = h.fileBytes(), .used = 0, .on_disk = true };
+        t.generation += 1;
+        e.* = .{ .generation = t.generation, .name = name, .tokens = tokens, .bytes = h.fileBytes(), .used = 0, .on_disk = true };
         return .{ .e = e, .saved = h.saved };
     }
 
@@ -1273,6 +1345,8 @@ pub const Reading = struct {
     tokens: []u32 = &.{},
     t0: i96,
     timed: bool = false,
+    generation: u64 = 0,
+    forget_on_failure: bool = true,
     ram: ?*Ram = null, // read from memory (a reference held until close), not from its file
 
     fn begin(r: *Reading) !void {
@@ -1304,6 +1378,12 @@ pub const Reading = struct {
     /// what the sink filled; the file goes).
     pub fn pump(r: *Reading, sink: Sink) !void {
         const t = r.tier;
+        if (r.ram == null and t.rbuf.len == 0) t.rbuf = t.gpa.alloc(u8, t.chunk) catch |err| return r.failWith(err);
+        return r.pumpBuffered(sink, t.rbuf);
+    }
+
+    pub fn pumpBuffered(r: *Reading, sink: Sink, buffer: []u8) !void {
+        const t = r.tier;
         // Resource failures follow the same conservative discard/cold-fallback policy as
         // other terminal read errors, even when the stored file itself is valid.
         if (r.ram) |held| {
@@ -1323,7 +1403,7 @@ pub const Reading = struct {
             t.mutex.unlock(t.io);
             return;
         }
-        if (t.rbuf.len == 0) t.rbuf = t.gpa.alloc(u8, t.chunk) catch |err| return r.failWith(err);
+        if (buffer.len == 0) return r.failWith(error.EmptyReadBuffer);
         // held again as it is read when the memory level holds it: the state was wanted, its next read is memory's
         const ram_gpa = t.ram_gpa orelse t.gpa;
         var copy: ?[]u8 = if (t.holds(r.header.payload_len)) ram_gpa.alloc(u8, @intCast(r.header.payload_len)) catch null else null;
@@ -1332,18 +1412,20 @@ pub const Reading = struct {
         const at = Header.payloadOffset(r.header.tokens);
         var off: u64 = 0;
         while (off < r.header.payload_len) {
-            const n: usize = @intCast(@min(t.chunk, r.header.payload_len - off));
-            if (!fs.preadAll(r.fd.?, t.rbuf[0..n], at + off)) return r.failWith(error.ShortFile);
+            const n: usize = @intCast(@min(buffer.len, r.header.payload_len - off));
+            if (!fs.preadAll(r.fd.?, buffer[0..n], at + off)) return r.failWith(error.ShortFile);
             t.advise_file(r.fd.?, at + off, n);
-            hash.update(t.rbuf[0..n]);
-            if (copy) |c| @memcpy(c[@intCast(off)..][0..n], t.rbuf[0..n]);
-            sink.write(sink.ptr, off, t.rbuf[0..n]) catch |err| return r.failWith(err);
+            hash.update(buffer[0..n]);
+            if (copy) |c| @memcpy(c[@intCast(off)..][0..n], buffer[0..n]);
+            sink.write(sink.ptr, off, buffer[0..n]) catch |err| return r.failWith(err);
             off += n;
         }
         if (hash.final() != r.header.payload_hash) {
-            t.mutex.lockUncancelable(t.io);
-            t.stats.hash_failed += 1;
-            t.mutex.unlock(t.io);
+            if (r.forget_on_failure) {
+                t.mutex.lockUncancelable(t.io);
+                t.stats.hash_failed += 1;
+                t.mutex.unlock(t.io);
+            }
             return r.failWith(error.PayloadHash);
         }
         if (copy) |c| if (t.promote(r, c)) {
@@ -1359,18 +1441,20 @@ pub const Reading = struct {
     }
 
     fn failWith(r: *Reading, err: anyerror) anyerror {
+        if (err == error.ReadCancelled) return err;
         r.fail();
         return err;
     }
 
     /// A read that failed: its file goes (it is not trusted again).
     fn fail(r: *Reading) void {
+        if (!r.forget_on_failure) return;
         const t = r.tier;
         t.mutex.lockUncancelable(t.io);
         t.stats.load_failed += 1;
         r.recordTime();
         t.mutex.unlock(t.io);
-        t.forget(r.name);
+        if (r.forget_on_failure) t.forgetGeneration(r.name, r.generation);
     }
 
     // Tier mutex held. Abandoned reads have no terminal sample.
@@ -1453,6 +1537,181 @@ pub const diskFree = fs.diskFree;
 
 test {
     _ = @import("spill_test.zig");
+}
+
+fn asyncEvent(r: *Read) !Read.Poll {
+    const deadline = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() + 5 * std.time.ns_per_s;
+    while (true) {
+        const event = r.poll();
+        if (event != .pending) return event;
+        if (std.Io.Clock.awake.now(std.testing.io).toNanoseconds() >= deadline) return error.TestReadTimeout;
+        std.Thread.yield() catch {};
+    }
+}
+
+test "async spill paused disk IO leaves tier available and cancellation nonblocking" {
+    const Pause = struct {
+        var entered: std.atomic.Value(bool) = .init(false);
+        var released: std.atomic.Value(bool) = .init(false);
+        fn advice(_: fs.File, at: u64, _: u64) void {
+            if (at != 0) return;
+            entered.store(true, .release);
+            while (!released.load(.acquire)) std.Thread.yield() catch {};
+        }
+    };
+    var f = try MetricsFixture.open();
+    defer f.close();
+    const name = try f.put(&.{ 1, 2 }, false);
+    f.tier.advise_file = Pause.advice;
+    Pause.entered.store(false, .release);
+    Pause.released.store(false, .release);
+    defer Pause.released.store(true, .release);
+    const r = try f.tier.readAsync(name);
+    const deadline = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() + 5 * std.time.ns_per_s;
+    while (!Pause.entered.load(.acquire)) {
+        if (std.Io.Clock.awake.now(std.testing.io).toNanoseconds() >= deadline) return error.TestReadTimeout;
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(r.description() == null);
+    try std.testing.expect(r.poll() == .pending);
+    try std.testing.expectEqual(@as(usize, 1), f.tier.info().entries);
+    r.release();
+    try std.testing.expectError(error.ReadBusy, f.tier.readAsync(name));
+    Pause.released.store(true, .release);
+    f.tier.shutdown();
+    try std.testing.expectEqual(@as(u64, 0), f.tier.info().stats.load_failed);
+    try std.testing.expect(f.tier.has(name));
+}
+
+test "async spill mailbox stays bounded and borrowed until consumed" {
+    var f = try MetricsFixture.open();
+    defer f.close();
+    f.tier.chunk = 5;
+    const name = try f.put(&.{ 1, 2 }, false);
+    const r = try f.tier.readAsync(name);
+    defer r.release();
+    try std.testing.expectError(error.ReadBusy, f.tier.readAsync(name));
+    const first = try asyncEvent(r);
+    try std.testing.expect(first == .chunk);
+    try std.testing.expectEqual(@as(usize, 5), first.chunk.bytes.len);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 7, 7, 7, 7 }, first.chunk.bytes);
+    try std.testing.expectEqual(@as(u64, 16), r.description().?.header.payload_len);
+    for (0..100) |_| {
+        std.Thread.yield() catch {};
+        const same = r.poll();
+        try std.testing.expectEqual(first.chunk.offset, same.chunk.offset);
+        try std.testing.expectEqual(first.chunk.bytes.ptr, same.chunk.bytes.ptr);
+    }
+    var bytes: u64 = 0;
+    while (true) {
+        switch (try asyncEvent(r)) {
+            .chunk => |c| {
+                try std.testing.expectEqual(bytes, c.offset);
+                try std.testing.expect(c.bytes.len <= 5);
+                bytes += c.bytes.len;
+                r.consume();
+            },
+            .done => break,
+            .failed => |err| return err,
+            .pending => unreachable,
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 16), bytes);
+    try std.testing.expectEqual(@as(u64, 1), f.tier.info().stats.loaded);
+    try std.testing.expectEqual(@as(usize, 0), f.tier.rbuf.len);
+}
+
+test "async spill cancellation releases blocked producer without corruption" {
+    var f = try MetricsFixture.open();
+    defer f.close();
+    f.tier.chunk = 5;
+    const name = try f.put(&.{ 1, 2 }, false);
+    const r = try f.tier.readAsync(name);
+    try std.testing.expect((try asyncEvent(r)) == .chunk);
+    r.cancel();
+    r.release();
+    f.tier.shutdown();
+    try std.testing.expect(f.tier.reader == null);
+    try std.testing.expect(f.tier.has(name));
+    try std.testing.expectEqual(@as(u64, 0), f.tier.info().stats.load_failed);
+    try std.testing.expectEqual(@as(u64, 0), f.tier.info().stats.loaded);
+}
+
+test "async spill shutdown cancels an unreleased borrowed chunk" {
+    var f = try MetricsFixture.open();
+    defer f.close();
+    f.tier.chunk = 5;
+    const name = try f.put(&.{ 1, 2 }, false);
+    const r = try f.tier.readAsync(name);
+    try std.testing.expect((try asyncEvent(r)) == .chunk);
+    f.tier.shutdown();
+    try std.testing.expect(f.tier.reader == null);
+    try std.testing.expect(f.tier.has(name));
+    try std.testing.expectEqual(@as(u64, 0), f.tier.info().stats.load_failed);
+}
+
+test "async spill promotes validated disk payload and reuses RAM" {
+    var f = try MetricsFixture.open();
+    defer f.close();
+    f.tier.chunk = 5;
+    f.tier.settings.ram_cap = 32;
+    const name = try f.put(&.{ 1, 2 }, false);
+    for (0..2) |attempt| {
+        const r = try f.tier.readAsync(name);
+        var bytes: u64 = 0;
+        while (true) switch (try asyncEvent(r)) {
+            .chunk => |c| {
+                try std.testing.expectEqual(bytes, c.offset);
+                for (c.bytes) |b| try std.testing.expectEqual(@as(u8, 7), b);
+                bytes += c.bytes.len;
+                r.consume();
+            },
+            .done => break,
+            .failed => |err| return err,
+            .pending => unreachable,
+        };
+        try std.testing.expectEqual(@as(u64, 16), bytes);
+        r.release();
+        const info = f.tier.info();
+        try std.testing.expectEqual(@as(u64, 1), info.stats.ram_promoted);
+        try std.testing.expectEqual(@as(u64, attempt), info.stats.ram_loaded);
+        try std.testing.expectEqual(@as(u64, 16), info.ram_bytes);
+        try std.testing.expect(f.tier.isRam(name));
+    }
+}
+
+test "async spill corruption invalidation cannot forget a replacement" {
+    var f = try MetricsFixture.open();
+    defer f.close();
+    f.tier.chunk = 5;
+    const name = try f.put(&.{ 1, 2 }, false);
+    var before = try f.tier.read(name);
+    var nb: [32]u8 = undefined;
+    const fd = fs.createTrunc(f.tier.dfd, name.file(&nb)) orelse return error.TestOpen;
+    try fs.pwriteAll(fd, &before.head, 0);
+    try fs.pwriteAll(fd, std.mem.sliceAsBytes(before.tokens), header_bytes);
+    const bad: [16]u8 = @splat(8);
+    try fs.pwriteAll(fd, &bad, Header.payloadOffset(before.tokens.len));
+    fs.close(fd);
+    before.close();
+    const r = try f.tier.readAsync(name);
+    defer r.release();
+    while (true) switch (try asyncEvent(r)) {
+        .chunk => r.consume(),
+        .failed => |err| {
+            try std.testing.expectEqual(error.PayloadHash, err);
+            break;
+        },
+        else => return error.TestExpectedFailure,
+    };
+    try std.testing.expect(f.tier.has(name));
+    f.tier.forget(name);
+    _ = try f.put(&.{ 1, 2 }, false);
+    r.forgetFailed();
+    r.forgetInvalid();
+    try std.testing.expect(f.tier.has(name));
+    try std.testing.expectEqual(@as(u64, 1), f.tier.info().stats.hash_failed);
+    try std.testing.expectEqual(@as(u64, 0), f.tier.info().stats.loaded);
 }
 
 const MetricsFixture = struct {

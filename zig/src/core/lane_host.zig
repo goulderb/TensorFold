@@ -39,6 +39,7 @@ pub const LaneHost = struct {
     wake: std.Io.Condition = .init,
     queued: std.ArrayList(*Job) = .empty,
     admitted: std.ArrayList(*Job) = .empty,
+    restore_cursor: usize = 0,
     filling: std.ArrayList(*Job) = .empty, // admitted jobs whose prompt is still going in, a chunk a round, oldest first
     cancels: std.ArrayList(Id) = .empty,
     closing: bool = false,
@@ -268,6 +269,10 @@ pub const LaneHost = struct {
 
     pub fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
         h.memory_lanes = null; // a lane may have freed: the next admission asks the backend for memory again
+        if (job.pending_restore) |*pending| {
+            h.cache.?.cancelRestore(pending);
+            job.pending_restore = null;
+        }
         if (h.rounds) |rd| rd.vtable.left(rd.ctx, @intFromPtr(job));
         job.reported();
         h.gpa.free(job.marks);
@@ -338,7 +343,9 @@ pub const LaneHost = struct {
         const r = job.request;
         if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) return h.ended(h.cancel(job)); // other work came first
         if (h.request_refusal) |check| if (check(r)) |message| return h.ended(h.drop(job, message));
-        if (!lane_stream.open(h, job)) return null; // the job was finished instead
+        if (h.rounds == null and h.cache != null and h.cache.?.family.vtable.spill_read_async != null) {
+            if (lane_stream.openAsync(h, job) != .ready) return null; // pending jobs stay admitted
+        } else if (!lane_stream.open(h, job)) return null;
         return job.began;
     }
 
@@ -579,8 +586,34 @@ pub const LaneHost = struct {
         var i: usize = 0;
         while (i < h.admitted.items.len) {
             const job = h.admitted.items[i];
+            if (!job.started) {
+                i += 1;
+                continue;
+            }
             if (h.deliver(job)) continue;
             i += 1;
+        }
+    }
+
+    /// One pending restore advances per engine loop; active streams keep decoding between uploads.
+    fn pollRestoreOne(h: *LaneHost) void {
+        const n = h.admitted.items.len;
+        if (n == 0) return;
+        var offset: usize = 0;
+        while (offset < n) : (offset += 1) {
+            const i = (h.restore_cursor + offset) % n;
+            const job = h.admitted.items[i];
+            if (job.pending_restore) |*pending| {
+                h.restore_cursor = (i + 1) % n;
+                const looked = h.cache.?.pollRestore(pending) catch {
+                    job.pending_restore = null; // terminal failure consumed the reader and reservation
+                    _ = h.drop(job, "out of memory");
+                    return;
+                } orelse return;
+                job.pending_restore = null;
+                if (lane_stream.resumeAsync(h, job, looked)) _ = h.launch(job, job.began);
+                return;
+            }
         }
     }
 
@@ -591,6 +624,7 @@ pub const LaneHost = struct {
         var cold_extension_used = false;
         while (true) {
             ends.takeCancels(h);
+            h.pollRestoreOne();
             rows_host.answer(h);
             learn.refuse(h);
             while (h.admitOne()) {}
@@ -636,8 +670,9 @@ pub const LaneHost = struct {
                     continue;
                 }
                 if (rows_host.idle(h)) continue;
-                if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
-                    h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
+                const restoring = h.cache != null and h.cache.?.pending_count > 0;
+                if (restoring or (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes)))
+                    h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(if (restoring) 1 else 100), .clock = .awake } }) catch {};
                 h.unlock();
                 continue;
             }
@@ -658,4 +693,5 @@ test {
     _ = @import("lane_host_tests.zig");
     _ = @import("lane_host_cold_test.zig");
     _ = @import("lane_proposers_test.zig");
+    _ = @import("lane_host_async_test.zig");
 }

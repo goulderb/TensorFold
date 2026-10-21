@@ -508,6 +508,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     qwen35_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = qwen35_adapter })).step);
     step.dependOn(&qwen35_run.step);
     const native = native_modules.engines;
+    const async_restore = b.createModule(.{
+        .root_source_file = b.path("zig/src/native/nemotron_spill.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = native_modules.api }, .{ .name = "nemotron", .module = mods.nemotron }, .{ .name = "lanes", .module = mods.lanes } },
+    });
+    b.step("test-nemotron-async-restore-host", "Bounded owner-thread uploads and cancelled partial cache restores without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = async_restore, .filters = &.{"async restore"} })).step);
     const qwen_native_run = b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{ "the Qwen host profile", "every registered family", "Qwen ModelOpt checkpoint refusal" } }));
     b.step("test-qwen35-native-host", "ModelOpt lane-host integration and combined native catalog without a GPU").dependOn(&qwen_native_run.step);
     @import("release_cuda_refusal.zig").tests(b, step, native_modules.api, mods.nemotron);

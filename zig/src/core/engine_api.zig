@@ -527,6 +527,12 @@ pub const SpillWrites = struct {
     capture_ns: u64 = 0,
     read_ok: u64 = 0,
     read_failed: u64 = 0,
+    async_started: u64 = 0,
+    async_completed: u64 = 0,
+    async_cancelled: u64 = 0,
+    async_chunks: u64 = 0,
+    async_uploaded_bytes: u64 = 0,
+    async_max_chunk_bytes: u64 = 0,
 };
 
 /// Prompt rows the primary model computed, counted where its prompt pass runs: `submitted` when a chunk is queued on

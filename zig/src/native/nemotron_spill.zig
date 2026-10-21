@@ -172,6 +172,12 @@ pub const Counts = struct {
     read_ok: u64 = 0, // states read back whole
     read_failed: u64 = 0, // reads refused or failed (not counting NotStored)
     held: u64 = 0, // states captured whole into the tier's memory level (Tier.adopt), no slot involved
+    async_started: u64 = 0,
+    async_completed: u64 = 0,
+    async_cancelled: u64 = 0,
+    async_chunks: u64 = 0,
+    async_uploaded_bytes: u64 = 0,
+    async_max_chunk_bytes: u64 = 0,
 };
 
 const retired_most = 4;
@@ -604,6 +610,124 @@ pub fn spillWrite(p: *anyopaque, saved: pc.Saved, tier: *spill.Tier, name: spill
 pub fn spillRead(p: *anyopaque, tier: *spill.Tier, name: spill.Name) anyerror!pc.Saved {
     return diskOf(p).read(@ptrCast(@alignCast(p)), tier, name);
 }
+
+pub fn spillReadAsync(p: *anyopaque, tier: *spill.Tier, name: spill.Name) anyerror!pc.SpillRead {
+    const d = diskOf(p);
+    if (tier != d.tier) return error.SpillTier;
+    d.reap();
+    const a = try d.gpa.create(Restore);
+    errdefer d.gpa.destroy(a);
+    const target: *N.Target = @ptrCast(@alignCast(p));
+    a.* = .{ .disk = d, .target = target, .name = name, .source = try tier.readAsync(name) };
+    d.counts.async_started += 1;
+    return .{ .ptr = a, .vtable = &.{ .poll = Restore.poll, .cancel = Restore.cancel } };
+}
+
+const Restore = struct {
+    disk: *Disk,
+    target: *N.Target,
+    name: spill.Name,
+    source: *spill.Read,
+    saved: ?pc.Saved = null,
+    uploaded: u64 = 0,
+
+    fn poll(ptr: *anyopaque) anyerror!?pc.Saved {
+        const a: *Restore = @ptrCast(@alignCast(ptr));
+        const d = a.disk;
+        const saved = a.step() catch |err| {
+            if (err != error.NotStored) d.counts.read_failed += 1;
+            a.dispose();
+            return err;
+        };
+        if (saved != null) d.gpa.destroy(a);
+        return saved;
+    }
+
+    fn step(a: *Restore) anyerror!?pc.Saved {
+        const d = a.disk;
+        const r = a;
+        if (r.saved == null) {
+            if (r.source.description()) |desc| {
+                const scalar = decode(d.layout, desc.meta(), a.name) catch |err| {
+                    r.source.forgetInvalid();
+                    return err;
+                };
+                if (@as(u64, desc.header.tokens) != @as(u64, a.name.at) + lookahead or desc.header.payload_len != try d.layout.payloadAt(scalar.pos)) {
+                    r.source.forgetInvalid();
+                    return error.SpillLayout;
+                }
+                try d.device.ctx.makeCurrent();
+                r.saved = try d.image.blank(a.target, a.name.at);
+            } else {
+                switch (r.source.poll()) {
+                    .failed => |err| {
+                        r.source.forgetFailed();
+                        return if (err == error.ReadCancelled) error.NotStored else err;
+                    },
+                    else => return null,
+                }
+            }
+        }
+        switch (r.source.poll()) {
+            .pending => return null,
+            .chunk => |chunk| {
+                const saved = r.saved orelse return error.SpillLayout;
+                if (chunk.offset != r.uploaded) return error.SpillSourceRange;
+                try d.device.ctx.makeCurrent();
+                var sink: Disk.Upload = .{ .disk = d, .target = a.target, .saved = saved, .at = a.name.at };
+                try Disk.Upload.write(&sink, chunk.offset, chunk.bytes);
+                d.counts.async_chunks += 1;
+                d.counts.async_uploaded_bytes += chunk.bytes.len;
+                d.counts.async_max_chunk_bytes = @max(d.counts.async_max_chunk_bytes, chunk.bytes.len);
+                r.uploaded += chunk.bytes.len;
+                r.source.consume();
+                return null;
+            },
+            .done => {
+                const saved = r.saved orelse return error.SpillLayout;
+                if (r.uploaded != try d.layout.payloadAt(a.name.at)) return error.SpillLayout;
+                const c: *const N.Copy = @ptrCast(@alignCast(saved));
+                d.check(c, a.name) catch |err| {
+                    r.source.forgetInvalid();
+                    return err;
+                };
+                if (c.rows != 0) {
+                    r.source.forgetInvalid();
+                    return error.SpillScalars;
+                }
+                r.saved = null;
+                r.source.release();
+                d.counts.read_ok += 1;
+                d.counts.async_completed += 1;
+                return saved;
+            },
+            .failed => |err| {
+                r.source.forgetFailed();
+                if (err == error.NotStored or err == error.ReadCancelled) {
+                    return error.NotStored;
+                }
+                return err;
+            },
+        }
+    }
+
+    fn cancel(ptr: *anyopaque) void {
+        const a: *Restore = @ptrCast(@alignCast(ptr));
+        a.disk.counts.async_cancelled += 1;
+        a.dispose();
+    }
+
+    fn dispose(a: *Restore) void {
+        const d = a.disk;
+        a.source.release();
+        if (a.saved) |saved| {
+            d.device.ctx.makeCurrent() catch {};
+            d.device.stream.synchronize() catch {};
+            d.drop(a.target, saved);
+        }
+        d.gpa.destroy(a);
+    }
+};
 
 /// The host reservation, inside the cache's budget for as long as the tier is open.
 pub fn spare(p: *anyopaque) u64 {

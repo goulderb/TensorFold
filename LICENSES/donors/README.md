@@ -508,6 +508,14 @@ adaptation imports no new donor kernel. All original and transitive notices abov
 remain applicable, and checkpoint provenance and licensing remain separate.
 
 
+## Asynchronous tier restore (2026-10-21)
+
+The local asynchronous reader extends the existing wojo/Mia-derived spill tier
+and upstream TensorFold compact Image adapter credited above. It separates file
+reads and validation from owner-thread GPU uploads, reserves pending cache state,
+and makes cancellation and invalidation generation-aware. It adds no donor code
+or CUDA kernels; original and transitive notices remain applicable.
+
 ## Publication privacy boundary
 
 This source-only publication omits private workstation evidence and run receipts.

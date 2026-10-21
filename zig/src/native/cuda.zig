@@ -43,6 +43,7 @@ const nemotron_spill_snaps: api.prompt_cache.Snapshots.VTable = .{
     .drop = nemotron.native.snap_drop,
     .spill_write = nspill.spillWrite,
     .spill_read = nspill.spillRead,
+    .spill_read_async = nspill.spillReadAsync,
     .spare = nspill.spare,
     .trim = nspill.trim,
     .rows = &cuda_disk.image,
@@ -188,7 +189,21 @@ pub const Host = struct {
         const h: *Host = @ptrCast(@alignCast(p));
         const store = h.store orelse return false;
         if (!api.spillStatus(store, out)) return false;
-        if (h.disk) |d| out.writes = .{ .submitted = d.counts.submitted, .written = d.counts.written, .lost = d.counts.lost, .skipped_busy = d.counts.skipped_busy, .capture_ns = d.counts.capture_ns, .read_ok = d.counts.read_ok, .read_failed = d.counts.read_failed };
+        if (h.disk) |d| out.writes = .{
+            .submitted = d.counts.submitted,
+            .written = d.counts.written,
+            .lost = d.counts.lost,
+            .skipped_busy = d.counts.skipped_busy,
+            .capture_ns = d.counts.capture_ns,
+            .read_ok = d.counts.read_ok,
+            .read_failed = d.counts.read_failed,
+            .async_started = d.counts.async_started,
+            .async_completed = d.counts.async_completed,
+            .async_cancelled = d.counts.async_cancelled,
+            .async_chunks = d.counts.async_chunks,
+            .async_uploaded_bytes = d.counts.async_uploaded_bytes,
+            .async_max_chunk_bytes = d.counts.async_max_chunk_bytes,
+        };
         return true;
     }
 

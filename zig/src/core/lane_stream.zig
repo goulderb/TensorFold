@@ -3,6 +3,7 @@ const std = @import("std");
 const lanes = @import("lanes");
 const host = @import("lane_host.zig");
 const recalls = @import("lane_host_recall.zig");
+const pc = @import("prompt_cache.zig");
 const LaneHost = host.LaneHost;
 const Job = LaneHost.Job;
 
@@ -19,11 +20,44 @@ pub fn open(h: *LaneHost, job: *Job) bool {
     // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
     job.prepareKey() catch return !h.drop(job, "out of memory");
     if (h.cache) |store| if (r.prompt_logprobs == null and !r.untaught) if (store.lookupRewind(h.gpa, job.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
-        job.entry = l.entry;
-        job.kept0 = store.counts.kept;
-        job.marks = l.marks;
-        reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
+        reuse = setLookup(job, store, l);
     } else |_| {};
+    return startStream(h, job, reuse);
+}
+
+pub const Opening = enum { ready, pending, failed };
+
+/// Start the cache lookup, retaining an unstarted job while a disk restore runs.
+pub fn openAsync(h: *LaneHost, job: *Job) Opening {
+    const r = job.request;
+    job.prepareKey() catch {
+        _ = h.drop(job, "out of memory");
+        return .failed;
+    };
+    if (h.cache) |store| if (r.prompt_logprobs == null and !r.untaught) {
+        const l = store.lookupRewindAsync(h.gpa, job.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r), &job.pending_restore) catch |err| {
+            if (err == error.RestorePending) return .pending;
+            return if (startStream(h, job, .{})) .ready else .failed;
+        };
+        return if (startStream(h, job, setLookup(job, store, l))) .ready else .failed;
+    };
+    return if (startStream(h, job, .{})) .ready else .failed;
+}
+
+/// A pending restore has become a normal cache lookup; only now initialize the stream.
+pub fn resumeAsync(h: *LaneHost, job: *Job, l: pc.Lookup) bool {
+    return startStream(h, job, setLookup(job, h.cache.?, l));
+}
+
+fn setLookup(job: *Job, store: *pc.Store, l: pc.Lookup) lanes.stream.Reuse {
+    job.entry = l.entry;
+    job.kept0 = store.counts.kept;
+    job.marks = l.marks;
+    return .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
+}
+
+fn startStream(h: *LaneHost, job: *Job, reuse: lanes.stream.Reuse) bool {
+    const r = job.request;
     if (h.proposers) |ps| {
         job.custom = ps.make(ps.ctx, h.gpa, r.prompt, r.eos) catch return !h.drop(job, "the drafter could not start");
     } else job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return !h.drop(job, "the drafter could not start");

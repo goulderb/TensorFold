@@ -21,6 +21,7 @@ pub const Fake = struct {
     var calls: [256]Call = undefined;
     var n: usize = 0;
     var live: isize = 0; // device allocations not yet freed
+    var uploaded: usize = 0;
     var drv: cuda.Driver = undefined;
     const stream_handle: abi.Stream = @ptrFromInt(0x5100);
 
@@ -30,6 +31,7 @@ pub const Fake = struct {
     }
     pub fn reset() void {
         n = 0;
+        uploaded = 0;
     }
     pub fn seen() []const Call {
         return calls[0..@min(n, calls.len)];
@@ -62,6 +64,7 @@ pub const Fake = struct {
     }
     fn htod(dst: abi.DevicePtr, src: ?*const anyopaque, len: usize) callconv(.c) abi.Result {
         put(.htod);
+        uploaded += len;
         @memcpy(@as([*]u8, @ptrFromInt(dst))[0..len], @as([*]const u8, @ptrCast(src.?))[0..len]);
         return abi.success;
     }
@@ -208,6 +211,86 @@ pub fn tokensFor(buf: []u32, n: usize) []u32 {
 /// Target pointing at a Disk: the Snapshots slots find their adapter through it.
 pub fn targetFor(d: *ns.Disk) N.Target {
     return .{ .e = undefined, .head = null, .disk = d };
+}
+
+fn asyncRoot() !Root {
+    var root = try Root.make();
+    errdefer root.deinit();
+    const path = try std.fmt.allocPrint(gpa, "{s}/async", .{root.path});
+    gpa.free(root.path);
+    root.path = path;
+    return root;
+}
+
+test "async restore uploads one bounded chunk per poll and publishes the complete state" {
+    var root = try asyncRoot();
+    defer root.deinit();
+    const l = layout(10);
+    const d = try openDisk(&root, l, identity_a);
+    defer d.abandon(null);
+    var target = targetFor(d);
+    var words: [16]u32 = undefined;
+    const tokens = tokensFor(&words, 9);
+    const name = spill.Name.of(tokens, 8);
+    const original = try copyAt(l, 8, 3);
+    defer freeCopy(original);
+    try ns.spillWrite(&target, original, d.tier, name, tokens);
+    d.settleAll();
+    const live = Fake.live;
+    Fake.reset();
+    const pending = try ns.spillReadAsync(&target, d.tier, name);
+    var waiting = true;
+    defer if (waiting) pending.vtable.cancel(pending.ptr);
+    try std.testing.expectEqual(live, Fake.live);
+    const until = std.Io.Clock.awake.now(io).toNanoseconds() + 5 * std.time.ns_per_s;
+    var got: ?pc.Saved = null;
+    var turns: usize = 0;
+    while (got == null and std.Io.Clock.awake.now(io).toNanoseconds() < until) {
+        const before = Fake.uploaded;
+        got = try pending.vtable.poll(pending.ptr);
+        try std.testing.expect(Fake.uploaded - before <= d.tier.chunk);
+        turns += @intFromBool(Fake.uploaded > before);
+        if (got == null) std.Thread.yield() catch {};
+    }
+    try std.testing.expect(got != null);
+    waiting = false;
+    const copy: *N.Copy = @ptrCast(@alignCast(got.?));
+    defer freeCopy(copy);
+    try std.testing.expect(turns > 1);
+    try std.testing.expectEqual(@as(u64, 1), d.counts.read_ok);
+    var before: [256]u8 = undefined;
+    var after: [256]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, bytesOf(original.kv, &before), bytesOf(copy.kv, &after));
+    try std.testing.expectEqualSlices(u8, bytesOf(original.mamba, &before), bytesOf(copy.mamba, &after));
+}
+
+test "async restore cancellation drops an unpublished GPU copy without counting failure" {
+    var root = try asyncRoot();
+    defer root.deinit();
+    const l = layout(10);
+    const d = try openDisk(&root, l, identity_a);
+    defer d.abandon(null);
+    var target = targetFor(d);
+    var words: [16]u32 = undefined;
+    const tokens = tokensFor(&words, 9);
+    const name = spill.Name.of(tokens, 8);
+    const original = try copyAt(l, 8, 3);
+    defer freeCopy(original);
+    try ns.spillWrite(&target, original, d.tier, name, tokens);
+    d.settleAll();
+    const live = Fake.live;
+    Fake.reset();
+    const pending = try ns.spillReadAsync(&target, d.tier, name);
+    const until = std.Io.Clock.awake.now(io).toNanoseconds() + 5 * std.time.ns_per_s;
+    while (Fake.uploaded == 0 and std.Io.Clock.awake.now(io).toNanoseconds() < until) {
+        try std.testing.expectEqual(@as(?pc.Saved, null), try pending.vtable.poll(pending.ptr));
+        std.Thread.yield() catch {};
+    }
+    try std.testing.expect(Fake.uploaded > 0);
+    pending.vtable.cancel(pending.ptr);
+    try std.testing.expectEqual(live, Fake.live);
+    try std.testing.expectEqual(@as(u64, 0), d.counts.read_failed);
+    try std.testing.expect(d.tier.has(name));
 }
 
 // ---- codec -----------------------------------------------------------------------------------------------------

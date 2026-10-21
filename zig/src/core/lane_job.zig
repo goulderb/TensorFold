@@ -31,6 +31,7 @@ pub const Job = struct {
     fill_on: std.atomic.Value(bool) = .init(false),
     prefilled: ?i96 = null,
     entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
+    pending_restore: ?pc.PendingRestore = null, // an admitted disk read; no stream exists until it finishes
     marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
     key: []u32 = &.{}, // the request's cache key with its image frame in the first word (gpa-owned); empty: its own
     kept_through: u32 = 0,

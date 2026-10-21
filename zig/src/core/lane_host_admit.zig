@@ -89,6 +89,7 @@ pub fn many(h: *LaneHost) bool {
         began[n] = at;
         n += 1;
     }
+    if (n == 0) return took;
     if (n == 1) return h.launch(jobs[0], began[0]);
     var streams: [lanes.Engine.max_together]*lanes.Stream = undefined;
     for (jobs[0..n], 0..) |job, i| streams[i] = &job.stream;
