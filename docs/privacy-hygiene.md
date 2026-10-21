@@ -1,29 +1,27 @@
 # Forward-only source privacy
 
-The canonical development store retains private historical commits and qualification
-receipts. It is not safe to push raw. Forward-only exclusions do not remove tracked
-files or erase their history. Keep historical evidence intact and keep production
-source/runtime pins unchanged. Publish only an independently verified clean copy.
+The public fork is the development source of truth. Local `trunk` tracks its public
+history. The former private Git store is a separate local archive for historical
+qualification evidence, old worktrees and pinned production commits.
 
-Local `trunk` can track public history while the same store retains private archive
-and task refs. Preserve those refs and their pinned objects. Start new task branches
-from the public-history `trunk`. Port reviewed changes from old tasks onto those new
-branches; never merge private ancestry into public `trunk`. Keep the canonical push
-guard active and use a clean publication clone for outgoing pull requests.
+Start new task branches from `trunk`. Port reviewed source changes from old tasks
+onto those new branches; never merge private ancestry into `trunk`. Keep archived
+evidence intact and production source/runtime pins unchanged. New private output
+belongs outside Git. Ignore rules do not remove files from an existing history.
 
 ## Local defaults and hooks
 
 From a task worktree, install the reviewed checker with your repository Python:
 
 ```sh
-python3 -I tools/install_privacy_hooks.py --canonical
+python3 -I tools/install_privacy_hooks.py
 ```
 
-`--canonical` is for the private-history store only: its pre-push hook refuses every
-push, including a direct URL that bypasses remote push settings. Do not use that
-option in an independently verified public-history clone. Other contributors can
-pass `--email` with their own approved GitHub no-reply identity. The installer's
-identity choice must agree with any protected identity in the policy.
+Use `--private-history` only for the separate archived store. Its pre-push hook
+refuses every push, including direct URLs. The old `--canonical` spelling remains
+an alias for that private-history mode; it is not for the public development store.
+Use `--email` to supply an approved GitHub no-reply identity. The choice must agree
+with any protected identity in the policy.
 
 The installer changes only repository-local defaults. It sets the interpreter to
 the Python running the installer, installs shared hooks and a checker/policy snapshot
@@ -96,10 +94,10 @@ The generic and protected-identity checks still run without that local supplemen
 
 ## Public branch and workflows
 
-Public `trunk` is append-only: deletion and force pushes are blocked and changes
-use pull requests. No approving-review count or unavailable CI status check is
-required. GitHub secret scanning/push protection supplement, but do not replace,
-the local privacy guard. Keep donor/upstream push URLs blocked.
+Push verified personal-fork changes directly to `trunk`; pull requests are not
+required. Deletion and force pushes remain blocked. GitHub secret scanning and
+push protection supplement the local privacy guard. Keep donor and upstream
+push URLs blocked.
 
 The no-GPU workflow includes regression tests and a full PR commit-range privacy
 check, with read-only permissions, full history and no persisted checkout credential.

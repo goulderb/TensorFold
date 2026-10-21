@@ -21,7 +21,8 @@
 - Follow [forward-only privacy hygiene](docs/privacy-hygiene.md): use the approved
   public identity, keep new raw evidence/debug captures outside tracked source,
   and run the staged/outgoing privacy gate. Keep private policy values out of Git.
-- The canonical store retains private archive and task refs even when `trunk`
-  tracks public history. Never merge private ancestry into public `trunk` or disable
-  the store's push guard. Port reviewed changes onto a clean public-history branch.
-  Preserve old evidence and production pins. Actions stay disabled until workflow review.
+- Public `trunk` is the development source of truth. Keep the historical private
+  Git store separate as an archive. Never merge its ancestry into public `trunk`;
+  port reviewed changes onto new branches from `trunk`. Preserve archived evidence
+  and production pins. Personal trunk updates do not require pull requests.
+  Actions stay disabled until workflow review.

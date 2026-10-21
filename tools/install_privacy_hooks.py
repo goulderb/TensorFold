@@ -110,7 +110,7 @@ def install(repo, email=None, canonical=False):
     state_file.write_text(json.dumps(previous, indent=2, sort_keys=True), encoding='utf-8')
     print('Installed managed pre-commit and pre-push hooks in the shared Git directory.')
     print('No-reply default set locally; globals, authorship and historical commits were not changed.')
-    print('Canonical push guard:', 'enabled' if previous['private_history'] else 'not enabled')
+    print('Private-history push guard:', 'enabled' if previous['private_history'] else 'not enabled')
     print('Rerun this installer after reviewing checker/policy updates; unrelated hooks are never overwritten.')
 
 
@@ -118,7 +118,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo', type=Path, default=Path.cwd())
     parser.add_argument('--email')
-    parser.add_argument('--canonical', action='store_true', help='refuse every push from this private-history store')
+    parser.add_argument('--private-history', '--canonical', dest='canonical', action='store_true',
+                        help='refuse every push from an archived private-history store')
     args = parser.parse_args(argv)
     try:
         install(args.repo, args.email, args.canonical)

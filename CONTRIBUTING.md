@@ -2,7 +2,8 @@
 
 TensorFold's main line is the Zig engine and server.
 Python 0.6.6 stays available at the `v0.6.6` tag and takes no further changes; Python clients and references under `tools` are development tools.
-In this fork, start from canonical `trunk` (upstream uses `main`) and keep one change per pull request.
+In this personal fork, start from `trunk` (upstream uses `main`) and keep each branch focused.
+Push verified changes to `trunk` directly; pull requests are not required here.
 Open an issue before a new model family, backend or arithmetic change so we can agree on its gate.
 
 ## Build and host tests
@@ -111,11 +112,11 @@ A clean diff or a passing test suite does not replace that review.
 
 [Forward-only privacy hygiene](docs/privacy-hygiene.md) documents the repository-local
 no-reply default, shared hooks, staged/outgoing checks and private artifact boundary.
-Install the reviewed hooks with `python3 -I tools/install_privacy_hooks.py --canonical`
-only in the private-history canonical store. Keep new raw evidence outside tracked
-source and publish sanitized summaries/hashes instead. Existing receipts/history
-remain private and unchanged; ignore rules do not untrack them. Do not push the
-canonical store raw or change qualified source/runtime pins as a privacy shortcut.
+Install the reviewed hooks with `python3 -I tools/install_privacy_hooks.py`.
+Use `--private-history` only for an archived private store, where all pushes must
+be refused. Keep new raw evidence outside tracked source and publish sanitized
+summaries and hashes instead. Historical receipts remain in the separate private
+archive. Do not import its ancestry or change qualified source/runtime pins.
 
 ## Bug reports and license
 

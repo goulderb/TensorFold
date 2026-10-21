@@ -76,8 +76,8 @@ class PrivacyHooks(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b'personal-home', result.stdout + result.stderr)
 
-    def test_canonical_push_is_rejected_before_updating_even_a_local_remote(self):
-        self.install('--canonical')
+    def test_private_history_push_is_rejected_before_updating_even_a_local_remote(self):
+        self.install('--private-history')
         remote = self.root / 'remote.git'
         subprocess.run(['git', 'init', '--bare', str(remote)], env=self.env, capture_output=True, check=True)
         result = self.git('push', str(remote), 'HEAD:refs/heads/main', check=False)
