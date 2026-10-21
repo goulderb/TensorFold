@@ -240,8 +240,14 @@ test "GLM prompt workflow: both ranks share exact packets and reject malformed b
         try t.expectEqual(a.slot, b.slot);
         try t.expectEqualSlices(u32, a.ids, b.ids);
     }
-    try t.expectEqual(@as(u32, 12), @backingInt(glm.follow.Kind.block));
-    try t.expectEqual(@as(u32, 13), @backingInt(glm.follow.Kind.many));
+    // layout 24 keeps fork spill/vision commands at 12-20 and appends incoming image/block/many/redraw.
+    try t.expectEqual(@as(u32, 12), @backingInt(glm.follow.Kind.spill_write));
+    try t.expectEqual(@as(u32, 13), @backingInt(glm.follow.Kind.spill_read));
+    try t.expectEqual(glm.follow.Kind.spill_write, @as(glm.follow.Kind, @fromBackingInt(12)));
+    try t.expectEqual(@as(u32, 21), @backingInt(glm.follow.Kind.image));
+    try t.expectEqual(@as(u32, 22), @backingInt(glm.follow.Kind.block));
+    try t.expectEqual(@as(u32, 23), @backingInt(glm.follow.Kind.many));
+    try t.expectEqual(@as(u32, 24), @backingInt(glm.follow.Kind.redraw));
     try t.expectError(error.BadStep, wire.decode(ids, 0, 4096, &decoded));
     try t.expectError(error.BadStep, wire.decode(ids, 17, 4096, &decoded));
     for (0..ids.len) |cut| try t.expectError(error.BadStep, wire.decode(ids[0..cut], 2, 4096, &decoded));

@@ -16,7 +16,7 @@ test {
     _ = @import("cuda_spill_order_test.zig");
 }
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve, spill_write, spill_read, spill_forget, vision, redraw_masked, verify_masked, draft_batch, prefill_shared, prelaunch_batch, image, block, many, redraw };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, reserve, spill_write, spill_read, spill_forget, vision, redraw_masked, verify_masked, draft_batch, prefill_shared, prelaunch_batch, image = 21, block = 22, many = 23, redraw = 24 };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -695,6 +695,16 @@ pub fn follow(e: *Engine, link: *Link) !void {
             .end => return,
         }
     }
+}
+
+test "layout-24 command ids keep fork spill commands and append incoming block" {
+    try std.testing.expectEqual(@as(u32, 12), @backingInt(Kind.spill_write));
+    try std.testing.expectEqual(@as(u32, 13), @backingInt(Kind.spill_read));
+    try std.testing.expectEqual(Kind.spill_write, @as(Kind, @fromBackingInt(12)));
+    try std.testing.expectEqual(@as(u32, 21), @backingInt(Kind.image));
+    try std.testing.expectEqual(@as(u32, 22), @backingInt(Kind.block));
+    try std.testing.expectEqual(@as(u32, 23), @backingInt(Kind.many));
+    try std.testing.expectEqual(@as(u32, 24), @backingInt(Kind.redraw));
 }
 
 test "a step's header is 64 bytes and keeps its fields" {

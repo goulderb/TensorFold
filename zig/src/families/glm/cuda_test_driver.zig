@@ -4,6 +4,7 @@ const cuda = @import("cuda");
 pub const Memory = struct {
     var mutex: std.atomic.Mutex = .unlocked;
     var blocks: [128]?[]align(256) u8 = @splat(null);
+    pub var launches: std.atomic.Value(usize) = .init(0);
 
     pub fn driver() cuda.Driver {
         var d: cuda.Driver = .{ .lib = undefined, .api = undefined };
@@ -25,9 +26,25 @@ pub const Memory = struct {
         d.api.cuCtxSetCurrent = setCurrent;
         d.api.cuMemsetD8_v2 = fill8;
         d.api.cuMemsetD8Async = fill8Async;
+        d.api.cuMemsetD32_v2 = fill32Sync;
         d.api.cuMemsetD32Async = fill32;
         d.api.cuStreamSynchronize = sync;
+        d.api.cuLaunchKernel = launch;
+        d.api.cuLaunchKernelEx = launchEx;
+        d.api.cuGetErrorName = errorName;
+        d.api.cuGetErrorString = errorName;
         return d;
+    }
+
+    pub fn dummyFunction(d: *const cuda.Driver) cuda.Function {
+        return .{ .d = d, .handle = @ptrFromInt(1) };
+    }
+
+    pub fn dummyGlue(d: *const cuda.Driver) @import("cuda_glue.zig").Kernels {
+        const f = dummyFunction(d);
+        var k: @import("cuda_glue.zig").Kernels = undefined;
+        inline for (@typeInfo(@import("cuda_glue.zig").Kernels).@"struct".field_names) |name| @field(k, name) = f;
+        return k;
     }
 
     pub fn slice(ptr: u64, n: usize) []u8 {
@@ -118,6 +135,21 @@ pub const Memory = struct {
     fn fill32(dst: u64, value: c_uint, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
         const p: [*]u32 = @ptrFromInt(dst);
         @memset(p[0..n], value);
+        return 0;
+    }
+    fn fill32Sync(dst: u64, value: c_uint, n: usize) callconv(.c) cuda.abi.Result {
+        return fill32(dst, value, n, null);
+    }
+    fn launch(_: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+        _ = launches.fetchAdd(1, .monotonic);
+        return 0;
+    }
+    fn launchEx(_: *const cuda.abi.LaunchConfig, _: cuda.abi.Function, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+        _ = launches.fetchAdd(1, .monotonic);
+        return 0;
+    }
+    fn errorName(_: cuda.abi.Result, s: *?[*:0]const u8) callconv(.c) cuda.abi.Result {
+        s.* = "CUDA_SUCCESS";
         return 0;
     }
     fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {

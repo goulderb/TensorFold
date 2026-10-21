@@ -100,27 +100,42 @@ test "production target warmup covers every shared width with at most two sixtee
 
 test "canonical Engine.verifyShared stages five 8-row windows and refuses a reduced allocation" {
     const Memory = @import("cuda_test_driver.zig").Memory;
-    const kda_block = @import("cuda_kda_block.zig");
+    const block = @import("dflash_block.zig");
     var d = Memory.driver();
     const c = config.Config{};
-    var layer: weights.Layer = undefined;
-    var k: kda_block.Layer = undefined;
-    k.qkv = .{ .mxfp8 = .{ .mode = .mxfp8, .codes = 1, .scales = 2, .n = 384, .k = @intCast(c.hidden), .npad = 384 } };
-    layer.mixer = .{ .kda = k };
-    layer.ffn = .{ .dense = undefined };
-    var layers = [_]weights.Layer{layer};
-    const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try shard.Share.of(&c, 0, 2), .layers = &layers };
+    const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try shard.Share.of(&c, 0, 2) };
     var dr: dflash.Drafter = .{ .gpa = std.testing.allocator, .d = &d, .module = undefined, .k = undefined, .weights = undefined, .split = false, .ff = 0, .rank = 0, .world = 1 };
-    defer dr.slots.deinit(std.testing.allocator);
-    var ids: [5][8]u32 = undefined;
-    var outs: [5][8]u32 = undefined;
-    var parts: [5]Part = undefined;
+    defer {
+        for (dr.slots.items) |*s| if (s.ring) |*r| r.free();
+        dr.slots.deinit(std.testing.allocator);
+    }
+    const dummy = Memory.dummyFunction(&d);
+    inline for (@typeInfo(dflash.Kernels).@"struct".field_names) |name| @field(dr.k, name) = dummy;
+    var tap_store = try cuda.DeviceBuffer.alloc(&d, dflash.STEP_ROWS * dflash.TAP_ROW);
+    defer tap_store.free();
+    dr.taps_step = tap_store.ptr;
+    var consumed = try cuda.DeviceBuffer.alloc(&d, 64 * dflash.TAP_ROW);
+    defer consumed.free();
+    var ids: [8][8]u32 = undefined;
+    var outs: [8][8]u32 = undefined;
+    var parts: [8]Part = undefined;
     for (&parts, &ids, &outs, 0..) |*p, *id, *out, i| {
         for (id, 0..) |*tok, r| tok.* = @intCast(i * 8 + r + 1);
         p.* = .{ .slot = @intCast(i), .ids = id, .out = out };
     }
     var e: Engine = undefined;
     e.full_graphs = null;
+    e.ffn_graphs = null;
+    e.route_trace = null;
+    e.prefetch = null;
+    e.tp_group = null;
+    e.replicas = .{};
+    e.target_graphs_active = false;
+    e.capture_lifetime = 0;
+    e.structured = false;
+    e.pair_failure = struct {
+        fn ignore(_: anyerror) void {}
+    }.ignore;
     e.settings = .{ .kv = .bf16 };
     e.drafter = &dr;
     e.canonical_owner = true;
@@ -129,10 +144,24 @@ test "canonical Engine.verifyShared stages five 8-row windows and refuses a redu
     e.d = &d;
     e.w = w;
     e.c = c;
+    e.share = w.share;
     e.capacity = 64;
     e.mtp = false;
     e.pool = null;
+    e.verify_widths = @splat(0);
     e.seqs = .empty;
+    e.stream = .{ .d = &d, .handle = null };
+    e.m = undefined;
+    e.m.glue = Memory.dummyGlue(&d);
+    e.m.tiled = false;
+    e.m.packs = null;
+    e.m.ck = null;
+    e.m.prompt_latent = null;
+    e.m.source_dense = null;
+    e.m.source_upcast = null;
+    e.m.copy_rows = dummy;
+    e.greedy_rows = try greedy_mod.Greedy.init(std.testing.allocator, &d, 1, 64);
+    defer e.greedy_rows.deinit();
     defer {
         for (e.seqs.items) |q| if (q) |s| {
             s.st.deinit();
@@ -147,7 +176,7 @@ test "canonical Engine.verifyShared stages five 8-row windows and refuses a redu
         defer small.deinit();
         try small.enableTaps(&d);
         e.bs = small;
-        try std.testing.expectError(error.WindowTooWide, e.verifyShared(&parts));
+        try std.testing.expectError(error.WindowTooWide, e.verifyShared(parts[0..5]));
     }
     {
         var big = try fw.Buffers.initShared(&d, &w, 64, 64);
@@ -159,6 +188,50 @@ test "canonical Engine.verifyShared stages five 8-row windows and refuses a redu
         var wide_out: [9]u32 = undefined;
         const overflow = [_]Part{.{ .slot = 0, .ids = &wide, .out = &wide_out }};
         try std.testing.expectError(error.WindowTooWide, e.verifyShared(&overflow));
+        for (0..40) |row| std.mem.writeInt(u32, Memory.slice(dr.taps_step + row * dflash.TAP_ROW, 4)[0..4], @intCast(0xC0DE0000 + row), .little);
+        Memory.launches.store(0, .monotonic);
+        try e.verifyShared(parts[0..5]);
+        try std.testing.expect(Memory.launches.load(.monotonic) >= 44);
+        try std.testing.expectEqual(@as(u64, 1), dr.verifies);
+        try std.testing.expectEqual(@as(u64, 1), e.verify_widths[40]);
+        for (0..5) |slot| {
+            const s = dr.slots.items[slot];
+            try std.testing.expectEqual(slot * 8, s.v_row0);
+            try std.testing.expectEqual(@as(usize, 8), s.v_rows);
+            try std.testing.expectEqual(@as(i64, 0), s.v_pos0);
+            try std.testing.expectEqual(dr.verifies, s.v_step);
+            try block.copy(&e, consumed.ptr + slot * 8 * dflash.TAP_ROW, dr.taps_step + s.v_row0 * dflash.TAP_ROW, 8 * dflash.TAP_ROW);
+            for (0..8) |r| {
+                const got = std.mem.readInt(u32, Memory.slice(consumed.ptr + (slot * 8 + r) * dflash.TAP_ROW, 4)[0..4], .little);
+                try std.testing.expectEqual(@as(u32, @intCast(0xC0DE0000 + slot * 8 + r)), got);
+            }
+        }
+        var stale: [5]dflash.Req = undefined;
+        for (&stale, 0..) |*q, i| q.* = .{ .slot = @intCast(i), .pos = 99, .n = 8, .anchor = 1, .propose = false };
+        dr.lost = 0;
+        try dr.draft(&e, &stale);
+        try std.testing.expectEqual(@as(u64, 5), dr.lost);
+        for (0..64) |row| std.mem.writeInt(u32, Memory.slice(dr.taps_step + row * dflash.TAP_ROW, 4)[0..4], @intCast(0xDA7A0000 + row), .little);
+        Memory.launches.store(0, .monotonic);
+        try e.verifyShared(&parts);
+        try std.testing.expect(Memory.launches.load(.monotonic) >= 68);
+        try std.testing.expectEqual(@as(u64, 2), dr.verifies);
+        try std.testing.expectEqual(@as(u64, 1), e.verify_widths[64]);
+        for (0..8) |slot| {
+            const s = dr.slots.items[slot];
+            try std.testing.expectEqual(slot * 8, s.v_row0);
+            try std.testing.expectEqual(@as(usize, 8), s.v_rows);
+            try block.copy(&e, consumed.ptr + slot * 8 * dflash.TAP_ROW, dr.taps_step + s.v_row0 * dflash.TAP_ROW, 8 * dflash.TAP_ROW);
+            for (0..8) |r| {
+                const got = std.mem.readInt(u32, Memory.slice(consumed.ptr + (slot * 8 + r) * dflash.TAP_ROW, 4)[0..4], .little);
+                try std.testing.expectEqual(@as(u32, @intCast(0xDA7A0000 + slot * 8 + r)), got);
+            }
+        }
+        var extra: [9]Part = undefined;
+        @memcpy(extra[0..8], &parts);
+        extra[8] = parts[0];
+        extra[8].slot = 8;
+        try std.testing.expectError(error.WindowTooWide, e.verifyShared(&extra));
     }
 }
 
