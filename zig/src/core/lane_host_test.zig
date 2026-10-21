@@ -10,6 +10,41 @@ const Event = api.Event;
 const Request = api.Request;
 const Engine = api.Engine;
 
+test "queue cap follows the lane count after memory requeue and resets when a lane ends" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{}, 1, 0);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .memory_lanes = 1 };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 8, .max_queued = 1 });
+    defer host.stop();
+    defer @import("lane_host_end.zig").closeAll(&host);
+    const Quiet = struct {
+        fn event(_: *anyopaque, _: Id, _: *const Event) void {}
+    };
+    var ctx: u8 = 0;
+    const sink: api.Sink = .{ .ctx = &ctx, .event = Quiet.event };
+    const request: Request = .{ .prompt = &.{1}, .max_tokens = 100 };
+    const engine = host.engine();
+    try engine.submit(1, &request, sink);
+    const first = host.takeJob().job;
+    _ = host.launch(first, host.setup(first).?);
+    try engine.submit(2, &request, sink);
+    const second = host.takeJob().job;
+    _ = host.launch(second, host.setup(second).?);
+    try std.testing.expectEqual(@as(?usize, 1), host.memory_lanes);
+    try std.testing.expectEqual(@as(usize, 1), host.admitted.items.len);
+    try std.testing.expectEqual(@as(usize, 1), host.queued.items.len);
+    try std.testing.expectError(error.Full, engine.submit(3, &request, sink));
+    engine.cancel(1);
+    @import("lane_host_end.zig").takeCancels(&host);
+    try std.testing.expectEqual(@as(?usize, null), host.memory_lanes);
+    try engine.submit(3, &request, sink);
+}
+
 test "a family refuses original request fields before stream construction and serves the next request" {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{}, 1, 0);

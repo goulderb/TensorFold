@@ -32,6 +32,7 @@ pub const omni = @import("cuda_native_omni.zig");
 pub const identity = @import("cuda_identity.zig");
 
 test {
+    _ = weights;
     _ = @import("config.zig");
     _ = @import("draft_ids.zig");
     _ = kernels;

@@ -37,6 +37,75 @@ fn drain(r: *rows.Rows) void {
     while (rows.write.step(r)) {}
 }
 
+test "conversation recall respects pending restore bytes" {
+    try conversationReservation(false);
+}
+
+test "conversation recall respects pending restore slots" {
+    try conversationReservation(true);
+}
+
+fn conversationReservation(slot_limited: bool) !void {
+    const async_fixture = @import("prompt_cache_async_test.zig");
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [128]u8 = undefined;
+    const dir = root(&buf, "pending-restore");
+    defer rmTree(dir);
+    const other = try prompt(a, 0, 1, 500);
+    {
+        var f: Fake = .{ .gpa = gpa };
+        const r = try rows.Rows.open(gpa, f.snapshots(), options(dir));
+        defer r.deinit();
+        var store = pc.Store.init(gpa, f.snapshots(), rules, 1 << 20);
+        defer store.deinit();
+        store.disk = r;
+        _ = try request(a, &store, &f, other, 200);
+        drain(r);
+    }
+    const Reader = struct {
+        fn begin(_: *anyopaque, _: *pc.spill.Tier, _: pc.spill.Name) anyerror!pc.SpillRead {
+            return error.ReadBusy;
+        }
+    };
+    {
+        const x = try async_fixture.Fixture.init();
+        defer x.deinit();
+        x.store.detach();
+        var f: Fake = .{ .gpa = gpa, .prompt = other };
+        var snapshots = f.snapshots();
+        var vt = snapshots.vtable.*;
+        vt.spill_read_async = Reader.begin;
+        snapshots.vtable = &vt;
+        const r = try rows.Rows.open(gpa, snapshots, options(dir));
+        defer r.deinit();
+        const budget = if (slot_limited) 1 << 20 else snapshots.vtable.bytes(snapshots.ptr, 400);
+        var store = pc.Store.init(gpa, snapshots, rules, budget);
+        defer store.deinit();
+        store.most = if (slot_limited) 1 else std.math.maxInt(usize);
+        store.disk = r;
+        store.attach(x.tier);
+        var pending: ?pc.PendingRestore = null;
+        try std.testing.expectError(error.RestorePending, store.lookupRewindAsync(a, &async_fixture.tokens, 500, 450, 0, &.{}, &.{}, &.{}, &pending));
+        defer if (pending != null) store.cancelRestore(&pending.?);
+        var second: ?pc.PendingRestore = null;
+        const result = try store.lookupRewindAsync(a, other, 500, 450, 0, &.{}, &.{}, &.{}, &second);
+        defer if (result.entry) |entry| store.release(entry);
+        try std.testing.expect(result.entry == null);
+        try std.testing.expectEqual(@as(u64, 0), r.counts.reads);
+        try std.testing.expect(store.held + store.pending_bytes <= store.budget);
+        try std.testing.expect(store.entries.items.len + store.pending_count <= store.most);
+        store.cancelRestore(&pending.?);
+        pending = null;
+        const retried = try store.begin(a, other, 450, &.{}, &.{}, null, &.{});
+        try std.testing.expectEqual(@as(u32, 200), retried.from);
+        try std.testing.expect(f.restored_ok);
+        try std.testing.expectEqual(@as(u64, 1), r.counts.reads);
+    }
+}
+
 test "a conversation's states outlive the server: a restart resumes from disk, equal to a fresh pass" {
     const gpa = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(gpa);

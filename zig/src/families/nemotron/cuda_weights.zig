@@ -706,3 +706,44 @@ pub fn draftIds(L: *Loader, ids: []const u32) !void {
     try L.ops.upload(L.w.draft_ids, L.host.items);
     L.w.draft_count = ids.len;
 }
+
+test "TP attention KV scales reject invalid calibration before device loading" {
+    const header =
+        \\{"k_proj.k_scale":{"dtype":"F32","shape":[],"data_offsets":[0,4]},
+        \\ "v_proj.v_scale":{"dtype":"F32","shape":[],"data_offsets":[4,8]}}
+    ;
+    var image: [8 + header.len + 8]u8 = @splat(0);
+    std.mem.writeInt(u64, image[0..8], header.len, .little);
+    @memcpy(image[8..][0..header.len], header);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    var kernels: kern.Kernels = undefined;
+    kernels.modelopt = null;
+    var weights: Weights = undefined;
+    weights.config = .{ .hidden = 64, .vocab = 16, .layers = 1, .mamba_heads = 1, .mamba_head_dim = 1, .groups = 1, .state = 1, .conv_kernel = 4, .heads = 1, .kv_heads = 1, .head_dim = 64, .experts = 1, .top_k = 1, .expert_width = 64, .shared_width = 64, .routed_scaling = 1, .eps = 1e-5, .tp_world = 2, .tp_rank = 0, .kv_fp8 = true };
+    var loader: Loader = undefined;
+    loader.w = &weights;
+    loader.ops.k = &kernels;
+    const invalid = [_]f32{ std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32), 0, -0.0, -0.5 };
+    for (invalid) |bad| {
+        for (0..2) |bad_index| {
+            const scales = if (bad_index == 0) [2]f32{ bad, 0.5 } else [2]f32{ 0.5, bad };
+            for (scales, 0..) |scale, i| std.mem.writeInt(u32, image[8 + header.len + i * 4 ..][0..4], @bitCast(scale), .little);
+            try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = &image });
+            var ck: core.Checkpoint = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+            defer ck.close();
+            try ck.add(dir, "model.safetensors");
+            try std.testing.expectError(error.BadKvScale, loader.attention(&ck, "attention", ""));
+        }
+    }
+    for ([_][2]f32{ .{ 0.5, 2 }, .{ std.math.floatMin(f32), std.math.floatMax(f32) } }) |scales| {
+        for (scales, 0..) |scale, i| std.mem.writeInt(u32, image[8 + header.len + i * 4 ..][0..4], @bitCast(scale), .little);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = &image });
+        var ck: core.Checkpoint = .{ .gpa = std.testing.allocator, .io = std.testing.io };
+        defer ck.close();
+        try ck.add(dir, "model.safetensors");
+        try std.testing.expectError(error.ModeloptNotLoaded, loader.attention(&ck, "attention", ""));
+    }
+}

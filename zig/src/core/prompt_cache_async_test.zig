@@ -7,6 +7,55 @@ const io = std.testing.io;
 pub const tokens: [500]u32 = @splat(1);
 const name = pc.spill.Name.of(tokens[0..401], 400);
 
+test "learned recall respects pending restore bytes" {
+    try learnedReservation(false);
+}
+
+test "learned recall respects pending restore slots" {
+    try learnedReservation(true);
+}
+
+fn learnedReservation(slot_limited: bool) !void {
+    const x = try Fixture.init();
+    defer x.deinit();
+    x.store.budget = if (slot_limited) 1 << 20 else 500;
+    x.store.most = if (slot_limited) 1 else std.math.maxInt(usize);
+    var pending: ?pc.PendingRestore = null;
+    try std.testing.expectError(error.RestorePending, x.lookup(&pending));
+    defer if (pending != null) x.store.cancelRestore(&pending.?);
+    const Learned = struct {
+        fn read(ptr: *anyopaque, _: [:0]const u8, _: u64, at: u32) anyerror!pc.Saved {
+            const f: *Family = @ptrCast(@alignCast(ptr));
+            f.fake.at = at;
+            const base = f.base();
+            return base.vtable.save(base.ptr, null, at);
+        }
+    };
+    var vt = x.store.family.vtable.*;
+    vt.read = Learned.read;
+    x.store.family.vtable = &vt;
+    const Imprint = @import("prompt_imprint.zig").Imprint;
+    var im: Imprint = .{ .gpa = gpa, .root = try gpa.dupe(u8, ""), .dir = try gpa.dupeSentinel(u8, "", 0), .cap = 1 << 20 };
+    defer im.deinit();
+    const other: [500]u32 = @splat(2);
+    try im.metas.append(gpa, .{ .key = 1, .at = 200, .tokens = try gpa.dupe(u32, other[0..200]), .starts = try gpa.alloc(u32, 0), .bytes = 300 });
+    x.store.imprint = &im;
+    defer x.store.imprint = null;
+    var second: ?pc.PendingRestore = null;
+    const result = try x.store.lookupRewindAsync(gpa, &other, other.len, 450, 0, &.{}, &.{}, &.{}, &second);
+    defer gpa.free(result.marks);
+    defer if (result.entry) |entry| x.store.release(entry);
+    try std.testing.expect(result.entry == null);
+    try std.testing.expect(x.store.held + x.store.pending_bytes <= x.store.budget);
+    try std.testing.expect(x.store.entries.items.len + x.store.pending_count <= x.store.most);
+    x.store.cancelRestore(&pending.?);
+    pending = null;
+    const retried = try x.store.lookupRewindAsync(gpa, &other, other.len, 450, 0, &.{}, &.{}, &.{}, &second);
+    defer gpa.free(retried.marks);
+    defer if (retried.entry) |entry| x.store.release(entry);
+    try std.testing.expectEqual(@as(u32, 200), retried.entry.?.at);
+}
+
 pub const Family = struct {
     fake: Fake,
     tier: *pc.spill.Tier,
