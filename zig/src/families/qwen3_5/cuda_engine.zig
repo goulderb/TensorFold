@@ -720,8 +720,13 @@ pub const Engine = struct {
         try e.stream.synchronize();
         const warm_start = profile.now(io);
         e.startup = .{ .load = warm_start - started };
-        e.startup.add(try profile.withCache(gpa, io, e, Cache));
+        if (warmsInConstructor(placement)) e.startup.add(try profile.withCache(gpa, io, e, Cache));
         return e;
+    }
+
+    /// Split pipeline stages warm through Chain's session, not a full-engine constructor forward.
+    pub fn warmsInConstructor(placement: checkpoint.Placement) bool {
+        return placement.ownsEmbedding() and placement.ownsHead();
     }
 
     fn configure(e: *Engine, gpa: std.mem.Allocator, ctx: *const cuda.Context, g: Geometry, placement: checkpoint.Placement, numerics: checkpoint.Numerics, kv8: bool, options: InitOptions) void {
@@ -900,6 +905,7 @@ pub const Engine = struct {
 
     /// Every path a request takes, run once now: WDDM stalls a process's first forwards for seconds (a 20 s launch).
     pub fn warmCache(e: *Engine, warm_cache: *Cache) !void {
+        if (!warmsInConstructor(e.placement)) return;
         const prompt_rows = e.warmupPromptRows();
         var ids: [32]u32 = @splat(0);
         try e.forward(&.{.{ .cache = warm_cache, .rows = prompt_rows }}, ids[0..prompt_rows], .last);
@@ -2576,6 +2582,28 @@ test "expert graph verification rejects opposite arms, wrong arguments, duplicat
     try std.testing.expectEqual([3]u32{ 128, 1, 1 }, roster[2].grid);
     try std.testing.expectEqual([3]u32{ 256, 1, 1 }, roster[2].block);
     try std.testing.expectEqualSlices(u8, &roster[0].args_sha256, &roster[2].args_sha256);
+}
+
+test "constructor cache warmup runs only for a complete embedding-and-head placement" {
+    const first: checkpoint.Placement = .{ .first = 0, .end = 10, .total = 40 };
+    const middle: checkpoint.Placement = .{ .first = 10, .end = 20, .total = 40 };
+    const last: checkpoint.Placement = .{ .first = 20, .end = 40, .total = 40 };
+    const full: checkpoint.Placement = .{ .first = 0, .end = 40, .total = 40 };
+    try std.testing.expect(first.ownsEmbedding() and !first.ownsHead());
+    try std.testing.expect(!middle.ownsEmbedding() and !middle.ownsHead());
+    try std.testing.expect(!last.ownsEmbedding() and last.ownsHead());
+    try std.testing.expect(full.ownsEmbedding() and full.ownsHead());
+    try std.testing.expect(!Engine.warmsInConstructor(first));
+    try std.testing.expect(!Engine.warmsInConstructor(middle));
+    try std.testing.expect(!Engine.warmsInConstructor(last));
+    try std.testing.expect(Engine.warmsInConstructor(full));
+    var partial: Engine = undefined;
+    partial.placement = first;
+    try partial.warmCache(@as(*Cache, undefined));
+    partial.placement = middle;
+    try partial.warmCache(@as(*Cache, undefined));
+    partial.placement = last;
+    try partial.warmCache(@as(*Cache, undefined));
 }
 
 test "plain BF16 execution refuses before checkpoint I/O or CUDA access" {
