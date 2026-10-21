@@ -54,7 +54,6 @@ pub fn run(comptime Host: type) !void {
     e.c.shared_width = 64;
     e.c.kinds[0..3].* = .{ .moe, .moe, .moe };
     e.k.d = &driver;
-    e.b.lane_part = 0;
     e.stream = .{ .d = &driver, .handle = null };
     var blocks: [3]weights.Block = undefined;
     for (&blocks) |*b| b.* = .{ .kind = .moe, .norm = 0, .moe = .{ .router = 0, .bias = 0, .experts = undefined, .pocket = .{ .up = @intFromPtr(&up), .down = @intFromPtr(&down), .n = neurons, .used = 2 } } };

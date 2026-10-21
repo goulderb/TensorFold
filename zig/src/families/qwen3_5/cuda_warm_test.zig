@@ -50,11 +50,22 @@ pub const Probe = struct {
         var cache: E.Cache = undefined;
         cache.cap = parts[0].cache.cap;
         cache.len = 0;
+        cache.gdn_layout = .value_key;
+        cache.hidden_invalid = false;
         var engine: E.Engine = undefined;
         engine.g.vocab = 1;
         engine.learning = null;
         engine.verify_rows = 128;
-        try engine.admit(&.{.{ .cache = &cache, .rows = parts[0].rows }}, ids, keep);
+        engine.numerics = .mlx_sanitized;
+        engine.bounded_hf_prefill = false;
+        engine.expert_up_n8 = false;
+        engine.expert_up_split_m = false;
+        engine.reuse_fp8_quant = false;
+        engine.expert_up_layout = .lane_major;
+        engine.kv8 = false;
+        engine.placement = .{ .first = 0, .end = 1, .total = 1 };
+        engine.n_taps = 0;
+        _ = engine.prepare(&.{.{ .cache = &cache, .rows = parts[0].rows }}, ids, keep) catch |err| return err;
         Clock.tick = @as(i96, @intCast(ids.len)) * 1_000_000;
         if (p.warm_seen) |seen| if (keep == .draws and seen.passes(E.Engine.Shape.init(ids.len, 1, true, p.n_taps > 0, 1)) >= 2) {
             p.timed_forwards += 1;

@@ -119,7 +119,7 @@ test "lesson stream: a closed writer still saves on cleanup, including errors" {
         defer srv.deinit();
         var arena = std.heap.ArenaAllocator.init(t.allocator);
         defer arena.deinit();
-        var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = t.allocator, .broken = true };
+        var conn: Conn = .{ .fd = Conn.no_socket, .peer = "", .buf = &.{}, .gpa = t.allocator, .broken = true };
         var out: slide.Out = .{ .conn = &conn, .a = arena.allocator(), .open = false };
         slide.finishLearning(srv, arena.allocator(), &out);
         try t.expectEqual(@as(usize, 1), m.saves.load(.monotonic));

@@ -73,7 +73,7 @@ fn check(fail_repair: bool) !void {
     defer arena.deinit();
     const a = arena.allocator();
     var cx: Cx = .{ .a = a };
-    var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a, .broken = true };
+    var conn: Conn = .{ .fd = Conn.no_socket, .peer = "", .buf = &.{}, .gpa = a, .broken = true };
     var out: slide.Out = .{ .conn = &conn, .a = a, .open = false };
     const result = rounds(srv, a, &cx, .{ .full = .{}, .facts = &.{"My dog is called Ginger."}, .held = &.{.{ .question = "What is my dog called?", .answer = "Your dog is called Ginger.", .short = "Ginger", .fact = 0 }}, .checks = &.{} }, Stays{}, id, &out);
     try t.expectEqualSlices(bool, &.{false}, result.recalled);

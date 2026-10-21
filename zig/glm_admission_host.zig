@@ -8,6 +8,17 @@ const Stream = lanes.Stream;
 const Backend = lanes.backend.Backend;
 const Choice = union(enum) { prompt: usize, decode };
 
+fn productionVtable(whole: bool) *const Backend.VTable {
+    var engine: glm.engine.Engine = undefined;
+    engine.settings = .{};
+    engine.dflash = null;
+    var real: glm.lanes.Lanes = undefined;
+    real.x.e = &engine;
+    real.whole = whole;
+    real.batch_prefill = false;
+    return real.backend().vtable;
+}
+
 const Fake = struct {
     target: lanes.fake.Fake = .{ .gpa = a },
     table: Backend.VTable = undefined,
@@ -17,9 +28,7 @@ const Fake = struct {
     batches: usize = 0,
 
     fn backend(f: *Fake) Backend {
-        var real: glm.lanes.Lanes = undefined;
-        real.whole = false;
-        const caps = real.backend().vtable;
+        const caps = productionVtable(false);
         f.table = f.target.backend().vtable.*;
         f.table.prefill = whole;
         f.table.prefill_step = if (caps.prefill_step != null) step else null;
@@ -37,7 +46,7 @@ const Fake = struct {
     fn whole(ptr: *anyopaque, s: *Stream) anyerror!void {
         const f = from(ptr);
         if (s.prompt_len != 4) {
-            if (!glm.lanes.canBatch(s)) return error.IneligibleFreshPrompt;
+            if (!glm.lanes.canBatchWhole(s)) return error.IneligibleFreshPrompt;
             try f.choices.append(a, .{ .prompt = s.prompt_len });
         }
         try f.target.backend().vtable.prefill(ptr, s);
@@ -143,9 +152,7 @@ test "GLM CUDA admission: a live decoder runs between three eligible fresh promp
 }
 
 test "GLM CUDA admission: whole-prompt mode retains its batch callback" {
-    var real: glm.lanes.Lanes = undefined;
-    real.whole = true;
-    const caps = real.backend().vtable;
+    const caps = productionVtable(true);
     try std.testing.expect(caps.prefill_many != null);
     try std.testing.expect(caps.prefill_step == null);
 }
