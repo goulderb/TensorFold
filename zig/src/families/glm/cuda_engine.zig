@@ -771,6 +771,13 @@ pub const Engine = struct {
         }
         e.replicas.invalidate();
         if (e.dflash) |drafter| drafter.release(slot);
+        if (e.drafter) |dr| if (slot < dr.slots.items.len) {
+            dr.slots.items[slot].from = 0;
+            dr.slots.items[slot].v_rows = 0;
+            dr.slots.items[slot].v_step = 0;
+            dr.slots.items[slot].v_row0 = 0;
+            dr.slots.items[slot].v_pos0 = 0;
+        };
         if (e.pool) |*p| p.regions.release(slot);
         if (e.settings.vision and slot < e.seqs.items.len) {
             e.synchronize() catch {};
@@ -839,6 +846,7 @@ pub const Engine = struct {
         try e.cur.st.reset(e.stream);
         e.replicas.invalidate();
         if (e.dflash) |drafter| try drafter.reset(e.slot);
+        if (e.drafter) |dr| try dr.restart(e.slot, 0);
     }
 
     /// decode.prefill: `ids` in 2,048-row chunks, then the first token from the last row; `from` restores a kept state.
@@ -982,7 +990,7 @@ pub const Engine = struct {
     }
 
     fn spillDraft(e: *const Engine) ranks.DraftSnapshot {
-        return ranks.persistedDraftSnapshot(e.canonical_owner, e.canonical, dflash.ring_bytes, if (e.dflash) |drafter| drafter.snapshotBytes() else 0, e.settings.draft_checkpoint);
+        return ranks.persistedDraftSnapshot(e.canonical_owner, e.canonical, dflash.snapshot_bytes, if (e.dflash) |drafter| drafter.snapshotBytes() else 0, e.settings.draft_checkpoint);
     }
 
     fn payloadBytes(e: *const Engine, target_bytes: u64) !u64 {
@@ -1089,16 +1097,23 @@ pub const Engine = struct {
         if (e.snaps.contains(id)) return error.StateKept;
         const st = &e.cur.st;
         if (st.pending != 0 or e.cur.in_head != 0 or st.mtp_len != (if (e.mtp) st.pos else 0)) return error.NotAtMark;
-        if (e.dflash) |drafter| if (!drafter.snapshotReady(e.slot, st.pos)) return error.NotAtMark;
+        if (e.canonical_owner) {
+            const dr = e.drafter orelse return error.NoDrafter;
+            if (!dr.snapshotReady(e.slot, st.pos)) return error.NotAtMark;
+        } else if (e.dflash) |drafter| if (!drafter.snapshotReady(e.slot, st.pos)) return error.NotAtMark;
         const plan = try st.layout.snapshot(.{ .main = st.pos, .mtp = st.mtp_len });
         const owner = if (st.layout.external_planes) st.mtp_caches.owner else null;
         const resident = owner == null or owner.? == e.share.rank;
         const target_bytes = plan.bytesFor(resident);
         var buf = try cuda.DeviceBuffer.alloc(e.d, @intCast(try e.payloadBytes(target_bytes)));
         errdefer buf.free();
+        try buf.fill8(0, e.stream.handle);
         var it = plan.rangesFor(resident);
         while (it.next()) |r| try e.copy(buf.ptr + r.saved, st.address(r), r.bytes);
-        if (e.dflash) |drafter| try drafter.save(e.slot, buf.ptr + std.mem.alignForward(usize, target_bytes, 256));
+        const draft_at = buf.ptr + std.mem.alignForward(usize, target_bytes, 256);
+        if (e.canonical_owner) {
+            try e.drafter.?.save(e.slot, draft_at, st.pos, e.stream);
+        } else if (e.dflash) |drafter| try drafter.save(e.slot, draft_at);
         try e.synchronize();
         const cur = try e.gpa.dupe(u1, e.cur.st.cur);
         errdefer e.gpa.free(cur);
@@ -1134,7 +1149,7 @@ pub const Engine = struct {
             if (!try e.pairedReady(problem == null)) return error.KeptStateRefused;
         }
         if (problem) |err| return err;
-        errdefer if (st.layout.external_planes or e.dflash != null) e.pair_failure(error.PairedRestoreFailed);
+        errdefer if (st.layout.external_planes or e.dflash != null or e.drafter != null) e.pair_failure(error.PairedRestoreFailed);
         const saved = s.?;
         var full = plan.?.ranges();
         var local = plan.?.rangesFor(source_resident);
@@ -1146,7 +1161,11 @@ pub const Engine = struct {
                 try e.copy(st.address(r), saved.buf.ptr + from.?.saved, r.bytes);
             }
         }
-        if (e.dflash) |drafter| try drafter.restore(e.slot, saved.buf.ptr + std.mem.alignForward(usize, plan.?.bytesFor(source_resident), 256), saved.pos);
+        const draft_at = saved.buf.ptr + std.mem.alignForward(usize, plan.?.bytesFor(source_resident), 256);
+        if (e.canonical_owner) {
+            const dr = e.drafter orelse return error.NoDrafter;
+            try dr.restore(e.slot, draft_at, saved.pos, e.stream);
+        } else if (e.dflash) |drafter| try drafter.restore(e.slot, draft_at, saved.pos);
         try e.synchronize();
         try st.restoreHost(e.stream, saved.pos, saved.mtp_len, saved.cur);
         e.replicas.invalidate();
@@ -1510,6 +1529,8 @@ test "prompt snapshot estimates follow the requested mark and MTP setting" {
     var e: Engine = undefined;
     e.tp_group = null;
     e.dflash = null;
+    e.drafter = null;
+    e.canonical_owner = false;
     e.cur = &seq;
     e.mtp = true;
     const at = 2048;
@@ -1532,6 +1553,8 @@ test "snapshot capture refuses uncommitted windows and mismatched MTP marks befo
     var e: Engine = undefined;
     e.tp_group = null;
     e.dflash = null;
+    e.drafter = null;
+    e.canonical_owner = false;
     e.snaps = .empty;
     e.cur = &seq;
     e.mtp = true;
@@ -1589,6 +1612,14 @@ test "engine snapshot save and restore preserve visible state through reused sto
             @memset(to[0..n], value);
             return 0;
         }
+        fn fill8(dst: u64, value: u8, n: usize) callconv(.c) cuda.abi.Result {
+            const to: [*]u8 = @ptrFromInt(dst);
+            @memset(to[0..n], value);
+            return 0;
+        }
+        fn fill8Async(dst: u64, value: u8, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return fill8(dst, value, n);
+        }
         fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
             return 0;
         }
@@ -1598,6 +1629,8 @@ test "engine snapshot save and restore preserve visible state through reused sto
     d.api.cuMemFree_v2 = Mock.free;
     d.api.cuMemcpyDtoDAsync_v2 = Mock.copy;
     d.api.cuMemsetD32Async = Mock.fill;
+    d.api.cuMemsetD8_v2 = Mock.fill8;
+    d.api.cuMemsetD8Async = Mock.fill8Async;
     d.api.cuStreamSynchronize = Mock.sync;
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
     for ([_]@import("cuda_cache.zig").Format{ .bf16, .fp8 }) |format| for ([_]bool{ false, true }) |mtp| {
@@ -1628,6 +1661,8 @@ test "engine snapshot save and restore preserve visible state through reused sto
         var e: Engine = undefined;
         e.tp_group = null;
         e.dflash = null;
+        e.drafter = null;
+        e.canonical_owner = false;
         e.d = &d;
         e.gpa = std.testing.allocator;
         e.stream = stream;
@@ -1659,6 +1694,175 @@ test "engine snapshot save and restore preserve visible state through reused sto
     };
 }
 
+fn canonicalRingSlot(base: u64, layer: usize, kv: usize, pos: i64) u64 {
+    const slot: u64 = @intCast(@mod(pos, dflash.WIN));
+    const plane = @as(u64, @intCast(dflash.WIN)) * dflash.KVW * 2;
+    return base + (layer * 2 + kv) * plane + slot * dflash.KVW * 2;
+}
+
+fn canonicalRingMark(pos: i64) u8 {
+    return 0x40 | @as(u8, @intCast(@mod(pos, 32)));
+}
+
+fn canonicalRingFill(base: u64, from: i64, pos: i64, unused: u8) void {
+    const M = @import("cuda_test_driver.zig").Memory;
+    @memset(M.slice(base, dflash.ring_bytes), unused);
+    var p = from;
+    while (p < pos) : (p += 1) {
+        const mark = canonicalRingMark(p);
+        for (0..dflash.LAYERS) |layer| {
+            for (0..2) |kv| {
+                @memset(M.slice(canonicalRingSlot(base, layer, kv, p), dflash.KVW * 2), mark);
+            }
+        }
+    }
+}
+
+fn canonicalRingExpect(base: u64, from: i64, pos: i64, unused: u8) !void {
+    const M = @import("cuda_test_driver.zig").Memory;
+    var occupied: [2048]bool = @splat(false);
+    var p = from;
+    while (p < pos) : (p += 1) {
+        occupied[@intCast(@mod(p, dflash.WIN))] = true;
+        const mark = canonicalRingMark(p);
+        for (0..dflash.LAYERS) |layer| {
+            for (0..2) |kv| {
+                try std.testing.expect(std.mem.allEqual(u8, M.slice(canonicalRingSlot(base, layer, kv, p), dflash.KVW * 2), mark));
+            }
+        }
+    }
+    for (0..@as(usize, @intCast(dflash.WIN))) |slot| {
+        if (occupied[slot]) continue;
+        for (0..dflash.LAYERS) |layer| {
+            for (0..2) |kv| {
+                const ptr = canonicalRingSlot(base, layer, kv, @intCast(slot));
+                try std.testing.expect(std.mem.allEqual(u8, M.slice(ptr, dflash.KVW * 2), unused));
+            }
+        }
+    }
+}
+
+test "canonical owner snapshot export import restore preserves initialized drafter context" {
+    const M = @import("cuda_test_driver.zig").Memory;
+    var d = M.driver();
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    const layout = try @import("cuda_layout.zig").Layout.init(.{ 4, 256, 256, 256, 256, 256, 256, 256, 0 }, 4096, fw.prefill_rows, 2, .bf16, 512, 128);
+    const live = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(256), layout.total_bytes);
+    defer std.testing.allocator.free(live);
+    for (live, 0..) |*v, i| v.* = @truncate(i *% 37);
+    var parity = [_]u1{ 1, 0 };
+    var seq: Seq = undefined;
+    seq.in_head = 0;
+    seq.st.arena = .{ .buf = .{ .d = &d, .ptr = @intFromPtr(live.ptr), .len = live.len, .borrowed = true } };
+    seq.st.layout = layout;
+    seq.st.capacity = layout.capacity;
+    var caches: [2]@import("cuda_dsa_block.zig").Caches = undefined;
+    for (&caches, 0..) |*c, layer| {
+        const offsets = layout.cacheOffsets(layer);
+        c.* = .{ .lc = .{ .ptr = seq.st.arena.buf.ptr + offsets[0], .format = .bf16 }, .index = .{ .keys = seq.st.arena.buf.ptr + offsets[1], .gates = seq.st.arena.buf.ptr + offsets[2], .rows = layout.ring_rows }, .pk = .{ .ptr = seq.st.arena.buf.ptr + offsets[3], .format = .bf16 }, .pk_rows = 1026 };
+    }
+    seq.st.caches = &caches;
+    const mo = layout.cacheOffsets(2);
+    seq.st.mtp_caches = .{ .lc = .{ .ptr = seq.st.arena.buf.ptr + mo[0], .format = .bf16 }, .index = .{ .keys = seq.st.arena.buf.ptr + mo[1], .gates = seq.st.arena.buf.ptr + mo[2], .rows = layout.ring_rows }, .pk = .{ .ptr = seq.st.arena.buf.ptr + mo[3], .format = .bf16 }, .pk_rows = 1026 };
+    seq.st.cur = &parity;
+    seq.st.pos_dev = seq.st.arena.buf.ptr + layout.fixed[0];
+    seq.st.mtp_pos_dev = seq.st.arena.buf.ptr + layout.mtp_pos;
+    seq.st.pending = 0;
+    try seq.st.setPos(stream, 2048);
+    try seq.st.setMtpLen(stream, 0);
+    var ring0 = try cuda.DeviceBuffer.alloc(&d, dflash.ring_bytes);
+    defer ring0.free();
+    var ring1 = try cuda.DeviceBuffer.alloc(&d, dflash.ring_bytes);
+    defer ring1.free();
+    const from: i64 = 1920;
+    canonicalRingFill(ring0.ptr, from, 2048, 0xa5);
+    @memset(M.slice(ring1.ptr, ring1.len), 0x3c);
+    var dr: dflash.Drafter = .{ .gpa = std.testing.allocator, .d = &d, .module = undefined, .k = undefined, .weights = undefined, .split = false, .ff = 0, .rank = 0, .world = 1 };
+    try dr.slots.append(std.testing.allocator, .{ .ring = ring0, .from = from });
+    try dr.slots.append(std.testing.allocator, .{ .ring = ring1, .from = 7, .v_rows = 3 });
+    defer dr.slots.deinit(std.testing.allocator);
+    var e: Engine = undefined;
+    e.tp_group = null;
+    e.dflash = null;
+    e.drafter = &dr;
+    e.canonical_owner = true;
+    e.canonical = .{ .checkpoint = ranks.hashBytes("canonical-snap"), .bits = 4 };
+    e.d = &d;
+    e.gpa = std.testing.allocator;
+    e.stream = stream;
+    e.cur = &seq;
+    e.slot = 0;
+    e.mtp = false;
+    e.replicas = .{};
+    e.pair_failure = owner_kv.failPair;
+    e.settings = .{ .kv = .bf16 };
+    e.share.rank = 0;
+    e.share.world = 1;
+    e.seqs = .empty;
+    try e.seqs.append(e.gpa, &seq);
+    defer e.seqs.deinit(e.gpa);
+    e.snaps = .empty;
+    defer e.snaps.deinit(e.gpa);
+    try e.keepAs(1);
+    defer e.freeSnap(e.snaps.getPtr(1).?);
+    const saved = e.snaps.get(1).?;
+    try std.testing.expectEqual(e.snapshotBytes(2048), saved.buf.len);
+    var host = try e.exportState(1, saved.buf.len);
+    defer e.gpa.free(host.bytes);
+    try std.testing.expectEqual(saved.buf.len, host.bytes.len);
+    const plan = try layout.snapshot(.{ .main = 2048, .mtp = 0 });
+    const draft = host.bytes[std.mem.alignForward(usize, plan.byteCount(), 256)..];
+    try std.testing.expect(draft.len >= dflash.ring_bytes);
+    try std.testing.expect(std.mem.indexOfScalar(u8, draft, 0xaa) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, draft, 0xa5) == null);
+    const Pump = struct {
+        fn copy(ptr: *anyopaque, buffer: *cuda.DeviceBuffer) !void {
+            const source: *[]u8 = @ptrCast(@alignCast(ptr));
+            @memcpy(M.slice(buffer.ptr, buffer.len), source.*);
+        }
+    };
+    var other = e.canonical;
+    other.bits = 16;
+    const previous = e.canonical;
+    e.canonical = other;
+    try std.testing.expectError(error.SpillShape, e.importState(2, 2048, host.meta[0..host.meta_len], host.bytes.len, @ptrCast(&host.bytes), Pump.copy));
+    try std.testing.expect(!e.holds(2));
+    e.canonical = previous;
+    try e.importState(2, 2048, host.meta[0..host.meta_len], host.bytes.len, @ptrCast(&host.bytes), Pump.copy);
+    defer e.discardState(2);
+    @memset(M.slice(ring0.ptr, ring0.len), 0x11);
+    dr.slots.items[0].from = 99;
+    dr.slots.items[0].v_rows = 4;
+    try e.restoreAt(2, 2048);
+    try std.testing.expectEqual(from, dr.slots.items[0].from);
+    try std.testing.expectEqual(@as(usize, 0), dr.slots.items[0].v_rows);
+    try canonicalRingExpect(ring0.ptr, from, 2048, 0);
+    try std.testing.expect(std.mem.allEqual(u8, M.slice(ring1.ptr, ring1.len), 0x3c));
+    try std.testing.expectEqual(@as(i64, 7), dr.slots.items[1].from);
+    try std.testing.expectEqual(@as(usize, 3), dr.slots.items[1].v_rows);
+    const Failed = struct {
+        var err: ?anyerror = null;
+        fn fail(cause: anyerror) void {
+            err = cause;
+        }
+    };
+    Failed.err = null;
+    e.pair_failure = Failed.fail;
+    M.slice(e.snaps.get(2).?.buf.ptr + std.mem.alignForward(usize, plan.byteCount(), 256), 8)[0] = 'X';
+    try std.testing.expectError(error.BadDraftSnapshot, e.restoreAt(2, 2048));
+    try std.testing.expectEqual(error.PairedRestoreFailed, Failed.err.?);
+    seq.st.conv = seq.st.arena.buf.ptr;
+    seq.st.rec = seq.st.arena.buf.ptr;
+    seq.st.kda_layers = 1;
+    seq.st.conv_c = 1;
+    seq.st.rec_layer = 8;
+    e.pool = null;
+    e.images = null;
+    try e.begin(null);
+    try std.testing.expectEqual(@as(i64, 0), dr.slots.items[0].from);
+    try std.testing.expectEqual(@as(usize, 0), dr.slots.items[0].v_rows);
+}
+
 test "spill snapshot roundtrip checks metadata and discards failed imports without publishing an id" {
     const M = @import("cuda_test_driver.zig").Memory;
     var d = M.driver();
@@ -1670,6 +1874,8 @@ test "spill snapshot roundtrip checks metadata and discards failed imports witho
         var e: Engine = undefined;
         e.tp_group = null;
         e.dflash = null;
+        e.drafter = null;
+        e.canonical_owner = false;
         e.gpa = std.testing.allocator;
         e.d = &d;
         e.stream = .{ .d = &d, .handle = null };
@@ -1836,6 +2042,8 @@ test "owner-only snapshots carry main and MTP prefixes to a new owner and refuse
             f.e = undefined;
             f.e.tp_group = null;
             f.e.dflash = null;
+            f.e.drafter = null;
+            f.e.canonical_owner = false;
             f.e.d = d;
             f.e.lib = lib;
             f.e.comm = @ptrCast(endpoint);
@@ -1954,6 +2162,8 @@ test "pooled engine refuses out-of-range slots before reading state or metadata"
     var e: Engine = undefined;
     e.tp_group = null;
     e.dflash = null;
+    e.drafter = null;
+    e.canonical_owner = false;
     e.settings = .{ .kv_pool_tokens = 8192 };
     e.pool = @as(cache_pool.Pool, undefined);
     e.slot = cache_pool.extent.max_slots;

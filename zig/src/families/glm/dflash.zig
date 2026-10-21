@@ -33,6 +33,46 @@ pub const TAP_ROW: usize = taps_mod.layers.len * D * 2; // bytes of one row's ta
 
 /// Device bytes a stream's context ring takes (K and V of every layer).
 pub const ring_bytes: u64 = LAYERS * 2 * @as(u64, @intCast(WIN)) * KVW * 2;
+pub const snapshot_magic = "DF2S0001";
+pub const snapshot_version: u32 = 1;
+pub const snapshot_header_bytes: usize = 256;
+pub const snapshot_bytes: u64 = snapshot_header_bytes + ring_bytes;
+
+pub const SnapshotHeader = extern struct {
+    magic: [8]u8,
+    version: u32,
+    reserved: u32 = 0,
+    from: i64,
+    pos: i64,
+    filled: u64,
+    v_step: u64,
+    v_row0: u64,
+    v_rows: u64,
+    v_pos0: i64,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(SnapshotHeader) <= snapshot_header_bytes);
+}
+
+pub fn ringSlotOffset(layer: usize, kv: usize, pos: i64) u64 {
+    const slot: u64 = @intCast(@mod(pos, WIN));
+    const plane = @as(u64, @intCast(WIN)) * KVW * 2;
+    return (layer * 2 + kv) * plane + slot * KVW * 2;
+}
+
+fn filledCount(from: i64, end: usize) u64 {
+    const last: i64 = @intCast(end);
+    if (last <= from) return 0;
+    return @intCast(@min(last - from, WIN));
+}
+
+fn validStart(from: i64, end: usize) i64 {
+    const last: i64 = @intCast(end);
+    if (last <= from) return from;
+    const span = last - from;
+    return if (span > WIN) last - WIN else from;
+}
 
 /// glm_dflash's functions.
 pub const Kernels = struct {
@@ -206,6 +246,78 @@ pub const Drafter = struct {
         const s = try dr.slot(i);
         s.from = @intCast(from);
         s.v_rows = 0;
+        s.v_step = 0;
+        s.v_row0 = 0;
+        s.v_pos0 = 0;
+    }
+
+    pub fn snapshotBytes(_: *const Drafter) u64 {
+        return snapshot_bytes;
+    }
+
+    pub fn snapshotReady(dr: *const Drafter, i: u32, end: usize) bool {
+        if (i >= dr.slots.items.len) return end == 0;
+        const s = dr.slots.items[i];
+        if (s.from > @as(i64, @intCast(end))) return false;
+        if (s.v_rows != 0) return false;
+        if (s.ring == null) return end == @as(usize, @intCast(s.from));
+        return true;
+    }
+
+    pub fn save(dr: *Drafter, i: u32, destination: u64, end: usize, stream: cuda.Stream) !void {
+        if (!dr.snapshotReady(i, end)) return error.DraftSnapshotNotReady;
+        const s: Slot = if (i < dr.slots.items.len) dr.slots.items[i] else .{};
+        try dr.d.check(dr.d.api.cuMemsetD8Async(destination, 0, snapshot_bytes, stream.handle), "cuMemsetD8Async");
+        var raw: [snapshot_header_bytes]u8 = @splat(0);
+        var header: SnapshotHeader = .{
+            .magic = snapshot_magic[0..8].*,
+            .version = snapshot_version,
+            .from = s.from,
+            .pos = @intCast(end),
+            .filled = filledCount(s.from, end),
+            .v_step = 0,
+            .v_row0 = 0,
+            .v_rows = 0,
+            .v_pos0 = 0,
+        };
+        @memcpy(raw[0..@sizeOf(SnapshotHeader)], std.mem.asBytes(&header));
+        try dr.d.check(dr.d.api.cuMemcpyHtoDAsync_v2(destination, &raw, snapshot_header_bytes, stream.handle), "cuMemcpyHtoDAsync");
+        if (s.ring) |ring| {
+            var p = validStart(s.from, end);
+            const last: i64 = @intCast(end);
+            while (p < last) : (p += 1) {
+                for (0..LAYERS) |layer| {
+                    for (0..2) |kv| {
+                        const off = ringSlotOffset(layer, kv, p);
+                        try dr.d.check(dr.d.api.cuMemcpyDtoDAsync_v2(destination + snapshot_header_bytes + off, ring.ptr + off, KVW * 2, stream.handle), "cuMemcpyDtoDAsync");
+                    }
+                }
+            }
+        }
+        try dr.d.check(dr.d.api.cuStreamSynchronize(stream.handle), "cuStreamSynchronize");
+    }
+
+    pub fn restore(dr: *Drafter, i: u32, source: u64, end: usize, stream: cuda.Stream) !void {
+        var raw: [snapshot_header_bytes]u8 = undefined;
+        try dr.d.check(dr.d.api.cuMemcpyDtoH_v2(&raw, source, snapshot_header_bytes), "cuMemcpyDtoH");
+        const header = std.mem.bytesToValue(SnapshotHeader, raw[0..@sizeOf(SnapshotHeader)]);
+        if (!std.mem.eql(u8, &header.magic, snapshot_magic) or header.version != snapshot_version or header.reserved != 0)
+            return error.BadDraftSnapshot;
+        if (header.pos != @as(i64, @intCast(end)) or header.from > header.pos or header.filled != filledCount(header.from, end))
+            return error.BadDraftSnapshot;
+        const s = try dr.slot(i);
+        s.from = std.math.maxInt(i64);
+        s.v_rows = 0;
+        s.v_step = 0;
+        s.v_row0 = 0;
+        s.v_pos0 = 0;
+        errdefer {
+            s.from = std.math.maxInt(i64);
+            s.v_rows = 0;
+        }
+        try dr.d.check(dr.d.api.cuMemcpyDtoDAsync_v2(s.ring.?.ptr, source + snapshot_header_bytes, ring_bytes, stream.handle), "cuMemcpyDtoDAsync");
+        try dr.d.check(dr.d.api.cuStreamSynchronize(stream.handle), "cuStreamSynchronize");
+        s.from = header.from;
     }
 
     /// A verify on slot `i` wrote `rows` tap rows at row `row0` of taps_step, for positions pos0...
@@ -442,4 +554,74 @@ test "actual canonical absorb-only request ingests accepted tap rows before a la
     try e.stream.synchronize(); // draft submits asynchronously; complete its owned staging before fixture teardown
     cuda.copy_source.dropSpares(&d, cuda.copy_source.current());
     try std.testing.expect(Memory.empty());
+}
+
+test "glm dflash: canonical snapshot save restores filled slots, zeros unused bytes, and refuses a bad header" {
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    var d = Memory.driver();
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    var ring = try cuda.DeviceBuffer.alloc(&d, ring_bytes);
+    defer ring.free();
+    var other = try cuda.DeviceBuffer.alloc(&d, ring_bytes);
+    defer other.free();
+    @memset(Memory.slice(ring.ptr, ring.len), 0xa5);
+    @memset(Memory.slice(other.ptr, other.len), 0x3c);
+    const from: i64 = 10;
+    var p: i64 = from;
+    while (p < 18) : (p += 1) {
+        const mark: u8 = 0x40 | @as(u8, @intCast(p - from));
+        for (0..LAYERS) |layer| {
+            for (0..2) |kv| {
+                @memset(Memory.slice(ring.ptr + ringSlotOffset(layer, kv, p), KVW * 2), mark);
+            }
+        }
+    }
+    var dr: Drafter = .{ .gpa = std.testing.allocator, .d = &d, .module = undefined, .k = undefined, .weights = undefined, .split = false, .ff = 0, .rank = 0, .world = 1 };
+    try dr.slots.append(std.testing.allocator, .{ .ring = ring, .from = from });
+    try dr.slots.append(std.testing.allocator, .{ .ring = other, .from = 3, .v_rows = 2 });
+    defer dr.slots.deinit(std.testing.allocator);
+    try std.testing.expect(dr.snapshotReady(0, 18));
+    try std.testing.expect(!dr.snapshotReady(1, 18));
+    var snap = try cuda.DeviceBuffer.alloc(&d, snapshot_bytes);
+    defer snap.free();
+    @memset(Memory.slice(snap.ptr, snap.len), 0xaa);
+    try dr.save(0, snap.ptr, 18, stream);
+    try std.testing.expect(std.mem.indexOfScalar(u8, Memory.slice(snap.ptr, snap.len), 0xaa) == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, Memory.slice(snap.ptr, snap.len), 0xa5) == null);
+    @memset(Memory.slice(ring.ptr, ring.len), 0x11);
+    dr.slots.items[0].from = 99;
+    try dr.restore(0, snap.ptr, 18, stream);
+    try std.testing.expectEqual(from, dr.slots.items[0].from);
+    try std.testing.expectEqual(@as(usize, 0), dr.slots.items[0].v_rows);
+    p = from;
+    while (p < 18) : (p += 1) {
+        const mark: u8 = 0x40 | @as(u8, @intCast(p - from));
+        for (0..LAYERS) |layer| {
+            for (0..2) |kv| {
+                try std.testing.expect(std.mem.allEqual(u8, Memory.slice(ring.ptr + ringSlotOffset(layer, kv, p), KVW * 2), mark));
+            }
+        }
+    }
+    try std.testing.expect(std.mem.allEqual(u8, Memory.slice(ring.ptr + ringSlotOffset(0, 0, 0), KVW * 2), 0));
+    try std.testing.expect(std.mem.allEqual(u8, Memory.slice(other.ptr, other.len), 0x3c));
+    Memory.slice(snap.ptr, 8)[0] = 'X';
+    try std.testing.expectError(error.BadDraftSnapshot, dr.restore(0, snap.ptr, 18, stream));
+    try std.testing.expectEqual(from, dr.slots.items[0].from);
+    const Failure = struct {
+        var calls: usize = 0;
+        var delegate: @TypeOf(d.api.cuMemcpyDtoDAsync_v2) = undefined;
+        fn copy(dst: u64, src: u64, n: usize, stream_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            calls += 1;
+            if (calls == 1) return cuda.abi.error_not_ready;
+            return delegate(dst, src, n, stream_);
+        }
+    };
+    Failure.calls = 0;
+    Failure.delegate = d.api.cuMemcpyDtoDAsync_v2;
+    d.api.cuMemcpyDtoDAsync_v2 = Failure.copy;
+    Memory.slice(snap.ptr, 8)[0] = snapshot_magic[0];
+    try std.testing.expectError(error.NotReady, dr.restore(0, snap.ptr, 18, stream));
+    try std.testing.expectEqual(std.math.maxInt(i64), dr.slots.items[0].from);
+    try std.testing.expect(!dr.snapshotReady(0, 18));
+    try std.testing.expectEqual(@as(i64, 3), dr.slots.items[1].from);
 }
