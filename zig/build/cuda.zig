@@ -534,6 +534,8 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
 
     b.step("test-cuda-readiness-host", "Real native readiness and synchronous startup preparation without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native, .filters = &.{"family readiness reaches"} })).step);
     b.step("test-runtime-api", "Optional planner, prompt piece, proposer and halt API tests").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native_modules.api })).step);
+    const snapshot_rules = b.createModule(.{ .root_source_file = b.path("zig/src/native/cuda_snaps.zig"), .target = host, .link_libc = true, .imports = &.{.{ .name = "engine_api", .module = native_modules.api }} });
+    b.step("test-prompt-snapshots-host", "Family snapshot cuts and spill grids without a GPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = snapshot_rules })).step);
     b.step("test-api-boundaries", "Runtime thread initialization failure regression").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native_modules.api, .filters = &.{"Failure boundaries:"} })).step);
     b.step("test-review-api", "Ownership rollback: ownership and final batching regressions").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native_modules.api, .filters = &.{"Ownership rollback:"} })).step);
     const check_native = nativeServer(b, cuda_target, .debug, check_cuda, check_mods.core, check_mods.lanes, check_mods.nemotron, check_mods.heat, check_mods.qwen35, check_mods.qwen_vision, check_mods.tokenizer, check_mods.living, build_options, false, null);

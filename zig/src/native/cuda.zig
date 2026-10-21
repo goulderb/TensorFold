@@ -668,7 +668,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         var rules = snaps.cacheRules(F);
         if (disk != null) {
             rules.planned = true;
-            rules.grid = F.prompt_rows;
+            rules.grid = snaps.spillGrid(F);
         }
         store.* = pc.Store.init(gpa, copies, rules, store_cache);
         errdefer {
@@ -1042,7 +1042,7 @@ fn openDisk(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, g: *Gpu,
     const t = loaded.target;
     // two-GPU TP: each file holds both ranks' shares, which the kept states copy through each rank's own engine
     const ranks: u32 = if (t.e.tp_link != null) 2 else 1;
-    const layout = (nspill.Layout.of(F.planes(t), F.prompt_rows) catch |e| {
+    const layout = (nspill.Layout.of(F.planes(t), snaps.spillGrid(F)) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "spill tier: the engine's state layout is not one the tier stores ({s})", .{@errorName(e)});
         return null;
     }).over(ranks) catch |e| {

@@ -2,6 +2,10 @@
 const std = @import("std");
 const api = @import("engine_api");
 
+pub fn spillGrid(comptime F: type) u32 {
+    return if (@hasDecl(F, "spill_grid")) F.spill_grid else F.prompt_rows;
+}
+
 /// Any row, the head one token on (Nemotron's); a family's snap_grid, snap_lookahead and warm_quiet if declared.
 pub fn cacheRules(comptime F: type) api.prompt_cache.Rules {
     var rules: api.prompt_cache.Rules = .{ .lookahead = 1, .min_prompt = 0 };
@@ -86,4 +90,24 @@ test "a family with snap_grid keeps on its chunk starts, any other at any row as
     defer store.deinit();
     const marks = try store.marks(arena.allocator(), prompt, 0, 3540, &.{}, &.{}, &.{});
     try std.testing.expectEqualSlices(u32, &[_]u32{2048}, marks);
+
+    const Utility = struct {
+        pub const prompt_rows: u32 = 4096;
+        pub const spill_grid: u32 = 1;
+    };
+    const longer = try arena.allocator().alloc(u32, 6250);
+    for (longer, 0..) |*t, i| t.* = @intCast(i);
+    var disk_rules = cacheRules(Utility);
+    disk_rules.planned = true;
+    disk_rules.grid = spillGrid(Utility);
+    var disk = api.prompt_cache.Store.init(std.testing.allocator, copies, disk_rules, 1 << 30);
+    defer disk.deinit();
+    const utility_marks = try disk.marks(arena.allocator(), longer, 0, 6244, &.{}, &.{}, &.{});
+    try std.testing.expectEqualSlices(u32, &.{6244}, utility_marks);
+    const short_marks = try disk.marks(arena.allocator(), prompt, 0, 3540, &.{}, &.{}, &.{});
+    try std.testing.expectEqualSlices(u32, &.{3540}, short_marks);
+    try std.testing.expectEqual(@as(u32, 4096), Utility.prompt_rows);
+    try std.testing.expectEqual(@as(u32, 4096), spillGrid(struct {
+        pub const prompt_rows: u32 = 4096;
+    }));
 }
