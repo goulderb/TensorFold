@@ -10,6 +10,7 @@ const reuse = @import("cuda_reuse.zig");
 const mtp = @import("cuda_mtp.zig");
 const Head = mtp.Head;
 const state = @import("cuda_state.zig");
+const prompt_cuts = @import("cuda_prompt_cuts.zig");
 const prompt_rows = @import("cuda_prompt_rows.zig");
 const config = @import("config.zig");
 const seq_graphs = @import("cuda_seq_graphs.zig");
@@ -355,7 +356,8 @@ pub const Cuda = struct {
         l.fill = null; // set again while the pass stands part way
         try e.setSampling(s.sampling); // the prompt's first token draws under its rule, which a round's may have replaced
         const keep: ?engine.Keep = if (s.reuse.marks.len == 0) null else .{ .at = s.reuse.marks, .ctx = s, .call = keptAt };
-        const first = try e.prefillStep(s.prompt(), at, going == null, .{ .ptr = s, .check = cancelled, .yields = s.yield_check != null }, keep) orelse {
+        const rows = prompt_cuts.sharedStep(e.pass, self.lanes.count());
+        const first = try e.prefillStep(s.prompt(), at, going == null, .{ .ptr = s, .check = cancelled, .yields = s.yield_check != null }, keep, rows) orelse {
             l.fill = e.pos;
             return false;
         };

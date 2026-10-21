@@ -3,6 +3,10 @@ const std = @import("std");
 
 pub const shared_rows: usize = 512;
 
+pub fn sharedStep(capacity: usize, lanes: usize) usize {
+    return if (lanes > 1) @min(capacity, shared_rows) else capacity;
+}
+
 /// The end of the chunk starting at `at`: `step` rows on, the prompt's end, or the first of `cuts` before them.
 pub fn end(at: usize, len: usize, step: usize, cuts: []const u32) usize {
     var e = @min(len, at + step);
@@ -27,11 +31,15 @@ test "chunks run `step` rows from where a pass starts, and a cut ends one" {
 }
 
 test "shared prompt turns stay bounded and retain fallback and exact history cuts" {
+    try std.testing.expectEqual(@as(usize, 2048), sharedStep(2048, 1));
+    try std.testing.expectEqual(@as(usize, 512), sharedStep(2048, 2));
+    try std.testing.expectEqual(@as(usize, 512), sharedStep(2048, 8));
+    try std.testing.expectEqual(@as(usize, 256), sharedStep(256, 2));
     var at: usize = 0;
     var fallback = false;
     var history = false;
     while (at < 6250) {
-        const next = end(at, 6250, shared_rows, &.{ 4096, 6244 });
+        const next = end(at, 6250, sharedStep(2048, 2), &.{ 4096, 6244 });
         try std.testing.expect(next > at and next - at <= 512);
         fallback = fallback or next == 4096;
         history = history or next == 6244;
