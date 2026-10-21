@@ -590,7 +590,6 @@ pub const Store = struct {
         } else {
             note("reading {d} spilled tokens failed ({s}); prefilled instead", .{ p.name.at, @errorName(err) });
             s.spill_counts.recall_failed += 1;
-            // The async reader owns generation-guarded local forget. Never erase a replacement here.
         }
         return s.finishRestore(p, if (p.fallback) |e| if (!e.expired) e else null else null);
     }

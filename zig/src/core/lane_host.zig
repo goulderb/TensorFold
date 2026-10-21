@@ -595,7 +595,6 @@ pub const LaneHost = struct {
         }
     }
 
-    /// One pending restore advances per engine loop; active streams keep decoding between uploads.
     fn pollRestoreOne(h: *LaneHost) void {
         const n = h.admitted.items.len;
         if (n == 0) return;
