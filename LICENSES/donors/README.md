@@ -418,6 +418,10 @@ reuses vit.cu's LayerNorm, bias and pointwise kernels and the BF16 lane matmul;
 `clef_head.cu` adds span means, the option-query and field adds, attention,
 the per-question routing summary, normalization, the score features and the
 logit combination, plus a 4096-wide copy of vit.cu's LayerNorm arithmetic.
+The decision engine drives the shared BF16 backbone in 16-row windows; the
+shared hidden-row owner gains `restart(rows)` so one allocation serves every
+request. `zig/build/clef.zig` builds the `tfclef` dynamic library with its six
+kernel images.
 
 ## Qwen host sampler tuning
 

@@ -75,6 +75,13 @@ pub const Rows = struct {
         self.state = .collecting;
     }
 
+    /// reset(), then a record of `rows` rows inside the existing allocation, so one owner serves every request.
+    pub fn restart(self: *Rows, rows: usize) !void {
+        if (rows == 0 or rows > self.buffer.len / (self.width * 2)) return error.InvalidQwenHiddenShape;
+        try self.reset();
+        self.rows = rows;
+    }
+
     pub fn cancel(self: *Rows) !void {
         try self.bind();
         if (self.state == .writing) cuda.completion.drain(self.engine.d, self.engine.stream, "hidden cancellation did not drain");
@@ -99,7 +106,7 @@ pub const Window = struct {
         if (o.width != e.g.hidden or o.rows == 0 or o.rows > max_rows or w.rows != rows or rows == 0 or
             w.offset > o.rows or rows > o.rows - w.offset) return error.InvalidQwenHiddenShape;
         const bytes = try std.math.mul(usize, try std.math.mul(usize, o.rows, o.width), 2);
-        if (o.buffer.len != bytes or o.buffer.ptr == 0) return error.InvalidQwenHiddenShape;
+        if (o.buffer.len < bytes or o.buffer.ptr == 0) return error.InvalidQwenHiddenShape;
         if (w.offset != o.filled) return error.QwenHiddenWriteOrder;
     }
 

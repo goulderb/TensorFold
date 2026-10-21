@@ -9,8 +9,10 @@ the guarded ModelOpt MoE loader or the MLX affine loader.
 Checkpoint admission, validated planning, mapped payload ownership, shared CUDA
 weight loading and a request-owned hidden terminal are implemented. An explicit
 development-only BF16 initializer now connects them to the shared backbone.
-It does not enable a native serving route. Numerical backbone qualification
-and the joint head remain separate units.
+The native joint head and the `tfclef` C library are implemented and checked on
+the CPU only (see [Native joint head and tfclef](#native-joint-head-and-tfclef)).
+No serving route uses them. Numerical backbone qualification, head parity and
+device fit remain separate units.
 
 ## Usage
 
@@ -326,6 +328,161 @@ pin or route changed.
 The fleet records sanitized results in
 `fleet/trials/clef-tensorfold-hidden-backbone-20261021.json`. Raw files and build
 receipts remain private. This is a diagnostic checkpoint, not a promotion.
+
+## Native joint head and tfclef
+
+`tfclef` is a C library for the existing Python decision service. It takes one
+record from the official `encode_record` and returns one logit per option.
+Python keeps request validation, tokenization, softmax and `systemone_answer`.
+The library owns the CUDA context, the BF16 backbone, the host lexical gather
+and the joint head. The head reimplements `JointSchemaHead.forward` from
+Cloudflare's `joint_schema_model.py`; no Cloudflare code is copied.
+
+### Build
+
+```sh
+# from a shell where nvcc and the host compiler work (vcvars64 on Windows)
+zig build tfclef -Dnvcc=/path/to/nvcc -Dsm=89 -Dclef-source=$(git rev-parse HEAD)
+# or embed prebuilt <name>.fatbin images
+zig build tfclef -Dfatbins=/abs/dir -Dclef-source=...
+```
+
+The library lands in `zig-out/native/lib`. It embeds six images: `qwen35`,
+`qwen35_hf`, `qmmf`, `modelopt_pack` and `vit` from the catalog, and
+`clef_head` (`zig/kernels/cuda/clef_head.cu`, glue flags). `exl3_candidate` is
+named by the shared projection dispatch's compile closure and embedded empty;
+the BF16 path never loads it. Any other referenced image fails to compile.
+`compile-clef-library` compiles the whole library with empty images, and
+`test-clef-host` runs the family and C-header tests; both are part of
+`test-cuda-host`.
+
+### Usage
+
+```c
+#include "tfclef.h"
+
+tf_clef_open_options o = {0};
+o.model_dir = "/models/clef-flash";
+memcpy(o.head_sha256, pin, 32);   /* joint_head.safetensors, from the verified HF metadata */
+memcpy(o.device_uuid, uuid, 16);  /* the decision GPU */
+o.cap_bytes = 14700ull << 20;
+o.max_tokens = 4096;
+char err[256];
+tf_clef_engine *e = tf_clef_open(&o, err, sizeof err);
+
+tf_clef_record r = {ids, n_ids, questions, n_questions, options, n_options};
+float logits[64];
+tf_clef_status s = tf_clef_decide(e, &r, logits, 64);
+tf_clef_close(e);
+```
+
+`TF_CLEF_OPEN_HEAD_ONLY` opens the head weights and the output table without
+the backbone. `tf_clef_head` then runs the same `Head.run` over caller hidden
+rows: `n_ids x 4096` BF16 bits after the backbone's final norm. It is the
+isolated head-parity entry. A full engine refuses `tf_clef_head`, and a
+head-only engine refuses `tf_clef_decide`.
+
+### ABI 1
+
+| Function | Contract |
+| --- | --- |
+| `tf_clef_abi_version()` | Returns 1. Callers refuse a mismatch before open. |
+| `tf_clef_open(options, err, len)` | Selects the device by UUID, then checks the budget against `cap_bytes` and free memory. It caps runtime allocations at `cap_bytes`, then loads the backbone and the head; the head file is hashed on its mapping against the pin before any upload. Every buffer is allocated here. Returns NULL with a message on failure. |
+| `tf_clef_decide(e, record, logits, cap)` | Backbone and head. Writes one BF16 value widened to float per option, in record order. |
+| `tf_clef_head(e, record, hidden, logits, cap)` | Head only, over caller rows. |
+| `tf_clef_info_get(e, out)` | ABI version, limits, budget bytes, free and total device memory, UUID, source commit. |
+| `tf_clef_last_error(e, buf, len)` | The last non-OK message; returns its full length. |
+| `tf_clef_close(e)` | Frees everything when the engine drains; NULL is a no-op. |
+
+| Status | Meaning |
+| --- | --- |
+| `OK` | Logits written. |
+| `INVALID` | The call or record failed validation, or a mode mismatch. The engine is unchanged. |
+| `CAPACITY` | `n_ids` exceeds `max_tokens`. The engine is unchanged. |
+| `DEVICE` | A device step failed and the stream or context drained. The cache resets on the next call. |
+| `FATAL` | A fault the engine could not drain. Every later call returns `FATAL`; close it and exit. |
+| `BUSY` | Another call is inside the engine. Nothing ran. |
+| `NONFINITE` | A logit is NaN or infinite. The engine stays usable. |
+
+`Record.parse` is the only validation boundary. It requires 1 to `max_tokens`
+ids, each below the vocabulary size, and 1 to `max_tokens / 2` questions and
+options. Spans must be nonempty and inside the ids. Question types are 0 to 2.
+The questions' option ranges must tile the options in order. The summed
+option span lengths, the lexical rows, may not exceed the ids. The
+option-to-question map is derived here, never taken from the caller.
+
+A request restarts the one hidden-row owner, which resets its bound cache.
+It forwards the ids in windows of at most `hf_prefill_rows` (16) rows and takes
+the completed device rows. The output-table rows of every option span are
+gathered on the host into pinned staging. One stream then uploads the request
+tables and lexical rows, runs the head and copies the logits back, with one
+synchronization. No request allocates. A device failure is probed with stream,
+then context synchronization, never with the shared drain-or-exit helper: a
+drain gives `DEVICE`, no drain gives `FATAL`. A sticky fault inside the
+backbone forward still ends the process through the shared hidden terminal's
+own drain rule, with exit status 1; the stack wrapper restarts it. Closing a
+poisoned engine releases host state only and leaves device objects to process
+exit.
+
+### Budget at 4096 tokens
+
+Logical allocations, computed by `Budget.of` on the CPU from the pinned
+metadata (`engine.zig` tests pin these numbers):
+
+| Allocation | Decision engine | Head-only engine |
+| --- | ---: | ---: |
+| Backbone steady (`Engine.bf16Budget`) | 14,128,534,528 | 0 |
+| Head weights (30 lanes, 10 split in_proj, rest stored) | 243,786,752 | 243,786,752 |
+| Head load stage (freed after open) | 8,388,608 | 8,388,608 |
+| Head scratch | 226,560,000 | 260,114,432 |
+| Lexical rows on the device | 33,554,432 | 33,554,432 |
+| Steady device total | 14,632,435,712 | 537,455,616 |
+| Load peak | 14,632,435,712 | 537,455,616 |
+| Pinned host (lexical stage, tables and logits, backbone input) | 33,771,520 | 33,640,448 |
+| Counted by the allocation cap at the peak | 14,666,207,232 | 571,096,064 |
+| Mapped host vocabulary tables (logical) | 4,068,474,880 | 4,068,474,880 |
+
+The decision engine's steady total is 13,955 MiB, under today's 14,700 MiB
+process cap. Driver, context and module overhead and resident mapped pages are
+not included; this is not fit evidence. The head-only scratch adds a
+`[4096, 4096]` BF16 upload destination for caller rows.
+
+### Numerical policy
+
+Each value torch's eager BF16 graph materializes is rounded to BF16 at the
+same point; reductions run in FP32 in a fixed order. Sources are torch 2.8.0
+as installed in the Python service's runtime; where only compiled code holds
+the rule, the policy is labelled inferred.
+
+| Step | torch semantics mirrored | Native |
+| --- | --- | --- |
+| Linear | `F.linear`, one BF16 rounding of `xW^T + b` (cuBLAS epilogue; compiled, inferred) | BF16 lane FP32 sums, then `tf_vit_bias` once; bias-free Linears round in the lane |
+| LayerNorm | `nn.LayerNorm`, eps 1e-5 (`normalization.py:180`, `transformer.py:1018`); kernel compiled | `tf_vit_layer_norm`; a 4096-wide copy of its arithmetic for `hidden_norm` |
+| GELU | `approximate="none"` (`activation.py:733`, `transformer.py:1189`): erf | `tf_vit_pointwise` erf GELU |
+| Span mean | `aten.mean.dim` (traced), FP32 accumulation (`AccumulateType.h:130`); multiply by the count's reciprocal (compiled, inferred) | `tf_clef_span_mean`: FP32 sum in index order times `1/len` |
+| Decoder layer | norm-first order (`transformer.py:1110-1120`); self-attention takes the MHA fast path in eval (`activation.py:1250`, `1320`); cross-attention and routing take `F.multi_head_attention_forward` (`functional.py:5694-5729`, `6484`) | Three Q/K/V lane Linears, attention, out Linear, BF16 residual adds in torch's order |
+| Attention | Memory-efficient SDPA on Windows (no flash kernel there, per the service's `attn_config.py`; selection inferred). First kernel at head dim 64 is 64x64 (`cutlassF.h:26-29`). Scores times `scale`, then `log2e` (`kernel_forward.h:799-802`, `916`, `1220`); `exp2f` against an online maximum (`1257`, `1291`); row sum from unrounded P (`1293-1300`); P stored as BF16 for P.V (`mma_from_smem.h:1524-1537`); output times `1/sum` (`epilogue_rescale_output.h:182-189`) | `tf_clef_attention` with the same 64-key tiles and rounding points; FP32 dot products in a fixed order rather than tensor-core order |
+| Routing summary | `mv`, divide by `sqrt(1024)`, `_softmax` over dim 0, BF16 product, `sum` (traced) | `tf_clef_segment_summary` |
+| normalize | `input / norm.clamp_min(1e-12)` (`functional.py:5567`, traced) | `tf_clef_normalize` |
+| cosine | torch 2.8 decomposition: each side divided by `max(norm, 1e-8)`, product, sum (traced) | `tf_clef_score_features` |
+| Scales and gate | `clamp(max=ln 100).exp()`, `sigmoid` (traced); the clamp never binds for the pinned 2.296875 scales | `tf_clef_logit_combine` |
+
+Recording-driver host tests check launch order against the graph, every write
+extent against named buffers, and zero allocations and syncs per head run.
+These checks bound control flow and extents, not values.
+
+### Unqualified
+
+- No kernel, head or engine has run on a device. Head parity against the
+  official head on identical hidden rows, the kernel units against FP64
+  references, and the noise-floor thresholds remain the next device unit.
+- The SDPA backend torch selects on the service, its key-tile size and the
+  cuBLAS reduction policy were not observed at runtime.
+- Physical device fit at 4096 tokens, open time, latency and the attention
+  kernel's speed are unmeasured.
+- The backbone's native/reference discrepancy above remains open.
+- The Python service integration (`NativeClefEngine`, its owner thread and the
+  launcher branch) is a separate fleet unit.
 
 ## Public-history port
 

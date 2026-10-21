@@ -285,8 +285,87 @@ test "closing a poisoned engine releases host state without touching the device"
 
 test "the device entry points compile on the host" {
     std.mem.doNotOptimizeAway(&engine.Engine.open);
+    std.mem.doNotOptimizeAway(&engine.Engine.decide);
     std.mem.doNotOptimizeAway(&engine.Engine.info);
     std.mem.doNotOptimizeAway(&engine.Engine.close);
     std.mem.doNotOptimizeAway(&head.Kernels.load);
     std.mem.doNotOptimizeAway(&head.loadWeights);
+}
+
+const FakeBackbone = struct {
+    const Window = struct { at: usize, rows: usize };
+    const Done = struct {
+        ptr: u64,
+        pub fn device(d: Done) !u64 {
+            return d.ptr;
+        }
+    };
+    const Rows = struct {
+        length: usize = 0,
+        filled: usize = 0,
+        restarts: usize = 0,
+        pub fn restart(r: *Rows, n: usize) !void {
+            r.length = n;
+            r.filled = 0;
+            r.restarts += 1;
+        }
+        pub fn window(r: *Rows, at: usize, n: usize) !Window {
+            if (at != r.filled or at + n > r.length) return error.QwenHiddenWriteOrder;
+            return .{ .at = at, .rows = n };
+        }
+        pub fn completed(r: *Rows) !Done {
+            if (r.filled != r.length) return error.QwenHiddenIncomplete;
+            return .{ .ptr = 0xd000 };
+        }
+    };
+    const Forward = struct { at: usize, rows: usize, first: u32 };
+    const Engine = struct {
+        rows: *Rows,
+        cache: *const u8,
+        calls: [8]Forward = undefined,
+        count: usize = 0,
+        fail_at: ?usize = null,
+        pub fn forward(e: *Engine, parts: anytype, ids: []const u32, keep: anytype) !void {
+            if (parts.len != 1 or parts[0].cache != e.cache or parts[0].rows != ids.len or keep.hidden.rows != ids.len) return error.UnexpectedForward;
+            e.calls[e.count] = .{ .at = keep.hidden.at, .rows = ids.len, .first = ids[0] };
+            e.count += 1;
+            if (e.fail_at == e.count) return error.NotReady;
+            e.rows.filled += ids.len;
+        }
+    };
+    engine: Engine,
+    cache: u8 = 0,
+    rows: Rows = .{},
+};
+
+test "the backbone's rows fill in hf_prefill_rows windows after one restart, then complete" {
+    var b: FakeBackbone = .{ .engine = undefined };
+    b.engine = .{ .rows = &b.rows, .cache = &b.cache };
+    var ids: [37]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast(100 + i);
+    try std.testing.expectEqual(@as(u64, 0xd000), try engine.fillHidden(&b, &ids));
+    try std.testing.expectEqual(@as(usize, 1), b.rows.restarts);
+    try std.testing.expectEqual(@as(usize, 37), b.rows.length);
+    try std.testing.expectEqual(@as(usize, 3), b.engine.count);
+    const want = [_]FakeBackbone.Forward{ .{ .at = 0, .rows = 16, .first = 100 }, .{ .at = 16, .rows = 16, .first = 116 }, .{ .at = 32, .rows = 5, .first = 132 } };
+    try std.testing.expectEqualSlices(FakeBackbone.Forward, &want, b.engine.calls[0..3]);
+    b.engine.count = 0;
+    b.engine.fail_at = 2;
+    try std.testing.expectError(error.NotReady, engine.fillHidden(&b, &ids));
+    try std.testing.expectEqual(@as(usize, 2), b.rows.restarts);
+    try std.testing.expectEqual(@as(usize, 2), b.engine.count);
+}
+
+test "tf_clef_head on a decision engine is refused before any device call" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const tables = f.e.source;
+    f.e.source = .{ .backbone = undefined };
+    defer f.e.source = tables;
+    var out: [3]f32 = undefined;
+    var m: abi.Message = .{};
+    try std.testing.expectError(error.Invalid, f.run(&out, &m));
+    try std.testing.expectEqualStrings("tf_clef_head needs an engine opened with TF_CLEF_OPEN_HEAD_ONLY", m.text());
+    try std.testing.expectEqual(@as(usize, 0), Fake.calls);
 }

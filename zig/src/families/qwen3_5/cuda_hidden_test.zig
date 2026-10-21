@@ -716,3 +716,31 @@ test "resetting or releasing an old output cannot poison a newer cache epoch" {
     try std.testing.expect(!f.cache.hidden_invalid);
     _ = try (try next.completed()).device();
 }
+
+test "a restarted owner reuses its allocation for each shorter or equal record and refuses a longer one" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    var output = try f.e.hiddenRows(5);
+    defer output.deinit();
+    const address = output.buffer.ptr;
+    try f.forward(try output.window(0, 5), &.{ 0, 1, 2, 3, 0 });
+    const first = try output.completed();
+    _ = try first.device();
+    const allocations = Fake.allocations;
+    try output.restart(2);
+    try std.testing.expectError(error.StaleQwenHiddenView, first.device());
+    try std.testing.expectEqual(@as(usize, 0), f.cache.len);
+    try std.testing.expectError(error.InvalidQwenHiddenShape, output.window(0, 3));
+    Fake.pattern = 50;
+    try f.forward(try output.window(0, 2), &.{ 3, 2 });
+    try std.testing.expectEqual(address, try (try output.completed()).device());
+    try std.testing.expectEqual(@as(usize, 2), f.cache.len);
+    try output.restart(5);
+    try f.forward(try output.window(0, 5), &.{ 0, 1, 2, 3, 0 });
+    _ = try (try output.completed()).device();
+    try std.testing.expectEqual(allocations, Fake.allocations);
+    try std.testing.expectError(error.InvalidQwenHiddenShape, output.restart(6));
+    try std.testing.expectError(error.InvalidQwenHiddenShape, output.restart(0));
+    try std.testing.expect(output.state == .complete);
+}

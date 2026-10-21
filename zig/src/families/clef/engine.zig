@@ -10,7 +10,7 @@ const build_options = @import("clef_build");
 const checkpoint = @import("head_checkpoint.zig");
 
 /// The backbone's share: the full BF16 engine, or only its mapped vocabulary tables for head-only parity runs.
-pub const Backbone = union(enum) {
+pub const BackboneShare = union(enum) {
     engine: qwen.engine.Engine.Bf16Budget,
     tables_only: usize,
 };
@@ -33,7 +33,7 @@ pub const Budget = struct {
     /// What the runtime's allocation limit counts at the load peak: device bytes plus pinned host bytes.
     accounted_peak: usize,
 
-    pub fn of(limits: record.Limits, head_bytes: checkpoint.Bytes, backbone: Backbone) !Budget {
+    pub fn of(limits: record.Limits, head_bytes: checkpoint.Bytes, backbone: BackboneShare) !Budget {
         const add = std.math.add;
         const d = head_mod.Dims.of(limits);
         const head_only = backbone == .tables_only;
@@ -70,7 +70,32 @@ pub const Budget = struct {
 pub const Source = union(enum) {
     /// Head-only parity runs: caller hidden rows, and the output table mapped from the checkpoint.
     tables: qwen.bf16.HostTables,
+    /// Decisions: the shared BF16 backbone's rows, and its own host output table.
+    backbone: Backbone,
 };
+
+/// The shared dense BF16 backbone with its request cache and the one hidden-row owner every request restarts.
+pub const Backbone = struct {
+    engine: *qwen.engine.Engine,
+    cache: qwen.engine.Cache,
+    rows: qwen.engine.hidden.Rows,
+};
+
+/// A request's hidden rows: caller rows to upload, or the backbone's completed device rows.
+const Hidden = union(enum) { host: []const u8, device: u64 };
+
+/// The backbone's rows for `ids`: the owner restarted (resetting its bound cache), forwards of at most
+/// hf_prefill_rows rows appended in order, then the completed record's device rows.
+pub fn fillHidden(b: anytype, ids: []const u32) !u64 {
+    try b.rows.restart(ids.len);
+    var at: usize = 0;
+    while (at < ids.len) {
+        const n = @min(qwen.engine.hf_prefill_rows, ids.len - at);
+        try b.engine.forward(&.{.{ .cache = &b.cache, .rows = n }}, ids[at..][0..n], .{ .hidden = try b.rows.window(at, n) });
+        at += n;
+    }
+    return (try b.rows.completed()).device();
+}
 
 const GetUuid = *const fn (*[16]u8, cuda.abi.Device) callconv(.c) cuda.abi.Result;
 
@@ -97,10 +122,6 @@ pub const Engine = struct {
     /// Opens the device whose UUID matches, refuses a budget above `cap_bytes` or the device's free memory, caps the
     /// runtime's allocations there, loads the head (its file hashed against the pin) and allocates every buffer.
     pub fn open(gpa: std.mem.Allocator, o: abi.Open, m: *abi.Message) !*Engine {
-        if (!o.head_only) {
-            m.set("the backbone decision path is not built yet; open with TF_CLEF_OPEN_HEAD_ONLY", .{});
-            return error.BackboneUnavailable;
-        }
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
         e.gpa = gpa;
@@ -125,7 +146,10 @@ pub const Engine = struct {
         var plan = try checkpoint.Plan.inspect(gpa, io, o.model_dir);
         defer plan.deinit();
         e.bounds = try record.Limits.init(o.max_tokens, std.math.cast(u32, backbone.geometry.vocab) orelse return error.Overflow);
-        e.budget = try Budget.of(e.bounds, plan.bytes, .{ .tables_only = backbone.bytes().host_tables });
+        e.budget = try Budget.of(e.bounds, plan.bytes, if (o.head_only)
+            .{ .tables_only = backbone.bytes().host_tables }
+        else
+            .{ .engine = try qwen.engine.Engine.bf16Budget(&backbone, o.max_tokens) });
         const memory = try e.ctx.memInfo();
         if (e.budget.accounted_peak > o.cap_bytes or e.budget.load_peak > memory.free) {
             m.set("budget {d} bytes (peak {d} with pinned host) exceeds the cap {d} or the free {d}", .{ e.budget.load_peak, e.budget.accounted_peak, o.cap_bytes, memory.free });
@@ -134,8 +158,19 @@ pub const Engine = struct {
         _ = try cuda.setAllocationLimit(o.cap_bytes);
         errdefer _ = cuda.setAllocationLimit(null) catch {};
 
-        e.source = .{ .tables = try backbone.upload(gpa, io, o.model_dir, &NoDevice{}) };
-        errdefer e.source.tables.deinit();
+        if (o.head_only) {
+            e.source = .{ .tables = try backbone.upload(gpa, io, o.model_dir, &NoDevice{}) };
+        } else {
+            const bb = qwen.engine.Engine.initBf16(gpa, io, &e.ctx, o.model_dir) catch |err| {
+                m.set("BF16 backbone: {s}", .{@errorName(err)});
+                return err;
+            };
+            errdefer bb.deinit();
+            var cache = try qwen.engine.Cache.init(gpa, bb, o.max_tokens);
+            errdefer cache.deinit(gpa);
+            e.source = .{ .backbone = .{ .engine = bb, .cache = cache, .rows = try bb.hiddenRows(o.max_tokens) } };
+        }
+        errdefer e.releaseSource(true);
         e.stream = try cuda.Stream.init(&e.driver, true);
         errdefer e.stream.deinit();
         e.kernels = head_mod.Kernels.load(&e.ctx) catch |err| {
@@ -159,7 +194,7 @@ pub const Engine = struct {
             };
         }
         const dims = head_mod.Dims.of(e.bounds);
-        const layout = try head_mod.Scratch.layout(dims, true);
+        const layout = try head_mod.Scratch.layout(dims, o.head_only);
         e.scratch = try cuda.DeviceBuffer.alloc(&e.driver, layout.bytes);
         errdefer e.scratch.free();
         e.lexical = try cuda.DeviceBuffer.alloc(&e.driver, e.budget.lexical_device);
@@ -176,23 +211,37 @@ pub const Engine = struct {
         return e.bounds;
     }
 
+    /// Backbone and head over one record, on this engine's context.
     pub fn decide(e: *Engine, rec: record.Record, out: []f32, m: *abi.Message) abi.Error!void {
-        _ = .{ e, rec, out };
-        m.set("this engine has no backbone", .{});
-        return error.Invalid;
+        const b = switch (e.source) {
+            .backbone => |*b| b,
+            .tables => {
+                m.set("a head-only engine has no backbone", .{});
+                return error.Invalid;
+            },
+        };
+        try e.bind(m);
+        e.gather(rec) catch |err| {
+            m.set("lexical rows refused: {s}", .{@errorName(err)});
+            return error.Invalid;
+        };
+        const rows = fillHidden(b, rec.ids) catch |err| return e.fault(err, m);
+        e.submit(rec, .{ .device = rows }) catch |err| return e.fault(err, m);
+        return e.read(rec, out, m);
     }
 
     /// The head over caller rows: [ids.len, 4096] BF16 bits after the backbone's final norm, in host memory.
     pub fn head(e: *Engine, rec: record.Record, rows: []const u16, out: []f32, m: *abi.Message) abi.Error!void {
-        const tables = switch (e.source) {
-            .tables => |*t| t,
-        };
+        if (e.source != .tables) {
+            m.set("tf_clef_head needs an engine opened with TF_CLEF_OPEN_HEAD_ONLY", .{});
+            return error.Invalid;
+        }
         try e.bind(m);
-        e.gather(tables, rec) catch |err| {
+        e.gather(rec) catch |err| {
             m.set("lexical rows refused: {s}", .{@errorName(err)});
             return error.Invalid;
         };
-        e.submit(rec, std.mem.sliceAsBytes(rows)) catch |err| return e.fault(err, m);
+        e.submit(rec, .{ .host = std.mem.sliceAsBytes(rows) }) catch |err| return e.fault(err, m);
         return e.read(rec, out, m);
     }
 
@@ -205,24 +254,35 @@ pub const Engine = struct {
     }
 
     /// Every option span's output-table rows, packed in option order into the pinned lexical stage. Host only.
-    fn gather(e: *Engine, tables: *const qwen.bf16.HostTables, rec: record.Record) !void {
+    fn gather(e: *Engine, rec: record.Record) !void {
         const row = head_mod.hidden * 2;
         var at: usize = 0;
         for (rec.options) |o| {
             const n = (o.end - o.start) * row;
-            try tables.gather(.output, rec.ids[o.start..o.end], e.lexical_host.bytes[at..][0..n]);
+            const ids = rec.ids[o.start..o.end];
+            const out = e.lexical_host.bytes[at..][0..n];
+            switch (e.source) {
+                .tables => |*t| try t.gather(.output, ids, out),
+                .backbone => |*b| try b.engine.gatherOutputRows(ids, out),
+            }
             at += n;
         }
     }
 
     /// Tables, lexical rows and hidden rows in; the head; logits out; one synchronization.
-    fn submit(e: *Engine, rec: record.Record, hidden_bytes: []const u8) !void {
+    fn submit(e: *Engine, rec: record.Record, hidden: Hidden) !void {
         const t = e.joint.scratch.tables;
         head_mod.stageTables(t, rec, e.staging.bytes[0..t.bytes]);
         try e.copyIn(e.joint.at(.tables), e.staging.bytes[0..t.bytes]);
         try e.copyIn(e.lexical.ptr, e.lexical_host.bytes[0 .. @as(usize, rec.lexical_rows) * head_mod.hidden * 2]);
-        try e.copyIn(e.joint.at(.input), hidden_bytes);
-        try e.joint.run(e.stream, .{ .hidden = e.joint.at(.input), .lexical = e.lexical.ptr, .rec = &rec });
+        const rows = switch (hidden) {
+            .host => |bytes| blk: {
+                try e.copyIn(e.joint.at(.input), bytes);
+                break :blk e.joint.at(.input);
+            },
+            .device => |p| p,
+        };
+        try e.joint.run(e.stream, .{ .hidden = rows, .lexical = e.lexical.ptr, .rec = &rec });
         try e.copyOut(e.staging.bytes[t.bytes..][0 .. rec.options.len * 2], e.joint.at(.logits));
         try e.stream.synchronize();
     }
@@ -266,6 +326,27 @@ pub const Engine = struct {
         try e.driver.check(e.driver.api.cuMemcpyDtoHAsync_v2(dst.ptr, src, dst.len, e.stream.handle), "cuMemcpyDtoHAsync");
     }
 
+    /// Whether the context binds and the head's and backbone's streams drain, probed without the drain-or-exit helper.
+    fn drains(e: *Engine) bool {
+        e.ctx.makeCurrent() catch return false;
+        e.stream.synchronize() catch return false;
+        if (e.source == .backbone) e.source.backbone.engine.stream.synchronize() catch return false;
+        return true;
+    }
+
+    /// The source's teardown. Device-backed parts are freed only when `drained`, since their own drains would end the
+    /// process otherwise; mapped host tables are always released.
+    fn releaseSource(e: *Engine, drained: bool) void {
+        switch (e.source) {
+            .tables => |*t| t.deinit(),
+            .backbone => |*b| if (drained) {
+                b.rows.deinit();
+                b.cache.deinit(e.gpa);
+                b.engine.deinit();
+            },
+        }
+    }
+
     pub fn info(e: *Engine, out: *abi.Info) void {
         out.budget_bytes = e.budget.steady;
         out.device_uuid = e.uuid;
@@ -280,7 +361,8 @@ pub const Engine = struct {
     /// Device teardown runs only while the context drains; a poisoned engine releases host state only and leaves
     /// its device objects to process exit, so no shared drain can end the process here.
     pub fn close(e: *Engine, poisoned: bool) void {
-        const drained = !poisoned and if (e.ctx.makeCurrent()) |_| (if (e.stream.synchronize()) |_| true else |_| false) else |_| false;
+        const drained = !poisoned and e.drains();
+        e.releaseSource(drained);
         if (drained) {
             e.lexical_host.free();
             e.staging.free();
@@ -289,9 +371,6 @@ pub const Engine = struct {
             e.weights.free();
             e.kernels.unload();
             e.stream.deinit();
-        }
-        switch (e.source) {
-            .tables => |*t| t.deinit(),
         }
         _ = cuda.setAllocationLimit(null) catch {};
         if (drained) {
@@ -359,6 +438,8 @@ test "the 4096-token budget sums its parts with the pinned backbone and head" {
     try std.testing.expectEqual((try head_mod.Scratch.layout(head_mod.Dims.of(limits), false)).bytes, b.head_scratch);
     try std.testing.expect(b.steady < 14_700 << 20);
     try std.testing.expectEqual(@as(usize, 14_632_435_712), b.steady);
+    try std.testing.expectEqual(@as(usize, 226_560_000), b.head_scratch);
+    try std.testing.expectEqual(@as(usize, 14_666_207_232), b.accounted_peak);
     try std.testing.expectEqual(b.host_lexical + b.host_staging + 131_072, b.host_pinned);
     try std.testing.expectEqual(b.load_peak + b.host_pinned, b.accounted_peak);
 }
@@ -371,6 +452,8 @@ test "a head-only budget carries no backbone and owns its hidden upload rows" {
     try std.testing.expectEqual(@as(usize, 0), only.backbone_steady);
     try std.testing.expectEqual(full.head_scratch + 4096 * 4096 * 2, only.head_scratch);
     try std.testing.expectEqual(only.head_weights + only.head_scratch + only.lexical_device, only.steady);
+    try std.testing.expectEqual(@as(usize, 537_455_616), only.steady);
+    try std.testing.expectEqual(@as(usize, 571_096_064), only.accounted_peak);
 }
 
 test "budget arithmetic is checked and its maxima follow the token limit" {
