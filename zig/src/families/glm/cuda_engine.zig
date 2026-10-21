@@ -1785,7 +1785,7 @@ test "canonical owner snapshot export import restore preserves initialized draft
     canonicalRingFill(ring0.ptr, from, 2048, 0xa5);
     @memset(M.slice(ring1.ptr, ring1.len), 0x3c);
     var dr: dflash.Drafter = .{ .gpa = std.testing.allocator, .d = &d, .module = undefined, .k = undefined, .weights = undefined, .split = false, .ff = 0, .rank = 0, .world = 1 };
-    try dr.slots.append(std.testing.allocator, .{ .ring = ring0, .from = from });
+    try dr.slots.append(std.testing.allocator, .{ .ring = ring0, .from = from, .upto = 2048 });
     try dr.slots.append(std.testing.allocator, .{ .ring = ring1, .from = 7, .v_rows = 3 });
     defer dr.slots.deinit(std.testing.allocator);
     var e: Engine = undefined;
@@ -1842,6 +1842,7 @@ test "canonical owner snapshot export import restore preserves initialized draft
     dr.slots.items[0].v_rows = 4;
     try e.restoreAt(2, 2048);
     try std.testing.expectEqual(from, dr.slots.items[0].from);
+    try std.testing.expectEqual(@as(i64, 2048), dr.slots.items[0].upto);
     try std.testing.expectEqual(@as(usize, 0), dr.slots.items[0].v_rows);
     try canonicalRingExpect(ring0.ptr, from, 2048, 0);
     try std.testing.expect(std.mem.allEqual(u8, M.slice(ring1.ptr, ring1.len), 0x3c));
@@ -1867,7 +1868,67 @@ test "canonical owner snapshot export import restore preserves initialized draft
     e.images = null;
     try e.begin(null);
     try std.testing.expectEqual(@as(i64, 0), dr.slots.items[0].from);
+    try std.testing.expectEqual(@as(i64, 0), dr.slots.items[0].upto);
     try std.testing.expectEqual(@as(usize, 0), dr.slots.items[0].v_rows);
+    try std.testing.expect(std.mem.allEqual(u8, M.slice(ring0.ptr, ring0.len), 0));
+}
+
+test "canonical keepAs at an early mark refuses until prompt context is materialized" {
+    const M = @import("cuda_test_driver.zig").Memory;
+    var d = M.driver();
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    const layout = try @import("cuda_layout.zig").Layout.init(.{ 4, 256, 256, 256, 256, 256, 256, 256, 0 }, 4096, fw.prefill_rows, 2, .bf16, 512, 128);
+    const live = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(256), layout.total_bytes);
+    defer std.testing.allocator.free(live);
+    var parity = [_]u1{ 1, 0 };
+    var seq: Seq = undefined;
+    seq.in_head = 0;
+    seq.st.arena = .{ .buf = .{ .d = &d, .ptr = @intFromPtr(live.ptr), .len = live.len, .borrowed = true } };
+    seq.st.layout = layout;
+    seq.st.capacity = layout.capacity;
+    var caches: [2]@import("cuda_dsa_block.zig").Caches = undefined;
+    for (&caches, 0..) |*c, layer| {
+        const offsets = layout.cacheOffsets(layer);
+        c.* = .{ .lc = .{ .ptr = seq.st.arena.buf.ptr + offsets[0], .format = .bf16 }, .index = .{ .keys = seq.st.arena.buf.ptr + offsets[1], .gates = seq.st.arena.buf.ptr + offsets[2], .rows = layout.ring_rows }, .pk = .{ .ptr = seq.st.arena.buf.ptr + offsets[3], .format = .bf16 }, .pk_rows = 1026 };
+    }
+    seq.st.caches = &caches;
+    const mo = layout.cacheOffsets(2);
+    seq.st.mtp_caches = .{ .lc = .{ .ptr = seq.st.arena.buf.ptr + mo[0], .format = .bf16 }, .index = .{ .keys = seq.st.arena.buf.ptr + mo[1], .gates = seq.st.arena.buf.ptr + mo[2], .rows = layout.ring_rows }, .pk = .{ .ptr = seq.st.arena.buf.ptr + mo[3], .format = .bf16 }, .pk_rows = 1026 };
+    seq.st.cur = &parity;
+    seq.st.pos_dev = seq.st.arena.buf.ptr + layout.fixed[0];
+    seq.st.mtp_pos_dev = seq.st.arena.buf.ptr + layout.mtp_pos;
+    seq.st.pending = 0;
+    try seq.st.setPos(stream, 2048);
+    try seq.st.setMtpLen(stream, 0);
+    var dr: dflash.Drafter = .{ .gpa = std.testing.allocator, .d = &d, .module = undefined, .k = undefined, .weights = undefined, .split = false, .ff = 0, .rank = 0, .world = 1 };
+    defer dr.slots.deinit(std.testing.allocator);
+    var e: Engine = undefined;
+    e.tp_group = null;
+    e.dflash = null;
+    e.drafter = &dr;
+    e.canonical_owner = true;
+    e.d = &d;
+    e.gpa = std.testing.allocator;
+    e.stream = stream;
+    e.cur = &seq;
+    e.slot = 0;
+    e.mtp = false;
+    e.replicas = .{};
+    e.pair_failure = owner_kv.failPair;
+    e.settings = .{ .kv = .bf16 };
+    e.share.rank = 0;
+    e.share.world = 1;
+    e.seqs = .empty;
+    try e.seqs.append(e.gpa, &seq);
+    defer e.seqs.deinit(e.gpa);
+    e.snaps = .empty;
+    defer e.snaps.deinit(e.gpa);
+    try dr.restart(0, 0);
+    defer if (dr.slots.items.len > 0) if (dr.slots.items[0].ring) |*r| r.free();
+    try std.testing.expectError(error.NotAtMark, e.keepAs(1));
+    dr.slots.items[0].upto = 2048;
+    try e.keepAs(1);
+    defer e.freeSnap(e.snaps.getPtr(1).?);
 }
 
 test "spill snapshot roundtrip checks metadata and discards failed imports without publishing an id" {

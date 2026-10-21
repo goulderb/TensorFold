@@ -102,7 +102,7 @@ const engine = struct {
     pub const Drafter = struct {
         taps_prefill: u64 = 0,
         states: [32]Slot = @splat(.{}),
-        const Slot = struct { ring: ?struct { ptr: u64 } = null };
+        const Slot = struct { ring: ?struct { ptr: u64 } = null, from: i64 = 0, upto: i64 = 0 };
         pub fn taps(dr: *Drafter, _: bool) fw.Taps {
             return .{ .out = dr.taps_prefill };
         }
@@ -216,13 +216,15 @@ test "GLM prompt workflow: DFlash context equals ordinary ingest at own offsets 
 test "GLM prompt workflow: context window cut preserves sequence positions independently of tap offsets" {
     const dr = glm.dflash;
     const run = (try dr.promptRun(1000, 2000, 2048, 2048, 5000, 0)).?;
-    try t.expectEqual(@as(i64, 2952), run.pos0);
-    try t.expectEqual(@as(usize, 1144), run.n);
-    try t.expectEqual(@as(u64, 2000 + 904 * dr.TAP_ROW), run.taps);
+    try t.expectEqual(@as(i64, 2048), run.pos0);
+    try t.expectEqual(@as(usize, 2048), run.n);
+    try t.expectEqual(@as(u64, 2000), run.taps);
     const shifted = (try dr.promptRun(1000, 2000, 0, 5, 5, 11)).?;
     try t.expectEqual(@as(i64, 0), shifted.pos0);
     try t.expectEqual(@as(u64, 2000 + 11 * dr.TAP_ROW), shifted.taps);
-    try t.expectEqual(@as(?dr.Run, null), try dr.promptRun(1000, 2000, 0, 2048, 5000, 0));
+    const early = (try dr.promptRun(1000, 2000, 0, 2048, 5000, 0)).?;
+    try t.expectEqual(@as(i64, 0), early.pos0);
+    try t.expectEqual(@as(usize, 2048), early.n);
     try t.expectError(error.BadPromptContext, dr.promptRun(0, 0, 9, 2, 10, 0));
     try t.expectError(error.DrafterContextTooWide, dr.promptRun(0, 0, 0, 5, 5, 2044));
 }
