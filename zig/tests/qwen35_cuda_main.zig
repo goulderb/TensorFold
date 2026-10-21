@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init) !u8 {
             try f.run(.{ .cache = &cache, .rows = 1 }, &.{id});
             const dt: i64 = @intCast(std.Io.Clock.awake.now(init.io).toNanoseconds() - t0);
             if (i == 0) first = dt else rest += dt;
-            @memcpy(cache.logits, e.rowLogits(0));
+            @memcpy(cache.logits, try e.rowLogits(0));
             try out.appendSlice(a, std.mem.sliceAsBytes(cache.logits));
         }
         const n: f64 = @floatFromInt(ids.items.len - 1);
@@ -97,7 +97,7 @@ pub fn main(init: std.process.Init) !u8 {
         while (at < ids.items.len) : (w = if (fixed > 0) fixed else w % e.window_rows + 1) {
             const n = @min(w, ids.items.len - at);
             try f.run(.{ .cache = &cache, .rows = n }, ids.items[at..][0..n]);
-            for (0..n) |r| try out.appendSlice(a, std.mem.sliceAsBytes(e.rowLogits(r)));
+            for (0..n) |r| try out.appendSlice(a, std.mem.sliceAsBytes(try e.rowLogits(r)));
             at += n;
         }
     } else if (std.mem.eql(u8, args[2], "tree")) {
@@ -131,7 +131,7 @@ pub fn main(init: std.process.Init) !u8 {
                 n += 1;
             }
             try f.run(.{ .cache = &cache, .rows = n, .parents = parents[0..n] }, toks[0..n]);
-            for (path[0..kept]) |r| try out.appendSlice(a, std.mem.sliceAsBytes(e.rowLogits(r)));
+            for (path[0..kept]) |r| try out.appendSlice(a, std.mem.sliceAsBytes(try e.rowLogits(r)));
             if (n > 1) try cache.keep(e, path[0..kept]);
             at += kept;
         }
@@ -368,7 +368,7 @@ fn kl(init: std.process.Init, a: std.mem.Allocator, model: []const u8, ids_path:
         try eb.forward(&.{.{ .cache = &cb, .rows = n }}, w, .logits);
         try e8.forward(&.{.{ .cache = &c8, .rows = n }}, w, .logits);
         for (0..n) |r| {
-            const d = divergence(eb.rowLogits(r), e8.rowLogits(r), ids.items[skip + at + r + 1]);
+            const d = divergence(try eb.rowLogits(r), try e8.rowLogits(r), ids.items[skip + at + r + 1]);
             kls[at + r] = d.kl;
             top1 += @intFromBool(d.same_top);
             for (&loss, d.loss) |*l, x| l.* += x;
