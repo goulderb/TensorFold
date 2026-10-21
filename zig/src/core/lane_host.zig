@@ -189,7 +189,8 @@ pub const LaneHost = struct {
         for (h.queued.items) |job| {
             if (!job.request.background) waiting += 1;
         }
-        return h.admitted.items.len + waiting >= @as(usize, h.info_.lanes) + @as(usize, cap);
+        const lanes_now = @min(h.info_.lanes, h.memory_lanes orelse h.info_.lanes);
+        return h.admitted.items.len + waiting >= lanes_now + @as(usize, cap);
     }
 
     fn cancelFn(ctx: *anyopaque, id: Id) void {
@@ -268,7 +269,9 @@ pub const LaneHost = struct {
     }
 
     pub fn finish(h: *LaneHost, job: *Job, reason: Reason, message: []const u8) void {
-        h.memory_lanes = null; // a lane may have freed: the next admission asks the backend for memory again
+        h.lock();
+        if (job.started or job.pending_restore != null) h.memory_lanes = null;
+        h.unlock();
         if (job.pending_restore) |*pending| {
             h.cache.?.cancelRestore(pending);
             job.pending_restore = null;
@@ -536,6 +539,7 @@ pub const LaneHost = struct {
             h.queued.insert(h.gpa, 0, job) catch break :blk false;
             break :blk true;
         };
+        if (waits) h.memory_lanes = others;
         h.unlock();
         if (!waits) {
             h.finish(job, .failed, if (others > 0) "out of memory" else alone_words);
@@ -555,7 +559,6 @@ pub const LaneHost = struct {
         job.marks = &.{};
         h.gpa.free(job.key);
         job.key = &.{};
-        h.memory_lanes = others;
         return false;
     }
 

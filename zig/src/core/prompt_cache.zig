@@ -903,10 +903,10 @@ pub const Store = struct {
         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
         if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
-        while (bytes <= s.budget -| s.pending_bytes and (s.held + s.pending_bytes + s.spare() + bytes > s.budget or s.entries.items.len + s.pending_count >= s.most)) {
+        if (bytes > s.budget -| s.pending_bytes or s.pending_count >= s.most) return have;
+        while (s.held + s.pending_bytes + s.spare() + bytes > s.budget or s.entries.items.len + s.pending_count >= s.most) {
             s.evict(s.victimBut(have, prompt, born) orelse return have);
         }
-        if (bytes > s.budget) return have;
         const e = s.gpa.create(Entry) catch return have;
         e.* = .{ .tokens = &.{}, .at = m.at, .saved = undefined, .bytes = bytes, .born = born, .used = s.clock, .last = &.{}, .shared = true };
         e.tokens = s.gpa.dupe(u32, m.tokens) catch return s.drop(e, have, false);

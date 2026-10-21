@@ -86,8 +86,8 @@ pub fn recall(s: *pc.Store, prompt: []const u32, born: u32, starts: []const u32,
     if (!worth(r, i, from)) return have;
     const st = r.states.items[i];
     const bytes = s.family.vtable.bytes(s.family.ptr, st.at);
-    if (bytes > s.budget or s.most == 0) return have;
-    while (s.held + s.spare() + bytes > s.budget or s.entries.items.len >= s.most) { // a slot too, where states take one
+    if (bytes > s.budget -| s.pending_bytes or s.pending_count >= s.most) return have;
+    while (s.held + s.pending_bytes + s.spare() + bytes > s.budget or s.entries.items.len + s.pending_count >= s.most) { // a slot too, where states take one
         s.remove(s.victimBut(have, prompt, born) orelse return have);
         s.counts.evicted += 1;
     }

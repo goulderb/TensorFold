@@ -474,19 +474,16 @@ pub const Loader = struct {
         var q: [128]u8 = undefined;
         var k: [128]u8 = undefined;
         var v: [128]u8 = undefined;
-        const qr = [_][2]usize{.{ r * qd, qd }};
-        const kr = [_][2]usize{.{ r * kd, kd }};
-        const qkv = try modelopt.denseCut(L, ck, try join(&a, name, ".qkv"), &.{ try join(&q, pre, "q_proj"), try join(&k, pre, "k_proj"), try join(&v, pre, "v_proj") }, &.{ .{ .rows = &qr }, .{ .rows = &kr }, .{ .rows = &kr } });
-        var att: Attention = .{ .qkv = qkv, .o = undefined };
-        att.o_rest = 0;
-        att.adapter = null;
-        att.o = try modelopt.denseCut(L, ck, try join(&a, name, ".o"), &.{try join(&q, pre, "o_proj")}, &.{.{ .cols = .{ r * qd, qd } }});
-        // the checkpoint's calibrated KV scales (ModelOpt's FP8 KV scheme): an FP8 cache stores value / scale
+        var att: Attention = .{ .qkv = undefined, .o = undefined };
         if (c.kv_fp8) {
             att.ks = try modelopt.scalarOf(ck, try join(&k, pre, "k_proj.k_scale"));
             att.vs = try modelopt.scalarOf(ck, try join(&v, pre, "v_proj.v_scale"));
-            if (!(att.ks > 0) or !(att.vs > 0)) return error.BadKvScale;
+            if (!std.math.isFinite(att.ks) or att.ks <= 0 or !std.math.isFinite(att.vs) or att.vs <= 0) return error.BadKvScale;
         }
+        const qr = [_][2]usize{.{ r * qd, qd }};
+        const kr = [_][2]usize{.{ r * kd, kd }};
+        att.qkv = try modelopt.denseCut(L, ck, try join(&a, name, ".qkv"), &.{ try join(&q, pre, "q_proj"), try join(&k, pre, "k_proj"), try join(&v, pre, "v_proj") }, &.{ .{ .rows = &qr }, .{ .rows = &kr }, .{ .rows = &kr } });
+        att.o = try modelopt.denseCut(L, ck, try join(&a, name, ".o"), &.{try join(&q, pre, "o_proj")}, &.{.{ .cols = .{ r * qd, qd } }});
         return att;
     }
 

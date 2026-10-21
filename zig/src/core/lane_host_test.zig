@@ -39,10 +39,15 @@ test "queue cap follows the lane count after memory requeue and resets when a la
     try std.testing.expectEqual(@as(usize, 1), host.admitted.items.len);
     try std.testing.expectEqual(@as(usize, 1), host.queued.items.len);
     try std.testing.expectError(error.Full, engine.submit(3, &request, sink));
+    engine.cancel(2);
+    @import("lane_host_end.zig").takeCancels(&host);
+    try std.testing.expectEqual(@as(?usize, 1), host.memory_lanes);
+    try engine.submit(3, &request, sink);
+    try std.testing.expectError(error.Full, engine.submit(4, &request, sink));
     engine.cancel(1);
     @import("lane_host_end.zig").takeCancels(&host);
     try std.testing.expectEqual(@as(?usize, null), host.memory_lanes);
-    try engine.submit(3, &request, sink);
+    try engine.submit(4, &request, sink);
 }
 
 test "a family refuses original request fields before stream construction and serves the next request" {
