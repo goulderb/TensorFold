@@ -1,6 +1,8 @@
 # Retained donor files and checkpoint fixtures must keep their pinned bytes.
 LICENSES/donors/clef-flash-fde727a2/* -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 zig/src/families/qwen3_5/fixtures/clef_flash/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+# The DFlash2 AOT manifest is hash-pinned in glm/cuda_dflash_aot.zig; a core.autocrlf checkout or git archive must not rewrite it.
+zig/kernels/dflash2-aot/** -text
 # Safetensors JSON headers include format padding covered by their hashes.
 zig/src/families/qwen3_5/fixtures/clef_flash/headers/*.safetensors.header.json -whitespace
 zig/src/families/clef/fixtures/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

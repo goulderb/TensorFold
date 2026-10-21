@@ -67,3 +67,48 @@ test "runtime kernel bytes are checked independently of a Triton cache key" {
     try std.testing.expectEqual(@as(usize, 25), pinned.len);
     try std.testing.expectEqualStrings("aot.json", pinned[0].name);
 }
+const shipped = "zig/kernels/dflash2-aot";
+fn stage(gpa: std.mem.Allocator, io: std.Io, tmp: std.testing.TmpDir) !void {
+    try tmp.dir.createDirPath(io, "cubins");
+    for (pinned) |file| {
+        const path = try std.fs.path.join(gpa, &.{ shipped, file.name });
+        defer gpa.free(path);
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 26));
+        defer gpa.free(bytes);
+        try tmp.dir.writeFile(io, .{ .sub_path = file.name, .data = bytes });
+    }
+}
+test "the dflash2-aot directory shipped from source satisfies every pin" {
+    // A text-converting checkout or archive (core.autocrlf) rewrites aot.json and is refused at engine start.
+    try validate(std.testing.allocator, std.testing.io, shipped);
+}
+test "a changed aot.json or cubin in a staged copy is refused" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try stage(gpa, io, tmp);
+    var path_buf: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    try validate(gpa, io, dir);
+
+    const manifest = try tmp.dir.readFileAlloc(io, "aot.json", gpa, .limited(1 << 26));
+    defer gpa.free(manifest);
+    const crlf = try std.mem.replaceOwned(u8, gpa, manifest, "\n", "\r\n");
+    defer gpa.free(crlf);
+    try std.testing.expect(crlf.len > manifest.len);
+    try tmp.dir.writeFile(io, .{ .sub_path = "aot.json", .data = crlf });
+    try std.testing.expectError(error.DraftKernelIdentityMismatch, validate(gpa, io, dir));
+    manifest[manifest.len - 2] ^= 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = "aot.json", .data = manifest });
+    try std.testing.expectError(error.DraftKernelIdentityMismatch, validate(gpa, io, dir));
+    manifest[manifest.len - 2] ^= 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = "aot.json", .data = manifest });
+    try validate(gpa, io, dir);
+
+    const cubin = try tmp.dir.readFileAlloc(io, pinned[1].name, gpa, .limited(1 << 26));
+    defer gpa.free(cubin);
+    cubin[cubin.len / 2] ^= 1;
+    try tmp.dir.writeFile(io, .{ .sub_path = pinned[1].name, .data = cubin });
+    try std.testing.expectError(error.DraftKernelIdentityMismatch, validate(gpa, io, dir));
+}
