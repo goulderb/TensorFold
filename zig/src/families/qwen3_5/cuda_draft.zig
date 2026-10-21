@@ -107,6 +107,7 @@ pub const Draft = struct {
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, e: *E, dir: []const u8) !*Draft {
         const started = profile.now(io);
+        _ = try e.vocabulary();
         const c = try Config.read(gpa, io, dir, e.g);
         const d = try gpa.create(Draft);
         errdefer gpa.destroy(d);

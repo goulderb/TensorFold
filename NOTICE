@@ -38,4 +38,19 @@ the fixtures. Cloudflare's original Apache-2.0 license and model card are
 retained in LICENSES/donors/clef-flash-fde727a2/. Local changes add strict BF16
 metadata admission, allocation planning, mapped payload ownership, host row
 gathers, loading through shared Qwen projection components and request-owned
-hidden output from the shared backbone. Native serving remains disabled. No checkpoint weights or Clef model implementation are included.
+hidden output from the shared backbone. An explicit development-only dense
+initializer adds bounded host embedding staging and separate terminal weights.
+Native serving remains disabled. No checkpoint weights or Cloudflare model
+code are included.
+
+The native Clef library in zig/src/families/clef/, zig/kernels/cuda/clef_head.cu
+and include/tfclef.h adapts the design of Cloudflare's clef-flash
+joint_schema_model.py (Apache-2.0, revision
+fde727a287004204b7518dcc983fe64379776712): the joint schema head's tensor
+roles and forward pass and the encoded record's spans. It is a
+reimplementation; no Cloudflare code is copied into Zig, C or CUDA. Its BF16
+rounding points follow PyTorch 2.8's module and kernel semantics (BSD-3-Clause,
+LICENSES/PyTorch-BSD-3.txt), read from the installed sources and headers; no
+PyTorch code is copied. Its fixtures retain Cloudflare's
+unmodified joint_head_config.json and joint_head.safetensors JSON header, with
+their hashes in zig/src/families/clef/fixtures/capture.json.

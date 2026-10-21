@@ -24,8 +24,25 @@ Its original Apache-2.0 license and model card are retained in
 `headers/capture.json` record hashes; `headers/provenance.json` bounds the
 capture. Local changes add BF16 metadata admission, allocation planning, mapped
 payload ownership, host row gathers, shared Qwen weight loading and request-owned
-hidden output from the shared backbone. No model implementation, checkpoint
-weights or joint-head arithmetic is copied.
+hidden output from the shared backbone. The development-only dense initializer
+reuses existing kernel bindings, stages bounded host embedding rows and separates
+terminal weights from final normalization. Native serving remains disabled.
+No model implementation, checkpoint weights or joint-head arithmetic is copied.
+
+The native Clef library (`zig/src/families/clef/`,
+`zig/kernels/cuda/clef_head.cu`, `include/tfclef.h`) adapts the design of
+Cloudflare's `joint_schema_model.py` from the same revision, Apache-2.0: the
+joint schema head's tensor roles, from its module tree, its forward pass, and
+the encoded record's question and option spans. It is a reimplementation; no
+Cloudflare code is copied into Zig, C or CUDA. The head's BF16 rounding points
+follow PyTorch 2.8 (BSD-3-Clause, `LICENSES/PyTorch-BSD-3.txt`):
+`nn.LayerNorm`, `nn.MultiheadAttention`, `nn.TransformerDecoderLayer`,
+`F.normalize`, `cosine_similarity` as it decomposes, and the memory-efficient
+SDPA forward's tile softmax as its shipped CUTLASS headers state it. No PyTorch
+code is copied; the attention kernel is written for this head. `zig/src/families/clef/fixtures/`
+copies the unmodified `joint_head_config.json` and the `joint_head.safetensors`
+JSON header; `capture.json` records their hashes and the pinned file digest.
+No head weights are included.
 
 TensorFold uses [MLX](https://github.com/ml-explore/mlx) and
 [mlx-lm](https://github.com/ml-explore/mlx-lm), MIT License, Copyright © 2023 Apple Inc.

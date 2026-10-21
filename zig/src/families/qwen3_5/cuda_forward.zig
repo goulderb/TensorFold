@@ -104,7 +104,7 @@ pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool) !void {
     try e.norm(true, e.final_norm, total);
     if (e.learning) |k| try k.final(e.h, total);
     // the head over the kept rows
-    try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
+    try e.proj(try e.vocabulary(), e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
     if (e.learning) |k| try hooks.logits(k, e.logits, e.stream);
 }
 

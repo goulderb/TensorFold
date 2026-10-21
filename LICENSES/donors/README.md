@@ -379,12 +379,49 @@ The weight loader consumes that manifest through the existing TensorFold BF16
 packer, projection views and parameter conversion. A separate binding owner
 reuses the existing HF operators without the ModelOpt-only expert bundle.
 The shared backbone also gains request-owned hidden output with host lifetime
-and graph-identity tests. Plain BF16 engine execution remains disabled pending
-integration and qualification. No Cloudflare model implementation, checkpoint
-weights, joint-head arithmetic or CUDA kernels are copied. Metadata, primitive
-and weight-only checks do not establish backbone parity or full-engine GPU fit.
+and graph-identity tests. A development-only dense initializer owns BF16 weights,
+separate host vocabulary tables, bounded pinned input staging and existing kernel
+bindings. An explicit terminal-weight union keeps final normalization separate
+from vocabulary projection. Ordinary plain BF16 loading and native serving remain
+closed. No Cloudflare model implementation, checkpoint weights, joint-head
+arithmetic or CUDA kernels are copied. CPU, primitive and weight-only checks do
+not establish backbone parity or full-engine GPU fit.
 Existing Qwen/Hugging Face, TensorFold and
 transitive notices remain applicable.
+
+## Clef Flash joint schema head design
+
+`zig/src/families/clef/` and `include/tfclef.h` adapt the design of
+`joint_schema_model.py` from
+[Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash), revision
+`fde727a287004204b7518dcc983fe64379776712`, Apache-2.0, whose license and model
+card stay in `clef-flash-fde727a2/`. Type of reuse: design only. The head
+checkpoint walk derives its 122 tensor names and shapes from that file's
+`JointSchemaHead`, `EvidenceRoutingLayer` and PyTorch `TransformerDecoderLayer`
+module tree and `joint_head_config.json`. `head.zig` and
+`zig/kernels/cuda/clef_head.cu` reimplement `JointSchemaHead.forward` for one
+record. The C record carries `encode_record`'s input ids and question and
+option spans. Nothing is copied from Cloudflare code into Zig, C or CUDA.
+Numerical semantics follow PyTorch 2.8 (BSD-3-Clause, `../PyTorch-BSD-3.txt`)
+as read from the installed `torch/nn` sources and ATen headers, including the
+memory-efficient SDPA forward's 64-key tiles; no PyTorch code is copied. `zig/src/families/clef/fixtures/`
+retains the unmodified `joint_head_config.json` and `joint_head.safetensors`
+JSON header bytes; `capture.json` records their SHA256 digests, the file size
+and the pinned file digest from the revision's Hugging Face metadata. No head
+weights are included.
+
+Local changes: strict config and header admission, a device packing plan
+through the existing BF16 lane packer, a digest check on the mapped file before
+any upload, record validation with a derived option-to-question map, a checked
+device budget and the versioned C export layer with host tests. The forward
+reuses vit.cu's LayerNorm, bias and pointwise kernels and the BF16 lane matmul;
+`clef_head.cu` adds span means, the option-query and field adds, attention,
+the per-question routing summary, normalization, the score features and the
+logit combination, plus a 4096-wide copy of vit.cu's LayerNorm arithmetic.
+The decision engine drives the shared BF16 backbone in 16-row windows; the
+shared hidden-row owner gains `restart(rows)` so one allocation serves every
+request. `zig/build/clef.zig` builds the `tfclef` dynamic library with its six
+kernel images.
 
 ## Qwen host sampler tuning
 

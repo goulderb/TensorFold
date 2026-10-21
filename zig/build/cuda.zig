@@ -24,7 +24,7 @@ pub fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     return cuda;
 }
 
-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module, radio: *std.Build.Module, living: *std.Build.Module } {
+pub fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module, radio: *std.Build.Module, living: *std.Build.Module } {
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
@@ -85,6 +85,8 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         break :blk run.captureStdOut(.{});
     }, .{ .name = "h3", .flags = &.{"-O3"} }, sms) else null;
     @import("h3_host.zig").library(b, target, optimize, h3_image);
+    const clef_images: ?@import("clef.zig").ImageSource = if (prebuilt) |dir| .{ .prebuilt = dir } else if (nvcc) |tool| .{ .nvcc = .{ .tool = tool, .version = version.?, .sms = sms } } else null;
+    @import("clef.zig").library(b, target, optimize, draft_ids, clef_images);
     const cuda = runtime(b, target, optimize, if (nvcc != null or prebuilt != null) &images else &.{});
     const mods = family(b, target, optimize, cuda, draft_ids);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
@@ -129,6 +131,8 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const startup = b.addObject(.{ .name = "modelopt-startup", .root_module = b.createModule(.{ .root_source_file = b.path("zig/modelopt_startup_compile.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "native", .module = native.engines }} }) });
     _ = startup.getEmittedBin();
     b.step("compile-modelopt-startup", "Compile actual native startup with test-only absent GPU images").dependOn(&startup.step);
+    const clef_bf16 = b.addObject(.{ .name = "clef-bf16-compile", .root_module = b.createModule(.{ .root_source_file = b.path("zig/clef_bf16_compile.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "qwen35", .module = mods.qwen35 }} }) });
+    b.step("compile-clef-bf16", "Compile explicit BF16 initialization and hidden execution without running a device").dependOn(&clef_bf16.step);
     const controls_file = b.option([]const u8, "contract-controls", "Compile-only controls image");
     const controls = if (controls_file) |file| b.graph.cwdRelativePath(file) else if (nvcc) |tool| fatbin(b, tool, version.?, .{ .name = "contract_controls", .flags = &.{"-O3"} }, sms) else null;
     const contract_images = @import("qwen_contract.zig").images(b, runner_exe, controls, h3_image, kernels, &images);
@@ -342,6 +346,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const recipes_host = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/core/modelopt.zig"), .target = host, .optimize = .debug }) }));
     b.step("test-modelopt-recipes-host", "Validated mixed-format recipes and exact/prefix lookup on CPU only").dependOn(&recipes_host.step);
     step.dependOn(&recipes_host.step);
+    @import("clef.zig").hostTests(b, cuda, mods.core, mods.qwen35, step);
     const deferred_run = b.addRunArtifact(b.addTest(.{ .root_module = mods.lanes, .filters = &.{"deferred draft shape"} }));
     b.step("test-deferred-draft-host", "Deferred head selection after host work and copy precedence").dependOn(&deferred_run.step);
     const contract_glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);

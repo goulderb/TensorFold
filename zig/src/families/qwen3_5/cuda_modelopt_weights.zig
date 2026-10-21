@@ -143,7 +143,7 @@ fn Loader(comptime planning: bool, comptime Source: type, comptime Target: type)
                 const head = try l.projection("lm_head", 248320, 2048);
                 const norm = try l.floatTensor(try l.tensor("model.language_model.norm.weight", .bf16, &.{2048}), .zero_centered_norm);
                 if (!planning) {
-                    l.e.head = head;
+                    l.e.terminal_weights = .{ .vocabulary = head };
                     l.e.final_norm = norm;
                 }
             }
@@ -334,7 +334,7 @@ test "recording arena loader matches planned allocation bytes for full and parti
         embed_s: u64 = 0,
         embed_b: u64 = 0,
         embed_bits: u8 = 0,
-        head: Proj = undefined,
+        terminal_weights: layers.TerminalWeights = .none,
         final_norm: u64 = 0,
 
         pub fn alloc(r: *@This(), bytes: usize) !u64 {

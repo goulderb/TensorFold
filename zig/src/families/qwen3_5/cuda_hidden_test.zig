@@ -92,6 +92,7 @@ const Fake = struct {
     }
     fn upload(dst: u64, src: ?*const anyopaque, bytes: usize, _: abi.Stream) callconv(.c) abi.Result {
         uploads += 1;
+        if (capturing) return 1;
         if (fail_upload) return abi.error_not_ready;
         @memcpy(@as([*]u8, @ptrFromInt(dst))[0..bytes], @as([*]const u8, @ptrCast(src.?))[0..bytes]);
         return 0;
@@ -178,6 +179,7 @@ const Fake = struct {
         d.api.cuEventCreate = eventCreate;
         d.api.cuEventDestroy_v2 = eventDone;
         d.api.cuEventQuery = eventDone;
+        d.api.cuEventSynchronize = eventDone;
         d.api.cuEventRecord = eventRecord;
         d.api.cuMemcpyHtoDAsync_v2 = upload;
         d.api.cuMemcpyDtoDAsync_v2 = copy;
@@ -204,6 +206,9 @@ const Fixture = struct {
     tables: [16384]u8 align(16),
     staged: [16384]u8 align(16),
     x: [128]u8 align(16),
+    input: [128]u8 align(256),
+    embedding: [32]u8,
+    output: [32]u8,
     state: [16]u8 align(16),
     logits: [4]u16,
 
@@ -219,6 +224,8 @@ const Fixture = struct {
         e.placement = .{ .first = 0, .end = 1, .total = 1 };
         e.numerics = .hf_modelopt;
         e.modelopt = null;
+        e.bf16 = null;
+        e.terminal_weights = .none;
         e.kv8 = false;
         e.n_taps = 0;
         e.verify_terminal_graphs = false;
@@ -261,7 +268,35 @@ const Fixture = struct {
         f.cache = .{ .owner = e, .state = .{ .d = &f.d, .ptr = @intFromPtr(&f.state), .len = f.state.len, .borrowed = true }, .kv = undefined, .log = undefined, .cap = 4096, .logits = &f.logits };
         Fake.scratch = &f.x;
     }
+    fn initBf16(f: *Fixture) !void {
+        f.init();
+        const e = &f.e;
+        e.numerics = .hf_dense_bf16;
+        e.terminal_weights = .hidden_only;
+        e.h = @intFromPtr(&f.input);
+        e.arena = .{ .d = &f.d, .ptr = e.h, .len = f.input.len, .borrowed = true };
+        for (&f.embedding, &f.output, 0..) |*embedding, *output, i| {
+            embedding.* = @intCast(i + 1);
+            output.* = @intCast(i + 64);
+        }
+        e.bf16 = .{
+            .weights = .{
+                .gpa = std.testing.allocator,
+                .stream = e.stream,
+                .arena = e.arena,
+                .layers = &.{},
+                .final_norm = e.final_norm,
+                .host = .{ .gpa = std.testing.allocator, .io = std.testing.io, .maps = &.{}, .tables = .{
+                    .{ .bytes = &f.embedding, .rows = 4, .row_bytes = 8, .shard = 0 },
+                    .{ .bytes = &f.output, .rows = 4, .row_bytes = 8, .shard = 1 },
+                } },
+            },
+            .bindings = undefined,
+            .input = try cuda.copy_source.Buffer.alloc(&f.d, f.input.len),
+        };
+    }
     fn deinit(f: *Fixture) void {
+        if (f.e.bf16) |*b| b.input.free();
         var it = f.e.graphs.valueIterator();
         while (it.next()) |exec| exec.deinit();
         f.e.graphs.deinit(std.testing.allocator);
@@ -271,6 +306,104 @@ const Fixture = struct {
         try f.e.forward(&.{.{ .cache = &f.cache, .rows = ids.len }}, ids, .{ .hidden = w });
     }
 };
+
+test "BF16 hidden forward gathers distinct host rows outside capture and replays to a fresh owner" {
+    var f: Fixture = undefined;
+    try f.initBf16();
+    defer f.deinit();
+    var rows = try f.e.hiddenRows(2);
+    defer rows.deinit();
+    try f.forward(try rows.window(0, 2), &.{ 3, 1 });
+    try std.testing.expectEqualSlices(u8, &.{ 25, 26, 27, 28, 29, 30, 31, 32, 9, 10, 11, 12, 13, 14, 15, 16 }, f.input[0..16]);
+    var lexical: [16]u8 = undefined;
+    try f.e.gatherOutputRows(&.{ 3, 1 }, &lexical);
+    try std.testing.expectEqualSlices(u8, &.{ 88, 89, 90, 91, 92, 93, 94, 95, 72, 73, 74, 75, 76, 77, 78, 79 }, &lexical);
+    try std.testing.expectEqual(@as(usize, 1), Fake.kernels);
+    try std.testing.expectEqual(@as(usize, 1), Fake.norms);
+    try std.testing.expectEqual(@as(usize, 1), Fake.captures);
+    const original = try (try rows.completed()).device();
+    try rows.reset();
+    var next = try f.e.hiddenRows(2);
+    defer next.deinit();
+    Fake.pattern = 30;
+    try f.forward(try next.window(0, 2), &.{ 0, 2 });
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 17, 18, 19, 20, 21, 22, 23, 24 }, f.input[0..16]);
+    const current = try (try next.completed()).device();
+    try std.testing.expect(original != current);
+    try std.testing.expectEqual(current, Fake.copy_destination);
+    try std.testing.expectEqual(@as(usize, 1), Fake.captures);
+    try std.testing.expectEqual(@as(usize, 2), Fake.replays);
+    try std.testing.expectEqual(@as(usize, 1), Fake.norms);
+    try std.testing.expectEqual(@as(usize, 2), f.cache.len);
+}
+
+test "BF16 projection rejects every other weight arm before backend access" {
+    var f: Fixture = undefined;
+    try f.initBf16();
+    defer f.deinit();
+    inline for (@typeInfo(engine.Proj).@"union".field_names) |name| {
+        if (!std.mem.eql(u8, name, "linear")) {
+            try std.testing.expectError(error.QwenFormatNotLoaded, f.e.proj(@unionInit(engine.Proj, name, undefined), 0, 0, 1, false));
+        }
+    }
+    inline for (@typeInfo(cuda.qlinear.Weight).@"union".field_names) |name| {
+        if (!std.mem.eql(u8, name, "bf16")) {
+            const p: engine.Proj = .{ .linear = @unionInit(cuda.qlinear.Weight, name, undefined) };
+            try std.testing.expectError(error.QwenFormatNotLoaded, f.e.proj(p, 0, 0, 1, false));
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), Fake.kernels);
+    const b = &f.e.bf16.?.bindings;
+    b.part = 0;
+    b.lane.clusters = false;
+    for (&b.lane.fns[4]) |*function| function.* = .{ .d = &f.d, .handle = @ptrFromInt(1) };
+    try f.e.proj(.{ .linear = .{ .bf16 = cuda.modelopt.bf16Weight(4096, 128, 64) } }, 8192, 16384, 1, false);
+    try std.testing.expectEqual(@as(usize, 1), Fake.kernels);
+    try std.testing.expectEqual(@as(usize, 0), Fake.uploads);
+}
+
+test "BF16 hidden-only refusals preserve cache and staging before device work" {
+    var f: Fixture = undefined;
+    try f.initBf16();
+    defer f.deinit();
+    var rows = try f.e.hiddenRows(17);
+    defer rows.deinit();
+    const w = try rows.window(0, 2);
+    const parts = [_]engine.Part{.{ .cache = &f.cache, .rows = 2 }};
+    f.cache.terminal_greedy = .{ .position = 99, .token = 1 };
+    f.cache.last = .{ .start = 0, .rows = 2 };
+    for ([_]engine.Keep{ .last, .logits, .prompt_logits, .{ .draws = &.{} } }) |keep|
+        try std.testing.expectError(error.QwenHiddenOnly, f.e.forward(&parts, &.{ 0, 1 }, keep));
+    try std.testing.expectEqual(@as(usize, 99), f.cache.terminal_greedy.?.position);
+    try std.testing.expect(f.cache.last != null);
+    try std.testing.expectError(error.QwenHiddenRequiresForward, f.e.prepare(&parts, &.{ 0, 1 }, .{ .hidden = w }));
+    try std.testing.expectError(error.QwenHiddenRequiresForward, f.e.execute(.{ .total = 2, .nseg = 1, .record = false, .prompt = true, .taps = false, .normalized_hidden = true }));
+    try std.testing.expectError(error.QwenHostEmbeddingRequired, f.e.embed(0, 0, 1, 0));
+    try std.testing.expectError(error.QwenHiddenOnly, f.e.vocabulary());
+    try std.testing.expectError(error.QwenHiddenOnly, f.e.rowLogits(0));
+    try std.testing.expectError(error.UnsupportedQwenTaps, f.e.setTaps(&.{0}));
+    try std.testing.expectError(error.UnsupportedQwenRewind, f.cache.keep(&f.e, &.{0}));
+    try std.testing.expectError(error.UnsupportedQwenGdnLayout, Cache.initWithLayout(std.testing.allocator, &f.e, 4096, .key_value));
+    try std.testing.expectError(error.InvalidQwenHiddenShape, Cache.init(std.testing.allocator, &f.e, 4097));
+    f.cache.last = null;
+    const ps = [_]i32{ -1, 0 };
+    var bad = parts;
+    bad[0].parents = &ps;
+    try std.testing.expectError(error.InvalidQwenHiddenShape, f.e.forward(&bad, &.{ 0, 1 }, .{ .hidden = w }));
+    bad = parts;
+    bad[0].images = @ptrFromInt(4096);
+    try std.testing.expectError(error.InvalidQwenHiddenShape, f.e.forward(&bad, &.{ 0, 1 }, .{ .hidden = w }));
+    const too_many: [17]u32 = @splat(0);
+    try std.testing.expectError(error.UnsupportedQwenWindow, f.forward(try rows.window(0, 17), &too_many));
+    try std.testing.expectError(error.InvalidQwenToken, f.forward(w, &.{ 0, 4 }));
+    try std.testing.expectEqual(@as(usize, 0), Fake.uploads);
+    try std.testing.expectEqual(@as(usize, 0), Fake.kernels);
+    try std.testing.expectEqual(@as(usize, 0), Fake.syncs);
+    try std.testing.expectEqual(@as(usize, 0), f.cache.len);
+    try std.testing.expectEqual(@as(usize, 99), f.cache.terminal_greedy.?.position);
+    try std.testing.expect(!f.cache.hidden_invalid);
+    try std.testing.expectEqual(@as(usize, 0), rows.filled);
+}
 
 test "hidden forward copies all rows in multiple chunks and replay uses the current request destination" {
     var f: Fixture = undefined;
@@ -582,4 +715,32 @@ test "resetting or releasing an old output cannot poison a newer cache epoch" {
     first.deinit();
     try std.testing.expect(!f.cache.hidden_invalid);
     _ = try (try next.completed()).device();
+}
+
+test "a restarted owner reuses its allocation for each shorter or equal record and refuses a longer one" {
+    var f: Fixture = undefined;
+    f.init();
+    defer f.deinit();
+    var output = try f.e.hiddenRows(5);
+    defer output.deinit();
+    const address = output.buffer.ptr;
+    try f.forward(try output.window(0, 5), &.{ 0, 1, 2, 3, 0 });
+    const first = try output.completed();
+    _ = try first.device();
+    const allocations = Fake.allocations;
+    try output.restart(2);
+    try std.testing.expectError(error.StaleQwenHiddenView, first.device());
+    try std.testing.expectEqual(@as(usize, 0), f.cache.len);
+    try std.testing.expectError(error.InvalidQwenHiddenShape, output.window(0, 3));
+    Fake.pattern = 50;
+    try f.forward(try output.window(0, 2), &.{ 3, 2 });
+    try std.testing.expectEqual(address, try (try output.completed()).device());
+    try std.testing.expectEqual(@as(usize, 2), f.cache.len);
+    try output.restart(5);
+    try f.forward(try output.window(0, 5), &.{ 0, 1, 2, 3, 0 });
+    _ = try (try output.completed()).device();
+    try std.testing.expectEqual(allocations, Fake.allocations);
+    try std.testing.expectError(error.InvalidQwenHiddenShape, output.restart(6));
+    try std.testing.expectError(error.InvalidQwenHiddenShape, output.restart(0));
+    try std.testing.expect(output.state == .complete);
 }

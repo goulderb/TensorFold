@@ -223,7 +223,7 @@ pub const Session = struct {
             const keep: engine.Keep = if (s.chain.prefill_rows > 1) .prompt_logits else .last;
             try s.stepRows(tokens[at..end], keep);
             const e = s.chain.partitions[s.chain.partitions.len - 1].engine;
-            for (0..end - at) |row| @memcpy(out[(at + row) * s.logits.len ..][0..s.logits.len], e.rowLogits(row));
+            for (0..end - at) |row| @memcpy(out[(at + row) * s.logits.len ..][0..s.logits.len], try e.rowLogits(row));
             at = end;
         }
     }

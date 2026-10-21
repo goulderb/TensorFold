@@ -25,6 +25,9 @@ pub const Proj = union(enum) {
     }
 };
 
+/// Final normalization is owned independently of the optional vocabulary projection.
+pub const TerminalWeights = union(enum) { none, vocabulary: Proj, hidden_only };
+
 pub const Delta = struct { qkv: Proj, z: Proj, a: Proj, b: Proj, out: Proj, conv: u64, norm: u64, a_log: u64, dt_bias: u64 };
 pub const Attention = struct { q: Proj, k: Proj, v: Proj, o: Proj, q_norm: u64, k_norm: u64 };
 pub const Dense = struct { gate: Proj, up: Proj, down: Proj };

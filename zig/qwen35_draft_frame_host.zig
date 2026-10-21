@@ -123,7 +123,7 @@ test "Draft frames: the real hold adapter emits one frame for every stream and i
     e.affine.group_fn = function(&driver, 10);
     e.affine.pdl = false;
     e.fns.norm = function(&driver, 13);
-    e.head = .{ .a4 = weight() };
+    e.terminal_weights = .{ .vocabulary = .{ .a4 = weight() } };
     e.draws.logprob_rows_fn = function(&driver, 9);
     e.draws.topk_slices_fn = function(&driver, 9);
     e.draws.topk_merge_fn = function(&driver, 12);
