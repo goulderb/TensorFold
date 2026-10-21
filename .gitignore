@@ -16,12 +16,18 @@ venv/
 .zig-cache/
 zig-out/
 
+# Private qualification output stays outside versioned source; required runtime assets remain tracked.
+/docs/plans/qwen35-ornith/evidence/
+/zig/src/families/glm/fixtures/weight-loader-verification.json
+.private-evidence/
+.artifacts/
+*.pdb
+*.ncu-rep
+*.nsys-rep
+*.etl
+
 # Native Qwen CPU-only Metal compiler receipts.
 .q27-metal-check/
 
 # Versioned GUI build resources, generated app engines stay ignored in app/.gitignore.
 !app/build/
-
-# Private workstation qualification receipts are not part of this source publication.
-/docs/plans/qwen35-ornith/evidence/
-/zig/src/families/glm/fixtures/weight-loader-verification.json

@@ -1,5 +1,7 @@
 """The Zig engine's lean rule: no file over 600 lines, every comment and docstring one line of at most 120 columns."""
+import argparse
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -67,12 +69,18 @@ def problems(path: Path) -> list[str]:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--lean-only', action='store_true', help='measure the lean baseline without the staged privacy gate')
+    args = parser.parse_args()
+    privacy = 0 if args.lean_only else subprocess.run(
+        [sys.executable, '-I', str(ROOT / 'tools/privacy_check.py'), '--repo', str(ROOT), '--staged'],
+        check=False).returncode
     files = [p for t in TREES for p in sorted((ROOT / t).rglob("*")) if p.is_file() and p.suffix in COMMENT]
     found = [f for p in files for f in problems(p)]
     for f in found:
         print(f)
     print(f"{len(files)} files, {len(found)} problems")
-    return 1 if found else 0
+    return 1 if found or privacy else 0
 
 
 if __name__ == "__main__":
