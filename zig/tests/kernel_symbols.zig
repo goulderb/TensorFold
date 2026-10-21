@@ -135,6 +135,18 @@ test "source tokens reject prefixes and require a mangled namespace and base in 
     try std.testing.expect(!probe("fn_copy_cols"));
 }
 
+test "Nemotron pattn lookup matches the CUDA paging instantiation" {
+    const a = std.testing.allocator;
+    const zig = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "zig/src/families/nemotron/cuda_kernels.zig", a, .limited(256 * 1024));
+    defer a.free(zig);
+    const cu = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, "zig/kernels/cuda/prefill_attention.cu", a, .limited(64 * 1024));
+    defer a.free(cu);
+    const want = "_ZN20tf_prefill_attention12pattn_kernelILi128ELi8ELi8ELi8EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifPKix";
+    try std.testing.expect(std.mem.indexOf(u8, zig, want) != null);
+    try std.testing.expect(std.mem.indexOf(u8, cu, "pattn_kernel<128, 8, 8, 8>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cu, "const int* __restrict__, long long)") != null);
+}
+
 test "lookup scanner handles whitespace, comments and trailing commas but excludes expressions and string contents" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

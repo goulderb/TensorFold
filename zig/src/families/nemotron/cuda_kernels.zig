@@ -8,7 +8,7 @@ const glue = @import("cuda_glue.zig");
 
 /// Mangled names of the instantiations the copies in zig/kernels/cuda export (cuobjdump -symbols of each fatbin).
 const sym = struct {
-    const pattn = "_ZN20tf_prefill_attention12pattn_kernelILi128ELi8ELi8ELi8EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiif";
+    const pattn = "_ZN20tf_prefill_attention12pattn_kernelILi128ELi8ELi8ELi8EEEvPK13__nv_bfloat16S3_S3_PS1_iiiiifPKix";
     const scan_rows = "_ZN12tf_scan_rows11scan_kernelILb0EEEvPK13__nv_bfloat16S3_PfPKfS6_S6_PS1_iiiiiiiiffNS_5SnapsE";
     const scan_snaps = "_ZN12tf_scan_rows11scan_kernelILb1EEEvPK13__nv_bfloat16S3_PfPKfS6_S6_PS1_iiiiiiiiffNS_5SnapsE";
 };
@@ -418,6 +418,9 @@ pub const Ops = struct {
         for ([_]u64{ q, kc, vc, out }) |v| a.add(v);
         for ([_]usize{ p0, rows, heads, kv_heads, g }) |v| a.add(int(v));
         a.add(scale);
+        // contiguous keys: a null page table (`const int* PT`) and its unused stride (`long long PS`)
+        a.add(@as(u64, 0));
+        a.add(@as(i64, 0));
         try o.go(o.k.pattn, .{ (rows + 15) / 16, kv_heads * (g / 8), 1 }, 256, pattn_smem, &a);
     }
 
@@ -475,4 +478,45 @@ test "items follow the Python shapes" {
 test "ModelOpt's floor refuses every card below sm_90, the Ampere ones included, and admits sm_90 up" {
     for ([_]u32{ 75, 80, 86, 89 }) |c| try std.testing.expect(modeloptRefusal(c) != null);
     for ([_]u32{ 90, 100, 120, 121 }) |c| try std.testing.expect(modeloptRefusal(c) == null);
+}
+
+test "pattn prefillAttention launches the 12-parameter kernel over contiguous keys" {
+    const abi = cuda.abi;
+    const Mock = struct {
+        var function: usize = 0;
+        var grid: [3]u32 = undefined;
+        var block: u32 = 0;
+        var shared: u32 = 0;
+        var in_storage: [12]bool = undefined;
+        var words: [12]u64 = undefined;
+        fn launch(f: abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, _: c_uint, _: c_uint, sh: c_uint, _: abi.Stream, params: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) abi.Result {
+            function = @intFromPtr(f);
+            grid = .{ gx, gy, gz };
+            block = bx;
+            shared = sh;
+            const base = @intFromPtr(params.?[0].?);
+            for (0..12) |i| {
+                const at = @intFromPtr(params.?[i]);
+                in_storage[i] = at >= base and at < base + cuda.Args.max_bytes;
+                if (!in_storage[i]) continue;
+                words[i] = switch (i) {
+                    4...9 => @as(*align(1) const u32, @ptrFromInt(at)).*,
+                    else => @as(*align(1) const u64, @ptrFromInt(at)).*,
+                };
+            }
+            return abi.success;
+        }
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Mock.launch;
+    var k: Kernels = undefined;
+    k.pattn = .{ .d = &d, .handle = @ptrFromInt(7) };
+    const ops: Ops = .{ .k = &k, .s = .{ .d = &d, .handle = null } };
+    try ops.prefillAttention(0x10, 0x20, 0x30, 0x40, 7, 40, 32, 4, 0.125);
+    try std.testing.expectEqual(@as(usize, 7), Mock.function);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 4, 1 }, &Mock.grid);
+    try std.testing.expectEqual(@as(u32, 256), Mock.block);
+    try std.testing.expectEqual(pattn_smem, Mock.shared);
+    try std.testing.expectEqual(@as([12]bool, @splat(true)), Mock.in_storage);
+    try std.testing.expectEqualSlices(u64, &.{ 0x10, 0x20, 0x30, 0x40, 7, 40, 32, 4, 8, @as(u32, @bitCast(@as(f32, 0.125))), 0, 0 }, &Mock.words);
 }
