@@ -62,8 +62,9 @@ pub const Cache = struct {
         var state = try DeviceBuffer.alloc(e.d, e.g.stateBytes());
         errdefer state.free();
         try state.fill8(0, null);
-        var before = try DeviceBuffer.alloc(e.d, e.g.stateBytes());
-        errdefer before.free();
+        var before: ?DeviceBuffer = null;
+        errdefer if (before) |*b| b.free();
+        if (e.numerics != .hf_dense_bf16) before = try DeviceBuffer.alloc(e.d, e.g.stateBytes());
         var kv = try DeviceBuffer.alloc(e.d, e.g.kvBytes(cap, e.kv8));
         errdefer kv.free();
         try kv.fill8(0, null); // touched now, not as the first request's keys land (the driver commits on first touch)
@@ -181,4 +182,62 @@ test "cache reset invalidates a terminal pick before a failed device clear" {
     try std.testing.expectError(error.NotReady, cache.reset(&e));
     try std.testing.expect(cache.terminal_greedy == null);
     try std.testing.expectEqual(@as(usize, 0), cache.len);
+}
+
+test "BF16 cache allocates state without a rewind backup" {
+    const Fake = struct {
+        var device: [8]?[]align(256) u8 = @splat(null);
+        fn alloc(out: *cuda.abi.DevicePtr, len: usize) callconv(.c) cuda.abi.Result {
+            for (&device) |*slot| if (slot.* == null) {
+                const bytes = std.testing.allocator.alignedAlloc(u8, .fromByteUnits(256), len) catch return cuda.abi.error_not_ready;
+                slot.* = bytes;
+                out.* = @intFromPtr(bytes.ptr);
+                return 0;
+            };
+            return cuda.abi.error_not_ready;
+        }
+        fn free(ptr: cuda.abi.DevicePtr) callconv(.c) cuda.abi.Result {
+            for (&device) |*slot| if (slot.*) |bytes| {
+                if (@intFromPtr(bytes.ptr) == ptr) {
+                    std.testing.allocator.free(bytes);
+                    slot.* = null;
+                    return 0;
+                }
+            };
+            return 1;
+        }
+        fn fill(_: cuda.abi.DevicePtr, _: u8, _: usize) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+        fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            return 0;
+        }
+        fn released() !void {
+            for (device) |slot| try std.testing.expect(slot == null);
+        }
+    };
+    var d: cuda.Driver = undefined;
+    d.api.cuMemAlloc_v2 = Fake.alloc;
+    d.api.cuMemFree_v2 = Fake.free;
+    d.api.cuMemsetD8_v2 = Fake.fill;
+    d.api.cuStreamSynchronize = Fake.sync;
+    var e: Engine = undefined;
+    e.d = &d;
+    e.numerics = .hf_dense_bf16;
+    e.g = .{ .hidden = 4, .intermediate = 4, .layers = 1, .vocab = 4, .k_heads = 1, .v_heads = 1, .q_heads = 1, .kv_heads = 1, .eps = 1e-6, .tied = false, .context = 4096, .linear = @splat(true) };
+    e.kv8 = false;
+    e.n_taps = 0;
+    e.terminal_weights = .hidden_only;
+    e.bf16 = .{ .weights = undefined, .bindings = undefined, .input = undefined };
+    e.placement = .{ .first = 0, .end = 1, .total = 1 };
+    e.context = cuda.copy_source.current();
+    e.verify_gdn_graphs = false;
+    e.verify_expert_graphs = false;
+    e.verify_terminal_graphs = false;
+    e.observer = null;
+    var cache = try Cache.init(std.testing.allocator, &e, 4);
+    try std.testing.expect(cache.before == null);
+    try std.testing.expectEqual(e.g.stateBytes(), cache.state.len);
+    cache.deinit(std.testing.allocator);
+    try Fake.released();
 }

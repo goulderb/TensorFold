@@ -203,8 +203,8 @@ const Fixture = struct {
     d: cuda.Driver,
     e: engine.Engine,
     cache: Cache,
-    tables: [16384]u8 align(16),
-    staged: [16384]u8 align(16),
+    tables: [engine.Engine.tables_len]u8 align(16),
+    staged: [engine.Engine.tables_len]u8 align(16),
     x: [128]u8 align(16),
     input: [128]u8 align(256),
     embedding: [32]u8,
@@ -242,6 +242,10 @@ const Fixture = struct {
         e.terminal = null;
         e.verify_rows = engine.most_verify;
         e.stream = .{ .d = &f.d, .handle = @ptrFromInt(1) };
+        e.learning = null;
+        e.mlp = null;
+        e.taught = 0;
+        e.pockets = .{ .gpa = std.testing.allocator, .d = &f.d, .hidden = 4, .layers = &.{} };
         e.layers = &.{};
         e.staged = .{ .d = &f.d, .bytes = &f.staged };
         e.tables = .{ .d = &f.d, .ptr = @intFromPtr(&f.tables), .len = f.tables.len, .borrowed = true };

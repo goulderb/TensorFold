@@ -33,6 +33,9 @@ const Recorder = struct {
         r.heads += 1;
         r.src = src;
     }
+    pub fn vocabulary(r: *const @This()) !u64 {
+        return r.head;
+    }
 };
 test "dense read cost: hidden taps skip only the output tail and a scoring pass retains it" {
     var r: Recorder = .{};

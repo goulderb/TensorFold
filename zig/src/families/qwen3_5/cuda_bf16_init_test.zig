@@ -169,6 +169,10 @@ pub fn exercise(comptime initialize: anytype) !void {
             try std.testing.expectEqual(@as(usize, 5), Fake.allocations);
             try std.testing.expect(e.terminal_weights == .hidden_only);
             try std.testing.expect(e.modelopt == null);
+            try std.testing.expect(e.learning == null);
+            try std.testing.expect(e.mlp == null);
+            try std.testing.expect(!e.pockets.any());
+            try std.testing.expectEqual(g.layers, e.pockets.layers.len);
             try std.testing.expectEqual(@as(u64, 0), e.logits);
             try std.testing.expectEqual(@as(usize, 0), e.host_logits.bytes.len);
             try std.testing.expectEqual(@as(usize, 131072), e.bf16.?.input.bytes.len);

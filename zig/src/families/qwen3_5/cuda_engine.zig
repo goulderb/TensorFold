@@ -125,9 +125,14 @@ test "BF16 initialization owns mappings scratch and bindings through every alloc
 test "BF16 constructor and owned runtime bodies are compiled on the host" {
     std.mem.doNotOptimizeAway(&Engine.initBf16);
     std.mem.doNotOptimizeAway(&Engine.initBf16Inspected);
+    std.mem.doNotOptimizeAway(&Engine.initBf16WithBinder);
     std.mem.doNotOptimizeAway(&Engine.gatherInput);
     std.mem.doNotOptimizeAway(&Engine.gatherOutputRows);
     std.mem.doNotOptimizeAway(&Engine.deinit);
+    std.mem.doNotOptimizeAway(&Engine.warmCache);
+    std.mem.doNotOptimizeAway(&Engine.warmupPromptRows);
+    std.mem.doNotOptimizeAway(&Engine.body);
+    std.mem.doNotOptimizeAway(&Engine.deltaScan);
 }
 
 test "BF16 budgeting and scratch use pinned dense widths without a vocabulary allocation" {
@@ -137,8 +142,8 @@ test "BF16 budgeting and scratch use pinned dense widths without a vocabulary al
     plan.budget = .{ .device_weights = 13_879_009_280, .device_load_stage = 100_663_296, .host_tables = 4_068_474_880, .host_conversion_peak = 201_326_592 };
     const budget = try Engine.bf16Budget(&plan, 4096);
     try std.testing.expectEqual(@as(usize, 28_558_336), budget.scratch_bytes - aligned(Engine.tables_len));
-    try std.testing.expectEqual(@as(usize, 28_567_552), budget.scratch_bytes);
-    try std.testing.expectEqual(@as(usize, 14_128_534_528), budget.steady_device_bytes);
+    try std.testing.expectEqual(@as(usize, 28_558_336) + aligned(Engine.tables_len), budget.scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 13_879_009_280) + budget.scratch_bytes + 187_403_264 + 33_554_432, budget.steady_device_bytes);
     try std.testing.expectEqual(@as(usize, 187_403_264), budget.cache_bytes);
     try std.testing.expectEqual(@as(usize, 33_554_432), budget.hidden_bytes);
     try std.testing.expectEqual(@as(usize, 131_072), budget.host_input_bytes);
@@ -604,19 +609,19 @@ pub const Engine = struct {
     /// During an image prompt chunk's forward: its feature rows (0: none); the chunk's src and positions are staged.
     features: u64 = 0,
 
-    const ids_at = 0;
-    const segs_at = max_rows * 4;
-    const rowseg_at = segs_at + max_segs * @sizeOf(Seg);
-    const rowpar_at = rowseg_at + max_rows * 4;
-    const rowanc_at = rowpar_at + max_rows * 4;
-    const rules_at = rowanc_at + max_rows * 4;
-    const meta_at = rules_at + most_verify * @sizeOf(cuda.sample.Rule);
-    const tokens_at = meta_at + most_verify * 4;
-    pub const params_at = tokens_at + most_verify * 4; // two unused words, the rows, the windows, record
+    pub const ids_at = Round.ids_at;
+    pub const segs_at = Round.segs_at;
+    pub const rowseg_at = Round.rowseg_at;
+    pub const rowpar_at = Round.rowpar_at;
+    pub const rowanc_at = Round.rowanc_at;
+    const rules_at = Round.rules_at;
+    const meta_at = Round.meta_at;
+    const tokens_at = Round.tokens_at;
+    pub const params_at = Round.params_at;
     pub const chain_segs_at = aligned(params_at + 8 * 4);
-    const src_at = chain_segs_at + hf_prefill_rows * @sizeOf(Seg); // image feature rows follow the immutable chain views
-    const mpos_at = src_at + max_rows * 4; // and their t, h and w positions, max_rows apart (qwen35.cuh's MAXR)
-    const tables_len = mpos_at + 3 * max_rows * 4;
+    pub const src_at = chain_segs_at + hf_prefill_rows * @sizeOf(Seg);
+    pub const mpos_at = src_at + max_rows * 4;
+    pub const tables_len = mpos_at + 3 * max_rows * 4;
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kv8: bool) !*Engine {
         const g = try Geometry.read(gpa, io, dir);
@@ -630,7 +635,6 @@ pub const Engine = struct {
     }
 
     pub fn initPlacedWithOptions(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, admitted: checkpoint.Admitted, placement: checkpoint.Placement, kv8: bool, options: InitOptions) !*Engine {
-        const started = profile.now(io);
         try admitted.requireExecutable();
         try validateMoeMath(admitted, options.moe_math);
         try validateAttentionMode(admitted, options.attention_mode, kv8);
@@ -638,6 +642,7 @@ pub const Engine = struct {
         if (options.terminal_greedy and admitted.numerics() != .hf_modelopt) return error.UnsupportedQwenTerminalGreedy;
         if (options.expert_up_layout == .slice_major_v1 and (admitted.numerics() != .hf_modelopt or g.hidden != 2048 or g.intermediate != 512 or g.experts != 256)) return error.UnsupportedQwenExpertUpLayout;
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+        const started = profile.now(io);
         var ck = try core.Checkpoint.openModel(gpa, io, dir);
         defer ck.close();
         const allocation = try weights.plan(&ck, admitted, placement);
@@ -712,7 +717,6 @@ pub const Engine = struct {
         errdefer e.staged.free();
         e.host_logits = try cuda.HostBuffer.alloc(d, TerminalOutput.init(most_verify, g.vocab).bytes);
         errdefer e.host_logits.free();
-        if (e.numerics == .mlx_sanitized) try e.warm(gpa);
         try e.stream.synchronize();
         const warm_start = profile.now(io);
         e.startup = .{ .load = warm_start - started };
@@ -833,6 +837,12 @@ pub const Engine = struct {
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
         e.configure(gpa, ctx, g, .{ .first = 0, .end = g.layers, .total = g.layers }, .hf_dense_bf16, false, .{});
+        e.pockets = try pocket.Pockets.init(gpa, ctx.d, g.hidden, g.layers);
+        errdefer e.pockets.deinit();
+        e.learning = null;
+        e.mlp = null;
+        e.taught = 0;
+        e.dir = &.{};
         e.bounded_hf_prefill = true;
         e.verify_rows = 0;
         e.window_rows = 1;
@@ -882,14 +892,24 @@ pub const Engine = struct {
         try b.weights.host.gather(.output, ids, out);
     }
 
+    /// Prompt rows admitted during open: ModelOpt default 1, bounded HF 16, MLX 32.
+    pub fn warmupPromptRows(e: *const Engine) usize {
+        if (!hfOrder(e.numerics)) return 32;
+        return if (e.bounded_hf_prefill) hf_prefill_rows else 1;
+    }
+
     /// Every path a request takes, run once now: WDDM stalls a process's first forwards for seconds (a 20 s launch).
     pub fn warmCache(e: *Engine, warm_cache: *Cache) !void {
-        const ids: [32]u32 = @splat(0);
+        const prompt_rows = e.warmupPromptRows();
+        var ids: [32]u32 = @splat(0);
+        try e.forward(&.{.{ .cache = warm_cache, .rows = prompt_rows }}, ids[0..prompt_rows], .last);
+        if (hfOrder(e.numerics)) {
+            try e.stream.synchronize();
+            return;
+        }
         const greedy: Draw = .{ .rule = null, .position = 33 };
-        try e.forward(&.{.{ .cache = warm_cache, .rows = ids.len }}, &ids, .last); // a prompt chunk: the prompt GEMMs
         try e.forward(&.{.{ .cache = warm_cache, .rows = 1 }}, ids[0..1], .{ .draws = &.{greedy} });
         try e.forward(&.{.{ .cache = warm_cache, .rows = 1 }}, ids[0..1], .{ .draws = &.{.{ .rule = .{ .seed = 1, .inv_t = 1.0 / 0.7, .top_p = 0.95, .near = 20.0, .min_log = -std.math.inf(f32), .top_k = 20 }, .position = 34 }} });
-        // a tree window and a branch of it kept: the keep kernels, and the forward's branch path
         try e.forward(&.{.{ .cache = warm_cache, .rows = 3, .parents = &.{ -1, 0, 0 } }}, ids[0..3], .{ .draws = &.{ greedy, greedy, greedy } });
         try warm_cache.keep(e, &.{ 0, 2 });
         try e.stream.synchronize();
@@ -907,12 +927,12 @@ pub const Engine = struct {
         e.staged.free();
         e.tables.free();
         e.arena.free();
+        e.pockets.deinit();
         if (e.bf16) |*b| {
             b.input.free();
             b.weights.deinit();
             b.bindings.unload();
         } else {
-            e.pockets.deinit();
             e.gpa.free(e.layers);
             if (e.modelopt) |*m| m.unload();
             e.gpa.free(e.dir);
@@ -1006,7 +1026,7 @@ pub const Engine = struct {
             if (mode == .allocate) e.bf16.?.bindings.part = part;
         }
         if (g.moe()) e.routed = try routed.Scratch.carve(t, g, R);
-        e.amax = try t.alloc(most_verify * argmaxSlices(g.vocab) * 8);
+        e.amax = if (e.numerics == .hf_dense_bf16) 0 else try t.alloc(most_verify * argmaxSlices(g.vocab) * 8);
         return total;
     }
 
@@ -1121,28 +1141,6 @@ pub const Engine = struct {
         try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ if (hfOrder(e.numerics)) (hf.Launches{}).norm else 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at, e.xs });
     }
 
-    /// A chain row's rowanc: its index in its window, as a prompt chunk's rows outnumber the bits.
-    const chain_row: u32 = 1 << 31;
-
-    /// The row tables of `parts`: each row's segment, parent row (-1: a window's first) and ancestors-and-self bits.
-    fn rowTables(st: []u8, parts: []const Part) !void {
-        const rowseg = std.mem.bytesAsSlice(c_int, st[rowseg_at..][0 .. max_rows * 4]);
-        const rowpar = std.mem.bytesAsSlice(c_int, st[rowpar_at..][0 .. max_rows * 4]);
-        const rowanc = std.mem.bytesAsSlice(u32, st[rowanc_at..][0 .. max_rows * 4]);
-        var row0: usize = 0;
-        for (parts, 0..) |p, i| {
-            if (p.parents) |ps| if (ps.len != p.rows or p.rows > most_window or ps[0] != -1) return error.InvalidQwenParents;
-            for (0..p.rows) |r| {
-                const parent: i32 = if (p.parents) |ps| ps[r] else if (r == 0) -1 else @intCast(r - 1);
-                if (parent >= @as(i32, @intCast(r)) or parent < -1) return error.InvalidQwenParents;
-                rowseg[row0 + r] = @intCast(i);
-                rowpar[row0 + r] = if (parent < 0) -1 else @intCast(row0 + @as(usize, @intCast(parent)));
-                rowanc[row0 + r] = if (p.parents == null) chain_row | @as(u32, @intCast(r)) else (@as(u32, 1) << @intCast(r)) | (if (parent < 0) 0 else rowanc[row0 + @as(usize, @intCast(parent))]);
-            }
-            row0 += p.rows;
-        }
-    }
-
     /// A request owns these rows across forward scratch reuse.
     pub fn hiddenRows(e: *Engine, tokens: usize) !hidden.Rows {
         return hidden.Rows.init(e, tokens);
@@ -1231,7 +1229,7 @@ pub const Engine = struct {
         // the tables
         const st = e.staged.bytes;
         @memcpy(std.mem.bytesAsSlice(u32, st[ids_at..][0 .. total * 4]), ids);
-        try rowTables(st, parts);
+        const slot_peak = try Round.build(st, parts, record);
         const segs = std.mem.bytesAsSlice(Seg, st[segs_at..][0 .. parts.len * @sizeOf(Seg)]);
         var row0: usize = 0;
         for (parts, 0..) |p, i| {
@@ -1270,12 +1268,12 @@ pub const Engine = struct {
             const mpos = std.mem.bytesAsSlice(i32, st[mpos_at..][0 .. 3 * max_rows * 4]);
             for (0..3) |a| @memcpy(mpos[a * max_rows ..][0..total], im.pos[a * n + p0 ..][0..total]);
         }
-        try e.tables.uploadAsync(0, st[0..if (images != null) tables_len else src_at], e.stream.handle); // text: as before
+        try e.tables.uploadAsync(0, st[0..if (images != null or (hfOrder(e.numerics) and total > 1)) tables_len else src_at], e.stream.handle);
         // a captured forward covers a row bucket and every window; kernels read the true counts; a lone step is exact
         const lone = total == 1 and parts.len == 1;
         const bucket: usize = if (lone) 1 else if (total <= 16) 16 else most_verify;
         const windows: usize = if (lone) 1 else max_segs;
-        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant, .expert_up_layout = e.expert_up_layout, .terminal_greedy = e.terminal != null and !record and keep != .hidden and keep != .learn, .moe_math = e.moeMath(), .attention_mode = e.attentionMode(), .normalized_hidden = keep == .hidden or keep == .learn };
+        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant, .expert_up_layout = e.expert_up_layout, .terminal_greedy = e.terminal != null and !record and keep != .hidden and keep != .learn, .moe_math = e.moeMath(), .attention_mode = e.attentionMode(), .normalized_hidden = keep == .hidden or keep == .learn, .slots = @intCast(Round.variant(slot_peak)) };
         e.features = if (images) |im| im.features else 0;
         return shape;
     }
@@ -1370,12 +1368,15 @@ pub const Engine = struct {
         if (params[2] != shape.total or params[3] != 1 or params[4] != 0) return error.QwenGdnTableMismatch;
         var parents: [hf_prefill_rows]c_int = undefined;
         var segments: [hf_prefill_rows]c_int = undefined;
-        var ancestors: [hf_prefill_rows]u32 = undefined;
+        var ancestors: [hf_prefill_rows]Round.Ancestor = undefined;
         try e.tables.download(rowpar_at, std.mem.sliceAsBytes(parents[0..shape.total]));
         try e.tables.download(rowseg_at, std.mem.sliceAsBytes(segments[0..shape.total]));
         try e.tables.download(rowanc_at, std.mem.sliceAsBytes(ancestors[0..shape.total]));
         for (0..shape.total) |row| {
-            if (segments[row] != 0 or parents[row] != @as(c_int, @intCast(row)) - 1 or ancestors[row] != (chain_row | @as(u32, @intCast(row)))) return error.QwenGdnTableMismatch;
+            const want: Round.Ancestor = .{ .bits = 0, .depth = @intCast(row), .chain = 1 };
+            if (segments[row] != 0 or parents[row] != @as(c_int, @intCast(row)) - 1 or
+                ancestors[row].bits != want.bits or ancestors[row].depth != want.depth or ancestors[row].chain != want.chain)
+                return error.QwenGdnTableMismatch;
         }
     }
 
@@ -1993,17 +1994,17 @@ pub const Engine = struct {
         moe_math: MoeMath = .legacy,
         attention_mode: AttentionMode = .reference,
         normalized_hidden: bool = false,
+        slots: u8 = 1,
 
         pub fn init(rows: usize, segments: usize, record: bool, taps: bool, slots: u8) Shape {
-            _ = slots;
             std.debug.assert(rows > 0 and rows <= most_verify and segments > 0 and segments <= rows);
             const bucket: usize = if (rows == 1) 1 else std.mem.alignForward(usize, rows, 16);
             const windows = std.math.ceilPowerOfTwo(usize, segments) catch unreachable;
-            return .{ .total = @intCast(if (record) bucket else rows), .nseg = @intCast(if (record) windows else segments), .record = record, .prompt = !record, .taps = taps };
+            return .{ .total = @intCast(if (record) bucket else rows), .nseg = @intCast(if (record) windows else segments), .record = record, .prompt = !record, .taps = taps, .slots = slots };
         }
 
         pub fn key(s: Shape) u32 {
-            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21 | @as(u32, @intFromBool(s.expert_up_split_m)) << 22 | @as(u32, @intFromBool(s.reuse_fp8_quant)) << 23 | @as(u32, @backingInt(s.expert_up_layout)) << 24 | @as(u32, @intFromBool(s.terminal_greedy)) << 25 | @as(u32, @backingInt(s.moe_math)) << 26 | @as(u32, @backingInt(s.attention_mode)) << 27 | @as(u32, @intFromBool(s.normalized_hidden)) << 28;
+            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21 | @as(u32, @intFromBool(s.expert_up_split_m)) << 22 | @as(u32, @intFromBool(s.reuse_fp8_quant)) << 23 | @as(u32, @backingInt(s.expert_up_layout)) << 24 | @as(u32, @intFromBool(s.terminal_greedy)) << 25 | @as(u32, @backingInt(s.moe_math)) << 26 | @as(u32, @backingInt(s.attention_mode)) << 27 | @as(u32, @intFromBool(s.normalized_hidden)) << 28 | @as(u32, @ctz(@as(u32, s.slots))) << 29;
         }
     };
 
@@ -2089,7 +2090,9 @@ pub const Engine = struct {
                     try e.mark(.conv_commit);
                     if (is_hf and total > 1) {
                         for (0..total) |row| try e.run(gdn_chain, .{ 1, launch.gdn_chain_grid_y, g.v_heads }, launch.gdn_chain, .{ geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + chain_segs_at + row * @sizeOf(Seg), t_par, layer, e.y, t_params });
-                    } else try e.run(gdn_chain, .{ 1, if (is_hf) launch.gdn_chain_grid_y else geometry.dk / 4, g.v_heads * nseg }, if (is_hf) launch.gdn_chain else .{ 32, 4, 1 }, .{ geo, e.q, e.k, e.v, e.g_, e.beta, t_segs, t_par, layer, e.y, t_params });
+                    } else if (is_hf) {
+                        try e.run(gdn_chain, .{ 1, launch.gdn_chain_grid_y, g.v_heads * nseg }, launch.gdn_chain, .{ geo, e.q, e.k, e.v, e.g_, e.beta, t_segs, t_par, layer, e.y, t_params });
+                    } else try e.deltaScan(record, shape.slots, nseg, layer);
                     try e.mark(.gdn_chain);
                     try e.run(e.fns.gdn_post, .{ 1, g.v_heads, total }, .{ if (is_hf) launch.gdn_post else 32, 1, 1 }, .{ geo, e.y, e.z, m.norm, g.eps, e.mix, t_params });
                     try e.mark(.gdn_post);
@@ -2130,7 +2133,7 @@ pub const Engine = struct {
                     if (e.mlp) |k| try k.f(k.ctx, i, e.x, e.r, total, e.taught) else try e.pockets.add(e.stream, i, e.x, e.r, total, e.taught);
                     try e.mark(.dense);
                 },
-                .moe => |m| try routed.rows(e, m.router, m.experts, m.shared, e.x, e.r, total, prompt and total > most_window, shape.expert_up_n8, shape.expert_up_split_m),
+                .moe => |m| try routed.rows(e, m.router, m.experts, m.shared, e.x, e.r, total, @import("cuda_forward.zig").promptMoe(prompt, total), shape.expert_up_n8, shape.expert_up_split_m),
             }
             if (shape.taps) for (e.taps[0..e.n_taps], 0..) |t, ti| if (t == e.placement.first + i) {
                 try e.run(e.fns.tap, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.r, t_segs, t_rows, @as(c_int, @intCast(ti)), @as(c_int, @intCast(g.hidden)), t_params });
@@ -2747,7 +2750,7 @@ test "attention mode owns graph bit 27 and rejects Engine/Shape disagreement" {
 }
 
 test "bounded HF chain views retain every state binding and reject field corruption" {
-    const base: Seg = .{ .rec = 101, .conv = 102, .kv = 103, .tap = 0, .log = 104, .cap = 4096, .len = 127, .row0 = 0, .rows = 16, .tap_rows = 0, .taps = 0, .delta = -3 };
+    const base: Seg = .{ .rec = 101, .conv = 102, .kv = 103, .tap = 0, .log = 104, .before = 0, .cap = 4096, .len = 127, .row0 = 0, .rows = 16, .tap_rows = 0, .taps = 0, .delta = -3 };
     var views: [hf_prefill_rows]Seg = undefined;
     for (&views, 0..) |*view, row| view.* = chainView(base, row);
     try validateChainViews(base, &views);
@@ -2780,12 +2783,12 @@ test "bounded HF verifies uploaded row views parents ancestors and counts" {
     driver.api.cuMemcpyDtoH_v2 = Fake.copy;
     var host: [Engine.tables_len]u8 align(16) = @splat(0);
     var device: [Engine.tables_len]u8 align(16) = @splat(0);
-    const base: Seg = .{ .rec = 101, .conv = 102, .kv = 103, .tap = 0, .log = 104, .cap = 4096, .len = 127, .row0 = 0, .rows = 2, .tap_rows = 0, .taps = 0, .delta = 0 };
+    const base: Seg = .{ .rec = 101, .conv = 102, .kv = 103, .tap = 0, .log = 104, .before = 0, .cap = 4096, .len = 127, .row0 = 0, .rows = 2, .tap_rows = 0, .taps = 0, .delta = 0 };
     @memcpy(host[Engine.segs_at..][0..@sizeOf(Seg)], std.mem.asBytes(&base));
     const views = std.mem.bytesAsSlice(Seg, host[Engine.chain_segs_at..][0 .. 2 * @sizeOf(Seg)]);
     for (views, 0..) |*view, row| view.* = chainView(base, row);
     var cache: Cache = undefined;
-    try Engine.rowTables(&host, &.{.{ .cache = &cache, .rows = 2 }});
+    _ = try Round.build(&host, &.{.{ .cache = &cache, .rows = 2 }}, false);
     const params = std.mem.bytesAsSlice(c_int, host[Engine.params_at..][0..32]);
     params[2] = 2;
     params[3] = 1;
@@ -2909,4 +2912,61 @@ test "immutable expert representation rejects stale shapes disabled consumers an
     e.expert_up_n8 = true;
     local[0].mlp.moe.experts.nvfp4_up_layout = .lane_major;
     try std.testing.expectError(error.QwenExpertUpLayoutMismatch, e.validateUpLayout(.slice_major_v1, true, true, 1));
+}
+
+test "warmup prompt rows follow ModelOpt admission and MLX 32" {
+    var e: Engine = undefined;
+    e.numerics = .mlx_sanitized;
+    e.bounded_hf_prefill = false;
+    try std.testing.expectEqual(@as(usize, 32), e.warmupPromptRows());
+    e.numerics = .hf_modelopt;
+    try std.testing.expectEqual(@as(usize, 1), e.warmupPromptRows());
+    e.bounded_hf_prefill = true;
+    try std.testing.expectEqual(@as(usize, hf_prefill_rows), e.warmupPromptRows());
+    e.numerics = .hf_dense_bf16;
+    try std.testing.expectEqual(@as(usize, hf_prefill_rows), e.warmupPromptRows());
+}
+
+test "live Engine prompt expert dispatch keeps 16-row cutoff and 64-row verify" {
+    const moe = @import("cuda_forward.zig").promptMoe;
+    try std.testing.expectEqual(@as(usize, 16), hf_prefill_rows);
+    try std.testing.expectEqual(@as(usize, 64), most_window);
+    try std.testing.expect(!moe(true, 16));
+    try std.testing.expect(moe(true, 17));
+    try std.testing.expect(moe(true, 64));
+    try std.testing.expect(moe(true, 65));
+    try std.testing.expect(!moe(false, 16));
+    try std.testing.expect(!moe(false, 64));
+    try std.testing.expect(!moe(false, 65));
+}
+
+test "production row tables store 16-byte ancestors for prompt parent and long chains" {
+    var st: [Engine.tables_len]u8 align(16) = @splat(0);
+    var cache: Cache = undefined;
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(Round.Ancestor));
+    try std.testing.expectEqual(Engine.rowanc_at, Round.rowanc_at);
+    _ = try Round.build(&st, &.{.{ .cache = &cache, .rows = 2 }}, false);
+    var anc = Round.ancestors(&st);
+    try std.testing.expectEqual(@as(u32, 1), anc[0].chain);
+    try std.testing.expectEqual(@as(u32, 0), anc[0].depth);
+    try std.testing.expectEqual(@as(u32, 1), anc[1].depth);
+    var p33: [33]i32 = undefined;
+    p33[0] = -1;
+    for (1..33) |i| p33[i] = @intCast(i - 1);
+    _ = try Round.build(&st, &.{.{ .cache = &cache, .rows = 33, .parents = &p33 }}, true);
+    anc = Round.ancestors(&st);
+    try std.testing.expectEqual(@as(u32, 0), anc[32].chain);
+    try std.testing.expectEqual(@as(u32, 32), anc[32].depth);
+    var p64: [64]i32 = undefined;
+    p64[0] = -1;
+    for (1..64) |i| p64[i] = @intCast(i - 1);
+    _ = try Round.build(&st, &.{.{ .cache = &cache, .rows = 64, .parents = &p64 }}, true);
+    anc = Round.ancestors(&st);
+    try std.testing.expectEqual(@as(u32, 63), anc[63].depth);
+    try std.testing.expectEqual(@as(u64, 1) << 63, anc[63].bits & (@as(u64, 1) << 63));
+    _ = try Round.build(&st, &.{.{ .cache = &cache, .rows = 65 }}, false);
+    anc = Round.ancestors(&st);
+    try std.testing.expectEqual(@as(u32, 1), anc[64].chain);
+    try std.testing.expectEqual(@as(u32, 64), anc[64].depth);
+    try std.testing.expectEqual(@as(u64, 0), anc[64].bits);
 }

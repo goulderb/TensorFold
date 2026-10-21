@@ -188,7 +188,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_hf_head_norm(
 
 extern "C" __global__ void __launch_bounds__(256) tf_q35_hf_rope(
     Geo geo, B* Qn, const B* Kn, const B* Vr, const Seg* segs, const int* rowseg,
-    const unsigned* rowanc, int layer, const int* P, const int* M) {
+    const Ancestor* rowanc, int layer, const int* P, const int* M) {
     if (past_rows(P, blockIdx.x)) return;
     const int d = threadIdx.x, row = blockIdx.x;
     const Seg sg = segs[rowseg[row]];
@@ -209,14 +209,14 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_hf_rope(
 }
 
 extern "C" __global__ void __launch_bounds__(256) tf_q35_hf_attn_partial(
-    Geo geo, const B* Q, const Seg* segs, const int* rowseg, const unsigned* rowanc,
+    Geo geo, const B* Q, const Seg* segs, const int* rowseg, const Ancestor* rowanc,
     int layer, const int* P, float scale, float* PM, float* PL, float* PO) {
     if (past_rows(P, blockIdx.z)) return;
     __shared__ float scratch[HD];
     const int h = blockIdx.y, row = blockIdx.z, d = threadIdx.x;
     const int kv = h / (geo.qh / geo.kvh);
     const Seg sg = segs[rowseg[row]];
-    const unsigned anc = rowanc[row];
+    const Ancestor anc = rowanc[row];
     const B* keys = reinterpret_cast<const B*>(sg.kv) + size_t(layer) * 2 * geo.kvh * sg.cap * HD;
     const B* values = keys + size_t(geo.kvh) * sg.cap * HD;
     const float query = bf(Q[(size_t(row) * geo.qh + h) * HD + d]);
@@ -241,7 +241,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_hf_attn_partial(
 
 extern "C" __global__ void __launch_bounds__(256) tf_q35_hf_attn_merge(
     Geo geo, const float* PM, const float* PL, const float* PO, const Seg* segs,
-    const int* rowseg, const unsigned* rowanc, const int* P, B* OUT) {
+    const int* rowseg, const Ancestor* rowanc, const int* P, B* OUT) {
     if (past_rows(P, blockIdx.y)) return;
     const size_t head = size_t(blockIdx.y) * geo.qh + blockIdx.x;
     const size_t slot = head * MAXCH;
@@ -298,7 +298,7 @@ struct Fp8Rows {
 // same pairwise tree. A row of at most 128 keys is one chunk and equals the serial kernels bit for bit.
 template <typename Rows>
 __device__ __forceinline__ void attn_partial_chunked(
-    Geo geo, const B* Q, const Seg* segs, const int* rowseg, const unsigned* rowanc,
+    Geo geo, const B* Q, const Seg* segs, const int* rowseg, const Ancestor* rowanc,
     int layer, const int* P, float scale, float* PM, float* PL, float* PO) {
     const int lane = threadIdx.x & 31, group = threadIdx.x >> 5;
     const int chunk = blockIdx.x, kv = blockIdx.y;
@@ -306,7 +306,7 @@ __device__ __forceinline__ void attn_partial_chunked(
     const size_t row = blockIdx.z;
     const int h = kv * (geo.qh / geo.kvh) + group;
     const Seg sg = segs[rowseg[row]];
-    const unsigned anc = rowanc[row];
+    const Ancestor anc = rowanc[row];
     const int total = sg.len + rows_seen(anc), width = chunk_keys(total);
     const int first = chunk * width, last = min(first + width, total);
     const size_t slot = (row * geo.qh + h) * MAXCH + chunk;
@@ -352,14 +352,14 @@ __device__ __forceinline__ void attn_partial_chunked(
 }  // namespace
 
 extern "C" __global__ void __launch_bounds__(256) tf_q35_hf_attn_partial_chunked(
-    Geo geo, const B* Q, const Seg* segs, const int* rowseg, const unsigned* rowanc,
+    Geo geo, const B* Q, const Seg* segs, const int* rowseg, const Ancestor* rowanc,
     int layer, const int* P, float scale, float* PM, float* PL, float* PO) {
     attn_partial_chunked<Bf16Rows>(geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO);
 }
 
 // Local change: the same partial over --kv-cache fp8's e4m3 rows (written by qwen35_kv8.cu's tf_q35_rope8).
 extern "C" __global__ void __launch_bounds__(256) tf_q35_hf_attn_partial8_chunked(
-    Geo geo, const B* Q, const Seg* segs, const int* rowseg, const unsigned* rowanc,
+    Geo geo, const B* Q, const Seg* segs, const int* rowseg, const Ancestor* rowanc,
     int layer, const int* P, float scale, float* PM, float* PL, float* PO) {
     attn_partial_chunked<Fp8Rows>(geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO);
 }
@@ -368,7 +368,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_hf_attn_partial8_chunke
 // reduces to tf_q35_hf_attn_merge's PO / PL exactly (its weight is expf(0) = 1).
 extern "C" __global__ void __launch_bounds__(32) tf_q35_hf_attn_merge_chunked(
     Geo geo, const float* PM, const float* PL, const float* PO, const Seg* segs,
-    const int* rowseg, const unsigned* rowanc, const int* P, B* OUT) {
+    const int* rowseg, const Ancestor* rowanc, const int* P, B* OUT) {
     constexpr int DPL = HD / 32;
     const int lane = threadIdx.x, h = blockIdx.x;
     if (past_rows(P, blockIdx.y)) return;
