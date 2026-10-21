@@ -74,6 +74,22 @@ fn validStart(from: i64, end: usize) i64 {
     return if (span > WIN) last - WIN else from;
 }
 
+/// Version 1 snapshots store unused tap fields and header padding as zero. Refuse anything else before a slot is touched.
+fn parseSnapshotHeader(raw: *const [snapshot_header_bytes]u8, end: usize) !SnapshotHeader {
+    const header = std.mem.bytesToValue(SnapshotHeader, raw[0..@sizeOf(SnapshotHeader)]);
+    if (!std.mem.eql(u8, &header.magic, snapshot_magic) or header.version != snapshot_version or header.reserved != 0)
+        return error.BadDraftSnapshot;
+    if (header.v_step != 0 or header.v_row0 != 0 or header.v_rows != 0 or header.v_pos0 != 0)
+        return error.BadDraftSnapshot;
+    if (!std.mem.allEqual(u8, raw[@sizeOf(SnapshotHeader)..], 0))
+        return error.BadDraftSnapshot;
+    if (header.from < 0)
+        return error.BadDraftSnapshot;
+    if (header.pos != @as(i64, @intCast(end)) or header.from > header.pos or header.filled != filledCount(header.from, end))
+        return error.BadDraftSnapshot;
+    return header;
+}
+
 /// glm_dflash's functions.
 pub const Kernels = struct {
     tap: cuda.Function,
@@ -300,11 +316,7 @@ pub const Drafter = struct {
     pub fn restore(dr: *Drafter, i: u32, source: u64, end: usize, stream: cuda.Stream) !void {
         var raw: [snapshot_header_bytes]u8 = undefined;
         try dr.d.check(dr.d.api.cuMemcpyDtoH_v2(&raw, source, snapshot_header_bytes), "cuMemcpyDtoH");
-        const header = std.mem.bytesToValue(SnapshotHeader, raw[0..@sizeOf(SnapshotHeader)]);
-        if (!std.mem.eql(u8, &header.magic, snapshot_magic) or header.version != snapshot_version or header.reserved != 0)
-            return error.BadDraftSnapshot;
-        if (header.pos != @as(i64, @intCast(end)) or header.from > header.pos or header.filled != filledCount(header.from, end))
-            return error.BadDraftSnapshot;
+        const header = try parseSnapshotHeader(&raw, end);
         const s = try dr.slot(i);
         s.from = std.math.maxInt(i64);
         s.v_rows = 0;
@@ -624,4 +636,67 @@ test "glm dflash: canonical snapshot save restores filled slots, zeros unused by
     try std.testing.expectEqual(std.math.maxInt(i64), dr.slots.items[0].from);
     try std.testing.expect(!dr.snapshotReady(0, 18));
     try std.testing.expectEqual(@as(i64, 3), dr.slots.items[1].from);
+}
+
+test "glm dflash: restore refuses nonzero unused header fields, padding, and a negative from before slot mutation" {
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    var d = Memory.driver();
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    var ring = try cuda.DeviceBuffer.alloc(&d, ring_bytes);
+    defer ring.free();
+    @memset(Memory.slice(ring.ptr, ring.len), 0xa5);
+    var dr: Drafter = .{ .gpa = std.testing.allocator, .d = &d, .module = undefined, .k = undefined, .weights = undefined, .split = false, .ff = 0, .rank = 0, .world = 1 };
+    try dr.slots.append(std.testing.allocator, .{ .ring = ring, .from = 10 });
+    defer dr.slots.deinit(std.testing.allocator);
+    var snap = try cuda.DeviceBuffer.alloc(&d, snapshot_bytes);
+    defer snap.free();
+    try dr.save(0, snap.ptr, 18, stream);
+    const valid = try std.testing.allocator.dupe(u8, Memory.slice(snap.ptr, snapshot_header_bytes));
+    defer std.testing.allocator.free(valid);
+    const Count = struct {
+        var copies: usize = 0;
+        var delegate: @TypeOf(d.api.cuMemcpyDtoDAsync_v2) = undefined;
+        fn copy(dst: u64, src: u64, n: usize, stream_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            copies += 1;
+            return delegate(dst, src, n, stream_);
+        }
+    };
+    Count.delegate = d.api.cuMemcpyDtoDAsync_v2;
+    d.api.cuMemcpyDtoDAsync_v2 = Count.copy;
+    const Kind = enum { v_step, v_row0, v_rows, v_pos0, padding, negative_from };
+    for ([_]Kind{ .v_step, .v_row0, .v_rows, .v_pos0, .padding, .negative_from }) |kind| {
+        @memcpy(Memory.slice(snap.ptr, snapshot_header_bytes), valid);
+        var header = std.mem.bytesToValue(SnapshotHeader, valid[0..@sizeOf(SnapshotHeader)]);
+        switch (kind) {
+            .v_step => header.v_step = 7,
+            .v_row0 => header.v_row0 = 3,
+            .v_rows => header.v_rows = 2,
+            .v_pos0 => header.v_pos0 = 11,
+            .padding => {},
+            .negative_from => {
+                header.from = -1;
+                header.filled = filledCount(-1, 18);
+            },
+        }
+        @memcpy(Memory.slice(snap.ptr, @sizeOf(SnapshotHeader)), std.mem.asBytes(&header));
+        if (kind == .padding) Memory.slice(snap.ptr, snapshot_header_bytes)[@sizeOf(SnapshotHeader)] = 1;
+        dr.slots.items[0].from = 99;
+        dr.slots.items[0].v_rows = 4;
+        Count.copies = 0;
+        try std.testing.expectError(error.BadDraftSnapshot, dr.restore(0, snap.ptr, 18, stream));
+        try std.testing.expectEqual(@as(i64, 99), dr.slots.items[0].from);
+        try std.testing.expectEqual(@as(usize, 4), dr.slots.items[0].v_rows);
+        try std.testing.expectEqual(@as(usize, 0), Count.copies);
+        try std.testing.expectEqual(@as(usize, 1), dr.slots.items.len);
+    }
+    var empty: Drafter = .{ .gpa = std.testing.allocator, .d = &d, .module = undefined, .k = undefined, .weights = undefined, .split = false, .ff = 0, .rank = 0, .world = 1 };
+    defer empty.slots.deinit(std.testing.allocator);
+    @memcpy(Memory.slice(snap.ptr, snapshot_header_bytes), valid);
+    var dirty = std.mem.bytesToValue(SnapshotHeader, valid[0..@sizeOf(SnapshotHeader)]);
+    dirty.v_rows = 1;
+    @memcpy(Memory.slice(snap.ptr, @sizeOf(SnapshotHeader)), std.mem.asBytes(&dirty));
+    Count.copies = 0;
+    try std.testing.expectError(error.BadDraftSnapshot, empty.restore(0, snap.ptr, 18, stream));
+    try std.testing.expectEqual(@as(usize, 0), empty.slots.items.len);
+    try std.testing.expectEqual(@as(usize, 0), Count.copies);
 }
