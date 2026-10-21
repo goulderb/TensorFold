@@ -376,18 +376,22 @@ test "canonical named tap layers publish distinct planes and ingest recorded sou
     try d.check(d.api.cuMemsetD8_v2(e.bs.?.taps.?.ptr, 0, e.bs.?.taps.?.len), "clear rank taps");
     var one: [1]fw.Rank = .{.{ .w = &e.w, .st = &e.seqs.items[0].?.st, .b = &e.bs.?, .segs = &.{} }};
     const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = .local, .replicas = &e.replicas, .taps = dr.taps(false), .target_failure = e.pair_failure };
+    const marker = struct {
+        fn of(layer: usize, row: usize) u32 {
+            return 0xA5000000 | @as(u32, @intCast(layer << 8 | row));
+        }
+    }.of;
     Capture.copies = 0;
     for (taps_mod.layers) |layer| {
-        const marker: u32 = 0xA5000000 | @as(u32, @intCast(layer));
-        for (0..40) |row| std.mem.writeInt(u32, Memory.slice(e.bs.?.x + row * c.hc * c.hidden * 2, 4)[0..4], marker, .little);
+        for (0..40) |row| std.mem.writeInt(u32, Memory.slice(e.bs.?.x + row * c.hc * c.hidden * 2, 4)[0..4], marker(layer, row), .little);
         try f.ffnSite(layer, 40);
     }
     try std.testing.expectEqual(taps_mod.layers.len, Capture.copies);
     for (taps_mod.layers, 0..) |layer, plane| {
-        const marker: u32 = 0xA5000000 | @as(u32, @intCast(layer));
+        try std.testing.expect(marker(layer, 0) != marker(layer, 32));
         for (0..40) |row| {
             const got = std.mem.readInt(u32, Memory.slice(dr.taps_step + row * dflash.TAP_ROW + plane * dflash.D * 2, 4)[0..4], .little);
-            try std.testing.expectEqual(marker, got);
+            try std.testing.expectEqual(marker(layer, row), got);
         }
     }
     const D = dflash.D;
@@ -449,9 +453,8 @@ test "canonical named tap layers publish distinct planes and ingest recorded sou
         for (0..8) |r| {
             const row = slot * 8 + r;
             for (taps_mod.layers, 0..) |layer, plane| {
-                const marker: u32 = 0xA5000000 | @as(u32, @intCast(layer));
                 const got = std.mem.readInt(u32, Memory.slice(dr.cin + row * dflash.TAP_ROW + plane * dflash.D * 2, 4)[0..4], .little);
-                try std.testing.expectEqual(marker, got);
+                try std.testing.expectEqual(marker(layer, row), got);
             }
         }
     }
