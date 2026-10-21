@@ -526,11 +526,11 @@ test "settings come from TENSORFOLD_SPILL_*: off without a size, GLM's defaults,
             return null;
         }
     };
-    try std.testing.expect((try spill.Settings.fromEnv(gpa, Env{ .vars = &.{.{ "HOME", "/home/x" }} })) == null);
-    try std.testing.expect((try spill.Settings.fromEnv(gpa, Env{ .vars = &.{ .{ "TENSORFOLD_SPILL_GIB", "0" }, .{ "HOME", "/home/x" } } })) == null);
-    const s = (try spill.Settings.fromEnv(gpa, Env{ .vars = &.{ .{ "TENSORFOLD_SPILL_GIB", "200" }, .{ "HOME", "/home/x" } } })).?;
+    try std.testing.expect((try spill.Settings.fromEnv(gpa, Env{ .vars = &.{.{ "HOME", "/home/user" }} })) == null);
+    try std.testing.expect((try spill.Settings.fromEnv(gpa, Env{ .vars = &.{ .{ "TENSORFOLD_SPILL_GIB", "0" }, .{ "HOME", "/home/user" } } })) == null);
+    const s = (try spill.Settings.fromEnv(gpa, Env{ .vars = &.{ .{ "TENSORFOLD_SPILL_GIB", "200" }, .{ "HOME", "/home/user" } } })).?;
     defer gpa.free(s.dir);
-    try std.testing.expectEqualStrings("/home/x/.cache/tensorfold/spill", s.dir);
+    try std.testing.expectEqualStrings("/home/user/.cache/tensorfold/spill", s.dir);
     try std.testing.expectEqual(@as(u64, 200 << 30), s.cap);
     try std.testing.expectEqual(@as(f64, 0.70), s.highwater);
     try std.testing.expectEqual(@as(u32, 8192), s.min_tokens);

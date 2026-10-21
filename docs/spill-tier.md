@@ -255,7 +255,7 @@ fixed cache budget: two shorter states may coexist, leaving the supposed disk re
 ### Before the window (no GPU)
 
 Use the binary from the separately approved build of
-`/home/bgoulder/tf-work/nvme-flashnext-spill-adm4`; do not reuse a binary from an older spill checkout.
+`~/tf-work/nvme-flashnext-spill-adm4` on the Spark host; do not reuse a binary from an older spill checkout.
 The build and artifact transfer are prerequisites, not GPU qualification steps performed by this note.
 
 On both Sparks, save the relevant production environment including its exact kernel path, and make the test
