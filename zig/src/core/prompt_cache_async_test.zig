@@ -191,3 +191,85 @@ test "terminal async failure falls back cold and releases its pending budget" {
     try std.testing.expectEqual(@as(u64, 0), x.store.pending_bytes);
     gpa.free(result.marks);
 }
+
+test "clear before the reader starts invalidates the candidate and replans cold" {
+    const x = try Fixture.init();
+    defer x.deinit();
+    var pending: ?pc.PendingRestore = null;
+    try std.testing.expectError(error.RestorePending, x.lookup(&pending));
+    x.store.clear();
+    const result = (try x.store.pollRestore(&pending.?)).?;
+    pending = null;
+    try std.testing.expect(result.entry == null);
+    try std.testing.expectEqual(@as(u32, 0), x.family.polls);
+    try std.testing.expectEqual(@as(u64, 0), x.store.pending_bytes);
+    try std.testing.expectEqual(@as(u64, 0), x.store.spill_counts.read_back);
+    gpa.free(result.marks);
+}
+
+test "clear during a reader cancels it before tier teardown and never publishes its copy" {
+    const x = try Fixture.init();
+    defer x.deinit();
+    var pending: ?pc.PendingRestore = null;
+    try std.testing.expectError(error.RestorePending, x.lookup(&pending));
+    try std.testing.expect((try x.store.pollRestore(&pending.?)) == null);
+    try std.testing.expect(x.family.active);
+    x.store.clear();
+    try std.testing.expect(!x.family.active);
+    try std.testing.expectEqual(@as(u32, 1), x.family.cancelled);
+    const result = (try x.store.pollRestore(&pending.?)).?;
+    pending = null;
+    try std.testing.expect(result.entry == null);
+    try std.testing.expectEqual(@as(u32, 1), x.family.polls);
+    try std.testing.expectEqual(@as(u64, 0), x.store.pending_bytes);
+    try std.testing.expectEqual(@as(u64, 0), x.store.spill_counts.read_back);
+    gpa.free(result.marks);
+}
+
+test "detaching and reattaching a tier cannot resume an older reader" {
+    const x = try Fixture.init();
+    defer x.deinit();
+    var pending: ?pc.PendingRestore = null;
+    try std.testing.expectError(error.RestorePending, x.lookup(&pending));
+    try std.testing.expect((try x.store.pollRestore(&pending.?)) == null);
+    x.store.detach();
+    x.store.attach(x.tier);
+    const result = (try x.store.pollRestore(&pending.?)).?;
+    pending = null;
+    try std.testing.expect(result.entry == null);
+    try std.testing.expectEqual(@as(u32, 1), x.family.cancelled);
+    try std.testing.expectEqual(@as(u32, 1), x.family.polls);
+    try std.testing.expectEqual(@as(u64, 0), x.store.pending_bytes);
+    gpa.free(result.marks);
+}
+
+test "clear cancels the surviving reader after middle and head pending links are removed" {
+    const x = try Fixture.init();
+    defer x.deinit();
+    x.family.hold.store(true, .release);
+    var first: ?pc.PendingRestore = null;
+    var middle: ?pc.PendingRestore = null;
+    var head: ?pc.PendingRestore = null;
+    try std.testing.expectError(error.RestorePending, x.lookup(&first));
+    try std.testing.expectError(error.RestorePending, x.lookup(&middle));
+    try std.testing.expectError(error.RestorePending, x.lookup(&head));
+    try std.testing.expectEqual(@as(usize, 3), x.store.pending_count);
+    try std.testing.expect((try x.store.pollRestore(&middle.?)) == null);
+    x.store.cancelRestore(&middle.?);
+    middle = null;
+    try std.testing.expectEqual(@as(usize, 2), x.store.pending_count);
+    try std.testing.expect((try x.store.pollRestore(&head.?)) == null);
+    x.store.clear();
+    try std.testing.expectEqual(@as(u32, 2), x.family.cancelled);
+    const last = (try x.store.pollRestore(&head.?)).?;
+    head = null;
+    try std.testing.expect(last.entry == null);
+    gpa.free(last.marks);
+    const oldest = (try x.store.pollRestore(&first.?)).?;
+    first = null;
+    try std.testing.expect(oldest.entry == null);
+    gpa.free(oldest.marks);
+    try std.testing.expectEqual(@as(usize, 0), x.store.pending_count);
+    try std.testing.expect(x.store.pending_head == null);
+    try std.testing.expectEqual(@as(u64, 0), x.store.pending_bytes);
+}

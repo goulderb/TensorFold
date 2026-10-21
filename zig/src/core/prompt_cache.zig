@@ -165,12 +165,13 @@ pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
 /// The borrowed entry a backend restores; the caller must report resumed or release it, even on cancellation.
 pub const Lookup = struct { entry: ?*Entry = null, marks: []const u32 = &.{} };
 
-/// One admitted request's disk candidate. Only the lane owner changes this value or its Store.
+/// One admitted request's disk candidate. Its address must not move while pending: the Store links it for detach cancellation.
 pub const PendingRestore = struct {
     allocator: Allocator,
     prompt: []const u32,
     born: u32,
     history_len: u32,
+    rewind_len: u32,
     rewind_at: u32,
     shared: []const u32,
     starts: []const u32,
@@ -180,6 +181,9 @@ pub const PendingRestore = struct {
     tokens: []u32,
     bytes: u64,
     reader: ?SpillRead = null,
+    epoch: u64,
+    previous: ?*PendingRestore = null,
+    next: ?*PendingRestore = null,
 };
 
 pub const Store = struct {
@@ -192,6 +196,8 @@ pub const Store = struct {
     held: u64 = 0,
     pending_bytes: u64 = 0,
     pending_count: usize = 0,
+    pending_head: ?*PendingRestore = null,
+    restore_epoch: u64 = 0,
     clock: u64 = 0,
     entries: std.ArrayList(*Entry) = .empty,
     counts: Counts = .{},
@@ -217,8 +223,27 @@ pub const Store = struct {
     /// The tier stops reaching this store (its hook released when this store set it); spilling stops.
     pub fn detach(s: *Store) void {
         const t = s.tier orelse return;
+        s.restore_epoch +%= 1;
+        var pending = s.pending_head;
+        while (pending) |p| : (pending = p.next) {
+            if (p.reader) |r| r.vtable.cancel(r.ptr);
+            p.reader = null;
+        }
         t.releaseHook(s);
         s.tier = null;
+    }
+
+    fn linkPending(s: *Store, p: *PendingRestore) void {
+        p.next = s.pending_head;
+        if (s.pending_head) |old| old.previous = p;
+        s.pending_head = p;
+    }
+
+    fn unlinkPending(s: *Store, p: *PendingRestore) void {
+        if (p.previous) |before| before.next = p.next else s.pending_head = p.next;
+        if (p.next) |after| after.previous = p.previous;
+        p.previous = null;
+        p.next = null;
     }
 
     fn forgotFn(ptr: *anyopaque, name: spill.Name) void {
@@ -330,7 +355,7 @@ pub const Store = struct {
     }
 
     pub fn deinit(s: *Store) void {
-        std.debug.assert(s.pending_count == 0 and s.pending_bytes == 0);
+        std.debug.assert(s.pending_count == 0 and s.pending_bytes == 0 and s.pending_head == null);
         s.detach();
         for (s.entries.items) |e| s.free(e);
         s.entries.deinit(s.gpa);
@@ -517,12 +542,14 @@ pub const Store = struct {
         if (have) |e| e.borrowers += 1;
         s.pending_bytes += bytes;
         s.pending_count += 1;
-        pending.* = .{ .allocator = a, .prompt = prompt, .born = born, .history_len = history_len, .rewind_at = s.active_rewind_at, .shared = shared, .starts = starts, .spans = spans, .fallback = have, .name = hit.name, .tokens = tokens, .bytes = bytes };
+        pending.* = .{ .allocator = a, .prompt = prompt, .born = born, .history_len = history_len, .rewind_len = rewind_len, .rewind_at = s.active_rewind_at, .shared = shared, .starts = starts, .spans = spans, .fallback = have, .name = hit.name, .tokens = tokens, .bytes = bytes, .epoch = s.restore_epoch };
+        s.linkPending(&pending.*.?);
         return error.RestorePending;
     }
 
     /// Advances one bounded family upload, then publishes either the verified state or the original fallback.
     pub fn pollRestore(s: *Store, p: *PendingRestore) !?Lookup {
+        if (p.epoch != s.restore_epoch or s.tier == null) return try s.staleRestore(p);
         if (p.reader == null) {
             p.reader = s.family.vtable.spill_read_async.?(s.family.ptr, s.tier.?, p.name) catch |err| {
                 if (err == error.ReadBusy) return null;
@@ -567,6 +594,7 @@ pub const Store = struct {
 
     fn finishRestore(s: *Store, p: *PendingRestore, candidate: ?*Entry) !Lookup {
         s.active_rewind_at = p.rewind_at;
+        s.unlinkPending(p);
         const fallback = p.fallback;
         s.pending_bytes -= p.bytes;
         s.pending_count -= 1;
@@ -583,6 +611,7 @@ pub const Store = struct {
     }
 
     pub fn cancelRestore(s: *Store, p: *PendingRestore) void {
+        s.unlinkPending(p);
         if (p.reader) |r| r.vtable.cancel(r.ptr);
         p.reader = null;
         s.pending_bytes -= p.bytes;
@@ -591,6 +620,20 @@ pub const Store = struct {
         p.tokens = &.{};
         if (p.fallback) |e| s.release(e);
         p.fallback = null;
+    }
+
+    fn staleRestore(s: *Store, p: *PendingRestore) !Lookup {
+        s.cancelRestore(p);
+        const endpoint = if (s.rules.planned) s.startAt(p.starts, p.history_len) else p.history_len;
+        const rewind = if (s.rules.planned) s.startAt(p.starts, p.rewind_len -| s.rules.lookahead) else p.rewind_len -| s.rules.lookahead;
+        const endpoint_bytes = if (endpoint > 0 and (endpoint < p.prompt.len or (s.rules.warm != .off and endpoint == p.prompt.len)) and endpoint + s.rules.lookahead <= p.prompt.len) s.family.vtable.bytes(s.family.ptr, endpoint) else 0;
+        const rewind_bytes = if (rewind > 0 and rewind < p.prompt.len and rewind + s.rules.lookahead <= p.prompt.len and s.usable(rewind, p.starts)) s.family.vtable.bytes(s.family.ptr, rewind) else 0;
+        const priority_bytes = if (endpoint_bytes <= s.budget) endpoint_bytes else 0;
+        s.active_rewind_at = if (p.prompt.len >= s.rules.min_prompt and rewind_bytes > 0 and rewind != endpoint and rewind_bytes <= s.budget - priority_bytes) rewind else 0;
+        if (s.active_rewind_at > 0) {
+            if (s.keptNear(p.prompt, p.starts, p.spans, s.active_rewind_at)) |at| s.active_rewind_at = at;
+        }
+        return s.finishLookup(p.allocator, p.prompt, p.born, p.history_len, p.shared, p.starts, p.spans, null, endpoint, endpoint_bytes);
     }
 
     fn finishLookup(s: *Store, a: Allocator, prompt: []const u32, born: u32, history_len: u32, shared: []const u32, starts: []const u32, spans: []const modes.Span, e: ?*Entry, endpoint: u32, endpoint_bytes: u64) !Lookup {
@@ -628,6 +671,7 @@ pub const Store = struct {
 
     /// Every kept state goes after a weight change, and learned states on disk stop being read: old arithmetic.
     pub fn clear(s: *Store) void {
+        s.restore_epoch +%= 1;
         for (s.entries.items) |e| e.expired = true;
         s.collectExpired();
         s.shared_keys.clearRetainingCapacity();
