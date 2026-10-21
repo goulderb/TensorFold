@@ -551,6 +551,9 @@ pub const Store = struct {
     pub fn pollRestore(s: *Store, p: *PendingRestore) !?Lookup {
         if (p.epoch != s.restore_epoch or s.tier == null) return try s.staleRestore(p);
         if (p.reader == null) {
+            if (s.find(p.prompt, p.starts, p.spans)) |kept| {
+                if (kept.at >= p.name.at) return try s.finishRestore(p, kept);
+            }
             p.reader = s.family.vtable.spill_read_async.?(s.family.ptr, s.tier.?, p.name) catch |err| {
                 if (err == error.ReadBusy) return null;
                 return try s.failedRestore(p, err);

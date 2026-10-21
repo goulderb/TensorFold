@@ -14,6 +14,7 @@ pub const Family = struct {
     busy: bool = false,
     fail: bool = false,
     polls: u32 = 0,
+    starts: u32 = 0,
     hold: std.atomic.Value(bool) = .init(false),
     cancelled: u32 = 0,
 
@@ -50,6 +51,7 @@ pub const Family = struct {
         const f = of(ptr);
         if (f.busy) return error.ReadBusy;
         try std.testing.expect(tier == f.tier and selected.eql(name));
+        f.starts += 1;
         f.active = true;
         return .{ .ptr = f, .vtable = &.{ .poll = poll, .cancel = cancel } };
     }
@@ -142,6 +144,29 @@ test "async disk lookup publishes only after terminal poll" {
     try std.testing.expectEqual(@as(u64, 1), x.store.spill_counts.read_back);
     x.store.release(result.entry.?);
     gpa.free(result.marks);
+}
+
+test "a second pending request reuses the first completed prefix without another read" {
+    const x = try Fixture.init();
+    defer x.deinit();
+    var first: ?pc.PendingRestore = null;
+    var second: ?pc.PendingRestore = null;
+    try std.testing.expectError(error.RestorePending, x.lookup(&first));
+    try std.testing.expectError(error.RestorePending, x.lookup(&second));
+    try std.testing.expect((try x.store.pollRestore(&first.?)) == null);
+    const one = (try x.store.pollRestore(&first.?)).?;
+    first = null;
+    const two = (try x.store.pollRestore(&second.?)).?;
+    second = null;
+    try std.testing.expect(one.entry == two.entry);
+    try std.testing.expectEqual(@as(u32, 1), x.family.starts);
+    try std.testing.expectEqual(@as(u64, 1), x.store.spill_counts.read_back);
+    try std.testing.expectEqual(@as(u64, 0), x.store.pending_bytes);
+    try std.testing.expectEqual(@as(usize, 0), x.store.pending_count);
+    x.store.release(one.entry.?);
+    x.store.release(two.entry.?);
+    gpa.free(one.marks);
+    gpa.free(two.marks);
 }
 
 test "busy async reader waits without a new tier lookup and cancellation frees its reservation" {
