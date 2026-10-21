@@ -1,6 +1,8 @@
 //! Where a prompt pass cuts its chunks: a row's bits are the same wherever the cuts fall, so states keep at any row.
 const std = @import("std");
 
+pub const shared_rows: usize = 512;
+
 /// The end of the chunk starting at `at`: `step` rows on, the prompt's end, or the first of `cuts` before them.
 pub fn end(at: usize, len: usize, step: usize, cuts: []const u32) usize {
     var e = @min(len, at + step);
@@ -22,4 +24,20 @@ test "chunks run `step` rows from where a pass starts, and a cut ends one" {
     try std.testing.expectEqual(@as(usize, 4148), end(2100, 5000, step, &.{})); // a resumed pass: 2048 rows from its start
     try std.testing.expectEqual(@as(usize, 2048), end(0, 5000, step, &.{2048})); // a cut at a chunk's end adds none
     try std.testing.expectEqual(@as(usize, 1000), end(0, 1000, step, &.{ 0, 1000 })); // cuts at the start or end cut nothing
+}
+
+test "shared prompt turns stay bounded and retain fallback and exact history cuts" {
+    var at: usize = 0;
+    var fallback = false;
+    var history = false;
+    while (at < 6250) {
+        const next = end(at, 6250, shared_rows, &.{ 4096, 6244 });
+        try std.testing.expect(next > at and next - at <= 512);
+        fallback = fallback or next == 4096;
+        history = history or next == 6244;
+        at = next;
+    }
+    try std.testing.expect(fallback and history);
+    try std.testing.expectEqual(@as(usize, 6250), at);
+    try std.testing.expectEqual(@as(usize, 6244), end(6144, 6250, shared_rows, &.{ 4096, 6244 }));
 }

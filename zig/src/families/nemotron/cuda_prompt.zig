@@ -115,7 +115,7 @@ pub fn chunksFrom(e: *Engine, prompt: []const u32, from: usize, dump: ?*Dump, he
             return error.Cancelled;
         }
         try e.beforeChunk(cancel);
-        const step: usize = if (wide and background) state.yield_rows else if (wide and inside(keep, s, s + e.pass) < marks.max) e.pass else state.prefill_rows; // 2,048 rows where a wide pass would crowd the scan's marks
+        const step: usize = if (wide and background) state.yield_rows else if (e.tp_link != null) cuts.shared_rows else if (wide and inside(keep, s, s + e.pass) < marks.max) e.pass else state.prefill_rows;
         var end = cuts.end(s, prompt.len, step, if (keep) |k| (if (k.cut) k.at else &.{}) else &.{});
         // the decision row ends its chunk: the rows after it read the lessons it latched
         if (e.decide != lesson_route.none and e.decide >= s and e.decide + 1 < end) end = @intCast(e.decide + 1);
