@@ -98,6 +98,70 @@ test "production target warmup covers every shared width with at most two sixtee
     }
 }
 
+test "canonical Engine.verifyShared stages five 8-row windows and refuses a reduced allocation" {
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    const kda_block = @import("cuda_kda_block.zig");
+    var d = Memory.driver();
+    const c = config.Config{};
+    var layer: weights.Layer = undefined;
+    var k: kda_block.Layer = undefined;
+    k.qkv = .{ .mxfp8 = .{ .mode = .mxfp8, .codes = 1, .scales = 2, .n = 384, .k = @intCast(c.hidden), .npad = 384 } };
+    layer.mixer = .{ .kda = k };
+    layer.ffn = .{ .dense = undefined };
+    var layers = [_]weights.Layer{layer};
+    const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try shard.Share.of(&c, 0, 2), .layers = &layers };
+    var dr: dflash.Drafter = .{ .gpa = std.testing.allocator, .d = &d, .module = undefined, .k = undefined, .weights = undefined, .split = false, .ff = 0, .rank = 0, .world = 1 };
+    defer dr.slots.deinit(std.testing.allocator);
+    var ids: [5][8]u32 = undefined;
+    var outs: [5][8]u32 = undefined;
+    var parts: [5]Part = undefined;
+    for (&parts, &ids, &outs, 0..) |*p, *id, *out, i| {
+        for (id, 0..) |*tok, r| tok.* = @intCast(i * 8 + r + 1);
+        p.* = .{ .slot = @intCast(i), .ids = id, .out = out };
+    }
+    var e: Engine = undefined;
+    e.full_graphs = null;
+    e.settings = .{ .kv = .bf16 };
+    e.drafter = &dr;
+    e.canonical_owner = true;
+    e.dflash = null;
+    e.gpa = std.testing.allocator;
+    e.d = &d;
+    e.w = w;
+    e.c = c;
+    e.capacity = 64;
+    e.mtp = false;
+    e.pool = null;
+    e.seqs = .empty;
+    defer {
+        for (e.seqs.items) |q| if (q) |s| {
+            s.st.deinit();
+            e.gpa.destroy(s);
+        };
+        e.seqs.deinit(e.gpa);
+    }
+    try std.testing.expectEqual(@as(usize, 8), e.targetRows());
+    try std.testing.expectEqual(@as(usize, 64), dflash.STEP_ROWS);
+    {
+        var small = try fw.Buffers.initShared(&d, &w, 32, 64);
+        defer small.deinit();
+        try small.enableTaps(&d);
+        e.bs = small;
+        try std.testing.expectError(error.WindowTooWide, e.verifyShared(&parts));
+    }
+    {
+        var big = try fw.Buffers.initShared(&d, &w, 64, 64);
+        defer big.deinit();
+        try big.enableTaps(&d);
+        e.bs = big;
+        try std.testing.expectEqual(@as(usize, 64), e.sharedCapacity());
+        var wide: [9]u32 = @splat(1);
+        var wide_out: [9]u32 = undefined;
+        const overflow = [_]Part{.{ .slot = 0, .ids = &wide, .out = &wide_out }};
+        try std.testing.expectError(error.WindowTooWide, e.verifyShared(&overflow));
+    }
+}
+
 pub const Part = types.Part;
 pub const DraftPart = struct { slot: u32, position: u64, pending: u32, depth: u32 };
 pub const DraftResult = dflash_mod.BatchResult;
@@ -222,7 +286,8 @@ pub const Engine = struct {
         // Canonical --drafter is the default owner. Env-selected DFlash stays only when --drafter is absent.
         // Read content and decode effective precision before the paired startup vote and before any warmup.
         const startup = try a.alloc(u32, world);
-        const with_mtp = settings.draft == .mtp;
+        const with_mtp = ranks.targetMtp(o.drafter != null, settings.draft);
+        const load_draft_head = ranks.loadDraftHead(o.drafter != null, settings.draft);
         const checkpoint_digest = try ranks.artifact(a, io, checkpoint);
         var fp = ranks.Fingerprint.of(world, rank, settings, o.capacity, with_mtp, try ranks.hashFile(a, io, cfg_path), try ranks.hashFile(a, io, "/proc/self/exe"), checkpoint_digest);
         if (o.vision) |lim| ranks.mediaFingerprint(&fp, lim);
@@ -313,7 +378,7 @@ pub const Engine = struct {
         errdefer if (loaded) |*w| w.deinit();
         var load_problem: ?anyerror = null;
         loaded = load: {
-            const w = weights.load(gpa, io, d, stream, wt, checkpoint, c, share, layers, with_mtp) catch |err| {
+            const w = weights.load(gpa, io, d, stream, wt, checkpoint, c, share, layers, load_draft_head) catch |err| {
                 load_problem = err;
                 break :load null;
             };

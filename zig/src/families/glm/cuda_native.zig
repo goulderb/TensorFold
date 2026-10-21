@@ -177,6 +177,7 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
             break :blk null;
         };
         if (!try own.e.pairedReady(draft_problem == null)) return draft_problem orelse error.PeerDrafterOpen;
+        if (own.e.drafter) |dr| try dr.restart(0, 0);
     }
     own.link = try follow.Link.init(gpa, ctx.d, &own.lib, own.comm, own.e.stream, try linkCapacity(cap, o.vision));
     errdefer own.link.deinit();
@@ -254,7 +255,7 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .rows = if (set.draft_profile.enabled) glm_lanes.max_rows else 1 + engine.max_drafts,
         .trim = if (set.draft_profile.enabled) own.e.settings.draft_profile.rowPolicy() else null,
         .proposers = if (set.draft_profile.enabled) own.e.settings.draft_profile.proposers() else null,
-        .stream_bytes = own.e.seqBytes() + (if (o.drafter != null) dflash.ring_bytes else 0) + (if (own.images) |v| v.streamBytes() else @as(usize, 0)), // each stream past the first makes its own sequence on every rank
+        .stream_bytes = extraStreamBytes(@intCast(own.e.seqBytes()), o.drafter != null, if (own.images) |v| v.streamBytes() else 0), // each stream past the first makes its own sequence on every rank; first canonical ring is allocated at load
         .lane_limit = laneLimit(own.e.drafter != null, own.e.dflash != null, own.e.pool != null),
         .free_streams = 1, // the first is the sequence the engine made
         .ctx = own,
@@ -278,6 +279,32 @@ pub fn laneLimit(canonical: bool, legacy: bool, pool: bool) u32 {
     if (legacy) limit = @min(limit, @as(u32, @intCast(engine.max_shared)));
     if (pool) limit = @min(limit, @as(u32, @intCast(@import("cuda_kv_extent.zig").max_slots)));
     return limit;
+}
+
+pub fn extraStreamBytes(seq_bytes: usize, canonical: bool, images: usize) usize {
+    return seq_bytes + (if (canonical) dflash.ring_bytes else 0) + images;
+}
+
+pub fn unchargedFirstRing(canonical: bool, allocated: bool) usize {
+    if (!canonical or allocated) return 0;
+    return dflash.ring_bytes;
+}
+
+test "canonical first ring is reserved before extra-stream admission" {
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    var d = Memory.driver();
+    var dr: dflash.Drafter = .{ .gpa = std.testing.allocator, .d = &d, .module = undefined, .k = undefined, .weights = undefined, .split = false, .ff = 0, .rank = 0, .world = 1 };
+    defer dr.slots.deinit(std.testing.allocator);
+    try std.testing.expectEqual(dflash.ring_bytes, unchargedFirstRing(true, false));
+    try std.testing.expectEqual(@as(usize, 0), unchargedFirstRing(true, true));
+    try std.testing.expectEqual(@as(usize, 0), unchargedFirstRing(false, false));
+    try dr.restart(0, 0);
+    defer if (dr.slots.items.len > 0) if (dr.slots.items[0].ring) |*r| r.free();
+    try std.testing.expect(dr.slots.items[0].ring != null);
+    try std.testing.expectEqual(@as(usize, 0), unchargedFirstRing(true, dr.slots.items[0].ring != null));
+    const seq: usize = 4096;
+    try std.testing.expectEqual(seq + dflash.ring_bytes, extraStreamBytes(seq, true, 0));
+    try std.testing.expectEqual(seq, extraStreamBytes(seq, false, 0));
 }
 
 test "canonical admission includes MAX_S and pool bounds" {

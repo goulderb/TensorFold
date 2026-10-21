@@ -246,16 +246,31 @@ test "canonical owner ignores leftover DFlash env and still refuses active bad s
             if (std.mem.eql(u8, name, "TF_GLM_DFLASH_DIR")) return "/draft";
             return null;
         }
+        fn leftover_profile(name: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "TF_GLM_DRAFT_PROFILE")) return "production";
+            if (std.mem.eql(u8, name, "TF_GLM_DRAFTER")) return "dflash2";
+            if (std.mem.eql(u8, name, "TF_GLM_DFLASH_DIR")) return "/draft";
+            return null;
+        }
     };
     var problem: []const u8 = "";
     try std.testing.expectError(error.BadSetting, Settings.read(Values.leftover, &problem));
     try std.testing.expectEqualStrings("TF_GLM_DFLASH_DIR is required for dflash2", problem);
     const canonical = try Settings.readForOwner(Values.leftover, &problem, true);
     try std.testing.expectEqual(ranks.Drafter.mtp, canonical.draft);
+    try std.testing.expect(ranks.loadDraftHead(true, canonical.draft));
+    try std.testing.expect(!ranks.targetMtp(true, canonical.draft));
     try std.testing.expectError(error.BadSetting, Settings.readForOwner(Values.leftover_and_bad_tile, &problem, true));
     try std.testing.expectEqualStrings("TF_GLM_PROMPT_TILE: 0 or 1", problem);
     const ignored = try Settings.readForOwner(Values.leftover_with_dir, &problem, true);
     try std.testing.expectEqual(ranks.Drafter.mtp, ignored.draft);
     const legacy = try Settings.read(Values.leftover_with_dir, &problem);
     try std.testing.expectEqual(ranks.Drafter.dflash2, legacy.draft);
+    const profiled = try Settings.readForOwner(Values.leftover_profile, &problem, true);
+    try std.testing.expect(profiled.draft_profile.enabled);
+    try std.testing.expectEqual(ranks.Drafter.mtp, profiled.draft);
+    try std.testing.expect(ranks.loadDraftHead(true, profiled.draft));
+    try std.testing.expect(!ranks.targetMtp(true, profiled.draft));
+    const legacy_profile = try Settings.read(Values.leftover_profile, &problem);
+    try std.testing.expectEqual(ranks.Drafter.dflash2, legacy_profile.draft);
 }

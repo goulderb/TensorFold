@@ -22,6 +22,15 @@ pub fn effectiveDraft(mode: Drafter, enabled: bool) !Drafter {
     return if (enabled) mode else .off;
 }
 
+/// Canonical --drafter loads the draft head without enabling target MTP execution.
+pub fn loadDraftHead(canonical: bool, draft: Drafter) bool {
+    return canonical or draft == .mtp;
+}
+
+pub fn targetMtp(canonical: bool, draft: Drafter) bool {
+    return draft == .mtp and !canonical;
+}
+
 /// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
 pub const Settings = struct {
     kv: cache.Format = .bf16,
@@ -178,7 +187,7 @@ pub const Settings = struct {
             }
         }
         s.draft_profile = try profile.Settings.read(get, problem);
-        if (s.draft_profile.enabled) {
+        if (s.draft_profile.enabled and !canonical) {
             s.draft = .dflash2;
             s.dflash_verify = .dflash7;
         }
@@ -196,7 +205,7 @@ pub const Settings = struct {
                 };
             }
         }
-        if (s.draft_profile.enabled and s.draft != .dflash2) {
+        if (s.draft_profile.enabled and s.draft != .dflash2 and !canonical) {
             problem.* = "TF_GLM_DRAFT_PROFILE=production requires TF_GLM_DRAFTER=dflash2";
             return error.BadSetting;
         }
