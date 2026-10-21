@@ -665,11 +665,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         // rules and budget from the family's snap_* declarations (cuda_snaps.zig)
         const image: ?*const pc.rows.Image = if (F == nemotron.native) &cuda_disk.image else null; // its disk rows
         const copies: pc.Snapshots = .{ .ptr = loaded.target, .vtable = if (F == nemotron.native and disk != null) &nemotron_spill_snaps else &snaps.Snaps(F, image).vtable };
-        var rules = snaps.cacheRules(F);
-        if (disk != null) {
-            rules.planned = true;
-            rules.grid = snaps.spillGrid(F);
-        }
+        const rules = if (disk != null) snaps.spillRules(F) else snaps.cacheRules(F);
         store.* = pc.Store.init(gpa, copies, rules, store_cache);
         errdefer {
             const rows = store.disk;

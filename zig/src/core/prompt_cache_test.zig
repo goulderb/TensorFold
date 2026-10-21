@@ -16,6 +16,29 @@ pub fn fresh(prompt: []const u32) u64 {
     return sum;
 }
 
+test "exact history retains the planned fallback for changed suffixes" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .planned = true, .grid = 4096, .lookahead = 1, .min_prompt = 0, .exact_history = true }, 1 << 20);
+    defer s.deinit();
+    const original = try a.alloc(u32, 6250);
+    for (original, 0..) |*t, i| t.* = @intCast(i + 1);
+    const cold = try s.begin(a, original, 6244, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqualSlices(u32, &.{ 4096, 6244 }, cold.marks);
+    try std.testing.expectEqual(fresh(original), f.pass(&s, original, cold));
+    const repeat = try s.begin(a, original, 6244, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 6244), repeat.from);
+    try std.testing.expectEqual(fresh(original), f.pass(&s, original, repeat));
+    const changed = try a.dupe(u32, original);
+    changed[6236] += 10000;
+    const branch = try s.begin(a, changed, 6244, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 4096), branch.from);
+    try std.testing.expectEqual(fresh(changed), f.pass(&s, changed, branch));
+}
+
 test "a growing conversation resumes each turn where the last one's history ended, and equals a fresh pass" {
     const gpa = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(gpa);

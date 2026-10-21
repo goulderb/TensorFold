@@ -109,6 +109,8 @@ pub const Rules = struct {
     planned: bool = false,
     /// A planned family's own zero-anchored chunk rows, its starts when a request names none (0: none).
     grid: u32 = 0,
+    /// Exact-row families may retain the history endpoint as well as their planned fallback cut.
+    exact_history: bool = false,
     /// A mark other than the history's is kept only this far from every other mark and the resume point.
     min_gap: u32 = 256,
     /// Shorter prompts keep only the history's mark, at a chunk end (`chunk`); a planned family's marks add no call.
@@ -366,7 +368,7 @@ pub const Store = struct {
     /// Whether a state at `at` may start or end a prompt pass: anywhere, or a chunk start for planned families.
     fn usable(s: *const Store, at: u32, starts: []const u32) bool {
         if (at == 0) return false;
-        if (!s.rules.planned or s.startAt(starts, at) == at) return true;
+        if (!s.rules.planned or (s.rules.exact_history and starts.len == 0) or s.startAt(starts, at) == at) return true;
         // A short chat history sits before the first grid point. The saved KV is a full prefix.
         return s.rules.grid > 0 and starts.len == 0 and at < s.rules.grid;
     }
@@ -611,6 +613,13 @@ pub const Store = struct {
                 if (near) continue;
             }
             if (std.mem.indexOfScalar(u32, out.items, at) == null) try out.append(a, at);
+        }
+        if (s.rules.exact_history and starts.len == 0 and history > from and history < prompt.len and
+            history + s.rules.lookahead <= prompt.len and std.mem.indexOfScalar(u32, out.items, history) == null)
+        {
+            var previous_cut = from;
+            for (out.items) |cut| previous_cut = @max(previous_cut, cut);
+            if (history -| previous_cut >= s.rules.min_gap) try out.append(a, history);
         }
         std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
         return out.toOwnedSlice(a);
