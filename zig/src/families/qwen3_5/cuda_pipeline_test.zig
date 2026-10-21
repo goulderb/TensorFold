@@ -24,18 +24,25 @@ test "pipeline rejects invalid placement and capacity before opening checkpoint 
 
 test "uneven stage budgets count only their own recurrent and KV state" {
     const model = try admitted();
-    const first = try pipeline.memoryBudget(.{ .weights_bytes = 1024, .staging_bytes = 256 }, model, .{ .first = 0, .end = 3, .total = 40 }, 4096, 1);
-    const last = try pipeline.memoryBudget(.{ .weights_bytes = 1024, .staging_bytes = 256 }, model, .{ .first = 3, .end = 40, .total = 40 }, 4096, 1);
-    const recurrence = 32 * 128 * 128 * 4;
-    const tail = 3 * 8192 * 2;
-    const log = 32 * 4 + 32 * 128 * 4 + 16 * 128 * 2 + tail;
-    const kv = 10 * 2 * 2 * 4096 * 256 * 2;
-    try std.testing.expectEqual(@as(usize, 3 * (recurrence + tail) + ((3 * log + 255) / 256) * 256), first.stream_bytes);
-    try std.testing.expectEqual(@as(usize, 27 * (recurrence + tail) + ((27 * log + 255) / 256) * 256 + kv), last.stream_bytes);
+    const first_place: checkpoint.Placement = .{ .first = 0, .end = 3, .total = 40 };
+    const last_place: checkpoint.Placement = .{ .first = 3, .end = 40, .total = 40 };
+    const first = try pipeline.memoryBudget(.{ .weights_bytes = 1024, .staging_bytes = 256 }, model, first_place, 4096, 1);
+    const last = try pipeline.memoryBudget(.{ .weights_bytes = 1024, .staging_bytes = 256 }, model, last_place, 4096, 1);
+    const g_first = try first_place.localGeometry(model.geometry);
+    const g_last = try last_place.localGeometry(model.geometry);
+    const copies = engine.streamStateCopies(model.numerics());
+    try std.testing.expectEqual(@as(usize, 2), copies);
+    const log_rows = engine.streamLogRows(model.numerics());
+    try std.testing.expectEqual(copies * g_first.stateBytes() + g_first.kvBytes(4096, false) + engine.aligned(g_first.logBytes(log_rows)), first.stream_bytes);
+    try std.testing.expectEqual(copies * g_last.stateBytes() + g_last.kvBytes(4096, false) + engine.aligned(g_last.logBytes(log_rows)), last.stream_bytes);
+    try std.testing.expectEqual(@as(usize, 1), engine.streamStateCopies(.hf_dense_bf16));
+    try std.testing.expectEqual(first.stream_bytes, g_first.stateBytes() + g_first.kvBytes(4096, false) + engine.aligned(g_first.logBytes(log_rows)) + g_first.stateBytes());
+    try std.testing.expectEqual(g_first.stateBytes() + g_first.kvBytes(4096, false) + engine.aligned(g_first.logBytes(engine.streamLogRows(.hf_dense_bf16))), first.stream_bytes - g_first.stateBytes());
+    try std.testing.expectEqual(pipeline.floor_bytes, 1536 << 20);
     try std.testing.expectEqual(first.steady_bytes + pipeline.floor_bytes, first.required_bytes);
     try pipeline.checkCapacity(first.required_bytes, first.required_bytes);
     try std.testing.expectError(error.InsufficientGpuMemory, pipeline.checkCapacity(first.required_bytes - 1, first.required_bytes));
-    try std.testing.expectError(error.Overflow, pipeline.memoryBudget(.{ .weights_bytes = std.math.maxInt(usize), .staging_bytes = 256 }, model, .{ .first = 0, .end = 3, .total = 40 }, 4096, 1));
+    try std.testing.expectError(error.Overflow, pipeline.memoryBudget(.{ .weights_bytes = std.math.maxInt(usize), .staging_bytes = 256 }, model, first_place, 4096, 1));
 }
 
 test "session validates the entire append before advancing either stage" {

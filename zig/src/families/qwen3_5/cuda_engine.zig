@@ -47,6 +47,14 @@ fn hfOrder(numerics: checkpoint.Numerics) bool {
     return numerics == .hf_modelopt or numerics == .hf_dense_bf16;
 }
 
+pub fn streamStateCopies(numerics: checkpoint.Numerics) usize {
+    return if (numerics == .hf_dense_bf16) 1 else 2;
+}
+
+pub fn streamLogRows(numerics: checkpoint.Numerics) usize {
+    return if (hfOrder(numerics)) 1 else most_window;
+}
+
 pub fn validateMoeMath(admitted: checkpoint.Admitted, math: MoeMath) !void {
     if (math == .legacy) return;
     const g = admitted.geometry;
@@ -952,8 +960,8 @@ pub const Engine = struct {
 
     /// A stream's device bytes at a `cap`-token window: recurrences, convolution tails, keys and values, taps, log.
     pub fn streamBytes(e: *const Engine, cap: usize) usize {
-        const state = if (e.numerics == .hf_dense_bf16) e.g.stateBytes() else 2 * e.g.stateBytes();
-        return state + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + e.g.logBytes(if (hfOrder(e.numerics)) 1 else most_window);
+        const state = streamStateCopies(e.numerics) * e.g.stateBytes();
+        return state + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + e.g.logBytes(streamLogRows(e.numerics));
     }
 
     /// A stream's tap ring: tap_rows rows of the tapped layers' residuals.

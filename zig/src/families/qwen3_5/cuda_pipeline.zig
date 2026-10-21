@@ -48,7 +48,8 @@ pub fn memoryBudget(plan: weights.Plan, admitted: checkpoint.Admitted, placement
     if (context == 0 or context > admitted.geometry.context or streams == 0) return error.InvalidContext;
     const g = try placement.localGeometry(admitted.geometry);
     const scratch = try engine.Engine.scratchBytes(admitted, placement);
-    const per_stream = g.stateBytes() + g.kvBytes(context, false) + engine.aligned(g.logBytes(if (admitted.numerics() == .hf_modelopt) 1 else engine.most_window));
+    const state = try std.math.mul(usize, engine.streamStateCopies(admitted.numerics()), g.stateBytes());
+    const per_stream = try std.math.add(usize, try std.math.add(usize, state, g.kvBytes(context, false)), engine.aligned(g.logBytes(engine.streamLogRows(admitted.numerics()))));
     const states = try std.math.mul(usize, per_stream, streams);
     const fixed = try std.math.add(usize, plan.weights_bytes, scratch);
     const steady = try std.math.add(usize, fixed, states);
