@@ -194,6 +194,7 @@ pub const Draft = struct {
     }
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, e: *E, dir: []const u8) !*Draft {
+        _ = try e.vocabulary();
         const c = try Config.read(gpa, io, dir, e.g);
         const d = try gpa.create(Draft);
         errdefer gpa.destroy(d);
@@ -413,7 +414,7 @@ pub const Draft = struct {
         // the mask rows' logits through the target's head, their best tokens and their selector projections
         const rows = B - 1;
         try d.norm(d.h + c.hidden * 2, d.w.final_norm, d.x, rows);
-        try e.projSums(e.head, d.x, d.xs, d.logits, rows, rows > 16, 0);
+        try e.projSums(try e.vocabulary(), d.x, d.xs, d.logits, rows, rows > 16, 0);
         try e.draws.logprobRows(e.stream, d.logits, c.vocab, d.picks, @intCast(c.topk), false, d.words, rows);
         try d.proj(d.w.selector, d.x, d.hp, rows);
         const st = d.staged.bytes;

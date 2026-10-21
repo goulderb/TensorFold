@@ -53,13 +53,17 @@ pub const Cache = struct {
 
     pub fn initWithLayout(gpa: std.mem.Allocator, e: *const Engine, cap: usize, layout: GdnLayout) !Cache {
         try layout.validate(e.numerics);
+        if (e.numerics == .hf_dense_bf16) {
+            try e.validateHiddenProfile();
+            if (cap == 0 or cap > engine.hidden.max_rows) return error.InvalidQwenHiddenShape;
+        }
         var state = try DeviceBuffer.alloc(e.d, e.g.stateBytes());
         errdefer state.free();
         try state.fill8(0, null);
         var kv = try DeviceBuffer.alloc(e.d, e.g.kvBytes(cap, e.kv8));
         errdefer kv.free();
         try kv.fill8(0, null); // touched now, not as the first request's keys land (the driver commits on first touch)
-        var log = try DeviceBuffer.alloc(e.d, e.g.logBytes(if (e.numerics == .hf_modelopt) 1 else engine.most_window));
+        var log = try DeviceBuffer.alloc(e.d, e.g.logBytes(if (e.numerics != .mlx_sanitized) 1 else engine.most_window));
         errdefer log.free();
         try log.fill8(0, null);
         var tap: ?DeviceBuffer = null;
@@ -68,7 +72,7 @@ pub const Cache = struct {
             try tap.?.fill8(0, null);
         }
         errdefer if (tap) |*t| t.free();
-        return .{ .gdn_layout = layout, .owner = e, .state = state, .kv = kv, .tap = tap, .log = log, .cap = cap, .logits = try gpa.alloc(u16, e.g.vocab) };
+        return .{ .gdn_layout = layout, .owner = e, .state = state, .kv = kv, .tap = tap, .log = log, .cap = cap, .logits = try gpa.alloc(u16, if (e.numerics == .hf_dense_bf16) 0 else e.g.vocab) };
     }
 
     /// Ready for another stream: no rows, the recurrences and tails zero (on the engine's stream, before its forwards).
@@ -101,7 +105,7 @@ pub const Cache = struct {
     /// Keeps `path` (window rows, ascending from 0): the state as that chain would leave it, a tree's keys moved down.
     pub fn keep(self: *Cache, e: *Engine, path: []const u32) !void {
         if (self.hidden_invalid) return error.QwenHiddenNeedsReset;
-        if (e.numerics == .hf_modelopt) return error.UnsupportedQwenRewind;
+        if (e.numerics != .mlx_sanitized) return error.UnsupportedQwenRewind;
         const last = self.last orelse return error.NothingToKeep;
         if (path.len == 0 or path.len > last.rows or path[0] != 0) return error.NothingToKeep;
         var p: Path = .{ .n = @intCast(path.len), .rows = @splat(0) };

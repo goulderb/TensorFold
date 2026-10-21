@@ -337,7 +337,7 @@ pub fn load(e: *Engine, ck: *core.Checkpoint, stage: *DeviceBuffer) !void {
     e.embed_w = try embedWords(e, ck, stage, m);
     e.embed_s = try tensor(e, ck, "{s}embed_tokens.scales", .{m}, .bf16, &.{ g.vocab, g.hidden / 64 });
     e.embed_b = try tensor(e, ck, "{s}embed_tokens.biases", .{m}, .bf16, &.{ g.vocab, g.hidden / 64 });
-    e.head = if (g.tied) try linear(e, e, ck, stage, m, "embed_tokens", g.vocab, g.hidden, g.bits.head) else try linear(e, e, ck, stage, "language_model.", "lm_head", g.vocab, g.hidden, g.bits.head);
+    e.terminal_weights = .{ .vocabulary = if (g.tied) try linear(e, e, ck, stage, m, "embed_tokens", g.vocab, g.hidden, g.bits.head) else try linear(e, e, ck, stage, "language_model.", "lm_head", g.vocab, g.hidden, g.bits.head) };
     e.final_norm = try tensor(e, ck, "{s}norm.weight", .{m}, .bf16, &.{g.hidden});
     const conv = g.convWidth();
     for (e.layers, 0..) |*l, i| {

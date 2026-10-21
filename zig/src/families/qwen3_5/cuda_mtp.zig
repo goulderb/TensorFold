@@ -101,6 +101,7 @@ pub const Mtp = struct {
     const staged_len = anc_at + max_lanes * anc_stride * 4;
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, e: *E, dir: []const u8, capacity: usize) !*Mtp {
+        _ = try e.vocabulary();
         if (!e.g.moe()) return error.NotRouted;
         const d = try gpa.create(Mtp);
         errdefer gpa.destroy(d);
@@ -295,7 +296,7 @@ pub const Mtp = struct {
     /// Rows [first, first + n) of x through the target's head: their logits and best tokens' words, row 0's pick.
     fn draw(d: *Mtp, first: usize, n: usize, cands: bool) !void {
         const e = d.e;
-        try d.proj(e.head, d.x + first * e.g.hidden * 2, d.logits, n);
+        try d.proj(try e.vocabulary(), d.x + first * e.g.hidden * 2, d.logits, n);
         try e.run(e.fns.argmax, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, .{ d.logits, @as(c_int, @intCast(e.g.vocab)), d.tok });
         if (cands and d.trees) try e.draws.logprobRows(e.stream, d.logits, e.g.vocab, d.picks, ranks, false, d.words, n);
     }

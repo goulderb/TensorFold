@@ -379,10 +379,13 @@ The weight loader consumes that manifest through the existing TensorFold BF16
 packer, projection views and parameter conversion. A separate binding owner
 reuses the existing HF operators without the ModelOpt-only expert bundle.
 The shared backbone also gains request-owned hidden output with host lifetime
-and graph-identity tests. Plain BF16 engine execution remains disabled pending
-integration and qualification. No Cloudflare model implementation, checkpoint
-weights, joint-head arithmetic or CUDA kernels are copied. Metadata, primitive
-and weight-only checks do not establish backbone parity or full-engine GPU fit.
+and graph-identity tests. A development-only dense initializer owns BF16 weights,
+separate host vocabulary tables, bounded pinned input staging and existing kernel
+bindings. An explicit terminal-weight union keeps final normalization separate
+from vocabulary projection. Ordinary plain BF16 loading and native serving remain
+closed. No Cloudflare model implementation, checkpoint weights, joint-head
+arithmetic or CUDA kernels are copied. CPU, primitive and weight-only checks do
+not establish backbone parity or full-engine GPU fit.
 Existing Qwen/Hugging Face, TensorFold and
 transitive notices remain applicable.
 

@@ -116,6 +116,8 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const startup = b.addObject(.{ .name = "modelopt-startup", .root_module = b.createModule(.{ .root_source_file = b.path("zig/modelopt_startup_compile.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "native", .module = native.engines }} }) });
     _ = startup.getEmittedBin();
     b.step("compile-modelopt-startup", "Compile actual native startup with test-only absent GPU images").dependOn(&startup.step);
+    const clef_bf16 = b.addObject(.{ .name = "clef-bf16-compile", .root_module = b.createModule(.{ .root_source_file = b.path("zig/clef_bf16_compile.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "qwen35", .module = mods.qwen35 }} }) });
+    b.step("compile-clef-bf16", "Compile explicit BF16 initialization and hidden execution without running a device").dependOn(&clef_bf16.step);
     const controls = if (nvcc) |tool| fatbin(b, tool, version.?, .{ .name = "contract_controls", .flags = &.{"-O3"} }, sms) else null;
     @import("qwen_contract.zig").images(b, runner_exe, controls, h3_image, kernels, &images);
     const server_exe = nativeServer(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.qwen35, mods.qwen_vision, mods.tokenizer, build_options, true, strip);

@@ -38,4 +38,7 @@ the fixtures. Cloudflare's original Apache-2.0 license and model card are
 retained in LICENSES/donors/clef-flash-fde727a2/. Local changes add strict BF16
 metadata admission, allocation planning, mapped payload ownership, host row
 gathers, loading through shared Qwen projection components and request-owned
-hidden output from the shared backbone. Native serving remains disabled. No checkpoint weights or Clef model implementation are included.
+hidden output from the shared backbone. An explicit development-only dense
+initializer adds bounded host embedding staging and separate terminal weights.
+Native serving remains disabled. No checkpoint weights or Clef model
+implementation are included.

@@ -24,8 +24,10 @@ Its original Apache-2.0 license and model card are retained in
 `headers/capture.json` record hashes; `headers/provenance.json` bounds the
 capture. Local changes add BF16 metadata admission, allocation planning, mapped
 payload ownership, host row gathers, shared Qwen weight loading and request-owned
-hidden output from the shared backbone. No model implementation, checkpoint
-weights or joint-head arithmetic is copied.
+hidden output from the shared backbone. The development-only dense initializer
+reuses existing kernel bindings, stages bounded host embedding rows and separates
+terminal weights from final normalization. Native serving remains disabled.
+No model implementation, checkpoint weights or joint-head arithmetic is copied.
 
 TensorFold uses [MLX](https://github.com/ml-explore/mlx) and
 [mlx-lm](https://github.com/ml-explore/mlx-lm), MIT License, Copyright © 2023 Apple Inc.

@@ -4,8 +4,10 @@ const layers = @import("cuda_layers.zig");
 
 pub const Bindings = struct {
     image: cuda.Module,
+    glue: cuda.Module,
     lane: cuda.qmmf.Lane,
     pack: cuda.modelopt.Packer,
+    part: u64 = 0,
 
     pub fn load(ctx: *const cuda.Context, fns: *layers.Fns) !Bindings {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -17,16 +19,21 @@ pub const Bindings = struct {
         errdefer lane.unload();
         var pack = try cuda.modelopt.Packer.load(ctx.d);
         errdefer pack.unload();
-        var bound = fns.*;
+        var glue = try cuda.Module.load(ctx.d, cuda.kernels.qwen35);
+        errdefer glue.unload();
+        var bound: layers.Fns = undefined;
+        inline for (@typeInfo(layers.Fns).@"struct".field_names) |name|
+            @field(bound, name) = try glue.function("tf_q35_" ++ name);
         try hf.bind(image, &bound);
         fns.* = bound;
-        return .{ .image = image, .lane = lane, .pack = pack };
+        return .{ .image = image, .glue = glue, .lane = lane, .pack = pack };
     }
 
     pub fn unload(b: *Bindings) void {
         b.pack.unload();
         b.lane.unload();
         b.image.unload();
+        b.glue.unload();
     }
 
     pub fn linear(b: *const Bindings) cuda.qlinear.Linear {

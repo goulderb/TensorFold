@@ -68,5 +68,6 @@ test "phase observers refuse captured execution before a graph can launch" {
     var e: engine.Engine = undefined;
     e.observer = .{ .ptr = &sentinel, .mark = Callback.mark };
     e.captured = true;
-    try std.testing.expectError(error.QwenObserverRequiresEager, e.execute(undefined));
+    e.numerics = .mlx_sanitized;
+    try std.testing.expectError(error.QwenObserverRequiresEager, e.execute(.{ .total = 1, .nseg = 1, .record = false, .prompt = true, .taps = false }));
 }

@@ -409,7 +409,7 @@ const Lanes = struct {
             for (windows[at..][0..n], out[at..][0..n]) |w, o| {
                 for (o.sampled, w.positions, 0..) |*t, p, r| {
                     const mask = if (w.masks.len > 0) w.masks[r * draws.mask_words ..][0..draws.mask_words] else &.{};
-                    t.* = if (masked) try draws.draw(self.gpa, self.e.rowLogits(row + r), w.stream.sampling, p, mask) else self.e.tokens[row + r];
+                    t.* = if (masked) try draws.draw(self.gpa, try self.e.rowLogits(row + r), w.stream.sampling, p, mask) else self.e.tokens[row + r];
                 }
                 @memcpy(o.drafts, w.tokens);
                 row += w.rows();

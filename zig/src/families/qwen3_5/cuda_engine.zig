@@ -1,5 +1,5 @@
 //! Qwen3.5's hybrids on CUDA: qlinear projections, qwen35.cu glue, one captured forward over every stream's window.
-//! Local modifications: refuse metadata-only BF16 execution; retain request-owned normalized hidden rows.
+//! Local modifications: explicit dense BF16 hidden-only initialization and request-owned normalized rows.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -10,6 +10,9 @@ const routed = @import("cuda_routed.zig");
 const checkpoint = @import("cuda_checkpoint.zig");
 const modelopt = @import("cuda_modelopt.zig");
 const hf = @import("cuda_hf.zig");
+const bf16_manifest = @import("cuda_bf16_checkpoint.zig");
+const bf16_weights = @import("cuda_bf16_weights.zig");
+const bf16_bindings = @import("cuda_bf16.zig");
 pub const hidden = @import("cuda_hidden.zig");
 
 pub const Geometry = geometry.Geometry;
@@ -31,6 +34,10 @@ pub const most_verify = 32;
 pub const most_window = 16;
 /// Experimental committed HF prefixes retain the decode operators' row arithmetic.
 pub const hf_prefill_rows = 16;
+
+fn hfOrder(numerics: checkpoint.Numerics) bool {
+    return numerics == .hf_modelopt or numerics == .hf_dense_bf16;
+}
 
 pub fn validateMoeMath(admitted: checkpoint.Admitted, math: MoeMath) !void {
     if (math == .legacy) return;
@@ -102,6 +109,55 @@ const TerminalOutput = struct {
         return pick.token;
     }
 };
+
+test "BF16 initialization owns mappings scratch and bindings through every allocation failure" {
+    try @import("cuda_bf16_init_test.zig").exercise(Engine.initBf16WithBinder);
+}
+
+test "BF16 constructor and owned runtime bodies are compiled on the host" {
+    std.mem.doNotOptimizeAway(&Engine.initBf16);
+    std.mem.doNotOptimizeAway(&Engine.initBf16Inspected);
+    std.mem.doNotOptimizeAway(&Engine.gatherInput);
+    std.mem.doNotOptimizeAway(&Engine.gatherOutputRows);
+    std.mem.doNotOptimizeAway(&Engine.deinit);
+}
+
+test "BF16 budgeting and scratch use pinned dense widths without a vocabulary allocation" {
+    const g = try @import("cuda_bf16_config.zig").parse(std.testing.allocator, @embedFile("fixtures/clef_flash/config.json"));
+    var plan: bf16_manifest.Plan = undefined;
+    plan.geometry = g;
+    plan.budget = .{ .device_weights = 13_879_009_280, .device_load_stage = 100_663_296, .host_tables = 4_068_474_880, .host_conversion_peak = 201_326_592 };
+    const budget = try Engine.bf16Budget(&plan, 4096);
+    try std.testing.expectEqual(@as(usize, 28_558_336), budget.scratch_bytes - aligned(Engine.tables_len));
+    try std.testing.expectEqual(@as(usize, 28_567_552), budget.scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 14_128_534_528), budget.steady_device_bytes);
+    try std.testing.expectEqual(@as(usize, 187_403_264), budget.cache_bytes);
+    try std.testing.expectEqual(@as(usize, 33_554_432), budget.hidden_bytes);
+    try std.testing.expectEqual(@as(usize, 131_072), budget.host_input_bytes);
+    try std.testing.expectEqual(@as(usize, 4_068_474_880), budget.host_tables_bytes);
+    try std.testing.expectEqual(budget.weights_bytes + budget.scratch_bytes + budget.cache_bytes + budget.hidden_bytes, budget.steady_device_bytes);
+    try std.testing.expectError(error.InvalidQwenHiddenShape, Engine.bf16Budget(&plan, 0));
+    try std.testing.expectError(error.InvalidQwenHiddenShape, Engine.bf16Budget(&plan, 4097));
+    plan.budget.device_weights = std.math.maxInt(usize);
+    try std.testing.expectError(error.Overflow, Engine.bf16Budget(&plan, 4096));
+
+    var e: Engine = undefined;
+    e.g = g;
+    e.numerics = .hf_dense_bf16;
+    e.arena = .{ .d = undefined, .ptr = 4096, .len = 28_558_336, .borrowed = true };
+    e.arena_at = 0;
+    e.bf16 = .{ .weights = undefined, .bindings = undefined, .input = undefined };
+    try std.testing.expectEqual(@as(usize, 28_558_336), try e.scratch(.allocate));
+    try std.testing.expectEqual(e.arena.len, e.arena_at);
+    try std.testing.expectEqual(@as(u64, 0), e.logits);
+    try std.testing.expectEqual(@as(u64, 16 * 4096 * 2), e.x - e.h);
+    try std.testing.expectEqual(@as(u64, 16 * 4096 * 4), e.mix - e.y);
+    try std.testing.expectEqual(@as(u64, 16 * 16 * 128 * 4), e.k - e.q);
+    try std.testing.expectEqual(@as(u64, 16 * 8192 * 2), e.gate - e.qkv);
+    try std.testing.expectEqual(@as(u64, 16 * 32 * 2), e.b - e.a);
+    try std.testing.expectEqual(@as(u64, 16 * 32 * 4), e.qraw - e.g_);
+    try std.testing.expectEqual(e.arena.ptr + e.arena.len, e.bf16.?.bindings.part + hf_part_bytes);
+}
 
 test "terminal output layout preserves row stride and aligns a contiguous Pick suffix" {
     for ([_]usize{ 1, 3, 257, 248320 }) |vocab| {
@@ -186,6 +242,7 @@ test "terminal finish uses one extended copy and publishes finite picks only at 
     e.stream = .{ .d = &d, .handle = null };
     e.placement = .{ .first = 0, .end = 1, .total = 1 };
     e.g.vocab = 3;
+    e.numerics = .hf_modelopt;
     e.logits = @intFromPtr(&device);
     e.host_logits = .{ .d = &d, .bytes = &host };
     for ([_]usize{ 1, 16 }) |rows| for ([_]bool{ false, true }) |all| {
@@ -211,7 +268,7 @@ test "terminal finish uses one extended copy and publishes finite picks only at 
         try std.testing.expectEqual(output.bytes, Fake.size);
         try std.testing.expectEqualSlices(u8, device[0..output.logits_bytes], host[0..output.logits_bytes]);
         for (host[output.bytes..]) |byte| try std.testing.expectEqual(@as(u8, 0x5a), byte);
-        try std.testing.expectEqualSlices(u16, e.rowLogits(heads - 1), &terminal);
+        try std.testing.expectEqualSlices(u16, try e.rowLogits(heads - 1), &terminal);
         try std.testing.expectEqual(@as(usize, 7), cache.len);
         try std.testing.expectEqual(7 + rows, cache.terminal_greedy.?.position);
         Engine.commit(&parts, false);
@@ -228,7 +285,7 @@ test "terminal finish uses one extended copy and publishes finite picks only at 
         @memcpy(device[output.pick_at..][0..8], std.mem.asBytes(&nonfinite));
         try e.finish(&parts, keep, shape);
         try std.testing.expect(cache.terminal_greedy == null);
-        try std.testing.expectEqualSlices(u16, e.rowLogits(heads - 1), &terminal);
+        try std.testing.expectEqualSlices(u16, try e.rowLogits(heads - 1), &terminal);
 
         var disabled = shape;
         disabled.terminal_greedy = false;
@@ -236,7 +293,7 @@ test "terminal finish uses one extended copy and publishes finite picks only at 
         try e.finish(&parts, keep, disabled);
         try std.testing.expectEqual(output.logits_bytes, Fake.size);
         try std.testing.expect(cache.terminal_greedy == null);
-        try std.testing.expectEqualSlices(u16, e.rowLogits(heads - 1), &terminal);
+        try std.testing.expectEqualSlices(u16, try e.rowLogits(heads - 1), &terminal);
 
         cache.terminal_greedy = .{ .position = cache.len, .token = 1 };
         Fake.fail_copy = true;
@@ -362,7 +419,7 @@ fn records(keep: Keep) bool {
 
 fn validateHfWindow(numerics: checkpoint.Numerics, bounded: bool, parts: []const Part, ids: usize, keep: Keep) !void {
     if (keep == .prompt_logits and numerics != .hf_modelopt) return error.UnsupportedQwenWindow;
-    if (numerics != .hf_modelopt) return;
+    if (!hfOrder(numerics)) return;
     const limit: usize = if (bounded) hf_prefill_rows else 1;
     if (parts.len != 1 or ids == 0 or ids > limit or parts[0].rows != ids or
         (keep != .last and keep != .hidden and !(bounded and keep == .prompt_logits))) return error.UnsupportedQwenWindow;
@@ -430,6 +487,11 @@ pub const Engine = struct {
     placement: checkpoint.Placement,
     numerics: checkpoint.Numerics,
     modelopt: ?modelopt.Bindings = null,
+    bf16: ?struct {
+        weights: bf16_weights.Loaded,
+        bindings: bf16_bindings.Bindings,
+        input: cuda.copy_source.Buffer,
+    } = null,
     captured: bool = true,
     graph_nodes: usize = 0,
     graph_launches: usize = 0,
@@ -481,7 +543,7 @@ pub const Engine = struct {
     embed_s: u64,
     embed_b: u64,
     embed_bits: u8, // the embedding's rows' width: 4 or 8
-    head: Proj,
+    terminal_weights: layers.TerminalWeights = .none,
     final_norm: u64,
     layers: []Layer,
     // scratch, max_rows rows each
@@ -566,47 +628,7 @@ pub const Engine = struct {
         const d = ctx.d;
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
-        e.* = undefined;
-        e.gpa = gpa;
-        e.d = d;
-        e.context = ctx.handle;
-        e.g = g;
-        e.placement = placement;
-        e.numerics = admitted.numerics();
-        e.modelopt = null;
-        e.captured = true;
-        e.graph_nodes = 0;
-        e.graph_launches = 0;
-        e.expert_up_n8 = e.numerics == .hf_modelopt;
-        e.expert_up_layout = options.expert_up_layout;
-        e.expert_up_split_m = options.expert_up_layout == .slice_major_v1;
-        e.reuse_fp8_quant = false;
-        e.bounded_hf_prefill = false;
-        e.attention_mode = if (e.numerics == .hf_modelopt) options.attention_mode else .reference;
-        e.terminal = null;
-        e.verify_terminal_graphs = false;
-        e.terminal_graph_roster = .empty;
-        e.verify_expert_graphs = false;
-        e.expert_graph_nodes_baseline = 0;
-        e.expert_graph_nodes_n8 = 0;
-        e.expert_graph_nodes_split_m = 0;
-        e.expert_graph_roster = .empty;
-        e.quant_graph_nodes_baseline = 0;
-        e.quant_graph_nodes_reuse = 0;
-        e.quant_graphs_verified = 0;
-        e.verify_gdn_graphs = false;
-        e.gdn_graph_nodes_baseline = 0;
-        e.gdn_graph_nodes_candidate = 0;
-        e.observer = null;
-        e.observed_layer = 0;
-        e.geo = .{ .hid = @intCast(g.hidden), .nk = @intCast(g.k_heads), .nv = @intCast(g.v_heads), .qh = @intCast(g.q_heads), .kvh = @intCast(g.kv_heads), .nl = @intCast(g.deltas()) };
-        e.verify_rows = most_verify;
-        e.kv8 = kv8;
-        e.window_rows = most_window;
-        e.arena_at = 0;
-        e.graphs = .empty;
-        e.n_taps = 0;
-        e.features = 0;
+        e.configure(gpa, ctx, g, placement, admitted.numerics(), kv8, options);
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
         e.arena = try DeviceBuffer.alloc(d, allocation.weights_bytes + try e.scratch(.measure));
@@ -671,6 +693,168 @@ pub const Engine = struct {
         return e;
     }
 
+    fn configure(e: *Engine, gpa: std.mem.Allocator, ctx: *const cuda.Context, g: Geometry, placement: checkpoint.Placement, numerics: checkpoint.Numerics, kv8: bool, options: InitOptions) void {
+        const d = ctx.d;
+        e.* = undefined;
+        e.gpa = gpa;
+        e.d = d;
+        e.context = ctx.handle;
+        e.g = g;
+        e.placement = placement;
+        e.numerics = numerics;
+        e.modelopt = null;
+        e.bf16 = null;
+        e.terminal_weights = .none;
+        e.captured = true;
+        e.graph_nodes = 0;
+        e.graph_launches = 0;
+        e.expert_up_n8 = e.numerics == .hf_modelopt;
+        e.expert_up_layout = options.expert_up_layout;
+        e.expert_up_split_m = options.expert_up_layout == .slice_major_v1;
+        e.reuse_fp8_quant = false;
+        e.bounded_hf_prefill = false;
+        e.attention_mode = if (e.numerics == .hf_modelopt) options.attention_mode else .reference;
+        e.terminal = null;
+        e.verify_terminal_graphs = false;
+        e.terminal_graph_roster = .empty;
+        e.verify_expert_graphs = false;
+        e.expert_graph_nodes_baseline = 0;
+        e.expert_graph_nodes_n8 = 0;
+        e.expert_graph_nodes_split_m = 0;
+        e.expert_graph_roster = .empty;
+        e.quant_graph_nodes_baseline = 0;
+        e.quant_graph_nodes_reuse = 0;
+        e.quant_graphs_verified = 0;
+        e.verify_gdn_graphs = false;
+        e.gdn_graph_nodes_baseline = 0;
+        e.gdn_graph_nodes_candidate = 0;
+        e.observer = null;
+        e.observed_layer = 0;
+        e.geo = .{ .hid = @intCast(g.hidden), .nk = @intCast(g.k_heads), .nv = @intCast(g.v_heads), .qh = @intCast(g.q_heads), .kvh = @intCast(g.kv_heads), .nl = @intCast(g.deltas()) };
+        e.verify_rows = most_verify;
+        e.kv8 = kv8;
+        e.window_rows = most_window;
+        e.arena_at = 0;
+        e.graphs = .empty;
+        e.n_taps = 0;
+        e.features = 0;
+    }
+
+    pub const Bf16Budget = struct {
+        weights_bytes: usize,
+        load_stage_bytes: usize,
+        scratch_bytes: usize,
+        cache_bytes: usize,
+        hidden_bytes: usize,
+        host_input_bytes: usize,
+        host_tables_bytes: usize,
+        host_conversion_peak: usize,
+        steady_device_bytes: usize,
+        load_device_peak_bytes: usize,
+    };
+
+    /// Logical allocations only. Mapped tables and driver/module residency are not measured here.
+    pub fn bf16Budget(plan: *const bf16_manifest.Plan, tokens: usize) !Bf16Budget {
+        if (tokens == 0 or tokens > hidden.max_rows) return error.InvalidQwenHiddenShape;
+        const g = plan.geometry;
+        var e: Engine = undefined;
+        e.g = g;
+        e.numerics = .hf_dense_bf16;
+        const add = std.math.add;
+        const mul = std.math.mul;
+        const scratch_bytes = try add(usize, try e.scratch(.measure), aligned(tables_len));
+        const row_bytes = try mul(usize, g.hidden, 2);
+        const hidden_bytes = try mul(usize, tokens, row_bytes);
+        const host_input = try mul(usize, hf_prefill_rows, row_bytes);
+        const state = try mul(usize, g.deltas(), try add(usize, g.recBytes(), g.convBytes()));
+        const kv = try mul(usize, try mul(usize, g.attentions(), 2 * g.kv_heads * head_dim * 2), tokens);
+        const cache = try add(usize, try add(usize, state, kv), g.logBytes(1));
+        const bytes = plan.bytes();
+        const fixed = try add(usize, bytes.device_weights, scratch_bytes);
+        const steady = try add(usize, fixed, try add(usize, cache, hidden_bytes));
+        return .{
+            .weights_bytes = bytes.device_weights,
+            .load_stage_bytes = bytes.device_load_stage,
+            .scratch_bytes = scratch_bytes,
+            .cache_bytes = cache,
+            .hidden_bytes = hidden_bytes,
+            .host_input_bytes = host_input,
+            .host_tables_bytes = bytes.host_tables,
+            .host_conversion_peak = bytes.host_conversion_peak,
+            .steady_device_bytes = steady,
+            .load_device_peak_bytes = @max(steady, try add(usize, bytes.device_weights, bytes.device_load_stage)),
+        };
+    }
+
+    /// Development-only dense Clef execution. No vocabulary head, pipeline, generation or FP8 KV.
+    /// The caller verifies the pinned checkpoint hashes and owns the current context until deinit.
+    pub fn initBf16(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8) !*Engine {
+        var plan = try bf16_manifest.Plan.inspect(gpa, io, dir);
+        defer plan.deinit();
+        _ = try bf16Budget(&plan, hidden.max_rows);
+        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+        if (ctx.handle != cuda.copy_source.current()) return error.QwenHiddenDeviceMismatch;
+        return initBf16Inspected(gpa, io, ctx, dir, &plan);
+    }
+
+    fn initBf16Inspected(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, plan: *const bf16_manifest.Plan) !*Engine {
+        return initBf16WithBinder(bf16_bindings.Bindings, gpa, io, ctx, dir, plan);
+    }
+
+    fn initBf16WithBinder(comptime Binder: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, plan: *const bf16_manifest.Plan) !*Engine {
+        const g = plan.geometry;
+        const e = try gpa.create(Engine);
+        errdefer gpa.destroy(e);
+        e.configure(gpa, ctx, g, .{ .first = 0, .end = g.layers, .total = g.layers }, .hf_dense_bf16, false, .{});
+        e.bounded_hf_prefill = true;
+        e.verify_rows = 0;
+        e.window_rows = 1;
+        e.terminal_weights = .hidden_only;
+        e.embed_w = 0;
+        e.embed_s = 0;
+        e.embed_b = 0;
+        e.embed_bits = 16;
+        e.stream = try cuda.Stream.init(ctx.d, true);
+        errdefer e.stream.deinit();
+        var bindings = try Binder.load(ctx, &e.fns);
+        errdefer bindings.unload();
+        var loaded = try bf16_weights.load(gpa, io, dir, plan, ctx.d, e.stream, &bindings.pack);
+        errdefer loaded.deinit();
+        e.layers = loaded.layers;
+        e.final_norm = loaded.final_norm;
+        e.arena = try DeviceBuffer.alloc(ctx.d, try e.scratch(.measure));
+        errdefer e.arena.free();
+        errdefer cuda.completion.drain(ctx.d, e.stream, "failed BF16 initialization did not drain");
+        try e.arena.fill8(0, null);
+        var input = try cuda.copy_source.Buffer.alloc(ctx.d, hf_prefill_rows * g.hidden * 2);
+        errdefer input.free();
+        e.bf16 = .{ .weights = loaded, .bindings = bindings, .input = input };
+        _ = try e.scratch(.allocate);
+        try e.validateHfWorkspaces();
+        e.tables = try DeviceBuffer.alloc(ctx.d, tables_len);
+        errdefer e.tables.free();
+        e.staged = try cuda.HostBuffer.alloc(ctx.d, tables_len);
+        errdefer e.staged.free();
+        e.host_logits = .{ .d = ctx.d, .bytes = &.{} };
+        return e;
+    }
+
+    fn gatherInput(e: *Engine, ids: []const u32) !void {
+        const b = if (e.bf16) |*b| b else return error.QwenFormatNotLoaded;
+        if (ids.len == 0 or ids.len > hf_prefill_rows) return error.InvalidQwenHiddenShape;
+        const bytes = try std.math.mul(usize, ids.len, e.g.hidden * 2);
+        try b.input.wait();
+        const out = b.input.bytes[0..bytes];
+        try b.weights.host.gather(.embedding, ids, out);
+        try b.input.copyTo(e.arena, e.h - e.arena.ptr, out, e.stream);
+    }
+
+    /// Untied lexical rows for the later joint head. This does not enqueue device work.
+    pub fn gatherOutputRows(e: *const Engine, ids: []const u32, out: []u8) !void {
+        const b = if (e.bf16) |*b| b else return error.QwenFormatNotLoaded;
+        try b.weights.host.gather(.output, ids, out);
+    }
+
     /// Every path a request takes, run once now: WDDM stalls a process's first forwards for seconds (a 20 s launch).
     fn warm(e: *Engine, gpa: std.mem.Allocator) !void {
         var warm_cache = try Cache.init(gpa, e, 64);
@@ -687,28 +871,35 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        cuda.completion.drain(e.d, e.stream, "Qwen engine still has active device work");
         e.terminal_graph_roster.deinit(e.gpa);
         e.expert_graph_roster.deinit(e.gpa);
         var it = e.graphs.valueIterator();
         while (it.next()) |x| x.deinit();
         e.graphs.deinit(e.gpa);
         if (e.terminal) |*t| t.module.unload();
-        e.host_logits.free();
+        if (e.numerics != .hf_dense_bf16) e.host_logits.free();
         e.staged.free();
         e.tables.free();
         e.arena.free();
-        e.gpa.free(e.layers);
-        if (e.modelopt) |*m| m.unload();
-        e.affine.deinit();
-        e.wide.deinit();
-        for (&e.mods) |*m| m.unload();
+        if (e.bf16) |*b| {
+            b.input.free();
+            b.weights.deinit();
+            b.bindings.unload();
+        } else {
+            e.gpa.free(e.layers);
+            if (e.modelopt) |*m| m.unload();
+            e.affine.deinit();
+            e.wide.deinit();
+            for (&e.mods) |*m| m.unload();
+        }
         e.stream.deinit();
         e.gpa.destroy(e);
     }
 
     /// A stream's device bytes at a `cap`-token window: recurrences, convolution tails, keys and values, taps, log.
     pub fn streamBytes(e: *const Engine, cap: usize) usize {
-        return e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + e.g.logBytes(if (e.numerics == .hf_modelopt) 1 else most_window);
+        return e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + e.g.logBytes(if (hfOrder(e.numerics)) 1 else most_window);
     }
 
     /// A stream's tap ring: tap_rows rows of the tapped layers' residuals.
@@ -718,7 +909,7 @@ pub const Engine = struct {
 
     /// The layers a drafter taps, told before the streams' caches exist; each forward then fills their rings.
     pub fn setTaps(e: *Engine, taps: []const u32) !void {
-        if (e.numerics == .hf_modelopt) return error.UnsupportedQwenTaps;
+        if (hfOrder(e.numerics)) return error.UnsupportedQwenTaps;
         if (taps.len > e.taps.len) return error.TooManyTaps;
         for (taps) |t| if (t >= e.g.layers) return error.BadTap;
         @memcpy(e.taps[0..taps.len], taps);
@@ -749,14 +940,14 @@ pub const Engine = struct {
             mode: @TypeOf(mode),
             total: *usize,
             pub fn alloc(t: @This(), bytes: usize) !u64 {
-                t.total.* += aligned(bytes);
+                t.total.* = try std.math.add(usize, t.total.*, (try std.math.add(usize, bytes, 255)) & ~@as(usize, 255));
                 return if (t.mode == .measure) 0 else try t.e.alloc(bytes);
             }
         };
         const t = Take{ .e = e, .mode = mode, .total = &total };
         const g = e.g;
-        const R: usize = if (e.numerics == .hf_modelopt) hf_prefill_rows else max_rows;
-        const fp: usize = if (e.numerics == .hf_modelopt) 4 else 2;
+        const R: usize = if (hfOrder(e.numerics)) hf_prefill_rows else max_rows;
+        const fp: usize = if (hfOrder(e.numerics)) 4 else 2;
         const wide = @max(g.valueWidth(), g.attnWidth(), g.hidden); // y and mix: either mixer's rows
         inline for (.{ "h", "x", "r" }) |name| @field(e, name) = try t.alloc(R * g.hidden * 2);
         e.y = try t.alloc(R * wide * fp);
@@ -773,7 +964,7 @@ pub const Engine = struct {
         e.pm = try t.alloc(R * g.q_heads * max_chunks * 4);
         e.pl = try t.alloc(R * g.q_heads * max_chunks * 4);
         e.po = try t.alloc(R * g.q_heads * max_chunks * head_dim * 4);
-        e.logits = try t.alloc(TerminalOutput.init(most_verify, g.vocab).bytes);
+        e.logits = if (e.numerics == .hf_dense_bf16) 0 else try t.alloc(TerminalOutput.init(most_verify, g.vocab).bytes);
         if (e.numerics == .hf_modelopt) {
             const rows = try t.alloc(R * hfInputWidth(g));
             const part = try t.alloc(hf_part_bytes);
@@ -781,6 +972,10 @@ pub const Engine = struct {
                 e.modelopt.?.rows = rows;
                 e.modelopt.?.part = part;
             }
+        }
+        if (e.numerics == .hf_dense_bf16) {
+            const part = try t.alloc(hf_part_bytes);
+            if (mode == .allocate) e.bf16.?.bindings.part = part;
         }
         if (g.moe()) e.routed = try routed.Scratch.carve(t, g, R);
         return total;
@@ -792,11 +987,12 @@ pub const Engine = struct {
             .nvfp4, .fp8, .bf16 => |w| w,
             else => return error.QwenLinearWorkspace,
         };
-        const m = e.modelopt.?;
-        var bytes = m.lane.partBytes(hf_prefill_rows, w);
+        if (e.numerics == .hf_dense_bf16 and p.linear != .bf16) return error.QwenLinearWorkspace;
+        const lane = if (e.numerics == .hf_dense_bf16) e.bf16.?.bindings.lane else e.modelopt.?.lane;
+        var bytes = lane.partBytes(hf_prefill_rows, w);
         if (p.linear == .fp8 and w.act != 0) {
             const sk = cuda.qmmf.splitK(w.n, w.k);
-            if (sk > 1 and !m.ck.clusters) bytes = @max(bytes, hf_prefill_rows * @as(usize, w.n) * sk * 4);
+            if (sk > 1 and !e.modelopt.?.ck.clusters) bytes = @max(bytes, hf_prefill_rows * @as(usize, w.n) * sk * 4);
         }
         if (bytes > hf_part_bytes) return error.QwenLinearWorkspace;
     }
@@ -814,7 +1010,7 @@ pub const Engine = struct {
                 },
             }
         }
-        if (e.placement.ownsHead()) try e.validateHfProjection(e.head);
+        if (e.terminal_weights == .vocabulary) try e.validateHfProjection(e.terminal_weights.vocabulary);
     }
 
     pub fn run(e: *Engine, f: cuda.Function, grid: [3]usize, block: [3]usize, args: anytype) !void {
@@ -831,6 +1027,11 @@ pub const Engine = struct {
 
     /// `proj` with group sums `xs` and device counts `params` (0: all real); prompts past 16 rows take a prompt GEMM.
     pub fn projSums(e: *Engine, l: Proj, x: u64, xs: u64, out: u64, rows: usize, prompt: bool, params: u64) !void {
+        if (e.numerics == .hf_dense_bf16) {
+            if (l != .linear or l.linear != .bf16) return error.QwenFormatNotLoaded;
+            const b = if (e.bf16) |*b| b else return error.QwenFormatNotLoaded;
+            return b.bindings.linear().decode(e.stream, l.linear, .{ .x = x, .part = b.bindings.part }, out, rows);
+        }
         if (l == .linear) {
             const m = &(e.modelopt orelse return error.QwenFormatNotLoaded);
             return m.linear().decode(e.stream, l.linear, .{ .x = x, .part = m.part }, out, rows);
@@ -859,12 +1060,13 @@ pub const Engine = struct {
 
     /// Token rows of the embedding into `out` (rows, hidden) bf16, at the width its words are served.
     pub fn embed(e: *Engine, ids: u64, out: u64, rows: usize, params: u64) !void {
+        if (e.numerics == .hf_dense_bf16) return error.QwenHostEmbeddingRequired;
         const f = if (e.embed_bits == 8) e.fns.embed8 else e.fns.embed;
         try e.run(f, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ ids, e.embed_w, e.embed_s, e.embed_b, out, @as(c_int, @intCast(e.g.hidden)), params });
     }
 
     fn norm(e: *Engine, residual: bool, w: u64, rows: usize) !void {
-        try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ if (e.numerics == .hf_modelopt) (hf.Launches{}).norm else 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at });
+        try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ if (hfOrder(e.numerics)) (hf.Launches{}).norm else 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at });
     }
 
     /// A chain row's rowanc: its index in its window, as a prompt chunk's rows outnumber the bits.
@@ -889,14 +1091,17 @@ pub const Engine = struct {
         }
     }
 
-    /// A request owns these rows across forward scratch reuse. Plain BF16 execution is still refused.
+    /// A request owns these rows across forward scratch reuse.
     pub fn hiddenRows(e: *Engine, tokens: usize) !hidden.Rows {
         return hidden.Rows.init(e, tokens);
     }
 
     pub fn validateHiddenProfile(e: *const Engine) !void {
         switch (e.numerics) {
-            .hf_dense_bf16 => return error.UnsupportedQwenPlainExecution,
+            .hf_dense_bf16 => {
+                if (e.bf16 == null or e.terminal_weights != .hidden_only or e.g.moe()) return error.UnsupportedQwenPlainExecution;
+                if (e.verify_gdn_graphs or e.verify_expert_graphs) return error.UnsupportedQwenHiddenProfile;
+            },
             .mlx_sanitized, .hf_modelopt => {},
         }
         if (!e.placement.ownsEmbedding() or !e.placement.ownsHead() or e.kv8 or e.n_taps != 0 or
@@ -920,7 +1125,8 @@ pub const Engine = struct {
             for (parts) |p| p.cache.terminal_greedy = null;
             if (keep == .hidden) keep.hidden.fail();
         }
-        try e.execute(shape);
+        if (e.numerics == .hf_dense_bf16) try e.gatherInput(ids);
+        try e.executeForward(shape);
         try e.finish(parts, keep, shape);
         commit(parts, shape.record);
         if (keep == .hidden) keep.hidden.commit();
@@ -928,11 +1134,13 @@ pub const Engine = struct {
 
     /// Hidden output is a whole forward transaction, not a pipeline terminal.
     pub fn prepare(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !Shape {
+        if (e.numerics == .hf_dense_bf16) return error.QwenHiddenRequiresForward;
         if (keep == .hidden) return error.QwenHiddenRequiresForward;
         return e.prepareForward(parts, ids, keep);
     }
 
     fn prepareForward(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !Shape {
+        if (e.numerics == .hf_dense_bf16 and keep != .hidden) return error.QwenHiddenOnly;
         if (keep == .hidden) try e.validateHidden(parts, ids, keep.hidden);
         if (parts.len == 0 or parts.len > max_segs) return error.InvalidQwenSegments;
         const gdn_layout = parts[0].cache.gdn_layout;
@@ -976,7 +1184,7 @@ pub const Engine = struct {
             segs[i] = p.cache.seg(e, p.cache.len, row0, p.rows);
             row0 += p.rows;
         }
-        if (e.numerics == .hf_modelopt and total > 1) {
+        if (hfOrder(e.numerics) and total > 1) {
             const views = std.mem.bytesAsSlice(Seg, st[chain_segs_at..][0 .. total * @sizeOf(Seg)]);
             for (views, 0..) |*view, row| view.* = chainView(segs[0], row);
             try validateChainViews(segs[0], views);
@@ -1017,6 +1225,12 @@ pub const Engine = struct {
     }
 
     pub fn execute(e: *Engine, shape: Shape) !void {
+        if (e.numerics == .hf_dense_bf16) return error.QwenHiddenRequiresForward;
+        return e.executeForward(shape);
+    }
+
+    fn executeForward(e: *Engine, shape: Shape) !void {
+        if (e.numerics == .hf_dense_bf16 and !shape.normalized_hidden) return error.QwenHiddenOnly;
         if (shape.normalized_hidden) {
             try e.validateHiddenProfile();
             if (!shape.prompt or shape.record or shape.taps or shape.heads_all or shape.terminal_greedy or
@@ -1026,7 +1240,7 @@ pub const Engine = struct {
         try validateCombined(e.numerics, shape.expert_up_n8, shape.expert_up_split_m, shape.reuse_fp8_quant);
         if (shape.expert_up_n8 and (e.numerics != .hf_modelopt or (shape.prompt and shape.total > most_window))) return error.UnsupportedQwenExpertUp;
         if (shape.heads_all and e.numerics != .hf_modelopt) return error.UnsupportedQwenWindow;
-        if (e.numerics == .hf_modelopt and (shape.total == 0 or shape.total > hf_prefill_rows or shape.nseg != 1 or shape.record or !shape.prompt or shape.taps or
+        if (hfOrder(e.numerics) and (shape.total == 0 or shape.total > hf_prefill_rows or shape.nseg != 1 or shape.record or !shape.prompt or shape.taps or
             (!e.bounded_hf_prefill and (shape.total != 1 or shape.heads_all)))) return error.UnsupportedQwenWindow;
         if (e.observer != null and e.captured) return error.QwenObserverRequiresEager;
         try e.validateUpLayout(shape.expert_up_layout, shape.expert_up_n8, shape.expert_up_split_m, shape.total);
@@ -1236,7 +1450,7 @@ pub const Engine = struct {
         }
         if (e.placement.ownsHead() and !shape.normalized_hidden) {
             const heads: usize = if (shape.record or shape.heads_all) shape.total else 1;
-            try e.addCkProjection(&list, e.head, e.x + (shape.total - heads) * e.g.hidden * 2, e.logits, heads, true);
+            try e.addCkProjection(&list, try e.vocabulary(), e.x + (shape.total - heads) * e.g.hidden * 2, e.logits, heads, true);
         }
         return list;
     }
@@ -1473,8 +1687,8 @@ pub const Engine = struct {
             result.terminal = try TerminalGraphKernel.read(nodes[nodes.len - 1], nodes[nodes.len - 2], p, &expected, strict_symbol, try readback.symbol(e.d, p.func));
         }
         if (result.owns_head) {
-            if (e.numerics != .hf_modelopt or e.modelopt == null or e.head != .linear) return error.QwenTerminalGraphHeadUnsupported;
-            const weight = switch (e.head.linear) {
+            if (e.numerics != .hf_modelopt or e.modelopt == null or e.terminal_weights != .vocabulary or e.terminal_weights.vocabulary != .linear) return error.QwenTerminalGraphHeadUnsupported;
+            const weight = switch (e.terminal_weights.vocabulary.linear) {
                 .fp8 => |w| if (w.act != 0) w else return error.QwenTerminalGraphHeadUnsupported,
                 .nvfp4 => |w| w,
                 else => return error.QwenTerminalGraphHeadUnsupported,
@@ -1482,7 +1696,7 @@ pub const Engine = struct {
             const head: CkProjection = .{ .weight = weight, .x = e.x + (shape.total - heads) * e.g.hidden * 2, .out = e.logits, .rows = heads, .quant = true };
             var expected: CkNode = undefined;
             var symbol: []const u8 = undefined;
-            if (e.head.linear == .nvfp4) {
+            if (e.terminal_weights.vocabulary.linear == .nvfp4) {
                 const plan = cuda.qmmf.plan(heads, weight.n, weight.k, e.modelopt.?.lane.clusters);
                 if (weight.mode != .fp4 or weight.act != 0 or weight.codes == 0 or weight.scales == 0 or !(weight.scale > 0) or !std.math.isFinite(weight.scale) or
                     weight.n != e.g.vocab or weight.k != e.g.hidden or weight.npad != cuda.nvfp4.padded(weight.n) or weight.k % cuda.qmmf.group != 0 or
@@ -1658,6 +1872,7 @@ pub const Engine = struct {
     }
 
     pub fn finish(e: *Engine, parts: []const Part, keep: Keep, shape: Shape) !void {
+        if (e.numerics == .hf_dense_bf16 and (keep != .hidden or !shape.normalized_hidden)) return error.QwenHiddenOnly;
         for (parts) |p| p.cache.terminal_greedy = null;
         if (!e.placement.ownsHead()) {
             try e.stream.synchronize();
@@ -1692,7 +1907,7 @@ pub const Engine = struct {
                 const token = if (shape.terminal_greedy) try output.token(out, g.vocab) else null;
                 if (keep == .last or keep == .prompt_logits) {
                     const cache = parts[0].cache;
-                    @memcpy(cache.logits, e.rowLogits(heads - 1));
+                    @memcpy(cache.logits, try e.rowLogits(heads - 1));
                     if (token) |id| cache.terminal_greedy = .{ .position = cache.len + parts[0].rows, .token = id };
                 }
             },
@@ -1750,7 +1965,7 @@ pub const Engine = struct {
         const t_params = e.tables.ptr + params_at;
         const geo = e.geo;
         const group = g.q_heads / g.kv_heads;
-        const is_hf = e.numerics == .hf_modelopt;
+        const is_hf = hfOrder(e.numerics);
         const launch: hf.Launches = .{};
         const attn_mode: AttentionMode = if (is_hf) shape.attention_mode else .chunked;
         const attn = hf.attnLaunch(attn_mode, g.q_heads, g.kv_heads, total, group, max_chunks);
@@ -1761,7 +1976,7 @@ pub const Engine = struct {
 
         e.observed_layer = e.placement.first;
         try e.mark(.begin);
-        if (e.placement.ownsEmbedding()) try e.embed(t_ids, e.h, total, t_params);
+        if (e.placement.ownsEmbedding() and e.numerics != .hf_dense_bf16) try e.embed(t_ids, e.h, total, t_params);
         // an image chunk's rows take the tower's features, and rotate at their staged t, h, w positions
         const mpos: u64 = if (e.features != 0) e.tables.ptr + mpos_at else 0;
         if (e.features != 0) try e.run(e.fns.splice, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.features, e.tables.ptr + src_at, @as(c_int, @intCast(g.hidden)), t_params });
@@ -1840,7 +2055,7 @@ pub const Engine = struct {
         try e.norm(true, e.final_norm, total);
         if (shape.normalized_hidden) return;
         // the head over the kept rows
-        try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
+        try e.proj(try e.vocabulary(), e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
         if (shape.terminal_greedy) try e.pickTerminal(heads);
         try e.mark(.head);
     }
@@ -1851,11 +2066,22 @@ pub const Engine = struct {
     }
 
     pub fn routedRows(e: *Engine, router: u64, layer: cuda.experts.Layer, shared: layers.SharedExpert, x: u64, out: u64, total: usize, wide_rows: bool) !void {
+        if (e.numerics == .hf_dense_bf16) return error.UnsupportedQwenExperts;
         return routed.rows(e, router, layer, shared, x, out, total, wide_rows, false, false);
     }
 
+    pub fn vocabulary(e: *const Engine) !Proj {
+        return switch (e.terminal_weights) {
+            .vocabulary => |p| p,
+            .hidden_only => error.QwenHiddenOnly,
+            .none => error.QwenVocabularyNotLoaded,
+        };
+    }
+
     /// Row `i`'s logits from the newest forward that kept logits.
-    pub fn rowLogits(e: *const Engine, i: usize) []const u16 {
+    pub fn rowLogits(e: *const Engine, i: usize) ![]const u16 {
+        if (e.numerics == .hf_dense_bf16) return error.QwenHiddenOnly;
+        if (i >= most_verify) return error.InvalidQwenLogitRow;
         return e.host_logits.slice(u16)[i * e.g.vocab ..][0..e.g.vocab];
     }
 };
@@ -1955,10 +2181,10 @@ test "terminal capture readback checks FP8 and real NVFP4 ABI, final head produc
     for ([_]usize{ 1, 16 }) |rows| for ([_]bool{ false, true }) |all| for ([_]usize{ 248320, 64 }) |width| for ([_]bool{ false, true }) |cluster_enabled| {
         e.modelopt.?.ck.clusters = cluster_enabled;
         e.g.vocab = width;
-        e.head = .{ .linear = .{ .fp8 = .{ .mode = .fp8, .codes = 65536, .scales = 0, .act = 0.5, .n = @intCast(width), .npad = @intCast(width), .k = 2048 } } };
+        e.terminal_weights = .{ .vocabulary = .{ .linear = .{ .fp8 = .{ .mode = .fp8, .codes = 65536, .scales = 0, .act = 0.5, .n = @intCast(width), .npad = @intCast(width), .k = 2048 } } } };
         const heads: usize = if (all) rows else 1;
         const output = TerminalOutput.init(heads, width);
-        const projection: Engine.CkProjection = .{ .weight = e.head.linear.fp8, .x = e.x + (rows - heads) * e.g.hidden * 2, .out = e.logits, .rows = heads, .quant = true };
+        const projection: Engine.CkProjection = .{ .weight = e.terminal_weights.vocabulary.linear.fp8, .x = e.x + (rows - heads) * e.g.hidden * 2, .out = e.logits, .rows = heads, .quant = true };
         const sk = cuda.qmmf.splitK(width, 2048);
         var head = e.ckNode(projection, if (sk > 1 and !cluster_enabled) .reduce else .lane);
         var terminal: Engine.CkNode = .{ .function = @ptrFromInt(10), .grid = .{ 1, 1, 1 }, .threads = 256 };
@@ -2076,8 +2302,8 @@ test "terminal capture readback checks FP8 and real NVFP4 ABI, final head produc
     e.modelopt.?.lane.clusters = true;
     for (0..7) |i| e.modelopt.?.lane.fns[0][i] = .{ .d = &driver, .handle = @ptrFromInt(40 + i) };
     e.g.vocab = 248320;
-    e.head = .{ .linear = .{ .nvfp4 = cuda.nvfp4.weight(65536, 131072, 0.125, e.g.vocab, e.g.hidden) } };
-    try std.testing.expectEqual(@as(f32, 0), e.head.linear.nvfp4.act);
+    e.terminal_weights = .{ .vocabulary = .{ .linear = .{ .nvfp4 = cuda.nvfp4.weight(65536, 131072, 0.125, e.g.vocab, e.g.hidden) } } };
+    try std.testing.expectEqual(@as(f32, 0), e.terminal_weights.vocabulary.linear.nvfp4.act);
     const linear: cuda.qlinear.Linear = .{ .lane = &e.modelopt.?.lane };
     for ([_]usize{ 1, 16, 32, 64 }) |rows| for ([_]bool{ false, true }) |all| {
         const heads: usize = if (all) rows else 1;
@@ -2092,7 +2318,7 @@ test "terminal capture readback checks FP8 and real NVFP4 ABI, final head produc
         Fake.count = 3;
         Fake.predecessors = .{ 0, 1, 2, 3 };
         const x = e.x + (rows - heads) * e.g.hidden * 2;
-        try linear.decode(.{ .d = &driver, .handle = null }, e.head.linear, .{ .x = x, .part = e.modelopt.?.part }, e.logits, heads);
+        try linear.decode(.{ .d = &driver, .handle = null }, e.terminal_weights.vocabulary.linear, .{ .x = x, .part = e.modelopt.?.part }, e.logits, heads);
         var shape: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .heads_all = all, .terminal_greedy = true };
         const record = try e.verifyTerminalGraph(graph, shape, 3, readback);
         try std.testing.expectEqual(13, record.head.?.argument_count);
@@ -2100,11 +2326,11 @@ test "terminal capture readback checks FP8 and real NVFP4 ABI, final head produc
         try std.testing.expectEqualSlices(usize, &.{ 8, 8, 8, 4, 8, 8, 4, 4, 4, 4, 4, 4, 4 }, record.head.?.argument_sizes[0..record.head.?.argument_count]);
         try std.testing.expectEqual(x, record.head_input);
         try std.testing.expectEqual(e.logits, record.head_output);
-        try std.testing.expectEqual(e.head.linear.nvfp4.codes, record.head_weight);
+        try std.testing.expectEqual(e.terminal_weights.vocabulary.linear.nvfp4.codes, record.head_weight);
         try std.testing.expectEqual(.nvfp4_lane, record.head_kind);
         try std.testing.expectEqual(.qmmf, record.head_image);
-        try std.testing.expectEqual(e.head.linear.nvfp4.scales, record.head_scales);
-        try std.testing.expectEqual(e.head.linear.nvfp4.scale, record.head_scale);
+        try std.testing.expectEqual(e.terminal_weights.vocabulary.linear.nvfp4.scales, record.head_scales);
+        try std.testing.expectEqual(e.terminal_weights.vocabulary.linear.nvfp4.scale, record.head_scale);
         try std.testing.expectEqual(2, record.terminal.?.predecessor);
         var head_hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(record.head.?.argument_bytes[0..record.head.?.argument_bytes_len], &head_hash, .{});
@@ -2131,25 +2357,25 @@ test "terminal capture readback checks FP8 and real NVFP4 ABI, final head produc
         Fake.params[1].extra = Fake.lane_args.pointers();
         try std.testing.expectError(error.QwenTerminalGraphArgumentMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
         Fake.params[1].extra = null;
-        const saved_weight = e.head.linear.nvfp4;
+        const saved_weight = e.terminal_weights.vocabulary.linear.nvfp4;
         inline for (.{ "codes", "scales", "scale" }) |field| {
-            @field(e.head.linear.nvfp4, field) = 0;
+            @field(e.terminal_weights.vocabulary.linear.nvfp4, field) = 0;
             try std.testing.expectError(error.QwenTerminalGraphHeadUnsupported, e.verifyTerminalGraph(graph, shape, 3, readback));
-            e.head.linear.nvfp4 = saved_weight;
+            e.terminal_weights.vocabulary.linear.nvfp4 = saved_weight;
         }
-        e.head.linear.nvfp4.scale = std.math.nan(f32);
+        e.terminal_weights.vocabulary.linear.nvfp4.scale = std.math.nan(f32);
         try std.testing.expectError(error.QwenTerminalGraphHeadUnsupported, e.verifyTerminalGraph(graph, shape, 3, readback));
-        e.head.linear.nvfp4 = saved_weight;
-        e.head.linear.nvfp4.act = 0.5;
+        e.terminal_weights.vocabulary.linear.nvfp4 = saved_weight;
+        e.terminal_weights.vocabulary.linear.nvfp4.act = 0.5;
         try std.testing.expectError(error.QwenTerminalGraphHeadUnsupported, e.verifyTerminalGraph(graph, shape, 3, readback));
-        e.head.linear.nvfp4 = saved_weight;
+        e.terminal_weights.vocabulary.linear.nvfp4 = saved_weight;
         e.g.vocab = 64;
-        e.head.linear.nvfp4 = cuda.nvfp4.weight(saved_weight.codes, saved_weight.scales, saved_weight.scale, 64, e.g.hidden);
+        e.terminal_weights.vocabulary.linear.nvfp4 = cuda.nvfp4.weight(saved_weight.codes, saved_weight.scales, saved_weight.scale, 64, e.g.hidden);
         shape.terminal_greedy = false;
         Fake.count = 2;
         try std.testing.expectError(error.QwenTerminalGraphHeadUnsupported, e.verifyTerminalGraph(graph, shape, 2, readback));
         e.g.vocab = 248320;
-        e.head.linear.nvfp4 = saved_weight;
+        e.terminal_weights.vocabulary.linear.nvfp4 = saved_weight;
         Fake.count = 3;
         shape.terminal_greedy = false;
         try std.testing.expectError(error.QwenTerminalGraphWorkCountMismatch, e.verifyTerminalGraph(graph, shape, 3, readback));
@@ -2561,13 +2787,14 @@ test "prompt logits finish copies every row and commits terminal cache logits on
     e.stream = .{ .d = &driver, .handle = null };
     e.placement = .{ .first = 0, .end = 1, .total = 1 };
     e.g.vocab = 2;
+    e.numerics = .hf_modelopt;
     e.logits = @intFromPtr(&device);
     e.host_logits = .{ .d = &driver, .bytes = &host };
     const parts = [_]Part{.{ .cache = &cache, .rows = 3 }};
     var shape: Engine.Shape = .{ .total = 3, .nseg = 1, .record = false, .prompt = true, .taps = false, .heads_all = true };
     try e.finish(&parts, .prompt_logits, shape);
     try std.testing.expectEqualSlices(u16, device[4..6], &terminal);
-    for (0..3) |row| try std.testing.expectEqualSlices(u16, device[row * 2 ..][0..2], e.rowLogits(row));
+    for (0..3) |row| try std.testing.expectEqualSlices(u16, device[row * 2 ..][0..2], try e.rowLogits(row));
     terminal = .{ 99, 98 };
     shape.record = true;
     shape.heads_all = false;

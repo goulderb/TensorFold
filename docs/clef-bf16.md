@@ -7,9 +7,10 @@ language-model answer-token scorer. Its plain BF16 checkpoint must not enter
 the guarded ModelOpt MoE loader or the MLX affine loader.
 
 Checkpoint admission, validated planning, mapped payload ownership, shared CUDA
-weight loading and a request-owned hidden terminal are implemented. They do not
-enable a native serving route. BF16 engine initialization, numerical backbone
-parity and the joint head remain separate units.
+weight loading and a request-owned hidden terminal are implemented. An explicit
+development-only BF16 initializer now connects them to the shared backbone.
+It does not enable a native serving route. Numerical backbone qualification
+and the joint head remain separate units.
 
 ## Usage
 
@@ -26,13 +27,13 @@ try std.testing.expectEqual(@as(usize, 4_068_474_880), plan.bytes().host_tables)
 ```
 
 Existing engine callers retain their existing admission and weight-planning
-operations. Plain BF16 engine execution is explicitly refused until its loader
-and numerical path are integrated and qualified. Config admission is not
-permission to execute.
+operations. Ordinary plain BF16 execution remains refused by
+`requireExecutable()`, ordinary weight planning/loading and
+`initPlacedWithOptions()`. Config admission is not permission to execute.
+Only the explicit development constructor described below accepts this profile.
 
-The shared forward path can retain every token's final normalized hidden state
-for existing executable profiles. The plain BF16 gate remains closed. A later
-Clef adapter will run the official joint head once over the whole encoded
+The shared forward path retains every token's final normalized hidden state.
+A later Clef adapter will run the official joint head once over the whole encoded
 record. Input embedding rows and output lexical rows remain separate, untied
 host tables. No full vocabulary projection is needed.
 
@@ -183,17 +184,19 @@ cache and invalidates old views. Preflight refusals leave cache state unchanged.
 
 The terminal supports a complete single-engine text placement with BF16 KV.
 MLX chunks retain their existing 128-row limit. HF ModelOpt retains one-row
-execution, or up to 16 rows with bounded HF prefill enabled. Images, parents,
-taps, recorded verification, terminal-graph verification and pipeline preparation
-are refused. The plain BF16 numerical profile is still explicitly refused.
+execution, or up to 16 rows with bounded HF prefill enabled. The explicit dense
+BF16 constructor supports up to 16 rows per chunk. Images, parents, taps,
+recorded verification, terminal-graph verification and pipeline preparation
+are refused for hidden output.
 
 The shared body applies its final RMSNorm once and skips the vocabulary head.
 Hidden mode has a separate graph-key bit. The current request destination is
 copied outside graph capture and synchronized before cache commit and scratch
 reuse. Recording-driver tests cover control flow and pointer extents, not
-numerical backbone parity. The legacy vocabulary-weight field still exists;
-BF16 initialization must separate final-norm ownership from vocabulary weights
-and logits allocation across loaders, workspace checks and pipeline planning.
+numerical backbone parity. `TerminalWeights` distinguishes absent, vocabulary
+and hidden-only terminals. Final normalization is independent of that union.
+Existing loaders, workspace checks and pipeline callers use the same source
+of terminal weights. The hidden-only engine allocates no vocabulary logits.
 
 Independent review found that teardown needed an unconditional drain for later
 consumers of completed rows. The owner now proves completion before freeing,
@@ -217,6 +220,81 @@ helpers. Both host tables remained available through retained mappings. The
 production verifier checked the complete pinned checkpoint hashes before the
 trial. No backbone forward or joint-head computation ran. Weight-only success
 does not qualify full-engine residency, 4096-token capacity or output parity.
+
+## Explicit hidden-only initialization
+
+The development entry is
+`Engine.initBf16(gpa, io, ctx, model_dir) !*Engine`. The caller verifies the
+pinned checkpoint payload hashes before loading and keeps the current CUDA
+context alive through teardown. Valid requests contain 1 through 4096 tokens.
+The engine uses dense `.hf_dense_bf16` numerics, BF16 KV and `value_key` GDN.
+It accepts one sequence per forward and chunks of at most 16 rows.
+
+```zig
+const e = try qwen.engine.Engine.initBf16(gpa, io, ctx, model_dir);
+defer e.deinit();
+var cache = try qwen.engine.Cache.init(gpa, e, ids.len);
+defer cache.deinit(gpa);
+var output = try e.hiddenRows(ids.len);
+defer output.deinit();
+
+var at: usize = 0;
+while (at < ids.len) {
+    const n = @min(qwen.engine.hf_prefill_rows, ids.len - at);
+    try e.forward(
+        &.{.{ .cache = &cache, .rows = n }},
+        ids[at..][0..n],
+        .{ .hidden = try output.window(at, n) },
+    );
+    at += n;
+}
+const device_rows = try (try output.completed()).device();
+```
+
+Host embedding gathers and uploads run outside graph capture through persistent
+pinned staging. The shared body skips device embedding for this profile.
+`gatherOutputRows(ids, out)` separately copies untied lexical rows into exact-sized
+caller-owned host bytes. Neither operation uploads a full vocabulary table.
+Generation, logits, pipeline execution, taps, media, parents, verification and
+transposed GDN remain unsupported for this constructor and fail during preflight.
+
+`Engine.bf16Budget(plan, tokens)` reports checked logical allocations. A CPU-only
+run against the pinned staged checkpoint produced these values for 4096 tokens.
+
+| Allocation | Bytes |
+| --- | ---: |
+| Device weights | 13,879,009,280 |
+| Temporary load stage | 100,663,296 |
+| Scratch and aligned device metadata | 28,567,552 |
+| Request cache | 187,403,264 |
+| Request-owned hidden rows | 33,554,432 |
+| Steady device budget | 14,128,534,528 |
+| Persistent pinned input staging | 131,072 |
+| Logical host tables | 4,068,474,880 |
+| Conservative host conversion peak | 201,326,592 |
+
+Driver/module overhead and resident mapped pages are not included. The computed
+load-device peak is the larger of the steady budget and weights plus temporary
+stage. These budgets do not prove full-engine device fit or occupied capacity.
+
+The runtime binding owner requires four real images: `qwen35`, `qwen35_hf`,
+`qmmf` and `modelopt_pack`. Ordinary convolution commit and attention gating bind
+from `qwen35` before the HF overrides. Offline export checks and kernel-enabled
+constructor/forward compilation passed. The shared qlinear compile closure also
+imports an empty EXL3 image in the private compile setup. That image is not a
+runnable backend. The BF16 projection entry rejects other weight encodings before
+backend access and carries no EXL3 binding. No shared kernel arithmetic changed.
+Numerical execution remains a separate device gate.
+
+Independent source/CPU review found no concrete initializer defect. An isolated
+cache run passed 158 CUDA-host tests and 11 native-host tests, plus both compile
+targets. These counts overlap the earlier preparation roots. A parent rerun
+passed all 19 steps with one executed test and cached subruns. Private rebuild
+receipts bind before/after repository source fingerprints and the listed build
+inputs, not a complete system-toolchain or reproducible-build attestation.
+The separate automated comment-only check remains failed/open after two invalid
+reports. Required legal notices and API ownership contracts remain intact.
+No automated style pass is claimed.
 
 ## Public-history port
 
