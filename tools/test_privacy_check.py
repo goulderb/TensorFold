@@ -313,6 +313,13 @@ class PrivacyCheckTest(unittest.TestCase):
         self.stage('notes.txt', 'C:' + chr(92) + 'Users' + chr(92) + 'runner\n/home/developer/bin\n')
         self.assertClean(self.check('--staged'))
 
+    def test_example_and_user_homes_pass_new_private_home_flagged(self):
+        self.stage('ok.txt', '/home/example/repo\n' + 'C:' + chr(92) + 'Users' + chr(92) + 'user' + chr(92) + 'src\n')
+        self.assertClean(self.check('--staged'))
+        self.stage('bad.txt', home_linux() + '\n')
+        self.assertFlagged(self.check('--staged'), 1, 'personal-home')
+        self.assertNotIn('jdoe', self.check('--staged').stdout)
+
     def test_private_addresses_flagged(self):
         content = '\n'.join([private_ip(), private_ip_172(), private_ip_192(), cgnat_ip()]) + '\n'
         self.stage('notes.txt', content)
@@ -321,6 +328,12 @@ class PrivacyCheckTest(unittest.TestCase):
     def test_public_and_loopback_addresses_pass(self):
         self.stage('notes.txt', '127.0.0.1\n192.0.2.1\n198.51.100.7\n203.0.113.9\n8.8.8.8\n')
         self.assertClean(self.check('--staged'))
+
+    def test_docs_address_passes_rfc1918_still_flagged(self):
+        self.stage('ok.txt', '192.0.2.1 refused as a documentation address\n')
+        self.assertClean(self.check('--staged'))
+        self.stage('bad.txt', private_ip() + ' still private\n')
+        self.assertFlagged(self.check('--staged'), 1, 'private-address')
 
     def test_credential_rules_flagged(self):
         content = '\n'.join([token_ghp(), token_sk(), token_aws(), token_slack(), token_google(), key_header()]) + '\n'
@@ -433,6 +446,17 @@ class PrivacyCheckTest(unittest.TestCase):
         approval['sha256'] = 'e' * 64
         policy = self.policy(approved_binaries={'assets/kernel.bin': approval})
         self.stage('assets/kernel.bin', data)
+        self.assertFlagged(self.check('--policy', str(policy)), 1, 'unexpected-binary-or-archive')
+
+    def test_named_bin_fixture_requires_exact_bytes(self):
+        data = b'\x04\x00\x00\x00lanes'
+        path = 'zig/src/core/fixtures/lanes-ref.bin'
+        self.stage(path, data)
+        self.assertFlagged(self.check('--staged'), 1, 'unexpected-binary-or-archive')
+        policy = self.policy(approved_binaries={path: self.approval_for(data)})
+        self.assertClean(self.check('--policy', str(policy)))
+        self.unstage(path)
+        self.stage(path, data + b'\xff')
         self.assertFlagged(self.check('--policy', str(policy)), 1, 'unexpected-binary-or-archive')
 
     def test_oversized_object_handling(self):

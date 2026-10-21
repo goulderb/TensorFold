@@ -6,18 +6,21 @@ const glue = @import("cuda_glue.zig");
 const experts = @import("cuda_experts.zig");
 const b16 = @import("cuda_b16.zig");
 const mia = @import("cuda_experts_mia.zig");
+const exl3 = @import("cuda_exl3.zig");
+const prof_mod = @import("cuda_prof.zig");
 
 /// One MoE layer on a rank: router (bf16) and fp32 bias, routed experts, shared [gate | up] (or EXL3's two) and down.
 pub const Layer = struct {
+    exl3: ?@import("cuda_exl3.zig").Experts = null,
     router: u64,
     bias: u64,
     routed: cuda.experts.Layer,
     mia_routed: ?mia.Experts = null,
     count: usize,
-    shared_gu: b16.Proj,
+    shared_gu: @import("cuda_proj.zig").Proj,
     shared_gate: ?cuda.qlinear.Weight = null,
     shared_up: ?cuda.qlinear.Weight = null,
-    shared_down: b16.Proj,
+    shared_down: @import("cuda_proj.zig").Proj,
     shared: usize,
     top_k: usize,
     scale: f32,
@@ -39,10 +42,11 @@ pub const Scratch = struct {
     sy: u64, // fp32 [rows][dims]
     mm_part: u64, // fp32 split-K partials of the shared expert's matmuls
     mia_scratch: ?mia.Scratch = null,
+    x3: exl3.Scratch = .{ .picks = 0, .xg = 0, .xu = 0, .z = 0 },
 };
 
 /// The kernels the block runs: the captured Triton set, the grouped NVFP4 experts, the plan, and glm_ops.
-pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, put_slot: cuda.Function, mia_kernels: ?*const mia.Kernels = null };
+pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, exl3: ?*const exl3.Kernels = null, put_slot: cuda.Function, mia_kernels: ?*const mia.Kernels = null, prof: ?*prof_mod.Prof = null };
 
 /// forward.moe_block: out [rows][dims] fp32 partial; `prompt`: 64-pair items, the prompt kernels, bf16 slot rows.
 pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool, out: u64) !void {
@@ -57,6 +61,9 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     const shared_id: i32 = @intCast(l.count);
     try glue.router(k.set, stream, x, x_stride, l.router, s.mlog, s.router_part, rows, d, l.count);
     try glue.select(k.set, stream, s.mlog, l.bias, s.pick, s.wts, rows, l.top_k, l.count, l.scale, l.norm);
+    if (k.prof) |p| p.mark(stream, .router);
+    defer if (k.prof) |p| p.mark(stream, .routed);
+    if (l.exl3) |w| return exl3.run(k.exl3 orelse return error.Exl3KernelsMissing, k.experts, stream, w, s.x3, s.plan, x, x_stride, s.pick, slots, rows, l.count, d, l.routed.width, l.routed.limit, prompt, s.ey, s.eact);
     const plan: experts.Plan = .{ .route = s.plan, .slots = slots, .experts = l.count + 1, .prompt = prompt };
     try experts.route(k.experts, stream, s.pick, rows * slots, plan);
     if (l.mia_routed) |m| {
@@ -79,23 +86,24 @@ pub fn shared(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_s
     if (l.shared_gate) |g| {
         // EXL3: gate and up apart, each through s.sact into its half of the [gate | up] rows
         for ([_]cuda.qlinear.Weight{ g, l.shared_up orelse return error.MissingSharedUp }, 0..) |w, j| {
-            try b16.proj(k.set, stream, x + lo * x_stride * 2, x_stride, .{ .q = w }, s.sact + lo * l.shared * 2, s.mm_part, n, l.shared, d, false);
-            try b16.copyRows(k.set, stream, s.sact + lo * l.shared * 2, l.shared * 2, gu + j * l.shared * 2, 2 * l.shared * 2, n, l.shared * 2);
+            try @import("cuda_proj.zig").matmul(k.set, stream, .{ .q = w }, x + lo * x_stride * 2, x_stride, s.sact + lo * l.shared * 2, s.mm_part, n, l.shared, d, false);
+            try @import("cuda_proj.zig").copyRows(k.set, stream, s.sact + lo * l.shared * 2, l.shared * 2, gu + j * l.shared * 2, 2 * l.shared * 2, n, l.shared * 2);
         }
-    } else try b16.proj(k.set, stream, x + lo * x_stride * 2, x_stride, l.shared_gu, gu, s.mm_part, n, 2 * l.shared, d, false);
+    } else try @import("cuda_proj.zig").matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, gu, s.mm_part, n, 2 * l.shared, d, false);
     try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
-    try b16.proj(k.set, stream, s.sact + lo * l.shared * 2, l.shared, l.shared_down, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
+    try @import("cuda_proj.zig").matmul(k.set, stream, l.shared_down, s.sact + lo * l.shared * 2, l.shared, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
 }
 
 pub fn finish(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi: usize, prompt: bool, out: u64) !void {
     const d = l.routed.dims;
     const slots = l.top_k + 1;
     const n = hi - lo;
-    const eb: usize = if (prompt) 2 else 4;
+    const bf16_slots = prompt and l.exl3 == null;
+    const eb: usize = if (bf16_slots) 2 else 4;
     var a: cuda.Args = .{};
     a.add(s.sy + lo * d * 4);
     a.add(s.ey + lo * slots * d * eb);
-    for ([_]usize{ n, d, slots, l.top_k, @intFromBool(prompt) }) |v| a.add(@as(c_int, @intCast(v)));
+    for ([_]usize{ n, d, slots, l.top_k, @intFromBool(bf16_slots) }) |v| a.add(@as(c_int, @intCast(v)));
     try cuda.launch.launch(k.put_slot, .{ .grid = .{ .x = @intCast((n * d + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
-    try glue.combine(k.set, stream, s.ey + lo * slots * d * eb, !prompt, s.wts + lo * slots * 4, out, n, d, slots);
+    try glue.combine(k.set, stream, s.ey + lo * slots * d * eb, !bf16_slots, s.wts + lo * slots * 4, out, n, d, slots);
 }

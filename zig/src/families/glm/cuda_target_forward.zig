@@ -131,7 +131,7 @@ pub const Runtime = struct {
             }
         };
         var call: Call = .{ .runtime = r, .forward = f };
-        try r.bank.run(f.stream, .{ .buffer = f.target_buffer, .layer = 0, .rows = ids.len }, &call, Call.compute);
+        try r.bank.run(f.stream, try f.graphKey(0, ids.len), &call, Call.compute);
     }
 
     pub fn kda(r: *Runtime, set: glue.Set, stream: cuda.Stream, b: *state.Buffers, layer: kda_block.Layer, index: usize, rows: usize, out: u64, wide: bool, output_prefetch: ?@import("cuda_l2pf.zig").Hook) !void {

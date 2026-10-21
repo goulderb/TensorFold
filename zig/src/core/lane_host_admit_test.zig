@@ -104,6 +104,29 @@ test "shared prefix admission lets unrelated work pass and releases attempted or
     try host.filling.append(gpa, &producer);
     try std.testing.expectEqual(@as(?usize, null), pick(&host));
     try std.testing.expectEqual(@as(u64, 2), host.shared_prefix_waits);
+
+    host.frame_key = struct {
+        fn key(images: []const api.Image) u32 {
+            return images[0].gw;
+        }
+    }.key;
+    const image_a = [_]api.Image{.{ .pixels = &.{}, .gh = 1, .gw = 1, .at = 2, .tokens = 4, .hash = 42 }};
+    const image_b = [_]api.Image{.{ .pixels = &.{}, .gh = 1, .gw = 2, .at = 2, .tokens = 4, .hash = 42 }};
+    const frame_a: Request = .{ .prompt = &prompt, .max_tokens = 2, .images = &image_a };
+    const frame_b: Request = .{ .prompt = &prompt, .max_tokens = 2, .images = &image_b };
+    producer.request = &frame_a;
+    try producer.prepareKey();
+    defer gpa.free(producer.key);
+    var different: LaneHost.Job = .{ .host = &host, .id = 5, .request = &frame_b, .sink = undefined };
+    defer gpa.free(different.key);
+    host.queued.items[0] = &different;
+    try std.testing.expectEqual(@as(?usize, 0), pick(&host));
+    var same: LaneHost.Job = .{ .host = &host, .id = 6, .request = &frame_a, .sink = undefined };
+    defer gpa.free(same.key);
+    host.queued.items[0] = &same;
+    try std.testing.expectEqual(@as(?usize, null), pick(&host));
+    host.filling.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(?usize, 0), pick(&host));
 }
 
 test "a short request behind one that waits for pool room runs beside the running stream" {

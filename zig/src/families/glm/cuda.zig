@@ -1,6 +1,12 @@
 //! GLM-5.3-Flash on CUDA: the family's parts, ported from the Python family's CUDA path.
 
 pub const experts = @import("cuda_experts.zig");
+pub const exl3 = @import("cuda_exl3.zig");
+pub const mm = @import("cuda_mm.zig");
+pub const relay = @import("cuda_relay.zig");
+pub const vision_config = @import("vision_config.zig");
+pub const image_core = @import("image_core.zig");
+pub const image = image_core.For(@import("core").picture);
 pub const glue = @import("cuda_glue.zig");
 pub const kda = @import("cuda_kda.zig");
 pub const b16 = @import("cuda_b16.zig");
@@ -29,6 +35,8 @@ pub const target_meta = @import("cuda_target_meta.zig");
 pub const target_forward = @import("cuda_target_forward.zig");
 pub const sampler = @import("cuda_sampler.zig");
 pub const greedy = @import("cuda_greedy.zig");
+pub const prompt_sink = @import("cuda_prompt_sink.zig");
+pub const prompt_logprobs = @import("cuda_prompt_logprobs.zig");
 pub const engine = @import("cuda_engine.zig");
 pub const follow = @import("cuda_follow.zig");
 pub const lanes = @import("cuda_lanes.zig");
@@ -43,6 +51,14 @@ pub const vision_probe = @import("cuda_vision_probe.zig");
 pub const vision_runtime = @import("cuda_vision_runtime.zig");
 
 test {
+    _ = @import("cuda_load_owner.zig");
+    _ = @import("cuda_images_interleave_test.zig");
+    _ = exl3;
+    _ = mm;
+    _ = relay;
+    _ = image_core;
+    _ = @import("cuda_qpack.zig");
+    _ = @import("cuda_tile.zig");
     _ = @import("cuda_l2pf_plan.zig");
     _ = @import("cuda_l2pf.zig");
     _ = @import("cuda_attn_fp8load_test.zig");
@@ -79,6 +95,7 @@ test {
     _ = target_meta;
     _ = target_forward;
     _ = sampler;
+    _ = prompt_logprobs;
     _ = engine;
     _ = follow;
     _ = lanes;
@@ -94,6 +111,13 @@ test {
     _ = @import("heat"); // upstream's heat bands, run where the GLM ranks use them
 }
 
+// Native entry coverage belongs to the family boundary, not the independently runnable source-format gather tests.
+test "mixed loader native entry points compile" {
+    _ = &@import("cuda_weights.zig").load;
+    _ = &@import("cuda_engine.zig").Engine.init;
+    _ = &@import("cuda_vision_runtime.zig").Service.open;
+}
+
 /// Components used by the model-free tap-commit proof, without constructing a DFlash engine.
 pub const taps_fixture = struct {
     pub const forward = @import("cuda_dflash_forward.zig");
@@ -103,3 +127,11 @@ pub const taps_fixture = struct {
     pub const ops = @import("cuda_dflash_ops.zig");
     pub const aot = @import("cuda_dflash_aot.zig");
 };
+pub const dflash = @import("dflash.zig");
+pub const dflash_candidates = @import("dflash_candidates.zig");
+pub const dflash_load_owner = @import("dflash_load_owner.zig");
+
+pub const prompts = @import("cuda_prompts.zig");
+pub const prompt_hold = @import("cuda_prompt_hold.zig");
+pub const prompt_wire = @import("cuda_prompt_wire.zig");
+pub const structured = @import("cuda_structured.zig");

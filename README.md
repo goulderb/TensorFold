@@ -219,6 +219,7 @@ The binary's `capabilities --json` response lists its supported flags and platfo
 | `--speed-up FILE` | Rank and link settings for two-Mac Flash Next or GLM serving. |
 | `--max-tokens N` | Default reply limit, 4096; requests can override it. |
 | `--temperature T` | Sampling temperature; zero requests greedy decoding. |
+| `--prompt-seed` | Use native prompt-derived keys instead of the fresh OS fallback; request and configured default seeds still win. |
 | `--top-p P`, `--top-k K`, `--min-p P` | Sampling defaults. |
 | `--thinking`, `--no-thinking` | Choose whether the chat template opens a reasoning block. |
 | `--reasoning-effort LEVEL` | Default template effort: `low`, `medium`, `high` or `xhigh`. |
@@ -363,7 +364,7 @@ Thank you to everyone who has sent TensorFold a pull request, a measurement or a
 [@johnymoo](https://github.com/johnymoo),
 [@JordiPosthumus](https://github.com/JordiPosthumus),
 [@JRaxworthy](https://github.com/JRaxworthy),
-[@jregan-beasley-smc](https://github.com/jregan-beasley-smc),
+[@jrb-ai](https://github.com/jrb-ai),
 [@jschmied](https://github.com/jschmied),
 [@juliankang4](https://github.com/juliankang4),
 [@kelchm](https://github.com/kelchm),

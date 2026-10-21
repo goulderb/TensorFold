@@ -17,22 +17,29 @@ pub fn emit(rank: u32, phase: Phase, reset: bool) void {
 
 pub fn emitUsage(rank: u32, phase: Phase, reset: bool, usage: memory.Usage) void {
     if (!enabled()) return;
-    var ts: std.c.timespec = undefined;
-    const ns: ?u64 = if (std.c.clock_gettime(.MONOTONIC, &ts) == 0)
-        @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec))
-    else
-        null;
-    const receipt: Receipt = .{ .pid = std.c.getpid(), .rank = rank, .phase = phase, .reset = reset, .monotonic_ns = ns, .usage = usage };
+    const ns: ?u64 = if (comptime @import("builtin").os.tag == .windows) null else blk: {
+        var ts: std.c.timespec = undefined;
+        break :blk if (std.c.clock_gettime(.MONOTONIC, &ts) == 0)
+            @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec))
+        else
+            null;
+    };
+    const receipt: Receipt = .{ .pid = processId(), .rank = rank, .phase = phase, .reset = reset, .monotonic_ns = ns, .usage = usage };
     std.debug.print("TF_MEMORY {f}\n", .{std.json.fmt(receipt, .{})});
 }
 
 pub fn snapshot(rank: u32, phase: Phase, reset: bool, monotonic_ns: ?u64) Receipt {
-    return .{ .pid = std.c.getpid(), .rank = rank, .phase = phase, .reset = reset, .monotonic_ns = monotonic_ns, .usage = memory.usage(reset) };
+    return .{ .pid = processId(), .rank = rank, .phase = phase, .reset = reset, .monotonic_ns = monotonic_ns, .usage = memory.usage(reset) };
+}
+
+fn processId() u32 {
+    if (comptime @import("builtin").os.tag == .windows) return std.os.windows.GetCurrentProcessId();
+    return @intCast(std.c.getpid());
 }
 
 pub const Receipt = struct {
     schema: u32 = 1,
-    pid: std.c.pid_t,
+    pid: u32,
     rank: u32,
     phase: Phase,
     reset: bool,

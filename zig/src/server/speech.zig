@@ -1,6 +1,6 @@
 //! POST /v1/audio/speech: WAV or raw PCM whole, or raw PCM chunks with stream; only complete synthesis is audio.
 const std = @import("std");
-const sock = @import("platform").sock;
+const sock = @import("sys").sock;
 const api = @import("engine_api");
 const json = @import("json");
 const errors = @import("errors.zig");

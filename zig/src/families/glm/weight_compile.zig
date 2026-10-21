@@ -13,8 +13,8 @@ export fn glmEngineCompile(a: *const std.mem.Allocator, io: *const std.Io, d: *c
     return E.Engine.init(a.*, io.*, d, ctx, std.mem.span(dir), lib, comm, rank, world, options.*) catch null;
 }
 
-export fn glmVisionCompile(a: *const std.mem.Allocator, io: *const std.Io, d: *const cuda.Driver, context: cuda.abi.Context, stream: *const cuda.Stream, dir: [*:0]const u8, probe: *@import("cuda_vision_probe.zig").Probe) ?*V.Service {
-    return V.Service.open(a.*, io.*, d, context, stream.*, std.mem.span(dir), probe) catch null;
+export fn glmVisionCompile(a: *const std.mem.Allocator, io: *const std.Io, d: *const cuda.Driver, context: cuda.abi.Context, stream: *const cuda.Stream, dir: [*:0]const u8, probe: *@import("cuda_vision_probe.zig").Probe, ql: *const cuda.qlinear.Linear) ?*V.Service {
+    return V.Service.open(a.*, io.*, d, context, stream.*, std.mem.span(dir), probe, ql.*, null) catch null;
 }
 
 pub fn main() void {}

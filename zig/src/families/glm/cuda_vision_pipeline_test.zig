@@ -663,3 +663,244 @@ test "vision pipeline cleanup wrong current context retains ready owner and inva
     w.deinit();
     try clean();
 }
+
+// Actual Tower.encode and Request/Service calls, with command/lifetime recordings instead of GPU arithmetic.
+// Feature byte markers below stand for recorded destination writes, not manufactured numerical embeddings.
+const CanonicalRecording = struct {
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    const Feature = struct { ptr: u64 = 0, bytes: usize = 0 };
+    const Layout = struct { rows: u64 = 0, cols: u64 = 0, dtype: lt.DataType = .bf16 };
+    const Write = struct { ptr: u64, bytes: usize };
+    var base: cuda.Driver = undefined;
+    var features: [8]Feature = @splat(.{});
+    var layouts: [8192]Layout = @splat(.{});
+    var writes: [32]Write = undefined;
+    var write_count: usize = 0;
+    var images: usize = 0;
+    var fail_image: usize = 0;
+    var scratch: u64 = 0;
+    var scratch_frees: usize = 0;
+    var waits: usize = 0;
+    var launches: usize = 0;
+    var queued: bool = false;
+    var stamp: u8 = 0x31;
+    const context: cuda.abi.Context = @ptrFromInt(0x1230);
+    fn alloc(out: *u64, bytes: usize) callconv(.c) cuda.abi.Result {
+        if (bytes >= 64 << 20) {
+            std.debug.assert(scratch == 0);
+            scratch = 0x7000000000;
+            out.* = scratch;
+            return 0;
+        }
+        std.debug.assert(bytes < 2 << 20); // admitted test feature tables only; scratch has no backing host allocation
+        const result = base.api.cuMemAlloc_v2(out, bytes);
+        if (result != 0) return result;
+        for (&features) |*f| if (f.ptr == 0) {
+            f.* = .{ .ptr = out.*, .bytes = bytes };
+            @memset(Memory.slice(out.*, bytes), 0xa5);
+            return 0;
+        };
+        unreachable;
+    }
+    fn free(ptr: u64) callconv(.c) cuda.abi.Result {
+        std.debug.assert(!queued); // both successful and failed encode must complete before scratch/output release
+        if (ptr == scratch) {
+            std.debug.assert(waits > 0);
+            scratch = 0;
+            scratch_frees += 1;
+            return 0;
+        }
+        for (&features) |*f| if (f.ptr == ptr) {
+            f.* = .{};
+            return base.api.cuMemFree_v2(ptr);
+        };
+        unreachable;
+    }
+    fn upload(_: u64, _: ?*const anyopaque, _: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        queued = true;
+        return 0;
+    }
+    fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        waits += 1;
+        queued = false;
+        return 0;
+    }
+    fn fence() callconv(.c) cuda.abi.Result {
+        queued = false;
+        return 0;
+    }
+    fn current(out: *cuda.abi.Context) callconv(.c) cuda.abi.Result {
+        out.* = context;
+        return 0;
+    }
+    fn launch(f: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+        queued = true;
+        launches += 1;
+        if (f == @as(cuda.abi.Function, @ptrFromInt(1))) {
+            images += 1;
+            if (images == fail_image) return cuda.abi.error_not_ready;
+        }
+        return 0;
+    }
+    fn layout(out: *lt.Layout, dtype: lt.DataType, rows: u64, cols: u64, ld: i64) callconv(.c) c_int {
+        const result = LT.layout(out, dtype, rows, cols, ld);
+        if (result == 0) layouts[@intFromPtr(out.*)] = .{ .rows = rows, .cols = cols, .dtype = dtype };
+        return result;
+    }
+    fn matmul(_: lt.Handle, _: lt.MatmulDesc, _: ?*const anyopaque, _: u64, _: lt.Layout, _: u64, _: lt.Layout, _: ?*const anyopaque, _: u64, _: lt.Layout, dst: u64, descriptor: lt.Layout, _: ?*const lt.Algo, _: u64, _: usize, _: cuda.abi.Stream) callconv(.c) c_int {
+        LT.matmuls += 1;
+        queued = true;
+        const dims = layouts[@intFromPtr(descriptor)];
+        const bytes: usize = @intCast(dims.rows * dims.cols * (if (dims.dtype == .bf16) @as(u64, 2) else 4));
+        for (features) |f| if (f.ptr != 0 and dst >= f.ptr and dst < f.ptr + f.bytes) {
+            std.debug.assert(dims.dtype == .bf16 and dst + bytes <= f.ptr + f.bytes);
+            writes[write_count] = .{ .ptr = dst, .bytes = bytes };
+            write_count += 1;
+            @memset(Memory.slice(dst, bytes), stamp);
+        };
+        return 0;
+    }
+    fn driver() cuda.Driver {
+        base = Memory.driver();
+        var d = base;
+        d.api.cuMemAlloc_v2 = alloc;
+        d.api.cuMemFree_v2 = free;
+        d.api.cuMemcpyHtoDAsync_v2 = upload;
+        d.api.cuStreamSynchronize = sync;
+        d.api.cuCtxSynchronize = fence;
+        d.api.cuCtxGetCurrent = current;
+        d.api.cuLaunchKernel = launch;
+        return d;
+    }
+    fn tower(d: *const cuda.Driver, c: p.Config) @import("cuda_vision.zig").Tower {
+        var api = LT.api;
+        api.cublasLtMatrixLayoutCreate = layout;
+        api.cublasLtMatmul = matmul;
+        var owner: @import("cuda_vision.zig").Tower = .{
+            .gpa = a,
+            .d = d,
+            .lt = .{ .lib = undefined, .api = api },
+            .mem = .{ .d = d, .ptr = 0x100000000, .len = 256, .borrowed = true },
+            .ql = .{},
+            .inv_freq = .{ .d = d, .ptr = 0x200000000, .len = 64, .borrowed = true },
+            .linears = .init(a),
+            .ws = .{ .d = d, .ptr = 0x300000000, .len = 64 << 20, .borrowed = true },
+            .eps = c.eps,
+            .theta = c.theta,
+            .limit = c.limit,
+            // Borrowed recording addresses, aligned just like actual stored Tower projections.
+            .patch_w = 0x100000000,
+            .down_w = 0x100000000,
+            .m_proj = .{ .bf16 = 0x100000000 },
+            .m_gate = .{ .bf16 = 0x100000000 },
+            .m_up = .{ .bf16 = 0x100000000 },
+            .m_down = .{ .bf16 = 0x100000000 },
+        };
+        for (&owner.blocks) |*b| b.* = .{ .n1 = 0, .n2 = 0, .qkv_w = .{ .bf16 = 0x100000000 }, .qkv_b = 0, .qn = 0, .kn = 0, .proj_w = .{ .bf16 = 0x100000000 }, .proj_b = 0, .g_w = .{ .bf16 = 0x100000000 }, .g_b = 0, .u_w = .{ .bf16 = 0x100000000 }, .u_b = 0, .d_w = .{ .bf16 = 0x100000000 }, .d_b = 0 };
+        return owner;
+    }
+    fn run(d: *const cuda.Driver) @import("cuda_vision.zig").Run {
+        var r: @import("cuda_vision.zig").Run = .{ .stream = .{ .d = d, .handle = @ptrFromInt(2) }, .f = undefined };
+        inline for (@typeInfo(@import("cuda_vision.zig").Funcs).@"struct".field_names, 0..) |name, i| @field(r.f, name) = .{ .d = d, .handle = @ptrFromInt(i + 1) };
+        return r;
+    }
+    fn deinit(owner: *@import("cuda_vision.zig").Tower) void {
+        var it = owner.linears.valueIterator();
+        while (it.next()) |linear| linear.deinit();
+        owner.linears.deinit();
+    }
+    fn resetRecording() void {
+        std.debug.assert(Memory.empty() and LT.live == 0);
+        LT.next = 1;
+        LT.matmuls = 0;
+        features = @splat(.{});
+        layouts = @splat(.{});
+        write_count = 0;
+        images = 0;
+        fail_image = 0;
+        scratch = 0;
+        scratch_frees = 0;
+        waits = 0;
+        launches = 0;
+        queued = false;
+        stamp = 0x31;
+    }
+};
+
+test "canonical Service.encode writes heterogeneous image offsets into request-owned rows, survives another request and completes before scratch release" {
+    const C = CanonicalRecording;
+    C.resetRecording();
+    var d = C.driver();
+    const c = try config();
+    {
+        defer cuda.copy_source.dropSpares(&d, cuda.copy_source.current());
+        var tower = C.tower(&d, c);
+        defer C.deinit(&tower);
+        const run = C.run(&d);
+        var pixels: Pixels = .{};
+        var probe: @import("cuda_vision_probe.zig").Probe = .{ .gpa = a, .io = t.io, .library = pixels.library(), .config = c };
+        const Service = @import("cuda_vision_runtime.zig").Service;
+        const service = try a.create(Service);
+        service.* = .{ .gpa = a, .context = C.context, .probe = &probe, .tower = &tower, .run = run };
+        defer service.close();
+        const rotated = indexOf("oriented_png_6");
+        var template = try prepare(a, &pixels, c, &.{ 0, rotated, 0 }, cpu_options);
+        defer template.deinit() catch unreachable;
+        const encoded: [3][]const u8 = .{ fixtures.all[0].encoded, fixtures.all[rotated].encoded, fixtures.all[0].encoded };
+        var first = try service.encode(&encoded, template.ids, 101, 1);
+        defer first.close() catch unreachable;
+        const request = first.request;
+        try t.expect(request.images[0].grid[1] != request.images[1].grid[1]);
+        try t.expectEqual(@as(usize, 3), C.write_count);
+        var offset: usize = 0;
+        for (request.images, 0..) |image, i| {
+            const record = C.writes[i];
+            try t.expectEqual(request.table.?.features.ptr + offset, record.ptr);
+            try t.expectEqual(image.visualTokens() * 8192, record.bytes);
+            offset += record.bytes;
+        }
+        try t.expectEqual(@as(usize, 3), C.scratch_frees);
+        try t.expect(!C.queued and C.scratch == 0 and C.launches > 300 and LT.matmuls > 300);
+        const binding_first = try request.borrowedBinding();
+        const saved = try a.dupe(u8, C.Memory.slice(binding_first.owner.features.ptr, binding_first.owner.features.len));
+        defer a.free(saved);
+        for (saved) |byte| try t.expectEqual(@as(u8, 0x31), byte);
+        C.stamp = 0x73;
+        var second = try service.encode(&encoded, template.ids, 102, 1);
+        defer second.close() catch unreachable;
+        try t.expect(first.request.table.?.features.ptr != second.request.table.?.features.ptr);
+        try t.expectEqual(@as(usize, 6), C.write_count);
+        try t.expectEqualSlices(u8, saved, C.Memory.slice(binding_first.owner.features.ptr, binding_first.owner.features.len));
+        for (C.Memory.slice(second.request.table.?.features.ptr, second.request.table.?.features.len)) |byte| try t.expectEqual(@as(u8, 0x73), byte);
+        try t.expectEqual(@as(usize, 6), C.scratch_frees);
+    }
+    try t.expect(C.Memory.empty());
+    try t.expectEqual(@as(usize, 0), LT.live);
+}
+
+test "actual canonical request later-image failure never exposes the earlier successful subset and drains before scratch release" {
+    const C = CanonicalRecording;
+    C.resetRecording();
+    var d = C.driver();
+    const c = try config();
+    {
+        defer cuda.copy_source.dropSpares(&d, cuda.copy_source.current());
+        var tower = C.tower(&d, c);
+        defer C.deinit(&tower);
+        var run = C.run(&d);
+        var pixels: Pixels = .{};
+        var request = try prepare(a, &pixels, c, &.{ 0, indexOf("oriented_png_6") }, cpu_options);
+        defer request.deinit() catch unreachable;
+        C.fail_image = 2;
+        try t.expectError(error.NotReady, request.encodeTower(&tower, &run, .{ .stream = run.stream, .replica = 99, .expected_context = C.context }));
+        try t.expectEqual(@as(usize, 1), C.write_count); // positive control: the first image really reached its output projection
+        try t.expectEqual(@as(usize, 2), C.images);
+        try t.expectEqual(@as(usize, 2), C.scratch_frees);
+        try t.expect(!C.queued and C.scratch == 0 and !tower.busy.load(.acquire));
+        try t.expect(!request.table.?.ready);
+        try t.expectEqual(@TypeOf(request.state).failed, request.state);
+        try t.expectError(error.VisionPipelineNotReady, request.borrowedBinding());
+    }
+    try t.expect(C.Memory.empty());
+    try t.expectEqual(@as(usize, 0), LT.live);
+}

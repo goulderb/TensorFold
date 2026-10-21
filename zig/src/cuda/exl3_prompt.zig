@@ -1,6 +1,6 @@
 //! The common EXL3 prompt path, after @BobClawblaw's #976 design and MiaAI-Lab's transposed kernels.
 const std = @import("std");
-const ex = @import("exl3_experts_common.zig");
+const ex = @import("exl3_experts.zig");
 const launch = @import("launch.zig");
 const grouped = @import("grouped.zig");
 const Module = @import("module.zig").Module;

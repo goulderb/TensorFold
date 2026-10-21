@@ -37,8 +37,7 @@ const merger_specs = [_]struct { n: u32, k: u32, weight: memory.host.Root }{
     .{ .n = 4096, .k = 10240, .weight = .down },
 };
 fn exact(c: Config) !void {
-    try c.check();
-    if (c.hidden != 1024 or c.heads != 16 or c.depth != 24 or c.intermediate != 4096 or c.output != 4096 or c.projection_intermediate != 10240) return error.UnsupportedVisionTowerConfig;
+    try @import("cuda_vision.zig").checkTowerConfig(c);
 }
 fn linearSpan(b: cuda.DeviceBuffer) lt.DeviceSpan {
     return .{ .ptr = b.ptr, .len = b.len };

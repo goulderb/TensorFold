@@ -29,6 +29,11 @@ pub const Plan = enum(u8) {
         return if (dflash) p else .baseline;
     }
 
+    /// Canonical seven-draft windows own the same plan at allocation, admission and tap staging.
+    pub fn effective(p: Plan, legacy: bool, canonical: bool) Plan {
+        return if (canonical) .dflash7 else p.active(legacy);
+    }
+
     pub fn drafts(p: Plan) usize {
         return switch (p) {
             .baseline => 3,
@@ -53,4 +58,13 @@ test "verify plans retain baseline and reach the 64 row boundary only by opt in"
     try std.testing.expectEqual(Plan.baseline, Plan.dflash6.active(false));
     try std.testing.expectEqual(Plan.dflash6, Plan.dflash6.active(true));
     try std.testing.expectEqual(@as(usize, 64), max_rows);
+}
+
+test "canonical option uses one 64 row plan for allocation admission and tap staging" {
+    try std.testing.expectEqual(Plan.dflash7, Plan.effective(.baseline, false, true));
+    try std.testing.expectEqual(@as(usize, 64), Plan.effective(.baseline, false, true).rows());
+    try std.testing.expectEqual(Plan.baseline, Plan.effective(.baseline, false, false));
+    try std.testing.expectEqual(@as(usize, 32), Plan.effective(.baseline, false, false).rows());
+    try std.testing.expectEqual(Plan.dflash7, Plan.effective(.dflash6, true, true));
+    try std.testing.expectEqual(@as(usize, 64), Plan.effective(.dflash6, true, true).rows());
 }

@@ -14,14 +14,14 @@ pub const Which = enum(u2) { gate_up, down_f32, down };
 /// Upstream's NVFP4 and EXL3 experts and plan kernels.
 pub const Kernels = struct {
     nvfp4: cuda.experts.Nvfp4Experts,
-    exl3: cuda.exl3_experts.Experts,
+    exl3: cuda.exl3_trellis_experts.Experts,
     router: cuda.grouped.Router,
 
     /// `plans`: the loaded experts module (its plan kernels).
     pub fn load(d: *const cuda.Driver, plans: cuda.Module, sms: u32) !Kernels {
         var nvfp4 = try cuda.experts.Nvfp4Experts.load(d, sms);
         errdefer nvfp4.unload();
-        var exl3 = try cuda.exl3_experts.Experts.load(d, sms);
+        var exl3 = try cuda.exl3_trellis_experts.Experts.load(d, sms);
         errdefer exl3.unload();
         return .{ .nvfp4 = nvfp4, .exl3 = exl3, .router = try cuda.grouped.Router.resolve(plans) };
     }

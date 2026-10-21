@@ -5,7 +5,6 @@ pub const Driver = @import("driver.zig").Driver;
 pub const copy_source = @import("copy_source.zig");
 pub const completion = @import("completion.zig");
 pub const Error = @import("driver.zig").Error;
-pub const dynlib = @import("dynlib.zig");
 pub const Context = @import("context.zig").Context;
 pub const DeviceBuffer = @import("memory.zig").DeviceBuffer;
 pub const HostBuffer = @import("memory.zig").HostBuffer;
@@ -67,14 +66,21 @@ pub const moe_glue = @import("moe_glue.zig");
 pub const dense_rows = @import("dense_rows.zig");
 pub const exl3 = @import("exl3.zig");
 pub const exl3_experts = @import("exl3_experts.zig");
-pub const exl3_experts_common = @import("exl3_experts_common.zig");
+pub const exl3_trellis_experts = @import("exl3_trellis_experts.zig");
 pub const exl3_upload = @import("exl3_upload.zig");
 pub const exl3_candidate = @import("exl3_candidate.zig");
 pub const exl3_grouped = @import("exl3_grouped.zig");
 
+pub const arena = @import("arena.zig");
+pub const pack = @import("pack.zig");
+pub const graph_cache = @import("graph_cache.zig");
+
 test {
-    _ = dynlib;
     _ = @import("driver.zig");
+    _ = exl3_grouped;
+    _ = gdn_train;
+    _ = train_q4;
+    _ = train_attn;
     _ = @import("memory.zig");
     _ = @import("nccl.zig");
     _ = @import("graph.zig");
@@ -86,7 +92,7 @@ test {
     _ = @import("embed_rows.zig");
     _ = @import("exl3_linear.zig");
     _ = @import("exl3_experts.zig");
-    _ = @import("exl3_experts_common.zig");
+    _ = @import("exl3_trellis_experts.zig");
     _ = @import("route_rows.zig");
     _ = @import("vit.zig");
     _ = @import("tree_round.zig");
@@ -133,3 +139,21 @@ test {
 }
 
 pub const ggml = @import("ggml.zig");
+
+pub const gdn_train = @import("gdn_train.zig");
+pub const train_q4 = @import("train_q4.zig");
+pub const train_attn = @import("train_attn.zig");
+
+test {
+    _ = tp_group;
+    _ = arena;
+    _ = pack;
+    _ = graph_cache;
+    _ = @import("graph_registry.zig");
+    _ = @import("graph_cache_regression_test.zig");
+    _ = @import("graph_cache_ranks_test.zig");
+    _ = exl3.block.dense;
+    _ = exl3.block.experts;
+    _ = exl3.block.lin2;
+    _ = exl3.block.x3gm;
+}

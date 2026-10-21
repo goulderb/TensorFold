@@ -33,10 +33,11 @@ fn waiting(h: *LaneHost, job: *Job) bool {
     if (!store.rules.shared_wait or job.request.untaught or job.request.prompt_logprobs != null) return false;
     const r = job.request;
     const spans = if (h.decoded_rows) r.decode_spans else &.{};
-    const have = if (store.find(r.prompt, r.chunks, spans)) |e| e.at else 0;
+    job.prepareKey() catch return false;
+    const have = if (store.find(job.cacheKey(), r.chunks, spans)) |e| e.at else 0;
     for (h.filling.items) |producer| {
         if (producer.request.untaught or producer.request.prompt_logprobs != null or producer.request.background) continue;
-        if (prefix.pending(.{ .tokens = r.prompt, .spans = spans, .starts = r.chunks }, .{ .tokens = producer.request.prompt, .spans = if (h.decoded_rows) producer.request.decode_spans else &.{} }, producer.marks, @max(have, producer.kept_through), store.rules.lookahead, store.rules.grid)) |at| {
+        if (prefix.pending(.{ .tokens = job.cacheKey(), .spans = spans, .starts = r.chunks }, .{ .tokens = producer.cacheKey(), .spans = if (h.decoded_rows) producer.request.decode_spans else &.{} }, producer.marks, @max(have, producer.kept_through), store.rules.lookahead, store.rules.grid)) |at| {
             if (store.family.vtable.bytes(store.family.ptr, at) <= store.budget) {
                 if (job.prefix_wait_at == null) {
                     job.prefix_wait_at = at;
@@ -53,9 +54,10 @@ fn fits(a: api.Admit, job: *const Job) bool {
     return a.fits(a.ctx, @intCast(job.request.prompt.len), job.request.max_tokens);
 }
 
-/// Whether to admit several at once: prompts batch, none fill by chunks, and two or more wait with two lanes free.
+/// Whether to admit several at once: prompts batch (beside chunked fills up to many_rows), two wait, two lanes free.
 pub fn batches(h: *LaneHost) bool {
-    if (!h.core.batchesPrompts() or h.core.fills()) return false;
+    if (!h.core.batchesPrompts()) return false;
+    if (h.core.fills() and h.core.backend.vtable.many_rows == 0) return false;
     h.lock();
     defer h.unlock();
     const lanes_now = @min(h.info_.lanes, h.memory_lanes orelse h.info_.lanes);
@@ -79,7 +81,7 @@ pub fn many(h: *LaneHost) bool {
         };
         took = true;
         const at = h.setup(job) orelse continue;
-        if (h.startsAlone(job)) {
+        if (h.startsAlone(job) or (h.core.fills() and !h.core.batchable(&job.stream))) { // long, image, resumed: filled
             _ = h.launch(job, at);
             continue;
         }

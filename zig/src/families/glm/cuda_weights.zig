@@ -1,4 +1,4 @@
-//! A TP rank's GLM-5.3-Flash weights on CUDA (the Python family's weights.load, NVFP4 or EXL3), named by its paths.
+//! A TP rank's GLM-5.3-Flash weights on CUDA (the Python family's weights.load, NVFP4), named by its paths for digests.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -12,13 +12,15 @@ const mlp = @import("cuda_mlp.zig");
 const moe = @import("cuda_moe.zig");
 const quant = @import("cuda_quant.zig");
 const q4 = @import("cuda_q4.zig");
-const b16 = @import("cuda_b16.zig");
+const exl3 = @import("cuda_exl3.zig");
 const x3 = @import("cuda_weights_exl3.zig");
-pub const projections = @import("cuda_weights_projs.zig");
-
-const source = @import("cuda_weight_source.zig");
-const src_dense = @import("cuda_weight_source_dense.zig");
 const precision = @import("cuda_weight_precision.zig");
+pub const projections = @import("cuda_weights_projs.zig");
+const mm_mod = @import("cuda_mm.zig");
+pub const formats = @import("cuda_formats.zig");
+const projection = @import("cuda_proj.zig");
+const glue = @import("cuda_glue.zig");
+
 const Tensor = core.checkpoint.Tensor;
 pub const prefix = "model.language_model.";
 
@@ -28,13 +30,13 @@ pub const Hc = struct { fn_w: u64, base: u64, scale: u64 };
 pub const Mixer = union(cfg.Kind) { kda: kda_block.Layer, mla: dsa_block.Layer };
 pub const Ffn = union(enum) { dense: mlp.Layer, moe: moe.Layer };
 
-pub const Layer = struct { index: u32, attn_hc: Hc, ffn_hc: Hc, in_norm: u64, post_norm: u64, mixer: Mixer, ffn: Ffn };
+pub const Layer = struct { index: u32, attn_hc: Hc, ffn_hc: Hc, in_norm: glue.Norm, post_norm: glue.Norm, mixer: Mixer, ffn: Ffn };
 
-/// The MTP head (weights.MTPW): norms, eh_proj, a DSA + MoE layer, shared_head.norm, 4-bit draft head (EXL3: the head).
-pub const Mtp = struct { enorm: u64, hnorm: u64, eh: b16.Proj, norm: u64, layer: Layer, draft: ?q4.Q4 };
+/// The MTP head (weights.MTPW): norms, eh_proj, a DSA + MoE layer (NVFP4 experts), shared_head.norm, 4-bit draft head.
+pub const Mtp = struct { enorm: u64, hnorm: u64, eh: projection.Proj, norm: u64, layer: Layer, draft: ?q4.Q4 };
 
-/// The kernels a load runs: affine4_pack's tf_pack_dense, and for the MTP head the quantizers and the 4-bit tiling.
-pub const Tools = struct { recipes: ?*const core.modelopt.Table = null, pack_dense: cuda.Function, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null, affine4: ?*const cuda.qlinear.Affine4Kernels = null, modelopt: ?*const cuda.modelopt.Packer = null, ck: ?*const cuda.ck.Ck = null, precision: @import("cuda_weight_precision.zig").Settings = .{}, exl3_routed: @import("cuda_experts_mia.zig").Mode = .generic };
+/// The kernels a load runs: affine4_pack's tf_pack_dense, the FP8 lane, and the MTP head's quantizers and 4-bit tiling.
+pub const Tools = struct { recipes: ?*const core.modelopt.Recipes = null, precision: precision.Settings = .{}, exl3_routed: @import("cuda_experts_mia.zig").Mode = .generic, affine4: ?*const cuda.qlinear.Affine4Kernels = null, modelopt: ?*const cuda.modelopt.Packer = null, ck: ?*const cuda.ck.Ck = null, pack_dense: cuda.Function, lane: ?*const cuda.qmmf.Lane = null, quant: ?*const quant.Kernels = null, q4: ?*const q4.Kernels = null };
 
 /// A loaded tensor by the Python family's attribute path, for digests against its weights.
 pub const Named = struct { name: []u8, ptr: u64, len: usize };
@@ -45,12 +47,13 @@ pub const Weights = struct {
     share: shard.Share,
     embed: u64 = 0, // bf16 [vocab][dims]
     layers: []Layer = &.{},
-    norm: u64 = 0,
-    head: b16.Proj = .{ .b16 = 0 }, // bf16 [share.vocab][dims], or EXL3
-    precision: @import("cuda_weight_precision.zig").Settings = .{},
-    native_conversions: [@import("cuda_weight_precision.zig").groups.len]u32 = @splat(0),
-    exl3: bool = false, // an EXL3 checkpoint: the attention, shared expert, dense MLP and head quantized
+    precision: precision.Settings = .{},
+    native_conversions: [precision.groups.len]u32 = @splat(0),
+    exl3: bool = false,
+    norm: glue.Norm = .{ .bf16 = 0 },
+    head: projection.Proj = .{ .bf16 = 0 }, // [share.vocab][dims]: bf16, or MXFP8 for the lane
     mtp: ?Mtp = null,
+    exl3_shx: bool = true, // EXL3: every layer's gate and up share one input rotation (a prompt rotates each row once)
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     named: std.ArrayList(Named) = .empty,
 
@@ -63,7 +66,6 @@ pub const Weights = struct {
         w.* = undefined;
     }
 
-    /// Whether the attention projections are quantized (an EXL3 checkpoint), so the KDA projection stages its rows.
     pub fn quantizedAttention(w: *const Weights) bool {
         return w.exl3;
     }
@@ -75,6 +77,19 @@ pub const Weights = struct {
     }
 };
 
+/// Host bf16 from fp32: round to nearest even (torch's float -> bfloat16), NaN kept quiet.
+fn toBf16(v: f32) u16 {
+    const b: u32 = @bitCast(v);
+    if (std.math.isNan(v)) return @intCast((b >> 16) | 0x40);
+    return @intCast((b + 0x7fff + ((b >> 16) & 1)) >> 16);
+}
+
+/// A float32 narrowed to bf16 by the loader, or null when bf16 does not hold it exactly (NaN stays NaN).
+fn narrow(v: f32) ?u16 {
+    const h = toBf16(v);
+    return if (std.math.isNan(v) or @as(f32, @bitCast(@as(u32, h) << 16)) == v) h else null;
+}
+
 pub const Loader = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -85,46 +100,115 @@ pub const Loader = struct {
     ck: *core.Checkpoint,
     host: std.ArrayList(u8) = .empty,
     name_buf: [192]u8 = undefined,
+    last: []const u8 = "", // the tensor `get` read last, named when its values are refused
+    recipes: ?*const core.modelopt.Recipes = null, // MIXED_PRECISION's table; null: the tensors decide (NVFP4)
 
-    pub fn get(L: *Loader, comptime fmt: []const u8, args: anytype) !source.Source {
-        const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, args);
-        return source.Source.read(L.ck, L.tools.recipes, name);
+    pub fn get(L: *Loader, comptime fmt: []const u8, args: anytype) !Tensor {
+        L.last = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, args);
+        return L.ck.get(L.last);
+    }
+
+    /// Hidden-size norm `fmt` uploaded as `up`: bf16 as stored, or kept float32 for the _f32w kernels.
+    pub fn norm(L: *Loader, comptime fmt: []const u8, args: anytype, comptime up: []const u8) !glue.Norm {
+        const t = try L.get(fmt, args);
+        const kept = t.dtype == .f32;
+        if (kept and t.numel() != L.w.config.hidden) return error.UnexpectedTensor;
+        try L.whole(t, if (kept) .f32 else .bf16);
+        const w = try L.put(up, args);
+        return if (kept) .{ .f32 = w } else .{ .bf16 = w };
+    }
+
+    /// The projection `fmt` (a module under the prefix) is stored as `want`, or it is refused by name (formats.of).
+    fn format(L: *Loader, comptime fmt: []const u8, args: anytype, want: formats.Format) !void {
+        var buf: [192]u8 = undefined;
+        return L.formatIn(L.ck, try std.fmt.bufPrint(&buf, prefix ++ fmt, args), want);
+    }
+
+    pub fn formatIn(L: *Loader, ck: *core.Checkpoint, module: []const u8, want: formats.Format) !void {
+        _ = try L.formatOne(ck, module, &.{want});
+    }
+
+    /// `module`'s stored format (formats.of) when it is one of `wants`; any other is refused by name.
+    pub fn formatOne(L: *Loader, ck: *core.Checkpoint, module: []const u8, wants: []const formats.Format) !formats.Format {
+        var buf: [224]u8 = undefined;
+        const w = try ck.get(try std.fmt.bufPrint(&buf, "{s}.weight", .{module}));
+        const scale_name = try std.fmt.bufPrint(&buf, "{s}.weight_scale", .{module});
+        const s: ?Tensor = if (ck.has(scale_name)) try ck.get(scale_name) else null;
+        const stored: formats.Stored = .{
+            .weight = .{ .dtype = w.dtype, .shape = w.shape[0..w.rank] },
+            .scale = if (s) |*t| .{ .dtype = t.dtype, .shape = t.shape[0..t.rank] } else null,
+            .csf = ck.has(try std.fmt.bufPrint(&buf, "{s}.weight_scale.csf32_bases", .{module})),
+        };
+        const declared = L.declaredAs(module);
+        const got = formats.of(declared, stored);
+        if (got) |f| {
+            for (wants) |want| if (f == want) return f;
+        } else |_| {}
+        var why: [320]u8 = undefined;
+        const said = formats.describe(&why, module, declared, stored);
+        if (got) |_| {
+            std.log.err("{s}; this loader reads it as {any}", .{ said, wants });
+        } else |e| std.log.err("{s} ({t}); this loader reads it as {any}", .{ said, e, wants });
+        return error.UnreadableFormat;
+    }
+
+    /// What config.json declares `module` to be: its MIXED_PRECISION recipe, or NVFP4 for every quantized linear.
+    pub fn declaredAs(L: *const Loader, module: []const u8) formats.Declared {
+        return if (L.recipes) |r| .{ .mixed = r.of(module) } else .nvfp4;
     }
 
     /// The host bytes gathered so far uploaded as one tensor named `fmt`.
     pub fn put(L: *Loader, comptime fmt: []const u8, args: anytype) !u64 {
-        const b = try cuda.DeviceBuffer.fromHost(L.d, L.host.items);
-        try L.w.buffers.append(L.gpa, b);
-        try L.w.named.append(L.gpa, .{ .name = try std.fmt.allocPrint(L.gpa, fmt, args), .ptr = b.ptr, .len = b.len });
+        var b = try cuda.DeviceBuffer.fromHost(L.d, L.host.items);
+        errdefer b.free();
+        const name = try std.fmt.allocPrint(L.gpa, fmt, args);
+        errdefer L.gpa.free(name);
+        try L.w.buffers.ensureUnusedCapacity(L.gpa, 1);
+        try L.w.named.append(L.gpa, .{ .name = name, .ptr = b.ptr, .len = b.len });
+        L.w.buffers.appendAssumeCapacity(b);
         L.host.clearRetainingCapacity();
         return b.ptr;
     }
 
-    fn view(t: anytype) source.Source {
-        return if (@TypeOf(t) == Tensor) .{ .weight = t } else t;
+    /// Elements [lo, hi) of `t` flat as `to` (bf16 or fp32 from a bf16 or fp32 tensor; other dtypes only as stored).
+    pub fn add(L: *Loader, t: Tensor, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
+        if (t.dtype == to) {
+            const size = t.bytes.len / t.numel();
+            return L.host.appendSlice(L.gpa, t.bytes[lo * size .. hi * size]);
+        }
+        for (lo..hi) |i| {
+            const v: f32 = switch (t.dtype) {
+                .bf16 => @bitCast(@as(u32, std.mem.readInt(u16, t.bytes[2 * i ..][0..2], .little)) << 16),
+                .f32 => std.mem.bytesToValue(f32, t.bytes[4 * i ..][0..4]),
+                else => return error.UnexpectedTensor,
+            };
+            switch (to) {
+                .f32 => try L.host.appendSlice(L.gpa, std.mem.asBytes(&v)),
+                .bf16 => try L.host.appendSlice(L.gpa, std.mem.asBytes(&(narrow(v) orelse {
+                    std.log.err("{s}: a float32 value bf16 does not hold, and its kernels read bf16", .{L.last});
+                    return error.InexactBf16;
+                }))),
+                else => return error.UnexpectedTensor,
+            }
+        }
     }
 
-    fn add(L: *Loader, t: anytype, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
-        try view(t).append(L.gpa, &L.host, lo, hi, to);
-    }
-
-    pub fn rows(L: *Loader, t: anytype, lo: usize, hi: usize, total: usize, to: core.checkpoint.DType) !void {
-        if (total == 0 or lo > hi or hi > total) return error.UnexpectedTensor;
-        const count = view(t).weight.numel();
-        const per = count / total;
-        if (per * total != count) return error.UnexpectedTensor;
+    /// Rows [lo, hi) of `t`'s outermost axis (`total` long; a vector's elements): split.py's "row" cut.
+    pub fn rows(L: *Loader, t: Tensor, lo: usize, hi: usize, total: usize, to: core.checkpoint.DType) !void {
+        const per = t.numel() / total;
+        if (per * total != t.numel()) return error.UnexpectedTensor;
         try L.add(t, lo * per, hi * per, to);
     }
 
-    pub fn whole(L: *Loader, t: anytype, to: core.checkpoint.DType) !void {
-        try L.add(t, 0, view(t).weight.numel(), to);
+    pub fn whole(L: *Loader, t: Tensor, to: core.checkpoint.DType) !void {
+        try L.add(t, 0, t.numel(), to);
     }
 
-    pub fn cols(L: *Loader, t: anytype, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
-        const w = view(t).weight;
-        if (w.rank != 2 or lo > hi or hi > w.dim(1)) return error.UnexpectedTensor;
-        const k = w.dim(1);
-        for (0..w.dim(0)) |r| try L.add(t, r * k + lo, r * k + hi, to);
+    /// Columns [lo, hi) of every row of a matrix: split.py's "col" cut.
+    pub fn cols(L: *Loader, t: Tensor, lo: usize, hi: usize, to: core.checkpoint.DType) !void {
+        if (t.rank != 2) return error.UnexpectedTensor;
+        const k = t.dim(1);
+        for (0..t.dim(0)) |r| try L.add(t, r * k + lo, r * k + hi, to);
     }
 
     fn hc(L: *Loader, i: u32, comptime site: []const u8) !Hc {
@@ -136,28 +220,34 @@ pub const Loader = struct {
         return .{ .fn_w = f, .base = base, .scale = try L.put("layers.{d}.{s}_hc.scale", .{ i, site }) };
     }
 
-    pub fn packFinish(L: *Loader, group: precision.Group, comptime fmt: []const u8, args: anytype, src: source.Source, row_spans: []const source.Span, col_span: source.Span) !b16.Proj {
-        var p = try src_dense.pack(L.gpa, src, row_spans, col_span);
-        defer p.deinit(L.gpa);
-        return projections.sourceFinish(L, group, fmt, args, p);
+    /// These bytes came through the exact BF16 gather, not a quantized-source materializer.
+    fn finishBf16(L: *Loader, group: precision.Group, comptime name: []const u8, args: anytype, n: usize, k: usize) !projection.Proj {
+        if (L.tools.precision.dense.get(group) == .source) return .{ .bf16 = try L.put(name, args) };
+        return projections.finish(L, group, name, args, n, k);
     }
 
     /// weights.load's kda(i): [q | k | v | f_a | g_a | b], f_b/g_b by heads, o by columns, conv taps, A_log, dt_bias.
     fn kda(L: *Loader, i: u32) !kda_block.Layer {
         if (L.w.exl3) return x3.kda(L, i);
-        if (L.tools.precision.dense.get(.kda) == .source) return kdaSource(L, i);
         const c = &L.w.config;
         const h = L.w.share.kda;
         const dk = c.kda_dim;
         const all = c.kda_heads * dk;
-        inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
+        const mx = (try L.get("layers.{d}.self_attn.q_proj.weight", .{i})).dtype == .f8_e4m3; // FP4-Local's q, k, v and o
+        inline for (.{ "q", "k", "v" }) |x| try L.format("layers.{d}.self_attn." ++ x ++ "_proj", .{i}, if (mx) .mxfp8 else .bf16);
+        const hr: [2]usize = .{ h.lo * dk, h.hi * dk }; // the rank's heads' rows
+        var qkv: ?projection.Proj = null; // [q | k | v] as one lane weight, then the stack's bf16 rest
+        if (mx) {
+            const parts = [_]formats.Part{ .{ .rel = "self_attn.q_proj", .rows = hr }, .{ .rel = "self_attn.k_proj", .rows = hr }, .{ .rel = "self_attn.v_proj", .rows = hr } };
+            qkv = try projections.cut(L, .kda, prefix, i, &parts, &.{.mxfp8}, "layers.{d}.kda.qkv");
+        } else inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i}), hr[0], hr[1], all, .bf16);
         inline for (.{ "f_a", "g_a" }) |x| try L.whole(try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i}), .bf16);
         try L.rows(try L.get("layers.{d}.self_attn.b_proj.weight", .{i}), h.lo, h.hi, c.kda_heads, .bf16);
-        const proj = try projections.finish(L, .kda, "layers.{d}.kda.proj", .{i}, 3 * h.len() * dk + 2 * dk + h.len(), c.hidden);
+        const proj = if (mx) try L.finishBf16(.kda, "layers.{d}.kda.rest", .{i}, 2 * dk + h.len(), c.hidden) else try L.finishBf16(.kda, "layers.{d}.kda.proj", .{i}, 3 * h.len() * dk + 2 * dk + h.len(), c.hidden);
         try L.rows(try L.get("layers.{d}.self_attn.f_b_proj.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
-        const fb = try projections.finish(L, .kda, "layers.{d}.kda.fb", .{i}, h.len() * dk, dk);
+        const fb = try L.finishBf16(.kda, "layers.{d}.kda.fb", .{i}, h.len() * dk, dk);
         try L.rows(try L.get("layers.{d}.self_attn.g_b_proj.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
-        const gb = try projections.finish(L, .kda, "layers.{d}.kda.gb", .{i}, h.len() * dk, dk);
+        const gb = try L.finishBf16(.kda, "layers.{d}.kda.gb", .{i}, h.len() * dk, dk);
         inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_conv1d.weight", .{i}), h.lo * dk, h.hi * dk, all, .f32);
         const conv = try L.put("layers.{d}.kda.conv", .{i});
         inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_conv1d.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
@@ -167,50 +257,9 @@ pub const Loader = struct {
         try L.rows(try L.get("layers.{d}.self_attn.dt_bias", .{i}), h.lo * dk, h.hi * dk, all, .f32);
         const dt = try L.put("layers.{d}.kda.dt_bias", .{i});
         try L.whole(try L.get("layers.{d}.self_attn.o_norm.weight", .{i}), .bf16);
-        const norm = try L.put("layers.{d}.kda.norm", .{i});
-        try L.cols(try L.get("layers.{d}.self_attn.o_proj.weight", .{i}), h.lo * dk, h.hi * dk, .bf16);
-        const o = try projections.finish(L, .kda, "layers.{d}.kda.o", .{i}, c.hidden, h.len() * dk);
-        return .{ .proj = proj, .fb = fb, .gb = gb, .o = o, .conv_w = conv, .prompt_conv_w = prompt_conv, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
-    }
-
-    fn kdaSource(L: *Loader, i: u32) !kda_block.Layer {
-        const c = &L.w.config;
-        const h = L.w.share.kda;
-        const dk = c.kda_dim;
-        const all = c.kda_heads * dk;
-        const hidden: source.Span = .{ .lo = 0, .hi = c.hidden };
-        const qkv: source.Span = .{ .lo = h.lo * dk, .hi = h.hi * dk };
-        var stacked = try src_dense.pack(L.gpa, try L.get("layers.{d}.self_attn.q_proj.weight", .{i}), &.{qkv}, hidden);
-        defer stacked.deinit(L.gpa);
-        inline for (.{ "k", "v" }) |x| {
-            var next = try src_dense.pack(L.gpa, try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i}), &.{qkv}, hidden);
-            defer next.deinit(L.gpa);
-            try stacked.extend(L.gpa, next);
-        }
-        inline for (.{ "f_a", "g_a" }) |x| {
-            const t = try L.get("layers.{d}.self_attn." ++ x ++ "_proj.weight", .{i});
-            var next = try src_dense.pack(L.gpa, t, &.{.{ .lo = 0, .hi = t.weight.dim(0) }}, hidden);
-            defer next.deinit(L.gpa);
-            try stacked.extend(L.gpa, next);
-        }
-        var b = try src_dense.pack(L.gpa, try L.get("layers.{d}.self_attn.b_proj.weight", .{i}), &.{.{ .lo = h.lo, .hi = h.hi }}, hidden);
-        defer b.deinit(L.gpa);
-        try stacked.extend(L.gpa, b);
-        const proj = try projections.sourceFinish(L, .kda, "layers.{d}.kda.proj", .{i}, stacked);
-        const fb = try L.packFinish(.kda, "layers.{d}.kda.fb", .{i}, try L.get("layers.{d}.self_attn.f_b_proj.weight", .{i}), &.{qkv}, .{ .lo = 0, .hi = dk });
-        const gb = try L.packFinish(.kda, "layers.{d}.kda.gb", .{i}, try L.get("layers.{d}.self_attn.g_b_proj.weight", .{i}), &.{qkv}, .{ .lo = 0, .hi = dk });
-        inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_conv1d.weight", .{i}), h.lo * dk, h.hi * dk, all, .f32);
-        const conv = try L.put("layers.{d}.kda.conv", .{i});
-        inline for (.{ "q", "k", "v" }) |x| try L.rows(try L.get("layers.{d}.self_attn." ++ x ++ "_conv1d.weight", .{i}), h.lo * dk, h.hi * dk, all, .bf16);
-        const prompt_conv = try L.put("layers.{d}.kda.prompt_conv", .{i});
-        try L.rows(try L.get("layers.{d}.self_attn.A_log", .{i}), h.lo, h.hi, c.kda_heads, .f32);
-        const a_log = try L.put("layers.{d}.kda.a_log", .{i});
-        try L.rows(try L.get("layers.{d}.self_attn.dt_bias", .{i}), h.lo * dk, h.hi * dk, all, .f32);
-        const dt = try L.put("layers.{d}.kda.dt_bias", .{i});
-        try L.whole(try L.get("layers.{d}.self_attn.o_norm.weight", .{i}), .bf16);
-        const norm = try L.put("layers.{d}.kda.norm", .{i});
-        const o = try L.packFinish(.kda, "layers.{d}.kda.o", .{i}, try L.get("layers.{d}.self_attn.o_proj.weight", .{i}), &.{.{ .lo = 0, .hi = c.hidden }}, qkv);
-        return .{ .proj = proj, .fb = fb, .gb = gb, .o = o, .conv_w = conv, .prompt_conv_w = prompt_conv, .a_log = a_log, .dt_bias = dt, .norm_w = norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
+        const o_norm = try L.put("layers.{d}.kda.norm", .{i});
+        const o = try projections.cut(L, .kda, prefix, i, &.{.{ .rel = "self_attn.o_proj", .cols = hr }}, &.{ .bf16, .mxfp8 }, "layers.{d}.kda.o");
+        return .{ .proj = proj, .qkv = qkv, .fb = fb, .gb = gb, .o = o, .conv_w = conv, .prompt_conv_w = prompt_conv, .a_log = a_log, .dt_bias = dt, .norm_w = o_norm, .eps = c.eps, .lower = c.lower_bound, .heads = h.len(), .dims = c.hidden };
     }
 
     /// weights.load's dsa(i) (latent): [q_a | kv_a], norms, q_b by heads, kv_b as wk/wv (AbsorbW), o by cols, indexer.
@@ -218,69 +267,37 @@ pub const Loader = struct {
         const c = &L.w.config;
         const h = L.w.share.mla;
         const qk = c.nope;
-        const ex = L.w.exl3;
-        const input: dsa_block.InputProjection = if (ex) .{ .separate = .{
+        // the MTP layer's may be MXFP8 (FP4-Local's): on the lane as stored, kv_b widened exactly for its halves
+        const mtp = i == c.layers;
+        const wants: []const formats.Format = if (mtp) &.{ .bf16, .fp8_pb, .mxfp8 } else &.{ .bf16, .fp8_pb };
+        var kb: [96]u8 = undefined;
+        const kv_name = try std.fmt.bufPrint(&kb, prefix ++ "layers.{d}.self_attn.kv_b_proj", .{i});
+        const kv_mx = mtp and (try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i})).dtype == .f8_e4m3;
+        try L.format("layers.{d}.self_attn.kv_b_proj", .{i}, if (kv_mx) .mxfp8 else .bf16);
+        const kv_wide: ?formats.mxfp8.Mxfp8 = if (kv_mx) try formats.mxfp8.Mxfp8.read(L.ck, kv_name) else null;
+        const input: dsa_block.InputProjection = if (L.w.exl3) .{ .separate = .{
             .qa = .{ .q = try x3.whole(L, "layers.{d}.self_attn.q_a_proj", i) },
             .kva = .{ .q = try x3.whole(L, "layers.{d}.self_attn.kv_a_proj_with_mqa", i) },
-        } } else if (L.tools.precision.dense.get(.dsa) == .source) blk: {
-            const qa = try L.packFinish(.dsa, "layers.{d}.dsa.qa", .{i}, try L.get("layers.{d}.self_attn.q_a_proj.weight", .{i}), &.{.{ .lo = 0, .hi = c.q_lora }}, .{ .lo = 0, .hi = c.hidden });
-            const kva = try L.packFinish(.dsa, "layers.{d}.dsa.kva", .{i}, try L.get("layers.{d}.self_attn.kv_a_proj_with_mqa.weight", .{i}), &.{.{ .lo = 0, .hi = c.kv_lora }}, .{ .lo = 0, .hi = c.hidden });
-            break :blk .{ .separate = .{ .qa = qa, .kva = kva } };
-        } else if (L.tools.precision.dense.get(.dsa) == .q4) blk: {
-            inline for (.{ "q_a_proj", "kv_a_proj_with_mqa" }) |x| try L.whole(try L.get("layers.{d}.self_attn." ++ x ++ ".weight", .{i}), .bf16);
-            break :blk .{ .combined = try projections.finish(L, .dsa, "layers.{d}.dsa.proj", .{i}, c.q_lora + c.kv_lora, c.hidden) };
-        } else if (L.tools.precision.dense.get(.dsa) != .bf16) blk: {
-            try L.whole(try L.get("layers.{d}.self_attn.q_a_proj.weight", .{i}), .bf16);
-            const qa = try projections.finish(L, .dsa, "layers.{d}.dsa.qa", .{i}, c.q_lora, c.hidden);
-            try L.whole(try L.get("layers.{d}.self_attn.kv_a_proj_with_mqa.weight", .{i}), .bf16);
-            const kva = try projections.finish(L, .dsa, "layers.{d}.dsa.kva", .{i}, c.kv_lora, c.hidden);
-            break :blk .{ .separate = .{ .qa = qa, .kva = kva } };
-        } else blk: {
-            inline for (.{ "q_a_proj", "kv_a_proj_with_mqa" }) |x| try L.whole(try L.get("layers.{d}.self_attn." ++ x ++ ".weight", .{i}), .bf16);
-            break :blk .{ .combined_bf16 = try L.put("layers.{d}.dsa.proj", .{i}) };
-        };
+        } } else if (L.tools.precision.dense.get(.dsa) == .source) .{ .separate = .{
+            .qa = try projections.cut(L, .dsa, prefix, i, &.{.{ .rel = "self_attn.q_a_proj" }}, wants, "layers.{d}.dsa.qa"),
+            .kva = try projections.cut(L, .dsa, prefix, i, &.{.{ .rel = "self_attn.kv_a_proj_with_mqa" }}, wants, "layers.{d}.dsa.kva"),
+        } } else .{ .combined = try projections.cut(L, .dsa, prefix, i, &.{ .{ .rel = "self_attn.q_a_proj" }, .{ .rel = "self_attn.kv_a_proj_with_mqa" } }, wants, "layers.{d}.dsa.proj") };
         try L.whole(try L.get("layers.{d}.self_attn.q_a_layernorm.weight", .{i}), .bf16);
         const q_norm = try L.put("layers.{d}.dsa.q_norm", .{i});
         try L.whole(try L.get("layers.{d}.self_attn.kv_a_layernorm.weight", .{i}), .bf16);
         const kv_norm = try L.put("layers.{d}.dsa.kv_norm", .{i});
-        const q_b: b16.Proj = if (ex) .{ .q = try x3.layerMatrix(L, "layers.{d}.self_attn.q_b_proj", i, 0, 0, &.{.{ .lo = h.lo * qk, .hi = h.hi * qk }}) } else if (L.tools.precision.dense.get(.dsa) == .source)
-            try L.packFinish(.dsa, "layers.{d}.dsa.q_b", .{i}, try L.get("layers.{d}.self_attn.q_b_proj.weight", .{i}), &.{.{ .lo = h.lo * qk, .hi = h.hi * qk }}, .{ .lo = 0, .hi = c.q_lora })
-        else blk: {
-            try L.rows(try L.get("layers.{d}.self_attn.q_b_proj.weight", .{i}), h.lo * qk, h.hi * qk, c.mla_heads * qk, .bf16);
-            break :blk try projections.finish(L, .dsa, "layers.{d}.dsa.q_b", .{i}, h.len() * qk, c.q_lora);
-        };
+        const q_b: projection.Proj = if (L.w.exl3) .{ .q = try x3.layerMatrix(L, "layers.{d}.self_attn.q_b_proj", i, 0, 0, &.{.{ .lo = h.lo * qk, .hi = h.hi * qk }}) } else try projections.cut(L, .dsa, prefix, i, &.{.{ .rel = "self_attn.q_b_proj", .rows = .{ h.lo * qk, h.hi * qk } }}, wants, "layers.{d}.dsa.q_b");
         const kv_b = try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i});
         const per = qk + c.v_dim; // a head's kv_b rows: its keys, then its values
         const total = c.mla_heads * per;
-        for (h.lo..h.hi) |head| try L.rows(kv_b, head * per, head * per + qk, total, .bf16);
+        for (h.lo..h.hi) |head| try absorbRows(L, kv_wide, kv_b, kv_name, head * per, head * per + qk, total);
         const wk = try L.put("layers.{d}.dsa.absorb.wk", .{i});
-        for (h.lo..h.hi) |head| try L.rows(kv_b, head * per + qk, (head + 1) * per, total, .bf16);
+        for (h.lo..h.hi) |head| try absorbRows(L, kv_wide, kv_b, kv_name, head * per + qk, (head + 1) * per, total);
         const wv = try L.put("layers.{d}.dsa.absorb.wv", .{i});
-        const o: b16.Proj = if (ex) .{ .q = try x3.layerMatrix(L, "layers.{d}.self_attn.o_proj", i, h.lo * c.v_dim, h.hi * c.v_dim, &.{.{ .lo = 0, .hi = c.hidden }}) } else if (L.tools.precision.dense.get(.dsa) == .source)
-            try L.packFinish(.dsa, "layers.{d}.dsa.o", .{i}, try L.get("layers.{d}.self_attn.o_proj.weight", .{i}), &.{.{ .lo = 0, .hi = c.hidden }}, .{ .lo = h.lo * c.v_dim, .hi = h.hi * c.v_dim })
-        else blk: {
-            try L.cols(try L.get("layers.{d}.self_attn.o_proj.weight", .{i}), h.lo * c.v_dim, h.hi * c.v_dim, .bf16);
-            break :blk try projections.finish(L, .dsa, "layers.{d}.dsa.o", .{i}, c.hidden, h.len() * c.v_dim);
-        };
-        const kw: b16.Proj = if (L.tools.precision.dense.get(.dsa) == .source) blk: {
-            const index_wk = try L.get("layers.{d}.self_attn.indexer.wk.weight", .{i});
-            var stacked = try src_dense.pack(L.gpa, index_wk, &.{.{ .lo = 0, .hi = index_wk.weight.dim(0) }}, .{ .lo = 0, .hi = c.hidden });
-            defer stacked.deinit(L.gpa);
-            const wp = try L.get("layers.{d}.self_attn.indexer.weights_proj.weight", .{i});
-            var next = try src_dense.pack(L.gpa, wp, &.{.{ .lo = 0, .hi = wp.weight.dim(0) }}, .{ .lo = 0, .hi = c.hidden });
-            defer next.deinit(L.gpa);
-            try stacked.extend(L.gpa, next);
-            break :blk try projections.sourceFinish(L, .dsa, "layers.{d}.dsa.index.kw", .{i}, stacked);
-        } else blk: {
-            inline for (.{ "wk", "weights_proj" }) |x| try L.whole(try L.get("layers.{d}.self_attn.indexer." ++ x ++ ".weight", .{i}), .bf16);
-            break :blk try projections.finish(L, .dsa, "layers.{d}.dsa.index.kw", .{i}, c.i_dim + c.i_heads, c.hidden);
-        };
-        const qb: b16.Proj = if (ex) .{ .q = try x3.whole(L, "layers.{d}.self_attn.indexer.wq_b", i) } else if (L.tools.precision.dense.get(.dsa) == .source)
-            try L.packFinish(.dsa, "layers.{d}.dsa.index.qb", .{i}, try L.get("layers.{d}.self_attn.indexer.wq_b.weight", .{i}), &.{.{ .lo = 0, .hi = c.i_heads * c.i_dim }}, .{ .lo = 0, .hi = c.q_lora })
-        else blk: {
-            try L.whole(try L.get("layers.{d}.self_attn.indexer.wq_b.weight", .{i}), .bf16);
-            break :blk try projections.finish(L, .dsa, "layers.{d}.dsa.index.qb", .{i}, c.i_heads * c.i_dim, c.q_lora);
-        };
+        const o: projection.Proj = if (L.w.exl3) .{ .q = try x3.layerMatrix(L, "layers.{d}.self_attn.o_proj", i, h.lo * c.v_dim, h.hi * c.v_dim, &.{.{ .lo = 0, .hi = c.hidden }}) } else try projections.cut(L, .dsa, prefix, i, &.{.{ .rel = "self_attn.o_proj", .cols = .{ h.lo * c.v_dim, h.hi * c.v_dim } }}, wants, "layers.{d}.dsa.o");
+        const iw: []const formats.Format = if (mtp) &.{ .bf16, .mxfp8 } else &.{.bf16};
+        const kw = try projections.cut(L, .dsa, prefix, i, &.{ .{ .rel = "self_attn.indexer.wk" }, .{ .rel = "self_attn.indexer.weights_proj" } }, iw, "layers.{d}.dsa.index.kw");
+        const qb: projection.Proj = if (L.w.exl3) .{ .q = try x3.whole(L, "layers.{d}.self_attn.indexer.wq_b", i) } else try projections.cut(L, .dsa, prefix, i, &.{.{ .rel = "self_attn.indexer.wq_b" }}, iw, "layers.{d}.dsa.index.qb");
         try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.weight", .{i}), .bf16);
         const ln_w = try L.put("layers.{d}.dsa.index.ln_w", .{i});
         try L.whole(try L.get("layers.{d}.self_attn.indexer.k_norm.bias", .{i}), .bf16);
@@ -309,12 +326,16 @@ pub const Loader = struct {
         };
     }
 
+    /// kv_b's rows [lo, hi) onto the host bytes: bf16 as stored, or MXFP8 (`mx`, the MTP layer's) widened exactly.
+    fn absorbRows(L: *Loader, mx: ?formats.mxfp8.Mxfp8, t: Tensor, name: []const u8, lo: usize, hi: usize, total: usize) !void {
+        if (mx) |p| return formats.mxfp8.appendWide(L, p, name, lo, hi);
+        try L.rows(t, lo, hi, total, .bf16);
+    }
+
     /// An NVFP4 linear's rows [lo, hi), inputs [klo, khi) as Fp4Linear.from_checkpoint (tf_pack_dense, packScales).
     fn fp4(L: *Loader, comptime fmt: []const u8, i: u32, lo: usize, hi: usize, klo: usize, khi: usize) !cuda.qmmf.Weight {
         const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ fmt, .{i});
-        var stored = try source.Fp4.read(L.gpa, L.ck, L.tools.recipes, name);
-        defer stored.deinit(L.gpa);
-        const l = stored.linear;
+        const l = try formats.plainLinear(L.ck, name, L.declaredAs(name));
         const n = hi - lo;
         const k = khi - klo;
         for (0..n) |r| try L.host.appendSlice(L.gpa, l.codes[(lo + r) * l.k / 2 + klo / 2 ..][0 .. k / 2]);
@@ -343,60 +364,34 @@ pub const Loader = struct {
         return cuda.nvfp4.weight(words.ptr, bs, l.global, n, k);
     }
 
-    /// weights.load's mlp for a dense layer: gate and up by the rank's rows, down by its columns (NVFP4).
+    /// weights.load's mlp for a dense layer: gate and up by the rank's rows, down by its columns (NVFP4 or MXFP8).
     fn dense(L: *Loader, i: u32) !mlp.Layer {
+        var name: [192]u8 = undefined;
+        if (L.w.exl3 and L.ck.has(try std.fmt.bufPrint(&name, prefix ++ "layers.{d}.mlp.gate_proj.trellis", .{i}))) return x3.dense(L, i);
         const c = &L.w.config;
         const s = L.w.share.dense;
         const d = c.hidden;
-        var dense_name: [192]u8 = undefined;
-        const weight_name = try std.fmt.bufPrint(&dense_name, prefix ++ "layers.{d}.mlp.gate_proj.weight", .{i});
-        if (L.ck.has(weight_name)) {
-            const gate = try L.ck.get(weight_name);
-            const rec = source.recipe(L.tools.recipes, weight_name[0 .. weight_name.len - 7]);
-            const bf16 = if (L.tools.recipes != null) (rec == null or rec.?.algo == .mxfp8 or rec.?.algo == .fp8_pb_wo) else (gate.dtype == .bf16 or gate.dtype == .f32);
-            if (bf16 and L.tools.precision.dense.get(.mlp) == .q4) {
-                inline for (.{ "gate_proj", "up_proj" }) |name| {
-                    const t = try L.get("layers.{d}.mlp." ++ name ++ ".weight", .{i});
-                    try L.rows(t, s.lo, s.hi, t.weight.dim(0), .bf16);
-                }
-                return .{
-                    .input = .{ .combined = try projections.finish(L, .mlp, "layers.{d}.mlp.gu", .{i}, 2 * s.len(), d) },
-                    .down = try L.denseB16(i, "down_proj", 0, d, s.lo, s.hi),
-                    .width = s.len(),
-                    .dims = d,
-                    .limit = c.swiglu_limit,
-                };
-            }
-            if (bf16) return .{
-                .input = .{ .separate = .{ .gate = try L.denseB16(i, "gate_proj", s.lo, s.hi, 0, d), .up = try L.denseB16(i, "up_proj", s.lo, s.hi, 0, d) } },
-                .down = try L.denseB16(i, "down_proj", 0, d, s.lo, s.hi),
-                .width = s.len(),
-                .dims = d,
-                .limit = c.swiglu_limit,
-            };
-        }
-        if (L.w.exl3) return .{
-            .input = .{ .separate = .{ .gate = .{ .q = try x3.layerMatrix(L, "layers.{d}.mlp.gate_proj", i, 0, 0, &.{s}) }, .up = .{ .q = try x3.layerMatrix(L, "layers.{d}.mlp.up_proj", i, 0, 0, &.{s}) } } },
-            .down = .{ .q = try x3.layerMatrix(L, "layers.{d}.mlp.down_proj", i, s.lo, s.hi, &.{.{ .lo = 0, .hi = d }}) },
-            .width = s.len(),
-            .dims = d,
-            .limit = c.swiglu_limit,
-        };
-        return .{
-            .input = .{ .separate = .{ .gate = .{ .q = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.gate_proj", i, s.lo, s.hi, 0, d) } }, .up = .{ .q = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.up_proj", i, s.lo, s.hi, 0, d) } } } },
+        const module = try std.fmt.bufPrint(&name, prefix ++ "layers.{d}.mlp.gate_proj", .{i});
+        const stored_format = try L.formatOne(L.ck, module, &.{ .bf16, .nvfp4, .mxfp8 });
+        inline for (.{ "up_proj", "down_proj" }) |x| try L.format("layers.{d}.mlp." ++ x, .{i}, stored_format);
+        if (stored_format == .nvfp4) return .{
+            .input = .{ .separate = .{
+                .gate = .{ .q = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.gate_proj", i, s.lo, s.hi, 0, d) } },
+                .up = .{ .q = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.up_proj", i, s.lo, s.hi, 0, d) } },
+            } },
             .down = .{ .q = .{ .nvfp4 = try L.fp4("layers.{d}.mlp.down_proj", i, 0, d, s.lo, s.hi) } },
             .width = s.len(),
             .dims = d,
             .limit = c.swiglu_limit,
         };
-    }
-
-    fn denseB16(L: *Loader, i: u32, comptime proj: []const u8, lo: usize, hi: usize, klo: usize, khi: usize) !b16.Proj {
-        const t = try L.get("layers.{d}.mlp." ++ proj ++ ".weight", .{i});
-        if (t.weight.rank != 2 or hi > t.weight.dim(0) or khi > t.weight.dim(1)) return error.UnexpectedTensor;
-        if (L.tools.precision.dense.get(.mlp) == .source) return L.packFinish(.mlp, "layers.{d}.mlp." ++ proj, .{i}, t, &.{.{ .lo = lo, .hi = hi }}, .{ .lo = klo, .hi = khi });
-        for (lo..hi) |row| try L.add(t, row * t.weight.dim(1) + klo, row * t.weight.dim(1) + khi, .bf16);
-        return projections.finish(L, .mlp, "layers.{d}.mlp." ++ proj, .{i}, hi - lo, khi - klo);
+        const parts = [_]formats.Part{ .{ .rel = "mlp.gate_proj", .rows = .{ s.lo, s.hi } }, .{ .rel = "mlp.up_proj", .rows = .{ s.lo, s.hi } } };
+        return .{
+            .input = .{ .combined = try projections.cut(L, .mlp, prefix, i, &parts, &.{stored_format}, "layers.{d}.mlp.gu") },
+            .down = try projections.cut(L, .mlp, prefix, i, &.{.{ .rel = "mlp.down_proj", .cols = .{ s.lo, s.hi } }}, &.{stored_format}, "layers.{d}.mlp.down"),
+            .width = s.len(),
+            .dims = d,
+            .limit = c.swiglu_limit,
+        };
     }
 
     /// One device allocation the loader frees itself (staging for the GPU's quantizers).
@@ -434,6 +429,7 @@ pub const Loader = struct {
                 const n = if (m < 2) ni else d; // gate and up: the rank's rows; down: every row, the rank's columns
                 const k = if (m < 2) d else ni;
                 for (e0..e0 + ec) |e| {
+                    try L.format("layers.{d}.mlp.experts.{d}." ++ proj, .{ i, e }, .bf16);
                     const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".weight", .{ i, e });
                     if (m < 2) try L.rows(t, cut.lo, cut.hi, c.moe_inter, .bf16) else try L.cols(t, cut.lo, cut.hi, .bf16);
                 }
@@ -466,9 +462,7 @@ pub const Loader = struct {
 
     /// weights.load's moe(i) on NVFP4: router and bias, routed experts as Experts4, the BF16 shared expert's share.
     pub fn moeLayer(L: *Loader, i: u32) !moe.Layer {
-        var routed_name: [192]u8 = undefined;
-        if (L.w.exl3 or L.ck.has(try std.fmt.bufPrint(&routed_name, prefix ++ "layers.{d}.mlp.experts.0.gate_proj.trellis", .{i}))) return x3.moe(L, i);
-        if (L.tools.exl3_routed == .mia_mcg4) return error.MiaNeedsMcg4Experts;
+        if (L.w.exl3 or L.tools.exl3_routed == .mia_mcg4) return x3.moe(L, i);
         const c = &L.w.config;
         const d: usize = c.hidden;
         const cut = L.w.share.moe;
@@ -477,6 +471,39 @@ pub const Loader = struct {
         const router = try L.put("layers.{d}.moe.router", .{i});
         try L.whole(try L.get("layers.{d}.mlp.gate.e_score_correction_bias", .{i}), .f32);
         const bias = try L.put("layers.{d}.moe.bias", .{i});
+        const count: usize = c.experts;
+        var routed: cuda.experts.Layer = .{ .format = .nvfp4, .up = 0, .down = 0, .width = ni, .dims = d, .experts = count, .limit = c.swiglu_limit };
+        var routed_exl3: ?exl3.Experts = null;
+        if (c.exl3) { // the MTP layer's experts too
+            routed_exl3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
+            if (!routed_exl3.?.shx) L.w.exl3_shx = false;
+        } else routed = try L.nvfp4Experts(i);
+        const sh = L.w.share.shared;
+        const sw: []const formats.Format = if (i == c.layers) &.{ .bf16, .fp8_pb, .mxfp8 } else &.{ .bf16, .fp8_pb }; // MTP's MXFP8
+        const gu_parts = [_]formats.Part{ .{ .rel = "mlp.shared_experts.gate_proj", .rows = .{ sh.lo, sh.hi } }, .{ .rel = "mlp.shared_experts.up_proj", .rows = .{ sh.lo, sh.hi } } };
+        const gu = try projections.cut(L, .shared, prefix, i, &gu_parts, sw, "layers.{d}.moe.shared.gu");
+        const sd = try projections.cut(L, .shared, prefix, i, &.{.{ .rel = "mlp.shared_experts.down_proj", .cols = .{ sh.lo, sh.hi } }}, sw, "layers.{d}.moe.shared.down");
+        return .{
+            .router = router,
+            .bias = bias,
+            .routed = routed,
+            .exl3 = routed_exl3,
+            .count = count,
+            .shared_gu = gu,
+            .shared_down = sd,
+            .shared = sh.len(),
+            .top_k = c.topk,
+            .scale = c.routed_scale,
+            .norm = c.norm_topk,
+        };
+    }
+
+    /// Layer `i`'s routed NVFP4 experts packed as Experts4 (the MTP layer's quantized from its BF16 ones).
+    fn nvfp4Experts(L: *Loader, i: u32) !cuda.experts.Layer {
+        const c = &L.w.config;
+        const d: usize = c.hidden;
+        const cut = L.w.share.moe;
+        const ni = cut.len();
         const count: usize = c.experts;
         const up_len = X.bytes(1, ni, d, 2) / 4;
         const down_len = X.bytes(1, d, ni, 1) / 4;
@@ -492,59 +519,43 @@ pub const Loader = struct {
         defer L.gpa.free(codes);
         const scales = try L.gpa.alloc(u8, d * ni / 16);
         defer L.gpa.free(scales);
-        if (i == c.layers and L.tools.recipes == null) try L.quantizedExperts(i, up, down, up_scale, down_scale) else for (0..count) |e| {
-            const globals = try source.packExpert(L.gpa, L.ck, L.tools.recipes, i, e, .{ .lo = cut.lo, .hi = cut.hi }, d, up[e * up_len ..][0..up_len], down[e * down_len ..][0..down_len], codes, scales);
-            up_scale[e * 2] = globals[0];
-            up_scale[e * 2 + 1] = globals[1];
-            down_scale[e] = globals[2];
+        const per = c.moe_inter * d / 16; // a whole gate, up or down's e4m3 scales
+        const decoded = try L.gpa.alloc(u8, 3 * per); // csf_32x2_v1's, decoded before the rank's cut
+        defer L.gpa.free(decoded);
+        // the MTP layer's experts: bf16 (nvidia's), quantized here, or W4A16_NVFP4 (FP4-Local's), read as stored
+        const bf16 = i == c.layers and (try L.get("layers.{d}.mlp.experts.0.gate_proj.weight", .{i})).dtype == .bf16;
+        if (bf16) try L.quantizedExperts(i, up, down, up_scale, down_scale) else for (0..count) |e| {
+            var ls: [3]core.nvfp4.Linear = undefined;
+            inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, m| {
+                const name = try std.fmt.bufPrint(&L.name_buf, prefix ++ "layers.{d}.mlp.experts.{d}." ++ proj, .{ i, e });
+                ls[m] = try formats.expert(L, name, decoded[m * per ..][0..per]);
+            }
+            // gate and up: the rank's rows; down: every row, the rank's columns
+            const gate = .{ ls[0].codes[cut.lo * d / 2 ..][0 .. ni * d / 2], ls[0].scales[cut.lo * d / 16 ..][0 .. ni * d / 16] };
+            const upm = .{ ls[1].codes[cut.lo * d / 2 ..][0 .. ni * d / 2], ls[1].scales[cut.lo * d / 16 ..][0 .. ni * d / 16] };
+            X.packGateUp(up[e * up_len ..][0..up_len], gate, upm, ni, d);
+            const l = ls[2];
+            for (0..d) |r| {
+                @memcpy(codes[r * ni / 2 ..][0 .. ni / 2], l.codes[r * l.k / 2 + cut.lo / 2 ..][0 .. ni / 2]);
+                @memcpy(scales[r * ni / 16 ..][0 .. ni / 16], l.scales[r * l.k / 16 + cut.lo / 16 ..][0 .. ni / 16]);
+            }
+            X.packOne(down[e * down_len ..][0..down_len], codes, scales, d, ni);
+            up_scale[e * 2] = ls[0].global;
+            up_scale[e * 2 + 1] = ls[1].global;
+            down_scale[e] = l.global;
         }
         var ptrs: [4]u64 = undefined;
         for (&ptrs, [_][]const u8{ std.mem.sliceAsBytes(up), std.mem.sliceAsBytes(down), std.mem.sliceAsBytes(up_scale), std.mem.sliceAsBytes(down_scale) }, [_][]const u8{ "up", "down", "up_scale", "down_scale" }) |*p, bytes, what| {
             try L.host.appendSlice(L.gpa, bytes);
             p.* = try L.put("layers.{d}.moe.experts.{s}", .{ i, what });
         }
-        const sh = L.w.share.shared;
-        const gu: b16.Proj, const sd: b16.Proj = if (L.tools.precision.dense.get(.shared) == .source) blk: {
-            const gate = try L.get("layers.{d}.mlp.shared_experts.gate_proj.weight", .{i});
-            var stacked = try src_dense.pack(L.gpa, gate, &.{.{ .lo = sh.lo, .hi = sh.hi }}, .{ .lo = 0, .hi = d });
-            defer stacked.deinit(L.gpa);
-            const up_src = try L.get("layers.{d}.mlp.shared_experts.up_proj.weight", .{i});
-            var next = try src_dense.pack(L.gpa, up_src, &.{.{ .lo = sh.lo, .hi = sh.hi }}, .{ .lo = 0, .hi = d });
-            defer next.deinit(L.gpa);
-            try stacked.extend(L.gpa, next);
-            const g = try projections.sourceFinish(L, .shared, "layers.{d}.moe.shared.gu", .{i}, stacked);
-            const shared_dn = try L.packFinish(.shared, "layers.{d}.moe.shared.down", .{i}, try L.get("layers.{d}.mlp.shared_experts.down_proj.weight", .{i}), &.{.{ .lo = 0, .hi = d }}, .{ .lo = sh.lo, .hi = sh.hi });
-            break :blk .{ g, shared_dn };
-        } else blk: {
-            inline for (.{ "gate_proj", "up_proj" }) |x| try L.rows(try L.get("layers.{d}.mlp.shared_experts." ++ x ++ ".weight", .{i}), sh.lo, sh.hi, c.shared_inter, .bf16);
-            const g = try projections.finish(L, .shared, "layers.{d}.moe.shared.gu", .{i}, 2 * sh.len(), d);
-            try L.cols(try L.get("layers.{d}.mlp.shared_experts.down_proj.weight", .{i}), sh.lo, sh.hi, .bf16);
-            break :blk .{ g, try projections.finish(L, .shared, "layers.{d}.moe.shared.down", .{i}, d, sh.len()) };
-        };
-        return .{
-            .router = router,
-            .bias = bias,
-            .routed = .{ .format = .nvfp4, .up = ptrs[0], .down = ptrs[1], .up_scale = ptrs[2], .down_scale = ptrs[3], .width = ni, .dims = d, .experts = count, .limit = c.swiglu_limit },
-            .count = count,
-            .shared_gu = gu,
-            .shared_down = sd,
-            .shared = sh.len(),
-            .top_k = c.topk,
-            .scale = c.routed_scale,
-            .norm = c.norm_topk,
-        };
-    }
-
-    fn mtp(L: *Loader) !Mtp {
-        return @import("cuda_weights_mtp.zig").load(L);
+        return .{ .format = .nvfp4, .up = ptrs[0], .down = ptrs[1], .up_scale = ptrs[2], .down_scale = ptrs[3], .width = ni, .dims = d, .experts = count, .limit = c.swiglu_limit };
     }
 
     fn layer(L: *Loader, i: u32) !Layer {
         const c = &L.w.config;
-        try L.whole(try L.get("layers.{d}.input_layernorm.weight", .{i}), .bf16);
-        const in_norm = try L.put("layers.{d}.in_norm", .{i});
-        try L.whole(try L.get("layers.{d}.post_attention_layernorm.weight", .{i}), .bf16);
-        const post_norm = try L.put("layers.{d}.post_norm", .{i});
+        const in_norm = try L.norm("layers.{d}.input_layernorm.weight", .{i}, "layers.{d}.in_norm");
+        const post_norm = try L.norm("layers.{d}.post_attention_layernorm.weight", .{i}, "layers.{d}.post_norm");
         return .{
             .index = i,
             .attn_hc = try L.hc(i, "attn"),
@@ -560,9 +571,8 @@ pub const Loader = struct {
     }
 };
 
-/// weights.load without the MTP head: embedding, layers, final norm, the rank's BF16 head rows; `pack_dense`.
+/// weights.load without the MTP head: embedding, layers, final norm, the rank's head rows (bf16, MXFP8); `pack_dense`.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, tools: Tools, dir: []const u8, c: cfg.Config, share: shard.Share, layers: []const u32, with_mtp: bool) !Weights {
-    if (tools.precision.dense.source() and tools.recipes == null) return error.SourceDenseRequiresMixed;
     var w: Weights = .{ .gpa = gpa, .config = c, .share = share, .precision = tools.precision };
     errdefer w.deinit();
     var ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, prefix);
@@ -571,6 +581,10 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     defer head_ck.close();
     var L: Loader = .{ .gpa = gpa, .d = d, .stream = stream, .pack_dense = tools.pack_dense, .tools = tools, .w = &w, .ck = &ck };
     defer L.host.deinit(gpa);
+    var recipes = try formats.readRecipes(gpa, io, dir);
+    defer if (recipes) |*r| r.deinit();
+    if (recipes) |*r| L.recipes = if (r.modules.count() > 0) r else null;
+    if (tools.recipes) |r| L.recipes = r;
     w.exl3 = ck.has(prefix ++ "layers.0.self_attn.qkv_proj.trellis");
     w.layers = try gpa.alloc(Layer, layers.len);
     for (layers, w.layers) |i, *l| {
@@ -580,19 +594,15 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
     }
     try L.whole(try L.get("embed_tokens.weight", .{}), .bf16);
     w.embed = try L.put("embed", .{});
-    try L.whole(try L.get("norm.weight", .{}), .bf16);
-    w.norm = try L.put("norm", .{});
+    w.norm = try L.norm("norm.weight", .{}, "norm");
+    const vocab: formats.Part = .{ .rel = "lm_head", .rows = .{ share.vocab.lo, share.vocab.hi } };
     if (w.exl3) {
         w.head = .{ .q = try x3.matrix(&L, &head_ck, "lm_head", 0, 0, &.{.{ .lo = share.vocab.lo, .hi = share.vocab.hi }}) };
-        // EXL3 keeps the MTP layer in mtp.safetensors or, in some quants, in the shards
         if (with_mtp and c.mtp > 0) ck.add(dir, "mtp.safetensors") catch |e| if (e != error.FileNotFound) return e;
-    } else {
-        try L.rows(try source.Source.read(&head_ck, tools.recipes, "lm_head.weight"), share.vocab.lo, share.vocab.hi, c.vocab, .bf16);
-        w.head = .{ .b16 = try L.put("head", .{}) };
-    }
-    if (with_mtp and c.mtp > 0) w.mtp = try L.mtp();
+    } else w.head = try formats.cut(&L, &head_ck, &.{"lm_head"}, &.{vocab}, &.{ .bf16, .mxfp8 }, "head", .{});
+    if (with_mtp and c.mtp > 0) w.mtp = try @import("cuda_mtp_load.zig").load(&L, &head_ck);
     try projections.head(&L);
-    if (tools.recipes != null) {
+    if (L.recipes != null) {
         for (0..c.layers) |i| {
             var selected = false;
             for (layers) |index| if (index == i) {
@@ -605,4 +615,90 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: c
         if (ck.unused() != 0 or head_ck.unused() != 0) return error.UnusedTensors;
     }
     return w;
+}
+
+test "actual mixed loading keeps an MXFP8 head and float32 norm" {
+    const gpa = std.testing.allocator;
+    const M = @import("cuda_test_driver.zig").Memory;
+    const hidden = 64;
+    const vocab = 128;
+    const embed: [vocab * hidden]u16 = @splat(0x3f80);
+    const norm: [hidden]f32 = @splat(@bitCast(@as(u32, 0x3f808001))); // not exactly representable as BF16
+    const codes: [vocab * hidden]u8 = @splat(0x38);
+    const scales: [vocab * hidden / 32]u8 = @splat(127);
+    const tensors = [_]core.shard_edit.New{
+        .{ .name = prefix ++ "embed_tokens.weight", .dtype = .bf16, .shape = &.{ vocab, hidden }, .bytes = std.mem.sliceAsBytes(&embed) },
+        .{ .name = prefix ++ "norm.weight", .dtype = .f32, .shape = &.{hidden}, .bytes = std.mem.sliceAsBytes(&norm) },
+        .{ .name = "lm_head.weight", .dtype = .f8_e4m3, .shape = &.{ vocab, hidden }, .bytes = &codes },
+        .{ .name = "lm_head.weight_scale", .dtype = .u8, .shape = &.{ vocab, hidden / 32 }, .bytes = &scales },
+    };
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var dir: [96]u8 = undefined;
+        const at = try std.fmt.bufPrint(&dir, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+        var path: [128]u8 = undefined;
+        try core.shard_edit.create(gpa, try std.fmt.bufPrint(&path, "{s}/model.safetensors", .{at}), &.{}, &tensors);
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data =
+            \\{"quantization_config":{"quant_method":"modelopt","quant_algo":"MIXED_PRECISION","quantized_layers":{"lm_head":{"quant_algo":"MXFP8","group_size":32}}}}
+        });
+        var driver = M.driver();
+        var lane: cuda.qmmf.Lane = undefined; // only the CPU shape planner is used; no kernel is launched
+        lane.clusters = true;
+        const tools: Tools = .{ .pack_dense = .{ .d = &driver, .handle = @ptrFromInt(1) }, .lane = &lane };
+        const c: cfg.Config = .{ .hidden = hidden, .vocab = vocab, .layers = 0, .mtp = 0 };
+        const share = try shard.Share.of(&c, 0, 1);
+        var w = try load(gpa, std.testing.io, &driver, .{ .d = &driver, .handle = null }, tools, at, c, share, &.{}, false);
+        defer w.deinit();
+        try std.testing.expect(w.head == .mxfp8);
+        try std.testing.expect(w.norm == .f32);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&norm), M.slice(w.norm.f32, @sizeOf(@TypeOf(norm))));
+        try std.testing.expectEqual(vocab * hidden, w.find("head.codes").?.len);
+        try std.testing.expectEqual(vocab * hidden / 32, w.find("head.scales").?.len);
+        try std.testing.expect(w.find("head") == null); // no materialized BF16 checkpoint head
+    }
+    try std.testing.expect(M.empty());
+}
+
+test "the actual startup loader refuses a missing checkpoint without device allocation" {
+    const Trace = struct {
+        var allocations: usize = 0;
+        fn alloc(_: *u64, _: usize) callconv(.c) cuda.abi.Result {
+            allocations += 1;
+            return 2; // an attempted allocation is observable, not real CUDA work
+        }
+    };
+    Trace.allocations = 0;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path: [160]u8 = undefined;
+    const missing = try std.fmt.bufPrint(&path, ".zig-cache/tmp/{s}/missing", .{tmp.sub_path});
+    var driver = @import("cuda_test_driver.zig").Memory.driver();
+    driver.api.cuMemAlloc_v2 = Trace.alloc;
+    const c: cfg.Config = .{};
+    const share = try shard.Share.of(&c, 0, 2);
+    try std.testing.expectError(error.FileNotFound, load(std.testing.allocator, std.testing.io, &driver, .{ .d = &driver, .handle = null }, .{ .pack_dense = .{ .d = &driver, .handle = @ptrFromInt(1) } }, missing, c, share, &.{0}, false));
+    try std.testing.expectEqual(@as(usize, 0), Trace.allocations);
+}
+
+test "bf16 rounding of fp32 is to nearest even" {
+    try std.testing.expectEqual(@as(u16, 0x3f80), toBf16(1.0));
+    try std.testing.expectEqual(@as(u16, 0x3f80), toBf16(@bitCast(@as(u32, 0x3f808000)))); // a tie to even (down)
+    try std.testing.expectEqual(@as(u16, 0x3f82), toBf16(@bitCast(@as(u32, 0x3f818000)))); // a tie to even (up)
+    try std.testing.expectEqual(@as(u16, 0x3f81), toBf16(@bitCast(@as(u32, 0x3f808001))));
+}
+
+test "the loader narrows a float32 to bf16 only when bf16 holds it, unlike FP4-Local's norms" {
+    try std.testing.expectEqual(@as(?u16, 0x3f80), narrow(1.0));
+    try std.testing.expectEqual(@as(?u16, null), narrow(@bitCast(@as(u32, 0x3f808001))));
+    try std.testing.expect(narrow(std.math.nan(f32)) != null);
+}
+
+test {
+    _ = projections;
+    _ = x3;
+    _ = @import("cuda_formats.zig");
+    _ = @import("cuda_proj.zig");
+    _ = @import("cuda_fp8pb.zig");
+    _ = @import("cuda_mxfp8.zig");
 }

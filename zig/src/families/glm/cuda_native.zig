@@ -13,9 +13,12 @@ const shard = @import("cuda_shard.zig");
 const vision_probe = @import("cuda_vision_probe.zig");
 const vision_runtime = @import("cuda_vision_runtime.zig");
 const vision_startup = @import("cuda_vision_startup.zig");
+const images_mod = @import("cuda_images.zig");
+const dflash = @import("dflash.zig");
+const dflash_load = @import("dflash_load.zig");
 
 pub const model_type = "glm5_next";
-pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "exl3" };
+pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "modelopt-mixed", "exl3" };
 // cc-defer: a fixed window; the Python family sizes it from free memory (capacity.admit), port that when serving needs
 pub const default_context: i64 = 8192;
 pub const max_segments: u32 = 1;
@@ -23,7 +26,7 @@ pub const prompt_rows: u32 = fw.prefill_rows;
 /// Prompt kernels change arithmetic with a chunk's rows: states keep and resume only on chunk starts.
 pub const snap_grid: u32 = prompt_rows;
 pub fn snap_shared_wait() bool {
-    return if (std.c.getenv("TF_GLM_SHARED_PREFIX_WAIT")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+    return if (@import("sys").getenv("TF_GLM_SHARED_PREFIX_WAIT")) |v| std.mem.eql(u8, v, "1") else false;
 }
 /// `explain` words this family's open refusals too (where to set the rank and the id).
 pub const explains_open = true;
@@ -32,7 +35,7 @@ pub const explains_open = true;
 pub const Room = engine.Room;
 /// `slide` stays false: the server refuses --slide for a family without a learner (no `slide` here).
 pub const PersistenceOpen = struct { ctx: *anyopaque, attach: *const fn (*anyopaque, *engine.Engine, *follow.Link) anyerror!engine.persistence.Port };
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, room: ?Room = null, persistence: ?PersistenceOpen = null };
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, room: ?Room = null, persistence: ?PersistenceOpen = null, vision: ?images_mod.Limits = null, drafter: ?[]const u8 = null, drafter_bits: u8 = 4 };
 /// The smallest room among the other ranks and whose it is.
 pub const Peer = struct { bytes: u64, rank: usize };
 
@@ -64,9 +67,9 @@ pub const Loaded = struct {
 pub const Place = struct { rank: usize, world: usize };
 
 pub fn place() !Place {
-    const r = std.c.getenv("TF_GLM_RANK") orelse return error.NoRank;
-    const w = std.c.getenv("TF_GLM_WORLD") orelse return error.NoRank;
-    const p: Place = .{ .rank = std.fmt.parseInt(usize, std.mem.span(r), 10) catch return error.NoRank, .world = std.fmt.parseInt(usize, std.mem.span(w), 10) catch return error.NoRank };
+    const r = @import("sys").getenv("TF_GLM_RANK") orelse return error.NoRank;
+    const w = @import("sys").getenv("TF_GLM_WORLD") orelse return error.NoRank;
+    const p: Place = .{ .rank = std.fmt.parseInt(usize, r, 10) catch return error.NoRank, .world = std.fmt.parseInt(usize, w, 10) catch return error.NoRank };
     return checked(p);
 }
 
@@ -101,6 +104,7 @@ const Owned = struct {
     lanes: glm_lanes.Lanes,
     probe: ?*vision_probe.Probe = null,
     vision: ?*vision_runtime.Service = null,
+    images: ?*images_mod.Images = null,
 };
 
 fn visionReady(ptr: *anyopaque, valid: bool) !bool {
@@ -110,19 +114,30 @@ fn visionReady(ptr: *anyopaque, valid: bool) !bool {
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, _: ?[]const u8, o: Options) !Loaded {
     const p = try place();
-    if (p.world > 1 and std.c.getenv("NCCL_COMM_ID") == null) return error.NoCommId;
+    if (p.world > 1 and @import("sys").getenv("NCCL_COMM_ID") == null) return error.NoCommId;
     var problem: []const u8 = "";
     const set = ranks.Settings.read(&ranks.environment, &problem) catch |err| {
         std.log.err("{s}", .{problem});
         return err;
     };
+    // the ranks' lines before NCCL (cuda/tp_watch.zig): a rank that fails, refuses or dies stops every rank
+    if (p.world > 1) try cuda.tp_watch.start(io, p.rank, p.world);
+    return openRank(gpa, io, ctx, dir, o, p, set) catch |err| {
+        cuda.tp_watch.fail(@errorName(err)); // the other ranks stop with this rank's error
+        return err;
+    };
+}
+
+/// `open` once the ranks' lines are up: NCCL, the engine and the link, then a follower's loop or rank 0's lanes.
+fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, o: Options, p: Place, set: ranks.Settings) !Loaded {
+    cuda.memory_receipt.emit(@intCast(p.rank), .load_begin, true); // the four phases tools/memory_receipts.py reads
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.gpa = gpa;
     own.probe = null;
     own.vision = null;
+    own.images = null;
     errdefer if (own.probe) |probe| probe.close();
-    errdefer if (own.vision) |vision| vision.close();
     own.lib = try cuda.nccl.Library.open();
     errdefer own.lib.close();
     var id: cuda.nccl.UniqueId = undefined;
@@ -131,9 +146,39 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     try own.lib.check(own.lib.api.ncclCommInitRank(&own.comm, @intCast(p.world), id, @intCast(p.rank)), "ncclCommInitRank");
     errdefer _ = own.lib.api.ncclCommDestroy(own.comm);
     const cap = capacity(o.context);
-    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.lib, own.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set, .room = o.room, .draft_kernels = ranks.environment("TF_GLM_DFLASH_KERNELS") });
+    own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.lib, own.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set, .vision = o.vision, .drafter = o.drafter, .drafter_bits = o.drafter_bits, .room = o.room, .draft_kernels = ranks.environment("TF_GLM_DFLASH_KERNELS") });
     errdefer own.e.deinit();
-    own.link = try follow.Link.init(gpa, ctx.d, &own.lib, own.comm, own.e.stream, cap);
+    errdefer if (own.images) |v| v.deinit();
+    // The adapter may borrow Images' Tower and the engine stream: close it before either owner.
+    errdefer if (own.vision) |v| v.close();
+    if (o.vision) |lim| { // before the rooms: the tower's bytes count against rank 0's
+        var problem: []const u8 = "";
+        var image_problem: ?anyerror = null;
+        const ql: cuda.qlinear.Linear = .{ .lane = &own.e.m.lane, .nvfp4_prompt = &own.e.m.prompt }; // the tower's MXFP8, NVFP4
+        own.images = images_mod.Images.init(gpa, io, ctx.d, own.e.stream, dir, lim, fw.prefill_rows + 1, p.rank == 0, ql, &problem) catch |err| blk: {
+            image_problem = err;
+            break :blk null;
+        };
+        if (own.images == null and image_problem == null) {
+            std.log.err("{s}", .{problem});
+            image_problem = error.NoVisionTower;
+        }
+        // A failed rank-zero tower cannot return while followers enter later collectives.
+        if (!try own.e.pairedReady(image_problem == null)) return image_problem orelse error.PeerVisionUnavailable;
+    }
+    own.e.images = own.images;
+    if (o.drafter) |dd| { // before the rooms: its weights and scratch count against every rank's
+        if (!o.drafts) return error.DrafterNeedsDrafts;
+        // Warmup ran without this sink. Retire its captures before attaching a new resource owner.
+        try own.e.invalidateCaptures();
+        var draft_problem: ?anyerror = null;
+        own.e.drafter = dflash_load.load(gpa, io, own.e, dd, p.rank, p.world, o.drafter_bits) catch |err| blk: {
+            draft_problem = err;
+            break :blk null;
+        };
+        if (!try own.e.pairedReady(draft_problem == null)) return draft_problem orelse error.PeerDrafterOpen;
+    }
+    own.link = try follow.Link.init(gpa, ctx.d, &own.lib, own.comm, own.e.stream, try linkCapacity(cap, o.vision));
     errdefer own.link.deinit();
     if (o.persistence) |persistence| {
         var problem_: ?anyerror = null;
@@ -151,13 +196,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (set.vision) {
         var vision_problem: ?anyerror = null;
         if (p.rank == 0) {
-            if (std.c.getenv("TF_GLM_VISION_CODEC")) |path| {
-                own.probe = vision_probe.Probe.open(gpa, io, dir, std.mem.span(path)) catch |err| blk: {
+            if (@import("sys").getenv("TF_GLM_VISION_CODEC")) |path| {
+                own.probe = vision_probe.Probe.open(gpa, io, dir, path) catch |err| blk: {
                     vision_problem = err;
                     break :blk null;
                 };
                 if (own.probe) |probe| {
-                    own.vision = vision_runtime.Service.open(gpa, io, ctx.d, ctx.handle, own.e.stream, dir, probe) catch |err| blk: {
+                    own.vision = vision_runtime.Service.open(gpa, io, ctx.d, ctx.handle, own.e.stream, dir, probe, .{ .lane = &own.e.m.lane, .nvfp4_prompt = &own.e.m.prompt }, own.images) catch |err| blk: {
                         vision_problem = err;
                         break :blk null;
                     };
@@ -167,8 +212,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         try vision_startup.paired(vision_problem, .{ .ctx = own.e, .ready = visionReady });
     }
     // Every rank checks TF_GLM_LONE_COSTS so a bad value stops both before they part; rank 0 alone plans with it.
-    const lone_costs: ?glm_lanes.LoneCosts = if (std.c.getenv("TF_GLM_LONE_COSTS")) |raw| glm_lanes.LoneCosts.parse(std.mem.span(raw)) catch {
-        std.log.err("rank {d}: TF_GLM_LONE_COSTS: ONE,ROW (positive ms, e.g. 38,7.9), not {s}", .{ p.rank, std.mem.span(raw) });
+    const lone_costs: ?glm_lanes.LoneCosts = if (@import("sys").getenv("TF_GLM_LONE_COSTS")) |raw| glm_lanes.LoneCosts.parse(raw) catch {
+        std.log.err("rank {d}: TF_GLM_LONE_COSTS: ONE,ROW (positive ms, e.g. 38,7.9), not {s}", .{ p.rank, raw });
         return error.BadSetting;
     } else null;
     // Rank 0 admits by the smallest room of the ranks; its sizes are the largest (the first ranks take the remainder).
@@ -180,31 +225,36 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     for (rooms[1..], 1..) |r, q| if (peer == null or r < peer.?.bytes) {
         peer = .{ .bytes = r, .rank = q };
     };
-    if (p.rank != 0) { // a follower never serves: it runs rank 0's steps, then leaves the process
+    // every rank loaded and agreed (cuda_ranks) before the first step; the digest names what they agreed on
+    if (p.world > 1) try cuda.tp_watch.ready(io, own.e.checkpoint_digest);
+    cuda.memory_receipt.emit(@intCast(p.rank), .load_end, false);
+    if (p.rank != 0) { // a follower never serves: it runs rank 0's steps, frees what it owns, then leaves the process
         follow.follow(own.e, &own.link) catch |err| {
             std.log.err("rank {d}: following rank 0 stopped ({s})", .{ p.rank, @errorName(err) });
             std.process.exit(1);
         };
         std.log.info("rank {d}: rank 0 ended; leaving", .{p.rank});
-        if (own.e.disk) |disk| disk.close(disk.ctx);
+        cuda.memory_receipt.emit(@intCast(p.rank), .cleanup_begin, false);
+        release(own);
+        cuda.memory_receipt.emit(@intCast(p.rank), .cleanup_end, false);
         std.process.exit(0);
     }
     // Rank 0 alone reads these: TF_GLM_PROMPT_STEPS=0 passes prompts whole, TF_GLM_SHARED=0 runs windows alone.
     const off = struct {
         fn get(name: [*:0]const u8) bool {
-            return if (std.c.getenv(name)) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
+            return if (@import("sys").getenv(name)) |v| std.mem.eql(u8, v, "0") else false;
         }
     }.get;
     own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .vision = own.vision, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .lone_costs = lone_costs };
-    own.lanes.batch_prefill = if (std.c.getenv("TF_GLM_MULTI_PREFILL")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
-    if (lone_costs != null) std.log.info("GLM lone-stream round costs: {s} ms (one row, each further row)", .{std.mem.span(std.c.getenv("TF_GLM_LONE_COSTS").?)});
+    own.lanes.batch_prefill = if (@import("sys").getenv("TF_GLM_MULTI_PREFILL")) |v| std.mem.eql(u8, v, "1") else false;
+    if (lone_costs != null) std.log.info("GLM lone-stream round costs: {s} ms (one row, each further row)", .{@import("sys").getenv("TF_GLM_LONE_COSTS").?});
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
         .rows = if (set.draft_profile.enabled) glm_lanes.max_rows else 1 + engine.max_drafts,
         .trim = if (set.draft_profile.enabled) own.e.settings.draft_profile.rowPolicy() else null,
         .proposers = if (set.draft_profile.enabled) own.e.settings.draft_profile.proposers() else null,
-        .stream_bytes = own.e.seqBytes(), // each stream past the first makes its own sequence on every rank
+        .stream_bytes = own.e.seqBytes() + (if (o.drafter != null) dflash.ring_bytes else 0) + (if (own.images) |v| v.streamBytes() else @as(usize, 0)), // each stream past the first makes its own sequence on every rank
         .lane_limit = if (own.e.dflash != null) engine.max_shared else if (own.e.pool != null) @import("cuda_kv_extent.zig").max_slots else std.math.maxInt(u32),
         .free_streams = 1, // the first is the sequence the engine made
         .ctx = own,
@@ -285,11 +335,25 @@ pub fn snap_spill_forget(ptr: *anyopaque, name: anytype) void {
 
 fn close(ptr: *anyopaque) void {
     const own: *Owned = @ptrCast(@alignCast(ptr));
+    const rank: u32 = @intCast(own.e.share.rank);
+    cuda.memory_receipt.emit(rank, .cleanup_begin, false);
+    cuda.tp_watch.ended(); // the other ranks leave on the end step, so their lines close on purpose from here
     own.lanes.x.end() catch {};
     own.lanes.deinit();
+    release(own);
+    cuda.memory_receipt.emit(rank, .cleanup_end, false);
+}
+
+/// What a rank owns, freed by rank 0's close and by a follower before it leaves.
+fn release(own: *Owned) void {
+    own.e.drain() catch |err| {
+        own.e.pair_failure(err);
+        return;
+    };
+    if (own.vision) |v| v.close();
+    if (own.images) |v| v.deinit();
     own.link.deinit();
     own.e.deinit();
-    if (own.vision) |v| v.close();
     if (own.probe) |probe| probe.close();
     _ = own.lib.api.ncclCommDestroy(own.comm);
     own.lib.close();
@@ -308,6 +372,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         ),
         error.WeightRecipeMismatch, error.BadFp8Source => "GLM checkpoint tensors disagree with the ModelOpt module recipe",
         error.NotModelOpt, error.UnsupportedQuant => "GLM-5.3-Flash on CUDA reads ModelOpt NVFP4, mixed FP4/FP8 and EXL3 checkpoints (the log names what config.json has)",
+        error.UnreadableFormat => "a projection is stored in a format GLM-5.3-Flash on CUDA does not read (the log names its module, recipe and tensors)",
         else => null,
     };
 }
@@ -319,8 +384,24 @@ test "a place inside its world of at most 16 ranks serves; a larger world is ref
     try std.testing.expect(explain(null, error.TooManyRanks) != null);
 }
 
+test "a checkpoint refused for its format, at the entry or by the loader, is explained" {
+    for ([_]anyerror{ error.NotModelOpt, error.UnsupportedQuant, error.UnreadableFormat }) |e| try std.testing.expect(explain(null, e) != null);
+}
+
 test "capacity keeps a verify window past the context and a multiple of 64" {
     try std.testing.expectEqual(@as(usize, 8256), capacity(8192));
     try std.testing.expectEqual(@as(usize, 330560), capacity(330529));
     try std.testing.expect(capacity(330529) % 64 == 0);
+}
+
+pub fn linkCapacity(cap: usize, media: ?images_mod.Limits) !usize {
+    const lim = media orelse return cap;
+    const frames: usize = (@as(usize, lim.max_frames) + 1) / 2;
+    const pairs = std.math.mul(usize, frames, lim.max_videos) catch return error.TooManyImages;
+    const spans = std.math.add(usize, pairs, lim.max_images) catch return error.TooManyImages;
+    const words = std.math.mul(usize, spans, 3) catch return error.TooManyImages;
+    return @max(cap, words);
+}
+test "a small text context still sizes the link for every offered media span" {
+    try std.testing.expectEqual(@as(usize, 792), try linkCapacity(64, .{ .image_tokens = 2048, .max_images = 8, .video_tokens = 4096, .max_videos = 2, .max_frames = 256 }));
 }

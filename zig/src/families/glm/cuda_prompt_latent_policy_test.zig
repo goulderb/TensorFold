@@ -25,11 +25,11 @@ test "prompt arithmetic separates rank agreement and persisted numerical policy"
     const off: ranks.Settings = .{};
     const on: ranks.Settings = .{ .prompt_latent_aot = true };
     var all = [_]ranks.Fingerprint{
-        ranks.Fingerprint.of(2, 0, off, 8192, zero, zero, "checkpoint"),
-        ranks.Fingerprint.of(2, 1, on, 8192, zero, zero, "checkpoint"),
+        ranks.Fingerprint.of(2, 0, off, 8192, true, zero, zero, ranks.hashBytes("checkpoint")),
+        ranks.Fingerprint.of(2, 1, on, 8192, true, zero, zero, ranks.hashBytes("checkpoint")),
     };
     try std.testing.expectEqual(ranks.Mismatch{ .field = .prompt_latent_aot, .rank = 1 }, ranks.mismatch(&all).?);
-    all[0] = ranks.Fingerprint.of(2, 0, on, 8192, zero, zero, "checkpoint");
+    all[0] = ranks.Fingerprint.of(2, 0, on, 8192, true, zero, zero, ranks.hashBytes("checkpoint"));
     try std.testing.expect(ranks.mismatch(&all) == null);
     var a = std.crypto.hash.sha2.Sha256.init(.{});
     var b = std.crypto.hash.sha2.Sha256.init(.{});

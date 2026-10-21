@@ -188,7 +188,7 @@ fn sendWith(reply: []const u32, thinking: bool, route: Route, body: []const u8, 
     const raw = (try json.parse(a, body)).ok;
     var cx: errors.Cx = .{ .a = a };
     const chat = if (route == .responses) (try responses_translate.translate(&cx, raw, NoHistory{})).chat else raw;
-    var conn: Conn = .{ .fd = @import("platform").sock.none, .peer = "", .buf = &.{}, .gpa = a };
+    var conn: Conn = .{ .fd = @import("sys").sock.none, .peer = "", .buf = &.{}, .gpa = a };
     var got: Got = .{};
     openai.run(srv, a, got.out(), .{ .conn = &conn }, route != .completions, chat);
     return got;

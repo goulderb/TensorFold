@@ -6,11 +6,11 @@ pub const Format = enum { nvfp4, modelopt_mixed, exl3, routed_exl3 };
 
 pub const Admission = struct {
     format: Format,
-    recipes: ?modelopt.Table = null,
+    recipes: ?modelopt.Recipes = null,
 
     pub fn read(gpa: std.mem.Allocator, bytes: []const u8, why: *modelopt.Why) !Admission {
         const format = try admit(gpa, bytes, why);
-        return .{ .format = format, .recipes = if (format == .modelopt_mixed) try modelopt.mixed(gpa, bytes, why) else null };
+        return .{ .format = format, .recipes = if (format == .modelopt_mixed) try modelopt.admitRecipes(gpa, bytes, why) else null };
     }
 
     pub fn deinit(self: *Admission) void {
@@ -31,7 +31,7 @@ pub fn admit(gpa: std.mem.Allocator, bytes: []const u8, why: *modelopt.Why) !For
     const method = q.object.get("quant_method") orelse return error.InvalidQuantization;
     if (method != .string) return error.InvalidQuantization;
     if (std.ascii.eqlIgnoreCase(method.string, "modelopt")) {
-        try modelopt.admit(gpa, bytes, why);
+        try @import("cuda_formats.zig").admit(gpa, bytes, why);
         if (q.object.get("quant_algo")) |algo| if (algo == .string and std.ascii.eqlIgnoreCase(algo.string, "MIXED_PRECISION")) return .modelopt_mixed;
         return .nvfp4;
     }

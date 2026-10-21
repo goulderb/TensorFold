@@ -5,10 +5,10 @@ const Tensor = core.checkpoint.Tensor;
 const DType = core.checkpoint.DType;
 pub const Span = core.fp8_source.Span;
 
-pub fn recipe(table: ?*const core.modelopt.Table, module: []const u8) ?core.modelopt.Recipe {
+pub fn recipe(table: ?*const core.modelopt.Recipes, module: []const u8) ?core.modelopt.Recipe {
     const t = table orelse return null;
-    if (t.recipe(module)) |r| return r;
-    if (std.mem.indexOf(u8, module, ".mlp.experts.")) |at| return t.recipe(module[0 .. at + ".mlp.experts".len]);
+    if (t.exact(module)) |r| return r;
+    if (std.mem.indexOf(u8, module, ".mlp.experts.")) |at| return t.exact(module[0 .. at + ".mlp.experts".len]);
     return null;
 }
 
@@ -22,14 +22,14 @@ pub const Source = struct {
     format: ?core.modelopt.Algo = null,
     scale: ?Tensor = null,
 
-    pub fn read(ck: *core.Checkpoint, table: ?*const core.modelopt.Table, name: []const u8) !Source {
+    pub fn read(ck: *core.Checkpoint, table: ?*const core.modelopt.Recipes, name: []const u8) !Source {
         const w = try ck.get(name);
         if (std.mem.endsWith(u8, name, ".weight")) {
             const module = name[0 .. name.len - 7];
             if (recipe(table, module)) |r| {
-                if (r.algo != .mxfp8 and r.algo != .fp8_pb_wo) return error.WeightRecipeMismatch;
+                if (r.algo() != .mxfp8 and r.algo() != .fp8_pb_wo) return error.WeightRecipeMismatch;
                 const s = try tensor(ck, module, "weight_scale");
-                const source: Source = .{ .weight = w, .format = r.algo, .scale = s };
+                const source: Source = .{ .weight = w, .format = r.algo(), .scale = s };
                 var empty: [0]u16 = .{};
                 try source.bf16(.{ .lo = 0, .hi = 0 }, .{ .lo = 0, .hi = 0 }, &empty);
                 return source;
@@ -90,10 +90,10 @@ pub const Fp4 = struct {
         s.* = undefined;
     }
 
-    pub fn read(a: std.mem.Allocator, ck: *core.Checkpoint, table: ?*const core.modelopt.Table, module: []const u8) !Fp4 {
+    pub fn read(a: std.mem.Allocator, ck: *core.Checkpoint, table: ?*const core.modelopt.Recipes, module: []const u8) !Fp4 {
         const r = recipe(table, module);
-        if (table != null and (r == null or (r.?.algo != .nvfp4 and r.?.algo != .w4a16_nvfp4))) return error.WeightRecipeMismatch;
-        if (r == null or r.?.scale == .none) return .{ .linear = try core.nvfp4.Linear.read(ck, module) };
+        if (table != null and (r == null or (r.?.algo() != .nvfp4 and r.?.algo() != .w4a16_nvfp4))) return error.WeightRecipeMismatch;
+        if (r == null or r.?.scaleEncoding() == .none) return .{ .linear = try core.nvfp4.Linear.read(ck, module) };
         const w = try tensor(ck, module, "weight");
         const g = try tensor(ck, module, "weight_scale_2");
         if (w.dtype != .u8 or w.rank != 2 or w.dim(0) == 0 or w.dim(1) == 0 or w.dim(1) % 8 != 0) return error.WeightRecipeMismatch;
@@ -132,7 +132,7 @@ fn meta(t: *const Tensor) core.nvfp4.Meta {
     return .{ .dtype = t.dtype, .shape = t.shape[0..t.rank] };
 }
 
-pub fn packExpert(a: std.mem.Allocator, ck: *core.Checkpoint, table: ?*const core.modelopt.Table, layer: u32, expert: usize, cut: Span, d: usize, up: []u32, down: []u32, codes: []u8, scales: []u8) ![3]f32 {
+pub fn packExpert(a: std.mem.Allocator, ck: *core.Checkpoint, table: ?*const core.modelopt.Recipes, layer: u32, expert: usize, cut: Span, d: usize, up: []u32, down: []u32, codes: []u8, scales: []u8) ![3]f32 {
     if (cut.lo > cut.hi or cut.lo % 32 != 0 or cut.hi % 32 != 0 or cut.lo == cut.hi or d == 0 or d % 32 != 0) return error.UnexpectedTensor;
     const ni = cut.hi - cut.lo;
     if (up.len != X.bytes(1, ni, d, 2) / 4 or down.len != X.bytes(1, d, ni, 1) / 4 or codes.len != d * ni / 2 or scales.len != d * ni / 16) return error.UnexpectedTensor;

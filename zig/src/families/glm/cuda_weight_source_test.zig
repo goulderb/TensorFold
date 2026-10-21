@@ -37,9 +37,9 @@ pub fn write(dir: std.Io.Dir, items: []const Item) !void {
     try dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = image.items });
 }
 
-fn table() !core.modelopt.Table {
+fn table() !core.modelopt.Recipes {
     var why: core.modelopt.Why = .{};
-    return core.modelopt.mixed(a,
+    return core.modelopt.admitRecipes(a,
         \\{"quantization_config":{"quant_method":"modelopt","quant_algo":"MIXED_PRECISION","quantized_layers":{
         \\"kda":{"quant_algo":"MXFP8","weight_block_size":[1,32]},
         \\"mla":{"quant_algo":"FP8_PB_WO","weight_block_size":[128,128]},
@@ -53,7 +53,7 @@ test "mixed loader admits the real fixture as a distinct format with owned recip
     var admitted = try admission.Admission.read(a, @embedFile("fixtures/fp4-local-config.json"), &why);
     defer admitted.deinit();
     try std.testing.expectEqual(admission.Format.modelopt_mixed, admitted.format);
-    try std.testing.expectEqual(@as(usize, 494), admitted.recipes.?.layers.count());
+    try std.testing.expectEqual(@as(usize, 494), admitted.recipes.?.modules.count());
     try std.testing.expectEqual(core.modelopt.Recipe.nvfp4_csf, source.recipe(&admitted.recipes.?, "model.language_model.layers.3.mlp.experts.287.gate_proj").?);
 }
 
@@ -170,7 +170,7 @@ test "mixed loader refuses a source disagreeing with its recipe and leaves unkno
     try std.testing.expect(!ck.used.contains("unknown.weight"));
 }
 
-test "mixed loader uses Loader row and column gathering before dense precision conversion" {
+test "explicit source conversion gathers FP8 spans while the default Loader refuses BF16 materialization" {
     const W = @import("cuda_weights.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -181,7 +181,7 @@ test "mixed loader uses Loader row and column gathering before dense precision c
         .{ .name = "model.language_model.kda.weight_scale", .dtype = "U8", .shape = &.{ 4, 2 }, .bytes = &scales },
     });
     var why: core.modelopt.Why = .{};
-    var recipes = try core.modelopt.mixed(a,
+    var recipes = try core.modelopt.admitRecipes(a,
         \\{"quantization_config":{"quant_method":"modelopt","quant_algo":"MIXED_PRECISION","quantized_layers":{"model.language_model.kda":{"quant_algo":"MXFP8","group_size":32}}}}
     , &why);
     defer recipes.deinit();
@@ -193,10 +193,15 @@ test "mixed loader uses Loader row and column gathering before dense precision c
     var L: W.Loader = .{ .gpa = a, .d = undefined, .stream = undefined, .pack_dense = undefined, .tools = .{ .pack_dense = undefined, .recipes = &recipes }, .w = &model, .ck = &ck };
     defer L.host.deinit(a);
     const t = try L.get("kda.weight", .{});
-    try L.cols(t, 31, 33, .bf16);
+    try std.testing.expectEqual(core.checkpoint.DType.f8_e4m3, t.dtype);
+    try std.testing.expectError(error.UnexpectedTensor, L.cols(t, 31, 33, .bf16));
+    try std.testing.expectEqual(@as(usize, 0), L.host.items.len);
+    const explicit = try source.Source.read(&ck, &recipes, "model.language_model.kda.weight");
+    for (0..4) |row| try explicit.append(a, &L.host, row * 64 + 31, row * 64 + 33, .bf16);
     try std.testing.expectEqualSlices(u16, &.{ 0x3f80, 0x4000, 0x3f00, 0x4080, 0x3f80, 0x3e80, 0x4100, 0x3f80 }, @alignCast(std.mem.bytesAsSlice(u16, L.host.items)));
     L.host.clearRetainingCapacity();
-    try L.rows(t, 1, 2, 4, .bf16);
+    try std.testing.expectError(error.UnexpectedTensor, L.rows(t, 1, 2, 4, .bf16));
+    try explicit.append(a, &L.host, 64, 128, .bf16);
     try std.testing.expectEqual(@as(usize, 128), L.host.items.len);
     try std.testing.expectEqual(@as(u16, 0x3f00), std.mem.readInt(u16, L.host.items[0..2], .little));
     try std.testing.expectEqual(@as(usize, 0), ck.unused());
@@ -231,7 +236,7 @@ test "mixed loader packs a TP2 CSF expert and a plain MTP expert through the sha
     }
     try write(tmp.dir, items.items);
     var why: core.modelopt.Why = .{};
-    var recipes = try core.modelopt.mixed(a,
+    var recipes = try core.modelopt.admitRecipes(a,
         \\{"quantization_config":{"quant_method":"modelopt","quant_algo":"MIXED_PRECISION","quantized_layers":{"model.language_model.layers.3.mlp.experts":{"quant_algo":"NVFP4","group_size":16,"weight_scale_encoding":"csf_32x2_v1"},"model.language_model.layers.45.mlp.experts":{"quant_algo":"W4A16_NVFP4","group_size":16}}}}
     , &why);
     defer recipes.deinit();
@@ -297,7 +302,7 @@ test "mixed loader vision converts attention and W4A16 matrices without owning B
     }
     try write(tmp.dir, items.items);
     var why: core.modelopt.Why = .{};
-    var recipes = try core.modelopt.mixed(a,
+    var recipes = try core.modelopt.admitRecipes(a,
         \\{"quantization_config":{"quant_method":"modelopt","quant_algo":"MIXED_PRECISION","quantized_layers":{"model.visual.blocks.0.attn.qkv":{"quant_algo":"MXFP8","group_size":32},"model.visual.merger.gate_proj":{"quant_algo":"W4A16_NVFP4","group_size":16}}}}
     , &why);
     defer recipes.deinit();
@@ -414,7 +419,7 @@ test "source dense packs FP8_PB_WO whole, unaligned, and head-interleaved kv_b_p
     var ck = try core.Checkpoint.openModel(a, io, try std.fmt.bufPrint(&path, ".zig-cache/tmp/{s}", .{tmp.sub_path}));
     defer ck.close();
     var why: core.modelopt.Why = .{};
-    var recipes = try core.modelopt.mixed(a,
+    var recipes = try core.modelopt.admitRecipes(a,
         \\{"quantization_config":{"quant_method":"modelopt","quant_algo":"MIXED_PRECISION","quantized_layers":{"mla":{"quant_algo":"FP8_PB_WO","weight_block_size":[128,128]},"kv":{"quant_algo":"FP8_PB_WO","weight_block_size":[128,128]}}}}
     , &why);
     defer recipes.deinit();
@@ -458,12 +463,6 @@ test "source dense refuses a BF16 linear and a non-mixed gather" {
     const n = try source.Source.read(&ck, &recipes, "norm.weight");
     try std.testing.expectEqual(@as(?core.modelopt.Algo, null), n.format);
     try std.testing.expectError(error.SourceDenseRequiresFp8, dense.pack(a, n, &.{core.fp8_source.all(1)}, core.fp8_source.all(32)));
-}
-
-test "mixed loader native entry points compile" {
-    _ = &@import("cuda_weights.zig").load;
-    _ = &@import("cuda_engine.zig").Engine.init;
-    _ = &@import("cuda_vision_runtime.zig").Service.open;
 }
 
 test "source dense CUDA refusal and upload account only checkpoint bytes and job metadata" {

@@ -6,8 +6,8 @@ const glue = @import("cuda_glue.zig");
 const b16 = @import("cuda_b16.zig");
 
 /// One dense layer on a rank: gate and up [width][dims] and down [dims][width], NVFP4 (Fp4Linear's) or EXL3.
-pub const Input = union(enum) { combined: b16.Proj, separate: struct { gate: b16.Proj, up: b16.Proj } };
-pub const Layer = struct { input: Input, down: b16.Proj, width: usize, dims: usize, limit: f32 };
+pub const Input = union(enum) { combined: @import("cuda_proj.zig").Proj, separate: struct { gate: @import("cuda_proj.zig").Proj, up: @import("cuda_proj.zig").Proj } };
+pub const Layer = struct { input: Input, down: @import("cuda_proj.zig").Proj, width: usize, dims: usize, limit: f32 };
 
 /// The block's scratch for up to `rows` rows: one projection's rows, the [gate | up] rows, the activation and its sums.
 pub const Scratch = struct { tmp: u64, gu: u64, act: u64, xs_act: u64, part: u64 };
@@ -15,13 +15,15 @@ pub const Scratch = struct { tmp: u64, gu: u64, act: u64, xs_act: u64, part: u64
 pub const Kernels = struct { set: glue.Set, linear: cuda.qlinear.Linear, copy_rows: cuda.Function };
 
 /// Fp4Linear.__call__ (prefill on a prompt chunk): bf16 out, or fp32 with `wide`; the prompt GEMM needs `ldx` % 8 == 0.
-fn mm(k: Kernels, stream: cuda.Stream, p: b16.Proj, x: u64, ldx: usize, rows: usize, out: u64, part: u64, n: usize, dims: usize, wide: bool, prompt: bool) !void {
-    const q = switch (p) {
-        .b16 => |w| return b16.matmul(k.set, stream, x, ldx, w, out, part, rows, n, dims, wide),
-        .source => return b16.proj(k.set, stream, x, ldx, p, out, part, rows, n, dims, wide),
+fn mm(k: Kernels, stream: cuda.Stream, p: @import("cuda_proj.zig").Proj, x: u64, ldx: usize, rows: usize, out: u64, part: u64, n: usize, dims: usize, wide: bool, prompt: bool) !void {
+    const q: cuda.qlinear.Weight = switch (p) {
+        .fp8g => |w| .{ .fp8g = w },
+        .mxfp8 => |w| .{ .mxfp8 = w },
+        .bf16 => |w| return b16.matmul(k.set, stream, x, ldx, w, out, part, rows, n, dims, wide),
+        .source => return @import("cuda_proj.zig").matmul(k.set, stream, p, x, ldx, out, part, rows, n, dims, wide),
         .q => |w| w,
     };
-    if (q == .affine4 and !prompt) try b16.groupSums(k.set, stream, x, ldx, part, rows, dims);
+    if (q == .affine4 and !prompt) try @import("cuda_proj.zig").groupSums(k.set, stream, x, ldx, part, rows, dims);
     const in: cuda.qlinear.Rows = .{ .x = x, .ldx = ldx, .sums = part, .part = part, .native = .{ .ptr = part, .bytes = try q.nativeWorkspaceBytes(rows) } };
     if (prompt) {
         std.debug.assert(x % 16 == 0 and (rows == 1 or ldx % 8 == 0));
@@ -46,7 +48,7 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     const w = l.width;
     switch (l.input) {
         .combined => |proj| try mm(k, stream, proj, x, x_stride, rows, s.gu, s.part, 2 * w, l.dims, false, prompt),
-        .separate => |pair| for ([_]b16.Proj{ pair.gate, pair.up }, 0..) |proj, j| {
+        .separate => |pair| for ([_]@import("cuda_proj.zig").Proj{ pair.gate, pair.up }, 0..) |proj, j| {
             // Fp4Linear(out=a column slice): the rows computed contiguous, then copied into their half of each row
             try mm(k, stream, proj, x, x_stride, rows, s.tmp, s.part, l.width, l.dims, false, prompt);
             var a: cuda.Args = .{};

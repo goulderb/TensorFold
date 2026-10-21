@@ -1,5 +1,5 @@
 const std = @import("std");
-const sock = @import("platform").sock;
+const sock = @import("sys").sock;
 
 pub fn pair() ![2]sock.Handle {
     const listener = try sock.create(std.posix.AF.INET, true);

@@ -15,12 +15,14 @@ const lfm2 = @import("lfm2.zig");
 const glm = @import("glm_cuda");
 const qwen35 = @import("qwen35");
 const qwen_modelopt = @import("qwen35_cuda.zig");
+const kolibri1 = @import("kolibri1");
 const Allocator = std.mem.Allocator;
 const budget = @import("cuda_memory.zig");
 const lane_backend = @import("cuda_bound.zig");
 const snaps = @import("cuda_snaps.zig");
 const nemotron_slide = @import("nemotron_slide.zig");
 const glm_spill = @import("glm_spill.zig");
+const slide_adapter = @import("slide_adapter.zig");
 const cuda_disk = @import("cuda_disk.zig");
 const vision_offer = @import("cuda_vision_offer.zig");
 const nspill = @import("nemotron_spill.zig");
@@ -29,7 +31,7 @@ const drafted = @import("cuda_drafted.zig");
 const kv_pages = @import("cuda_kv_pool.zig");
 
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
-const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native };
+const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native };
 /// --record opens here (engines.zig refuses it for a backend without this).
 pub const records = true;
 
@@ -70,6 +72,9 @@ pub const chip = cuda_device.chip;
 pub const deviceName = cuda_device.deviceName;
 const getenv = cuda_device.getenv;
 const setting = cuda_device.setting;
+const windows = @import("cuda_window.zig");
+const modelContext = windows.modelContext;
+const contextWindow = windows.contextWindow;
 
 /// TENSORFOLD_SPLIT=1 asks for the two-GPU layer split. Unset or 0: one device, the existing path.
 /// TENSORFOLD_TP=2: two-GPU tensor parallel in one process (cuda_tp2.zig).
@@ -88,35 +93,12 @@ fn splitOnly() bool {
     return t.len > 0 and !std.mem.eql(u8, t, "0");
 }
 
-/// The model's window (config.json's max_position_embeddings, text_config's first), 0 when it names none.
-fn modelContext(a: Allocator, io: std.Io, dir: []const u8) i64 {
-    const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return 0;
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch return 0;
-    const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return 0;
-    if (doc != .object) return 0;
-    const text = if (doc.object.get("text_config")) |t| (if (t == .object) t else doc) else doc;
-    const limit = text.object.get("max_position_embeddings") orelse doc.object.get("max_position_embeddings") orelse return 0;
-    return if (limit == .integer and limit.integer > 0) limit.integer else 0;
-}
-
-/// Prompt plus reply tokens a request may use: --context (0: the model's window), else the family default within it.
-fn contextWindow(requested: ?i64, native: i64, default: i64) error{ Negative, NoNative, PastNative }!i64 {
-    const r = requested orelse return if (native > 0) @min(default, native) else default;
-    if (r < 0) return error.Negative;
-    if (r == 0) return if (native > 0) native else error.NoNative;
-    if (native > 0 and r > native) return error.PastNative;
-    return r;
-}
-
 /// A lone driver returns false at completion or true when yield hands it to the lane core.
 const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool, resumed: bool) anyerror!bool;
-
 /// The context a lane thread needs current: the lane host steps rounds on its own thread, CUDA binds per thread.
 threadlocal var bound: ?*const cuda.Context = null;
-
 const failed_load = @import("cuda_load_gpu.zig");
 const Gpu = failed_load.Gpu;
-
 /// One loaded model behind the lane host: everything the engine thread reads lives here.
 pub const Host = struct {
     gpa: Allocator,
@@ -144,7 +126,7 @@ pub const Host = struct {
     follow_fn: ?*const fn (*anyopaque) anyerror!void = null,
     health: ?api.HealthSource = null,
     recording: ?*record.Recording = null, // --record: the recorder in front of the family's backend
-    served: drafted.Served = undefined, // the family's backend, wrapped with --drafter's draft model when given
+    served: drafted.Served = .{ .backend = undefined, .facts = .{}, .stream_bytes = 0 }, // the family's backend, wrapped with --drafter's draft model when given
     memory_source: ?api.MemorySource = null,
     request_refusal: ?*const fn (*const api.Request) ?[]const u8 = null,
 
@@ -153,12 +135,14 @@ pub const Host = struct {
         if (h.gpu) |g| try g.ctx.makeCurrent();
         return h.follow_fn.?(h.family);
     }
-
     /// A family's readiness reads host state only: no CUDA binding or blocking device work.
     fn readiness(h: *Host, comptime F: type) void {
         if (@hasDecl(F, "healthy")) h.health = .{ .ctx = h.family, .read = F.healthy };
     }
-
+    fn halt(ctx: *anyopaque, reason: []const u8) void {
+        const h: *Host = @ptrCast(@alignCast(ctx));
+        h.host.halt(reason);
+    }
     pub fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
         h.host.stop();
@@ -230,10 +214,18 @@ pub const Host = struct {
         h.proposers = if (@hasField(L, "proposers")) loaded.proposers else null;
     }
 
+    fn initThread(ctx: *anyopaque) !void {
+        const h: *Host = @ptrCast(@alignCast(ctx));
+        if (h.gpu) |g| {
+            try g.ctx.makeCurrent();
+            bound = &g.ctx;
+        }
+    }
     /// The round loop and the lane host over the family's backend, its thread started.
     pub fn serve(h: *Host, io: std.Io, facts: lanes.Model, rows: u32, info: api.Info, explain: ?api.Explain) !void {
         h.cfg = try lanes.Config.init(h.gpa, facts, rows, rows - 1);
         errdefer h.cfg.deinit(h.gpa);
+        if (h.served.prepare != null) try @import("cuda_startup_costs.zig").open(h, &bound);
         // a drafter's trees: the planner picks a lone stream's lanes, as deep as it drafts
         if (facts.head_trees) h.cfg.head_lanes = rows - 1;
         if (facts.head_trees) h.cfg.head_depth = @max(1, facts.drafts);
@@ -243,6 +235,7 @@ pub const Host = struct {
         h.core.trim = h.trim;
         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
         h.host.proposers = h.proposers;
+        h.host.on_thread = .{ .ctx = h, .run = initThread };
         h.host.memory = h.memory_source orelse (if (h.gpu != null) api.MemorySource{ .read = family_memory.read } else null);
         h.host.request_refusal = h.request_refusal;
         h.host.explain = explain;
@@ -254,7 +247,6 @@ pub const Host = struct {
         if (h.learn != null) h.host.learner = h.learner();
         try h.host.start();
     }
-
     /// The family's learner, each call made with the context current on the lane thread.
     fn learner(h: *Host) api.Learner {
         return .{
@@ -279,25 +271,24 @@ pub const Host = struct {
             }.f,
         };
     }
-
     /// The family's lone driver with the context current on the lane thread.
     fn loneRun(p: *anyopaque, s: *lanes.Stream, hooks: api.LoneHooks) anyerror!bool {
         const x = bind(p);
         return x.lone.?(x.family, s, hooks.ctx, hooks.committed, hooks.yield, hooks.resumed);
     }
-
     /// The family's backend, each call made with the context current on the calling thread.
     fn backend(h: *Host) lanes.backend.Backend {
         h.vtable = lane_backend.vtable(Host, h.inner.vtable.*);
-        return .{ .ptr = h, .vtable = &h.vtable };
+        return .{ .ptr = h, .vtable = &h.vtable, .first_before_draft = h.inner.first_before_draft };
     }
 };
-
 const refusals = @import("cuda_refusal.zig");
 const record = @import("cuda_record.zig");
-
 /// The engine for `o.dir`, or null with `problem` set when `refusal` names a flag or no CUDA family reads it.
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+    const report = platform.optional_libraries.atBoundary();
+    defer report.deinit();
+    if (@import("save_admission.zig").refused(io, o.dir, problem)) return null;
     if (refusals.backend(o)) |why| {
         problem.* = why;
         return null;
@@ -388,7 +379,6 @@ const no_stream = "the CUDA memory budget fits no stream: one at a {d}-token win
     "lower --context, or free device memory";
 const too_many = "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token window, " ++
     "and the CUDA memory budget leaves {d:.2} GiB{s}: serve --parallel {d}, or lower --context";
-
 fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     if (refusals.family(F, o)) |why| {
         problem.* = why;
@@ -422,11 +412,13 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         return null;
     }
     if (o.slide) {
+        // a family learns once its module declares `slide` (its learner), `learnModel` and `linked`
         if (!@hasDecl(F, "slide")) {
             problem.* = try std.fmt.allocPrint(a, "--slide: {s} checkpoints do not learn on CUDA yet", .{o.model_type});
             return null;
         }
-        if (try nemotron_slide.refusal(F, a, io, o.dir, "`cp -RL` (a copy that follows links)")) |why| {
+        comptime if (!@hasDecl(F, "learnModel") or !@hasDecl(F, "linked")) @compileError(F.model_type ++ " declares slide without learnModel and linked");
+        if (try slide_adapter.refusal(F, a, io, o.dir, "`cp -RL` (a copy that follows links)")) |why| {
             problem.* = why;
             return null;
         }
@@ -554,10 +546,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     }
     const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, opts) catch |e| {
         cuda.tp_watch.fail(@errorName(e)); // a family over hosts: its other ranks stop with this error
-        if (@hasDecl(F, "explains_open")) if (F.explain(null, e)) |text| {
+        if (@import("sys").optional_libraries.explain(e) orelse (if (@hasDecl(F, "explains_open")) F.explain(null, e) else null)) |text| {
             problem.* = text;
             return null;
-        };
+        }
         switch (@as(anyerror, e)) { // every family's open: GLM's error set has no ModeloptNeedsSm90
             error.LoadRetained => {
                 opened = true;
@@ -603,13 +595,14 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const host_budget = if (host_cache and @hasDecl(F, "snap_save")) budget.hostCacheBytes(a, io, o.prompt_cache_gib) else 0;
     // a split's model bytes span both devices: this one's room is its free memory less the larger of the reserve and
     // the 1536 MiB floor (the peer checked its own floor at open)
-    var room = if (split) after.free -| @max(after.reserve, 1536 << 20) else try kv_pages.startupRoom(F, a, loaded, o, after.room(model), host_budget, problem) orelse return null;
+    var room = if (split) after.free -| @max(after.reserve, 1536 << 20) else try @import("cuda_startup_costs.zig").room(a, served.prepare, try kv_pages.startupRoom(F, a, loaded, o, after.room(model), host_budget, problem) orelse return null, problem) orelse return null;
     var low: []const u8 = ""; // names the rank whose room bounds the streams, when it is not this one
     if (@hasField(@TypeOf(loaded), "peer_room")) if (loaded.peer_room) |pr| if (pr.bytes < room) {
         room = pr.bytes;
         low = try std.fmt.allocPrint(a, " on rank {d}, the smallest room of the ranks", .{pr.rank});
     };
     const free = loaded.free_streams;
+    const grow = budget.growRoom(room, !@hasField(F.Options, "lanes"));
     const layout = kv_pages.layout(loaded);
     var paged: ?kv_pages.Plan = null;
     const lane_limit = if (@hasField(@TypeOf(loaded), "lane_limit")) loaded.lane_limit else std.math.maxInt(u32);
@@ -620,7 +613,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const streams: u32 = if (split and !tp) 1 else if (layout) |l| blk: {
         paged = try kv_pages.plan(F, a, l, room, o, @intCast(window), problem, host_cache) orelse return null;
         break :blk paged.?.lanes;
-    } else budget.admit(room, served.stream_bytes, free, asked, o.lanes_fixed) catch |e| {
+    } else budget.admit(grow, served.stream_bytes, free, asked, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
             error.NoStream => try std.fmt.allocPrint(a, no_stream, .{
                 window,
@@ -636,7 +629,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
                 window,
                 toGib(room),
                 low,
-                free + room / served.stream_bytes,
+                free + grow / served.stream_bytes,
             }),
         };
         return null;
@@ -693,12 +686,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         if (spill_owner) |owner| store.rules.spill_timing = owner.timing;
         if (@hasDecl(F, "snap_tier")) if (F.snap_tier(loaded.target)) |tier| store.attach(@ptrCast(@alignCast(tier)));
     }
-    errdefer if (h.store) |store| {
-        store.deinit(); // detaches the tier; the disk itself goes in the deferred abandon below this frame's start
-        gpa.destroy(store);
-    };
+    errdefer if (h.store) |store| kv_pages.closeStore(gpa, store);
+    var conversations = false;
     if (@hasDecl(F, "slide")) if (loaded.learns != null) {
-        const Slide = nemotron_slide.Adapter(F.slide);
+        const Slide = slide_adapter.Adapter(F.slide);
         h.dir = try gpa.dupe(u8, o.dir);
         const s = try gpa.create(Slide);
         s.* = Slide.init(gpa, io, F.learnModel(loaded.ctx, h.dir));
@@ -711,6 +702,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
             }
         }.f;
         h.learn = s.hook();
+        conversations = s.learner.readsConversations();
     };
     errdefer if (h.slide) |s| {
         h.slide_free.?(gpa, s);
@@ -734,6 +726,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .call_gates = true,
         .context_window = @intCast(window),
         .startup = h.startup,
+        .policy = if (@hasField(@TypeOf(loaded), "policy")) loaded.policy else "",
         .prompt_cache = h.store != null,
         .warm_turns = h.store != null and @hasDecl(F, "warm_quiet"),
         .fill_arrival = F == nemotron.native, // agent turns grow: shortest-first starved the longest ones
@@ -744,15 +737,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision, o.vision) else null,
         .encoded_vision = if (@hasField(@TypeOf(loaded), "vision_probe")) if (loaded.vision_probe) |image_probe| .{ .ctx = image_probe.ctx, .rows = image_probe.rows } else null else null,
         .admit = admit,
+        .slide_conversations = conversations,
     }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     if (@hasField(@TypeOf(loaded), "follow")) if (loaded.follow) |f| {
         h.follow_fn = f;
-        return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .follow = Host.followFamily };
+        return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .halt = Host.halt, .follow = Host.followFamily };
     };
-    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+    return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h, .halt = Host.halt };
 }
-
 const toGib = family_memory.toGib;
 
 /// A retained family's pool owns its admission; paged families expose it through the common plan.
@@ -832,12 +825,15 @@ test {
     _ = spill_facts;
 }
 
-test "the lane core sees a family's prefill_step through the lane backend, so a served prompt can step" {
+test "CUDA host preserves prefill_step and first-before-draft capability" {
     var target: lanes.fake.Fake = .{ .gpa = std.testing.allocator, .prefill_chunks = 3 };
     defer target.deinit();
     var h: Host = undefined;
     h.inner = target.stepped();
     try std.testing.expect(h.backend().vtable.prefill_step != null);
+    try std.testing.expect(!h.backend().first_before_draft);
+    h.inner.first_before_draft = true;
+    try std.testing.expect(h.backend().first_before_draft);
 }
 
 test "every registered family and d1's decision engine are listed for capabilities" {
@@ -1107,7 +1103,6 @@ test "Flash Next refuses tensor-rank draft caching before files or CUDA" {
 test "Flash Next takes --vision at family admission" {
     try @import("cuda_flashnext_refusal_test.zig").vision();
 }
-
 test {
     _ = @import("cuda_vision_offer.zig");
     _ = kv_pages;
@@ -1130,4 +1125,18 @@ test "Qwen ModelOpt checkpoint refusal stays on its native route before CUDA" {
     var problem: []const u8 = "";
     try std.testing.expect(try open(arena.allocator(), gpa, io, .{ .dir = dir, .model_type = "qwen3_5_moe" }, &problem) == null);
     try std.testing.expectEqualStrings("Qwen ModelOpt checkpoint refused: UnsupportedQwenGeometry", problem);
+}
+
+test "Learner ownership: actual native close drains Nemotron before any source, trainer or parent free" {
+    try @import("nemotron_trainer_test.zig").run(Host, Host.serve, Host.close, false);
+}
+test "Learner ownership: direct Nemotron trainer destruction drains before its first owner free" {
+    try @import("nemotron_trainer_test.zig").run(Host, Host.serve, Host.close, true);
+}
+test "Save recovery: real native close drains the accepted trainer before any child or parent is released" {
+    try @import("trainer_close_test.zig").run(Host, Host.serve, Host.close);
+}
+
+test "Save recovery: real native close drains the dense trainer before any child or parent is released" {
+    try @import("dense_trainer_close_test.zig").run(Host, Host.serve, Host.close);
 }

@@ -40,7 +40,7 @@ test "plain BF16 binds only the shared lane projection format" {
     const linear = b.linear();
     try std.testing.expect(linear.lane.? == &b.lane);
     try std.testing.expect(linear.nvfp4_prompt == null and linear.ck == null and linear.affine4 == null);
-    try std.testing.expect(linear.exl3 == null and linear.exl3_dense == null and linear.ggml == null);
+    try std.testing.expect(linear.exl3_trellis == null and linear.exl3 == null and linear.ggml == null);
     try std.testing.expectEqual(@as(u64, 0), linear.ck_rows);
     try std.testing.expectEqual(@as(u64, 0), linear.ck_part);
 }

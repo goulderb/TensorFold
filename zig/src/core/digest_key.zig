@@ -31,7 +31,9 @@ pub const Key = struct {
         }
         const s = try file.stat(io);
         if (s.kind != .file) return error.DigestNotRegular;
-        return .{ .device = 0, .inode = s.inode, .size = s.size, .mtime = s.mtime.toNanoseconds(), .ctime = s.ctime.toNanoseconds() };
+        // An inode is an opaque identity, not a signed quantity (Windows exposes i64).
+        const InodeBits = @Int(.unsigned, @bitSizeOf(@TypeOf(s.inode)));
+        return .{ .device = 0, .inode = @as(InodeBits, @bitCast(s.inode)), .size = s.size, .mtime = s.mtime.toNanoseconds(), .ctime = s.ctime.toNanoseconds() };
     }
 
     pub fn equal(a: Key, b: Key) bool {

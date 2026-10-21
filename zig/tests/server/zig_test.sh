@@ -3,12 +3,12 @@
 set -euo pipefail
 zig="${ZIG:-zig}"
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
-"$zig" test -lc --dep engine_api --dep tokenizer --dep template --dep json --dep platform \
+"$zig" test -lc --dep engine_api --dep tokenizer --dep template --dep json --dep sys \
   "-Mroot=$root/zig/src/server/root.zig" \
   "-Mjson=$root/zig/src/server/json.zig" \
   --dep lanes "-Mengine_api=$root/zig/src/core/engine_api.zig" \
   "-Mlanes=$root/zig/src/core/lanes/lanes.zig" \
   "-Mtokenizer=$root/zig/src/core/tokenizer/tokenizer.zig" \
-  "-Mtemplate=$root/zig/src/core/template/template.zig" "-Mplatform=$root/zig/src/core/platform.zig" "$@"
+  "-Mtemplate=$root/zig/src/core/template/template.zig" "-Msys=$root/zig/src/platform/sys.zig" "$@"
 "$zig" test "$root/zig/src/server/json.zig"
 "$zig" test -lc --dep lanes "-Mroot=$root/zig/src/core/engine_api.zig" "-Mlanes=$root/zig/src/core/lanes/lanes.zig"

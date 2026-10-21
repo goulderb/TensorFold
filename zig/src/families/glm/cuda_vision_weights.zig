@@ -136,7 +136,7 @@ pub const Weights = struct {
     tensors: []st.Tensor,
     quantized: []?Converted = &.{},
 
-    pub fn loadMixed(a: std.mem.Allocator, c: Config, ck: *core.Checkpoint, table: *const core.modelopt.Table) !Weights {
+    pub fn loadMixed(a: std.mem.Allocator, c: Config, ck: *core.Checkpoint, table: *const core.modelopt.Recipes) !Weights {
         var specs = try Specs.init(c);
         const tensors = try a.alloc(st.Tensor, specs.count());
         errdefer a.free(tensors);
@@ -153,7 +153,7 @@ pub const Weights = struct {
             const rec = if (std.mem.endsWith(u8, spec.name, ".weight")) source.recipe(table, spec.name[0 .. spec.name.len - 7]) else null;
             if (rec) |r| {
                 if (spec.rank != 2) return error.InvalidVisionWeightShape;
-                if (r.algo == .nvfp4 or r.algo == .w4a16_nvfp4) {
+                if (r.algo() == .nvfp4 or r.algo() == .w4a16_nvfp4) {
                     quantized[i] = .{ .fp4 = try source.Fp4.read(a, ck, table, spec.name[0 .. spec.name.len - 7]) };
                     const l = quantized[i].?.fp4.linear;
                     if (l.n != spec.shape[0] or l.k != spec.shape[1]) return error.InvalidVisionWeightShape;

@@ -31,6 +31,7 @@ pub const act_ref = @import("act_ref.zig");
 pub const contract = @import("contract.zig");
 pub const nvfp4 = @import("nvfp4.zig");
 pub const csf = @import("csf.zig");
+pub const nvfp4_csf32 = @import("nvfp4_csf32.zig");
 pub const modelopt = @import("modelopt.zig");
 pub const fp8_source = @import("fp8_source.zig");
 /// Pictures as 0.6.6 loaded them: PNG, JPEG through the pinned libjpeg-turbo, orientation, the shared bicubic resizes.
@@ -86,6 +87,7 @@ test {
     _ = @import("copy_index.zig");
     _ = ids_json;
     _ = nvfp4;
+    _ = nvfp4_csf32;
     _ = modelopt;
     _ = fp8_source;
     _ = csf;
@@ -97,3 +99,8 @@ test {
 }
 
 pub const frame_rounds = @import("frame_rounds.zig");
+pub const tree_slots = @import("tree_slots.zig");
+
+pub const exl3_layout = @import("exl3_layout.zig");
+
+pub const exl3_prepare = @import("exl3_prepare.zig");

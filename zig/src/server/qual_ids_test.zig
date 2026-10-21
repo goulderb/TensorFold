@@ -25,7 +25,7 @@ fn chat(srv: *server.Server, body: []const u8) !lp.Got {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    var conn: Conn = .{ .fd = @import("platform").sock.none, .peer = "", .buf = &.{}, .gpa = a };
+    var conn: Conn = .{ .fd = @import("sys").sock.none, .peer = "", .buf = &.{}, .gpa = a };
     var got: lp.Got = .{};
     openai.run(srv, a, got.out(), .{ .conn = &conn }, true, (try json.parse(a, body)).ok);
     return got;

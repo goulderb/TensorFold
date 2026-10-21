@@ -260,15 +260,23 @@ pub const Collector = struct {
         try c.append(pointers, null);
     }
 
-    pub fn projection(c: Collector, p: b16.Proj) !void {
+    pub fn norm(c: Collector, n: @import("cuda_glue.zig").Norm) !void {
+        // Collect the actual allocation extent, including f32 storage; never narrow a norm for prefetch.
+        switch (n) {
+            .bf16, .f32 => |ptr| try c.plain(&.{ptr}),
+        }
+    }
+
+    pub fn projection(c: Collector, p: @import("cuda_proj.zig").Proj) !void {
         switch (p) {
-            .b16 => |ptr| try c.plain(&.{ptr}),
+            .bf16 => |ptr| try c.plain(&.{ptr}),
+            .fp8g, .mxfp8 => |q| try c.plain(&.{ q.codes, q.scales }),
             .source => |s| try c.plain(&.{ s.weights, s.jobs, s.groups }),
             .q => |weight| switch (weight) {
                 .affine4 => |q| try c.append(&.{ q.w, q.s, q.b }, .{ .n = q.n, .k = q.k, .split_k = cuda.qlinear.splitK(q.n, q.k) }),
                 .fp8g, .mxfp8, .nvfp4, .fp8, .bf16 => |q| try c.plain(&.{ q.codes, q.scales }),
-                .exl3 => |q| try c.plain(&.{ q.trellis, q.suh, q.svh }),
-                .exl3_dense => |q| try c.plain(&.{ q.trellis, q.suh, q.svh, q.bias }),
+                .exl3_trellis => |q| try c.plain(&.{ q.trellis, q.suh, q.svh }),
+                .exl3 => |q| try c.plain(&.{ q.trellis, q.suh, q.svh, q.bias }),
                 .ck8 => |q| try c.plain(&.{q.codes}),
                 .ck4 => |q| try c.plain(&.{ q.words, q.scales }),
                 .q8_0, .iq2xxs => |q| try c.plain(&.{q.w}),
@@ -311,7 +319,7 @@ fn appendNextMixer(c: Collector, mixer: weights.Mixer) !void {
             try c.projection(kda.gb);
             try c.plain(&.{ kda.conv_w, kda.a_log, kda.dt_bias });
             try c.projection(kda.proj);
-            if (kda.qkv) |qkv| try c.projection(.{ .q = qkv });
+            if (kda.qkv) |qkv| try c.projection(qkv);
         },
         .mla => |dsa| {
             try c.plain(&.{ dsa.q_norm, dsa.kv_norm });
@@ -352,7 +360,7 @@ pub fn build(gpa: std.mem.Allocator, settings: Settings, model: *const weights.W
         if (settings.sites[0]) {
             groups.clearRetainingCapacity();
             try appendHc(c, layer.ffn_hc);
-            try c.plain(&.{layer.post_norm});
+            try c.norm(layer.post_norm);
             try appendFfn(c, layer.ffn);
             try builder.add(i, .a, groups.items);
         }
@@ -361,10 +369,10 @@ pub fn build(gpa: std.mem.Allocator, settings: Settings, model: *const weights.W
             if (i + 1 < model.layers.len) {
                 const next = model.layers[i + 1];
                 try appendHc(c, next.attn_hc);
-                try c.plain(&.{next.in_norm});
+                try c.norm(next.in_norm);
                 try appendNextMixer(c, next.mixer);
             } else {
-                try c.plain(&.{model.norm});
+                try c.norm(model.norm);
                 try c.projection(model.head);
             }
             try builder.add(i, .f, groups.items);

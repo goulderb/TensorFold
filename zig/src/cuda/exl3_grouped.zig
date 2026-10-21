@@ -1,6 +1,6 @@
 //! #741's Grouped interface on #837's pointer tables and independent per-expert projection widths.
 const std = @import("std");
-const ex = @import("exl3_experts_common.zig");
+const ex = @import("exl3_experts.zig");
 const experts = @import("experts.zig");
 const grouped = @import("grouped.zig");
 const memory = @import("memory.zig");

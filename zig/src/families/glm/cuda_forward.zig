@@ -7,6 +7,7 @@ const weights = @import("cuda_weights.zig");
 const glue = @import("cuda_glue.zig");
 const kda = @import("cuda_kda.zig");
 const b16 = @import("cuda_b16.zig");
+const projection = @import("cuda_proj.zig");
 const latent = @import("cuda_latent.zig");
 const sparse = @import("cuda_sparse.zig");
 const experts = @import("cuda_experts.zig");
@@ -20,7 +21,7 @@ const state = @import("cuda_state.zig");
 const shared = @import("cuda_shared.zig");
 const prompt_split = @import("cuda_prefill_split.zig");
 const vision_binding = @import("cuda_vision_binding.zig");
-const taps = @import("cuda_taps.zig");
+const taps_mod = @import("cuda_taps.zig");
 const mia = @import("cuda_experts_mia.zig");
 const route_trace = @import("cuda_route_trace.zig");
 const target_graph = @import("cuda_target_graph.zig");
@@ -28,9 +29,11 @@ const target_forward = @import("cuda_target_forward.zig");
 const l2pf = @import("cuda_l2pf.zig");
 const l2pf_plan = @import("cuda_l2pf_plan.zig");
 const prompt_latent = @import("cuda_prompt_latent_aot.zig");
+const mm_mod = @import("cuda_mm.zig");
+const routed_exl3 = @import("cuda_exl3.zig");
 
 test {
-    _ = taps;
+    _ = taps_mod;
 }
 
 pub const prefill_rows = state.prefill_rows;
@@ -56,7 +59,7 @@ pub fn promptDispatch() PromptDispatch {
 /// The modules a forward launches from: our fatbins.
 pub const Modules = struct {
     glue: glue.Kernels,
-    mods: [9]cuda.Module,
+    mods: [10]cuda.Module,
     kda: kda.Kernels,
     chunk_mod: cuda.Module,
     lane: cuda.qmmf.Lane, // the NVFP4 linears' decode rows (qlinear)
@@ -65,6 +68,10 @@ pub const Modules = struct {
     exl3_mod: cuda.Module,
     exl3: cuda.exl3_linear.Kernels, // EXL3 checkpoints' projections (qlinear)
     experts: experts.Kernels,
+    routed_exl3: routed_exl3.Kernels,
+    mm: mm_mod.Kernels,
+    tiled: bool = false,
+    packs: ?*const mm_mod.Packed = null,
     copy_rows: cuda.Function,
     put_slot: cuda.Function,
     pack_dense: cuda.Function,
@@ -87,9 +94,11 @@ pub const Modules = struct {
         m.source_dense = null;
         m.source_upcast = null;
         m.prompt_latent = null;
+        m.tiled = false;
+        m.packs = null;
         var n: usize = 0;
         errdefer for (m.mods[0..n]) |*x| x.unload();
-        for (&m.mods, [_][]const u8{ k.glm_kda, k.glm_ops, k.experts, k.affine4_pack, k.glm_quant, k.qmm_group, k.glm_glue, k.qmm_prefill, k.lane_gemv }) |*x, image| {
+        for (&m.mods, [_][]const u8{ k.glm_kda, k.glm_ops, k.experts, k.affine4_pack, k.glm_quant, k.qmm_group, k.glm_glue, k.qmm_prefill, k.lane_gemv, k.glm_mm }) |*x, image| {
             x.* = try cuda.Module.load(d, image);
             n += 1;
         }
@@ -116,12 +125,15 @@ pub const Modules = struct {
         m.q4 = try q4.Kernels.load(m.mods[5], m.mods[3], ctx);
         m.glue = try glue.Kernels.load(m.mods[6]);
         m.affine4 = try cuda.qlinear.Affine4Kernels.resolve(d, m.mods[5], m.mods[7], m.mods[8], m.mods[3], @intCast(try ctx.attribute(.multiprocessor_count)), try ctx.attribute(.compute_capability_major) == 12 and try ctx.attribute(.compute_capability_minor) == 1);
+        m.routed_exl3 = try routed_exl3.Kernels.load(d);
+        errdefer m.routed_exl3.unload();
+        m.mm = try mm_mod.Kernels.load(m.mods[9]);
         return m;
     }
 
-    /// What weights.load runs: the dense packing, and for the MTP head the quantizers and the 4-bit tiling.
+    /// What weights.load runs: the dense packing, the FP8 lane, and the MTP head's quantizers and 4-bit tiling.
     pub fn tools(m: *const Modules) weights.Tools {
-        return .{ .pack_dense = m.pack_dense, .quant = &m.quant, .q4 = &m.q4, .affine4 = &m.affine4, .modelopt = &m.modelopt, .ck = if (m.ck) |*c| c else null };
+        return .{ .pack_dense = m.pack_dense, .lane = &m.lane, .quant = &m.quant, .q4 = &m.q4, .affine4 = &m.affine4, .modelopt = &m.modelopt, .ck = if (m.ck) |*c| c else null };
     }
 
     pub fn enableNativeDense(m: *Modules, d: *const cuda.Driver, ctx: *const cuda.Context) !void {
@@ -148,6 +160,7 @@ pub const Modules = struct {
     }
 
     pub fn deinit(m: *Modules) void {
+        m.routed_exl3.unload();
         if (m.prompt_latent) |*kernels| kernels.unload();
         if (m.source_mods) |*mods| for (mods) |*x| x.unload();
         if (m.ck) |*c| c.unload();
@@ -216,6 +229,11 @@ pub const Pieces = struct {
 };
 
 /// How the ranks' partials meet: every rank in-process copying into the others' slots, or one rank over NCCL.
+const relay = @import("cuda_relay.zig");
+const prof_mod = @import("cuda_prof.zig");
+const images_mod = @import("cuda_images.zig");
+pub const ImageRows = struct { v: *images_mod.Images, slot: u32 };
+
 pub const Exchange = union(enum) {
     local,
     nccl: struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm },
@@ -249,21 +267,56 @@ pub const Forward = struct {
     prefill_overlap: u8 = 0,
     prefill_pieces: u32 = 2,
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
+    ring: bool = false,
+    images: ?ImageRows = null,
+    prof: ?*prof_mod.Prof = null,
+    taps: ?taps_mod.Taps = null,
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
     vision: ?@import("cuda_vision_binding.zig").Binding = null,
     route_trace: ?*route_trace.Trace = null,
     target_graphs: ?*target_graph.Bank = null,
     full_target: ?*target_forward.Runtime = null,
     target_buffer: target_graph.Buffer = .lone,
+    capture_lifetime: u64 = 0, // renewed only after the engine drains and retires captured resources
     target_failure: *const fn (anyerror) void = @import("cuda_kv_owner.zig").failPair,
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue, .linear = f.linear(), .copy_rows = f.m.copy_rows, .exlr8_dense = if (f.m.source_dense) |*d| d else null, .source_upcast = f.m.source_upcast, .attn_fp8load = f.attn_fp8load, .prompt = f.ranks[0].b.prefill, .prompt_aot = if (f.ranks[0].b.prefill) if (f.m.prompt_latent) |*kernels| kernels else null else null };
+        return .{ .glue = &f.m.glue, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .linear = f.linear(), .copy_rows = f.m.copy_rows, .exlr8_dense = if (f.m.source_dense) |*d| d else null, .source_upcast = f.m.source_upcast, .attn_fp8load = f.attn_fp8load, .prompt = f.ranks[0].b.prefill, .prompt_aot = if (f.ranks[0].b.prefill) if (f.m.prompt_latent) |*kernels| kernels else null else null };
     }
 
-    /// qlinear over every format a GLM checkpoint brings: NVFP4 (lane and prompt GEMM) and EXL3.
+    /// Captured sinks and fixed owners only. Request addresses/positions live in staged device metadata.
+    pub fn graphKey(f: *const Forward, layer: usize, rows: usize) !target_graph.Key {
+        if (f.capture_lifetime == 0) return error.InvalidCaptureLifetime;
+        const r = f.ranks[0];
+        if (f.taps) |t| if (t.lifetime == 0) return error.InvalidCaptureLifetime;
+        return .{
+            .buffer = f.target_buffer,
+            .layer = layer,
+            .rows = rows,
+            .context = .{
+                .lifetime = f.capture_lifetime,
+                .modules = @intFromPtr(f.m),
+                .scratch = @intFromPtr(r.b),
+                .weights = @intFromPtr(r.w),
+                .transport = @intFromPtr(f.tp_group),
+                .prefetch = @intFromPtr(f.prefetch),
+                .replicas = @intFromPtr(f.replicas),
+                .packs = @intFromPtr(f.m.packs),
+                .local_taps = if (r.b.taps) |t| t.ptr else 0,
+                .tap_rows = r.b.rows,
+                .policy = @as(u64, @intFromBool(f.m.tiled)) | (@as(u64, @intFromBool(f.attn_fp8load)) << 1) |
+                    (@as(u64, @intFromBool(f.kda_wide)) << 2) | (@as(u64, @intFromBool(f.split)) << 3) |
+                    (@as(u64, @intFromBool(f.ring)) << 4) | (@as(u64, @backingInt(f.affine_prompt_policy)) << 8) |
+                    (@as(u64, @backingInt(f.kda_prompt)) << 16),
+                .tap = if (f.taps) |t| .{ .lifetime = t.lifetime, .address = t.out, .callback = @intFromPtr(t.f.handle) } else .{},
+            },
+            .profile = if (f.prof) |p| p.graphProfile() else null,
+        };
+    }
+
+    /// Every supported projection format, with explicit conversions kept separate from stored formats.
     pub fn linear(f: *const Forward) cuda.qlinear.Linear {
-        return .{ .affine4 = &f.m.affine4, .affine_prompt_policy = f.affine_prompt_policy, .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt, .exl3 = &f.m.exl3, .ck = if (f.m.ck) |*c| c else null };
+        return .{ .affine4 = &f.m.affine4, .affine_prompt_policy = f.affine_prompt_policy, .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt, .exl3_trellis = &f.m.exl3, .ck = if (f.m.ck) |*c| c else null };
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
@@ -292,7 +345,7 @@ pub const Forward = struct {
     }
 
     /// forward._pre: hc_pre of every row at a site into b.normed, xs, post and comb.
-    fn pre(f: *const Forward, r: Rank, hc: weights.Hc, norm: u64, rows: usize) !void {
+    fn pre(f: *const Forward, r: Rank, hc: weights.Hc, norm: glue.Norm, rows: usize) !void {
         const c = &r.w.config;
         const b = r.b;
         try glue.hcPre(f.set(), f.stream, b.x, hc.fn_w, hc.base, hc.scale, norm, b.normed, b.xs, b.post, b.comb, b.hcpart, c.eps, c.hc_eps, c.sinkhorn, rows, c.hidden, c.hc);
@@ -397,7 +450,7 @@ pub const Forward = struct {
     }
 
     fn moeKernels(f: *const Forward) moe.Kernels {
-        return .{ .set = f.set(), .experts = &f.m.experts, .put_slot = f.m.put_slot, .mia_kernels = if (f.m.mia) |*k| k else null };
+        return .{ .set = f.set(), .experts = &f.m.experts, .put_slot = f.m.put_slot, .mia_kernels = if (f.m.mia) |*k| k else null, .exl3 = &f.m.routed_exl3, .prof = f.prof };
     }
 
     const Site = enum { mixer, ffn };
@@ -473,13 +526,8 @@ pub const Forward = struct {
                     const me = r.w.share.rank;
                     const mine = share(n, world, me);
                     const own = mine[1] - mine[0];
-                    try x.lib.check(x.lib.api.ncclGroupStart(), "ncclGroupStart");
-                    for (0..world) |peer| if (peer != me) {
-                        const theirs = share(n, world, peer);
-                        try x.lib.check(x.lib.api.ncclSend(r.b.part + (lo + theirs[0]) * D * 4, (theirs[1] - theirs[0]) * D, .f32, @intCast(peer), x.comm, p.side.handle), "ncclSend");
-                        try x.lib.check(x.lib.api.ncclRecv(room(r, lo) + peer * own * D * 4, own * D, .f32, @intCast(peer), x.comm, p.side.handle), "ncclRecv");
-                    };
-                    try x.lib.check(x.lib.api.ncclGroupEnd(), "ncclGroupEnd");
+                    const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
+                    if (f.ring) try relay.partials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
                     try f.copy(p.side, room(r, lo) + me * own * D * 4, r.b.part + (lo + mine[0]) * D * 4, own * D * 4);
                 },
             }
@@ -498,7 +546,7 @@ pub const Forward = struct {
     }
 
     /// forward._pre of rows lo..hi.
-    fn preRows(f: *const Forward, r: Rank, hc: weights.Hc, norm: u64, lo: usize, hi: usize) !void {
+    fn preRows(f: *const Forward, r: Rank, hc: weights.Hc, norm: glue.Norm, lo: usize, hi: usize) !void {
         const c = &r.w.config;
         const b = r.b;
         const S: usize = c.hc;
@@ -545,7 +593,7 @@ pub const Forward = struct {
                     for (f.ranks) |to| if (to.w.share.rank != from.w.share.rank) {
                         const at = (lo + mine[0]) * D * 2;
                         try f.copy(p.side, (if (last) to.b.hidden else to.b.normed) + at, (if (last) from.b.hidden else from.b.normed) + at, bytes);
-                        if (site == .ffn) if (taps.index(j)) |plane| if (from.b.taps) |source| {
+                        if (site == .ffn) if (taps_mod.index(j)) |plane| if (from.b.taps) |source| {
                             const destination = to.b.taps orelse return error.BadTapView;
                             try f.copy(p.side, destination.ptr + plane * to.b.rows * D * 2 + at, source.ptr + plane * from.b.rows * D * 2 + at, bytes);
                         };
@@ -555,19 +603,12 @@ pub const Forward = struct {
                     const r = f.ranks[0];
                     const me = r.w.share.rank;
                     const rows_of = if (last) r.b.hidden else r.b.normed;
-                    const mine = share(n, world, me);
-                    try x.lib.check(x.lib.api.ncclGroupStart(), "ncclGroupStart");
-                    for (0..world) |peer| if (peer != me) {
-                        const theirs = share(n, world, peer);
-                        try x.lib.check(x.lib.api.ncclSend(rows_of + (lo + mine[0]) * D * 2, (mine[1] - mine[0]) * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclSend");
-                        try x.lib.check(x.lib.api.ncclRecv(rows_of + (lo + theirs[0]) * D * 2, (theirs[1] - theirs[0]) * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclRecv");
-                        if (site == .ffn) if (taps.index(j)) |plane| if (r.b.taps) |storage| {
-                            const base = storage.ptr + plane * r.b.rows * D * 2;
-                            try x.lib.check(x.lib.api.ncclSend(base + (lo + mine[0]) * D * 2, (mine[1] - mine[0]) * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclSend tap");
-                            try x.lib.check(x.lib.api.ncclRecv(base + (lo + theirs[0]) * D * 2, (theirs[1] - theirs[0]) * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclRecv tap");
-                        };
+                    const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
+                    if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
+                    if (site == .ffn) if (taps_mod.index(j)) |plane| if (r.b.taps) |storage| {
+                        const base = storage.ptr + plane * r.b.rows * D * 2;
+                        if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, base, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, base, lo, D);
                     };
-                    try x.lib.check(x.lib.api.ncclGroupEnd(), "ncclGroupEnd");
                 },
             }
             try p.shared[q].record(p.side);
@@ -583,12 +624,13 @@ pub const Forward = struct {
         var li: usize = 0;
         var di: usize = 0;
         for (layers, 0..) |_, j| {
-            for (f.ranks) |r| try f.mixer(r, r.w.layers[j], li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), null);
+            for (f.ranks) |r| if (r.segs.len > 0) try shared.mixer(f, r, r.w.layers[j], li, di, R, null) else try f.mixer(r, r.w.layers[j], li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), null);
             try f.exchangePieces(p, j, .mixer, cut);
             try f.gluePieces(p, j, .mixer, cut);
             for (f.ranks) |r| try f.ffn(r, r.w.layers[j], R, null);
             try f.exchangePieces(p, j, .ffn, cut);
             try f.gluePieces(p, j, .ffn, cut);
+            try f.publishTaps(j, R);
             switch (layers[j].mixer) {
                 .kda => li += 1,
                 .mla => di += 1,
@@ -717,7 +759,7 @@ pub const Forward = struct {
                     const bytes = piece.rows * D * 2;
                     for (f.ranks) |to| if (to.w.share.rank != from.w.share.rank) {
                         try f.copy(p.side, (if (last) to.b.hidden else to.b.normed) + at, (if (last) from.b.hidden else from.b.normed) + at, bytes);
-                        if (site == .ffn) if (taps.index(j)) |plane| if (from.b.taps) |src| {
+                        if (site == .ffn) if (taps_mod.index(j)) |plane| if (from.b.taps) |src| {
                             const dst = to.b.taps orelse return error.BadTapView;
                             try f.copy(p.side, dst.ptr + plane * to.b.rows * D * 2 + at, src.ptr + plane * from.b.rows * D * 2 + at, bytes);
                         };
@@ -733,7 +775,7 @@ pub const Forward = struct {
                     try x.lib.check(x.lib.api.ncclGroupStart(), "ncclGroupStart");
                     try x.lib.check(x.lib.api.ncclSend(buffer + mine * D * 2, piece.rows * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclSend");
                     try x.lib.check(x.lib.api.ncclRecv(buffer + peer_at * D * 2, piece.rows * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclRecv");
-                    if (site == .ffn) if (taps.index(j)) |plane| if (r.b.taps) |storage| {
+                    if (site == .ffn) if (taps_mod.index(j)) |plane| if (r.b.taps) |storage| {
                         const base = storage.ptr + plane * r.b.rows * D * 2;
                         try x.lib.check(x.lib.api.ncclSend(base + mine * D * 2, piece.rows * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclSend tap");
                         try x.lib.check(x.lib.api.ncclRecv(base + peer_at * D * 2, piece.rows * D, .bf16, @intCast(peer), x.comm, p.side.handle), "ncclRecv tap");
@@ -783,6 +825,7 @@ pub const Forward = struct {
             for (f.ranks) |r| try f.promptFfn(r, r.w.layers[j], rows, if (f.prefill_overlap == 2) (try f.promptPlan(r, rows)).owned() else null);
             try f.exchangePrompt(p, j, .ffn, rows);
             try f.gluePrompt(p, j, .ffn, rows);
+            try f.publishTaps(j, rows);
             switch (layers[j].mixer) {
                 .kda => li += 1,
                 .mla => di += 1,
@@ -864,7 +907,7 @@ pub const Forward = struct {
         }
         const R = ids.len;
         try f.beginRows(R);
-        for (f.ranks) |r| try f.d.check(f.d.api.cuMemcpyHtoDAsync_v2(r.b.ids, ids.ptr, R * 4, f.stream.handle), "cuMemcpyHtoDAsync");
+        for (f.ranks) |r| try cuda.copy_source.enqueue(f.d, r.b.ids, std.mem.sliceAsBytes(ids), f.stream);
         const c = &f.ranks[0].w.config;
         for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
         if (f.vision) |binding| for (f.ranks) |r| try vision_binding.inject(binding, .{
@@ -878,15 +921,18 @@ pub const Forward = struct {
             .world = @intCast(r.w.share.world),
             .rank = @intCast(r.w.share.rank),
         }, ids);
+        if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
+        if (f.prof) |p| p.mark(f.stream, .embed);
         var cut: [max_pieces][2]usize = undefined;
         const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill and f.ranks[0].segs.len == 0) ranges(R, p.count, &cut) else 0) else 0;
         // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
-        const exact_prompt = f.ranks[0].b.prefill and f.ranks[0].segs.len == 0 and f.pieces != null and prompt_split.applies(f.prefill_overlap, f.ranks[0].w.share.world, R, f.ranks[0].b.rows);
+        const exact_prompt = f.ranks[0].b.prefill and f.ranks[0].segs.len == 0 and f.pieces != null and !f.ring and prompt_split.applies(f.prefill_overlap, f.ranks[0].w.share.world, R, f.ranks[0].b.rows);
         if (exact_prompt) {
             try f.productionPrompt(f.pieces.?, R);
             _ = overlap_dispatch[f.prefill_overlap - 1].fetchAdd(1, .monotonic);
         } else if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
         try f.finish(R);
+        if (f.prof) |p| p.mark(f.stream, .head);
         try f.joinPrefetch();
     }
 
@@ -901,9 +947,12 @@ pub const Forward = struct {
                 try f.pre(r, l.attn_hc, l.in_norm, R);
                 if (r.segs.len > 0) try shared.mixer(f, r, l, li, di, R, slot(r, R)) else try f.mixer(r, l, li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
             }
+            if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].mixer == .kda) .kda else .mla);
             try f.prefetchSite(j, .a, R);
             try f.gather(R);
+            if (f.prof) |p| p.mark(f.stream, .gather_a);
             try f.ffnLayer(j, R);
+            if (f.prof) |p| p.mark(f.stream, .gather_b);
             switch (f.ranks[0].w.layers[j].mixer) {
                 .kda => li += 1,
                 .mla => di += 1,
@@ -915,7 +964,7 @@ pub const Forward = struct {
     fn ffnLayer(f: *const Forward, layer: usize, rows: usize) !void {
         if (f.target_graphs) |bank| {
             if (!f.ranks[0].b.prefill and f.route_trace == null and rows <= target_graph.max_rows) {
-                bank.run(f.stream, .{ .buffer = f.target_buffer, .layer = layer, .rows = rows }, f, ffnSite) catch |err| {
+                bank.run(f.stream, try f.graphKey(layer, rows), f, ffnSite) catch |err| {
                     // A peer may already be capturing or replaying NCCL. Never fall back on just this rank.
                     f.target_failure(err);
                     return err;
@@ -938,12 +987,14 @@ pub const Forward = struct {
                 .dense => {},
             };
         }
+        if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[layer].ffn == .dense) .dense else .shared);
         try f.prefetchSite(layer, .f, rows);
         try f.gather(rows);
         for (f.ranks) |r| {
             try f.post(r, rows);
             try f.captureTap(r, layer, 0, rows);
         }
+        try f.publishTaps(layer, rows);
         if (f.full_target == null) try f.joinPrefetch();
     }
 
@@ -961,10 +1012,20 @@ pub const Forward = struct {
 
     fn captureTap(f: *const Forward, r: Rank, layer: usize, lo: usize, hi: usize) !void {
         const storage = r.b.taps orelse return;
-        const plane = taps.index(layer) orelse return;
+        const plane = taps_mod.index(layer) orelse return;
         const c = &r.w.config;
-        if (c.hidden != taps.hidden or hi > r.b.rows or lo > hi) return error.BadTapView;
+        if (c.hidden != taps_mod.hidden or hi > r.b.rows or lo > hi) return error.BadTapView;
         try glue.streamMean(f.set(), f.stream, r.b.x + lo * c.hc * c.hidden * 2, storage.ptr + (plane * r.b.rows + lo) * c.hidden * 2, hi - lo, c.hidden, c.hc);
+    }
+
+    fn publishTaps(f: *const Forward, layer: usize, rows: usize) !void {
+        const target = f.taps orelse return;
+        const plane = taps_mod.index(layer) orelse return;
+        const r = f.ranks[0];
+        const source = r.b.taps orelse return error.BadTapView;
+        const D = r.w.config.hidden;
+        if (D != taps_mod.hidden or rows > r.b.rows) return error.BadTapView;
+        try projection.copyRows(f.set(), f.stream, source.ptr + plane * r.b.rows * D * 2, D * 2, target.out + plane * D * 2, taps_mod.layers.len * D * 2, rows, D * 2);
     }
 
     /// The final norm and this rank's rows of the head (a prompt buffer's last row only).
@@ -972,11 +1033,14 @@ pub const Forward = struct {
         const c = &f.ranks[0].w.config;
         for (f.ranks) |r| {
             const b = r.b;
-            try glue.rmsnorm(f.set(), f.stream, b.hidden, c.hidden, r.w.norm, b.fnormed, c.hidden, b.fxs, c.eps, R, c.hidden);
-            if (b.prefill and r.segs.len > 0) continue; // the engine draws each prompt's last row separately
+            try glue.rmsnormBy(f.set(), f.stream, b.hidden, c.hidden, r.w.norm, b.fnormed, c.hidden, b.fxs, c.eps, R, c.hidden);
+            if (b.prefill and r.segs.len > 0) {
+                try shared.heads(f, r);
+                continue;
+            }
             const head_rows: usize = if (b.prefill) 1 else R;
             const first = if (b.prefill) R - 1 else 0;
-            try b16.proj(f.set(), f.stream, b.fnormed + first * c.hidden * 2, c.hidden, r.w.head, b.logits, b.kda.mm_part, head_rows, r.w.share.vocab.len(), c.hidden, false);
+            try projection.matmul(f.set(), f.stream, r.w.head, b.fnormed + first * c.hidden * 2, c.hidden, b.logits, b.kda.mm_part, head_rows, r.w.share.vocab.len(), c.hidden, false);
         }
     }
 
@@ -989,16 +1053,17 @@ pub const Forward = struct {
             if (r.w.mtp == null) return error.NoMtpHead;
             if (n == 0 or n > r.b.rows) return error.BadWindow;
             if (r.st.mtp_len + n > r.st.capacity) return error.PastCapacity;
-            try f.d.check(f.d.api.cuMemcpyHtoDAsync_v2(r.b.ids, ids.ptr, n * 4, f.stream.handle), "cuMemcpyHtoDAsync");
+            try cuda.copy_source.enqueue(f.d, r.b.ids, std.mem.sliceAsBytes(ids), f.stream);
             if (h != r.b.hin) try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(r.b.hin, h, n * D * 2, f.stream.handle), "cuMemcpyDtoDAsync");
             const m = r.w.mtp.?;
             const b = r.b;
             try glue.embedB16(f.set(), f.stream, b.ids, r.w.embed, b.me, n, D, 1);
             if (r.st.mtp_len == 0) try f.d.check(f.d.api.cuMemsetD8Async(b.me, 0, D * 2, f.stream.handle), "cuMemsetD8Async"); // position 0's embedding is zeroed
+            if (f.images) |im| try im.v.splice(f.stream, im.slot, r.st.mtp_len + 1, r.st.mtp_len + 1 + n, b.me, 1);
             try glue.rmsnorm(f.set(), f.stream, b.me, D, m.enorm, b.mcat, 2 * D, null, c.eps, n, D);
             try glue.rmsnorm(f.set(), f.stream, b.hin, D, m.hnorm, b.mcat + D * 2, 2 * D, null, c.eps, n, D);
-            try b16.proj(f.set(), f.stream, b.mcat, 2 * D, m.eh, b.mx, b.kda.mm_part, n, D, 2 * D, false);
-            try glue.rmsnorm(f.set(), f.stream, b.mx, D, m.layer.in_norm, b.normed, D, b.xs, c.eps, n, D);
+            try projection.matmul(f.set(), f.stream, m.eh, b.mcat, 2 * D, b.mx, b.kda.mm_part, n, D, 2 * D, false);
+            try glue.rmsnormBy(f.set(), f.stream, b.mx, D, m.layer.in_norm, b.normed, D, b.xs, c.eps, n, D);
             const nch = @min(latent.chunksFor(r.st.mtp_len + n), b.nch);
             var ks = f.dsaKernels(r);
             ks.slot = 12;
@@ -1010,7 +1075,7 @@ pub const Forward = struct {
             const m = r.w.mtp.?;
             const b = r.b;
             try glue.residualAdd(f.set(), f.stream, b.mx, b.mx, b.gathered, n, D, r.w.share.world);
-            try glue.rmsnorm(f.set(), f.stream, b.mx, D, m.layer.post_norm, b.normed, D, b.xs, c.eps, n, D);
+            try glue.rmsnormBy(f.set(), f.stream, b.mx, D, m.layer.post_norm, b.normed, D, b.xs, c.eps, n, D);
             try f.ffn(r, m.layer, n, slot(r, n));
         }
         try f.gather(n);
@@ -1020,7 +1085,7 @@ pub const Forward = struct {
             try glue.residualAdd(f.set(), f.stream, b.mx, b.mx, b.gathered, n, D, r.w.share.world);
             try glue.rmsnorm(f.set(), f.stream, b.mx + (n - 1) * D * 2, D, m.norm, b.fnormed, D, b.fxs, c.eps, 1, D);
             if (b.prefill) continue;
-            if (m.draft) |dq| try q4.matmul(&f.m.q4, f.stream, b.fnormed, D, b.fxs, dq, b.logits, 1) else try b16.proj(f.set(), f.stream, b.fnormed, D, r.w.head, b.logits, b.kda.mm_part, 1, r.w.share.vocab.len(), D, false);
+            if (m.draft) |dq| try q4.matmul(&f.m.q4, f.stream, b.fnormed, D, b.fxs, dq, b.logits, 1) else try @import("cuda_proj.zig").matmul(f.set(), f.stream, r.w.head, b.fnormed, D, b.logits, b.kda.mm_part, 1, r.w.share.vocab.len(), D, false);
         }
     }
 
@@ -1054,6 +1119,265 @@ pub const Forward = struct {
     }
 };
 
+test "actual forward and MTP bodies refuse invalid input before launches or token upload" {
+    const Trace = struct {
+        var submissions: usize = 0;
+        fn launch(_: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            submissions += 1;
+            return 2;
+        }
+        fn upload(_: u64, _: ?*const anyopaque, _: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            submissions += 1;
+            return 2;
+        }
+    };
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    var d = Memory.driver();
+    Trace.submissions = 0;
+    d.api.cuLaunchKernel = Trace.launch;
+    d.api.cuMemcpyHtoDAsync_v2 = Trace.upload;
+    var b: Buffers = undefined;
+    b.rows = 8;
+    var st: State = undefined;
+    var w: weights.Weights = .{ .gpa = std.testing.allocator, .config = .{}, .share = undefined };
+    var modules: Modules = undefined;
+    const ranks = [_]Rank{.{ .w = &w, .st = &st, .b = &b }};
+    const f: Forward = .{ .d = &d, .m = &modules, .stream = .{ .d = &d, .handle = null }, .ranks = &ranks, .exchange = .local };
+    try std.testing.expectError(error.BadWindow, f.run(&.{}));
+    // The MTP refusal checks the actual optional head before accessing sequence or device memory.
+    try std.testing.expectError(error.NoMtpHead, f.mtp(&.{}, &.{0}));
+    try std.testing.expectEqual(@as(usize, 0), Trace.submissions);
+    try std.testing.expect(Memory.empty());
+}
+
 test {
     _ = prompt_split;
+}
+
+// Records the actual copyRows submissions used by publishTaps and their captured replay destinations.
+const CaptureRecording = struct {
+    const Command = struct { src: u64, src_stride: i64, dst: u64, dst_stride: i64, rows: i32, bytes: i32 };
+    var capturing: bool = false;
+    var pending: ?Command = null;
+    var graphs: [64]?Command = @splat(null);
+    var execs: [64]?Command = @splat(null);
+    var graph_count: usize = 0;
+    var exec_count: usize = 0;
+    var freed: usize = 0;
+    var launches: usize = 0;
+    var writes: [128]Command = undefined;
+    var written: usize = 0;
+    var inflight: bool = false;
+    var syncs: usize = 0;
+    var events: usize = 0;
+
+    fn driver() cuda.Driver {
+        capturing = false;
+        pending = null;
+        @memset(&graphs, null);
+        @memset(&execs, null);
+        graph_count = 0;
+        exec_count = 0;
+        freed = 0;
+        launches = 0;
+        written = 0;
+        inflight = false;
+        syncs = 0;
+        events = 0;
+        var d: cuda.Driver = .{ .lib = undefined, .api = undefined };
+        d.api.cuStreamSynchronize = sync;
+        d.api.cuStreamBeginCapture_v2 = begin;
+        d.api.cuStreamEndCapture = end;
+        d.api.cuGraphInstantiateWithFlags = instantiate;
+        d.api.cuGraphDestroy = destroyGraph;
+        d.api.cuGraphExecDestroy = destroyExec;
+        d.api.cuGraphLaunch = replay;
+        d.api.cuLaunchKernel = kernel;
+        d.api.cuEventRecord = event;
+        return d;
+    }
+    fn execute(c: Command) void {
+        writes[written] = c;
+        written += 1;
+        inflight = true;
+    }
+    fn sync(_: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        syncs += 1;
+        inflight = false;
+        return 0;
+    }
+    fn begin(_: cuda.abi.Stream, _: cuda.abi.CaptureMode) callconv(.c) cuda.abi.Result {
+        std.debug.assert(!capturing and !inflight);
+        capturing = true;
+        pending = null;
+        return 0;
+    }
+    fn end(_: cuda.abi.Stream, out: *cuda.abi.Graph) callconv(.c) cuda.abi.Result {
+        std.debug.assert(capturing);
+        capturing = false;
+        graph_count += 1;
+        graphs[graph_count] = pending;
+        out.* = @ptrFromInt(graph_count);
+        return 0;
+    }
+    fn instantiate(out: *cuda.abi.GraphExec, graph: cuda.abi.Graph, _: u64) callconv(.c) cuda.abi.Result {
+        exec_count += 1;
+        execs[exec_count] = graphs[@intFromPtr(graph)];
+        out.* = @ptrFromInt(exec_count);
+        return 0;
+    }
+    fn destroyGraph(_: cuda.abi.Graph) callconv(.c) cuda.abi.Result {
+        return 0;
+    }
+    fn destroyExec(_: cuda.abi.GraphExec) callconv(.c) cuda.abi.Result {
+        // A replacement cannot release the old executable while its tap write is in flight.
+        std.debug.assert(!inflight);
+        freed += 1;
+        return 0;
+    }
+    fn replay(exec: cuda.abi.GraphExec, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        launches += 1;
+        if (execs[@intFromPtr(exec)]) |c| execute(c);
+        return 0;
+    }
+    fn event(_: cuda.abi.Event, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        if (!capturing) {
+            events += 1;
+            inflight = true;
+        }
+        return 0;
+    }
+    fn kernel(_: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+        const a = args.?;
+        const c: Command = .{
+            .src = @as(*const u64, @ptrCast(@alignCast(a[0].?))).*,
+            .src_stride = @as(*const i64, @ptrCast(@alignCast(a[1].?))).*,
+            .dst = @as(*const u64, @ptrCast(@alignCast(a[2].?))).*,
+            .dst_stride = @as(*const i64, @ptrCast(@alignCast(a[3].?))).*,
+            .rows = @as(*const i32, @ptrCast(@alignCast(a[4].?))).*,
+            .bytes = @as(*const i32, @ptrCast(@alignCast(a[5].?))).*,
+        };
+        if (capturing) pending = c else execute(c);
+        return 0;
+    }
+    fn compute(f: *const Forward, layer: usize, rows: usize) !void {
+        try f.publishTaps(layer, rows);
+        if (f.prof) |p| p.mark(f.stream, .shared);
+    }
+};
+
+test "warmup without taps is a negative control; attached replaced detached and recycled sinks recapture real tap publication" {
+    const R = CaptureRecording;
+    var d = R.driver();
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    var m: Modules = undefined;
+    m.tiled = false;
+    m.packs = null;
+    m.copy_rows = .{ .d = &d, .handle = @ptrFromInt(7) };
+    var b: Buffers = undefined;
+    b.rows = 8;
+    b.taps = .{ .d = &d, .ptr = 0x1000, .len = 8 * taps_mod.hidden * 2 * taps_mod.layers.len };
+    var w: weights.Weights = .{ .gpa = std.testing.allocator, .config = .{}, .share = undefined };
+    w.config.hidden = taps_mod.hidden;
+    var st: State = undefined;
+    var st2: State = undefined;
+    var ranks = [_]Rank{.{ .w = &w, .st = &st, .b = &b }};
+    var f: Forward = .{ .d = &d, .m = &m, .stream = stream, .ranks = &ranks, .exchange = .local, .capture_lifetime = target_graph.newLifetime() };
+    var bank = try target_graph.Bank.init(std.testing.allocator, 6);
+    defer bank.deinit();
+    // This frozen key reproduces the old defect at the actual Bank.run boundary, not merely key equality.
+    const frozen = try f.graphKey(5, 3);
+    try bank.run(stream, frozen, &f, R.compute);
+    f.taps = .{ .lifetime = target_graph.newLifetime(), .f = m.copy_rows, .out = 0x200000 };
+    try bank.run(stream, frozen, &f, R.compute);
+    try std.testing.expectEqual(@as(usize, 0), R.written); // stale warmup really omits the sink
+    // The real forward caller supplies the current context. It must not replay that warmup executable.
+    try bank.run(stream, try f.graphKey(5, 3), &f, R.compute);
+    try std.testing.expectEqual(@as(usize, 1), R.written);
+    try bank.retire(stream);
+    R.written = 0;
+    // Repeat the real owner transitions in a separate bounded bank.
+    var tapped = try target_graph.Bank.init(std.testing.allocator, 6);
+    defer tapped.deinit();
+    f.taps = null;
+    try tapped.run(stream, try f.graphKey(5, 3), &f, R.compute);
+    f.taps = .{ .lifetime = target_graph.newLifetime(), .f = m.copy_rows, .out = 0x200000 };
+    try tapped.run(stream, try f.graphKey(5, 3), &f, R.compute);
+    try std.testing.expectEqual(@as(usize, 1), R.written);
+    try std.testing.expectEqual(@as(u64, 0x1000), R.writes[0].src);
+    try std.testing.expectEqual(@as(i64, 8192), R.writes[0].src_stride);
+    try std.testing.expectEqual(@as(i64, 40960), R.writes[0].dst_stride);
+    try std.testing.expectEqual(@as(i32, 3), R.writes[0].rows);
+    try std.testing.expectEqual(@as(i32, 8192), R.writes[0].bytes);
+    const captures = tapped.stats.site_captures;
+    ranks[0].st = &st2; // request ownership changes are metadata, not capture context
+    try tapped.run(stream, try f.graphKey(5, 3), &f, R.compute);
+    try std.testing.expectEqual(captures, tapped.stats.site_captures);
+    try std.testing.expectEqual(@as(usize, 2), R.written);
+    f.taps.?.out = 0x300000; // replacement, not just absent/present
+    try tapped.run(stream, try f.graphKey(5, 3), &f, R.compute);
+    try std.testing.expectEqual(@as(u64, 0x300000), R.writes[2].dst);
+    f.taps.?.lifetime = target_graph.newLifetime(); // same address, new allocation/module owner
+    try tapped.run(stream, try f.graphKey(5, 3), &f, R.compute);
+    try std.testing.expectEqual(captures + 2, tapped.stats.site_captures);
+    f.taps = null;
+    const written = R.written;
+    try tapped.run(stream, try f.graphKey(5, 3), &f, R.compute);
+    try tapped.run(stream, try f.graphKey(5, 3), &f, R.compute);
+    try std.testing.expectEqual(written, R.written);
+    try std.testing.expectEqual(captures + 3, tapped.stats.site_captures);
+    try tapped.retire(stream);
+    try std.testing.expectEqual(R.exec_count, R.freed);
+}
+
+test "graph event profile trace rewinds eager marks and restores host metadata on unchanged replay" {
+    const R = CaptureRecording;
+    var d = R.driver();
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    var m: Modules = undefined;
+    m.tiled = false;
+    m.packs = null;
+    var b: Buffers = undefined;
+    b.rows = 1;
+    b.taps = null;
+    var w: weights.Weights = .{ .gpa = std.testing.allocator, .config = .{}, .share = undefined };
+    var st: State = undefined;
+    const ranks = [_]Rank{.{ .w = &w, .st = &st, .b = &b }};
+    var f: Forward = .{ .d = &d, .m = &m, .stream = stream, .ranks = &ranks, .exchange = .local, .capture_lifetime = target_graph.newLifetime() };
+    var p: prof_mod.Prof = undefined;
+    p.capture_lifetime = target_graph.newLifetime();
+    p.open = true;
+    p.n = 0;
+    for (&p.events, 0..) |*event, i| event.* = .{ .d = &d, .handle = @ptrFromInt(i + 1) };
+    var other = p;
+    other.capture_lifetime = target_graph.newLifetime();
+    var bank = try target_graph.Bank.init(std.testing.allocator, 1);
+    defer bank.deinit();
+    try bank.run(stream, try f.graphKey(0, 1), &f, R.compute); // warmup, no profiler
+    f.prof = &p;
+    try bank.run(stream, try f.graphKey(0, 1), &f, R.compute);
+    try std.testing.expectEqual(@as(usize, 1), p.n); // not eager + capture twice
+    try std.testing.expectEqual(prof_mod.Section.shared, p.ends[0]);
+    p.n = 0;
+    p.ends[0] = .head; // a different call may overwrite this host array
+    try bank.run(stream, try f.graphKey(0, 1), &f, R.compute);
+    try std.testing.expectEqual(@as(u64, 2), bank.stats.site_captures);
+    try std.testing.expectEqual(@as(usize, 1), p.n);
+    try std.testing.expectEqual(prof_mod.Section.shared, p.ends[0]);
+    f.prof = &other;
+    try bank.run(stream, try f.graphKey(0, 1), &f, R.compute);
+    try std.testing.expectEqual(@as(u64, 3), bank.stats.site_captures);
+    other.n = 0;
+    other.capture_lifetime = target_graph.newLifetime(); // recycled same host/event addresses
+    try bank.run(stream, try f.graphKey(0, 1), &f, R.compute);
+    try std.testing.expectEqual(@as(u64, 4), bank.stats.site_captures);
+    other.n = 1; // event cursor is part of capture context too
+    try bank.run(stream, try f.graphKey(0, 1), &f, R.compute);
+    try std.testing.expectEqual(@as(u64, 5), bank.stats.site_captures);
+    f.prof = null;
+    try bank.run(stream, try f.graphKey(0, 1), &f, R.compute);
+    try bank.run(stream, try f.graphKey(0, 1), &f, R.compute);
+    try std.testing.expectEqual(@as(u64, 6), bank.stats.site_captures);
+    try bank.retire(stream);
+    try std.testing.expectEqual(R.exec_count, R.freed);
 }

@@ -2,6 +2,7 @@
 //! Local modification: expose BF16 checkpoint preparation and include its host tests.
 pub const config = @import("config.zig");
 pub const geometry = @import("cuda_geometry.zig");
+pub const round = @import("cuda_round.zig");
 pub const engine = @import("cuda_engine.zig");
 pub const native = @import("cuda_native.zig");
 pub const native_moe = @import("cuda_native_moe.zig");
@@ -12,6 +13,7 @@ pub const vision = @import("cuda_vision.zig");
 pub const reuse = @import("cuda_reuse.zig");
 
 test {
+    _ = @import("cuda_forward.zig");
     _ = engine;
     _ = native;
     _ = native_moe;
@@ -33,6 +35,11 @@ pub const bf16_weights = @import("cuda_bf16_weights.zig");
 pub const bf16_bindings = @import("cuda_bf16.zig");
 pub const weights = @import("cuda_weights.zig");
 pub const pipeline = @import("cuda_pipeline.zig");
+pub const slide = @import("cuda_slide.zig");
+pub const train_ops = @import("cuda_train_ops.zig");
+pub const train = @import("cuda_train.zig");
+pub const Engine = engine.Engine;
+
 test {
     _ = @import("cuda_checkpoint_test.zig");
     _ = bf16;
@@ -41,4 +48,23 @@ test {
     _ = @import("cuda_modelopt_weights.zig");
     _ = pipeline;
     _ = @import("cuda_pipeline_test.zig");
+}
+
+test {
+    _ = slide;
+    _ = @import("cuda_pocket.zig");
+    _ = @import("cuda_vision.zig");
+}
+
+test {
+    _ = @import("cuda_wide.zig");
+}
+
+test {
+    _ = @import("cuda_completion.zig");
+}
+
+test {
+    _ = train;
+    _ = @import("cuda_read_cost_test.zig");
 }

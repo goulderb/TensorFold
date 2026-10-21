@@ -54,3 +54,24 @@ test "only the five post-layer residuals are drafter taps" {
     try std.testing.expectEqual(@as(?usize, null), index(43));
     try std.testing.expectEqual(@as(?usize, null), index(4));
 }
+
+const cuda = @import("cuda");
+/// Where a forward's taps go: rows [R][5 * hidden] bf16 at `out`, through glm_dflash's df_tap.
+pub const Taps = struct {
+    lifetime: u64 = 0, // unique allocation/module owner generation, not the device address
+    f: cuda.Function,
+    out: u64,
+
+    /// After layer `j` of an `R`-row pass on residual `x` (bf16 [R][4][4096]): its tap slot, if `j` is tapped.
+    pub fn at(t: Taps, s: cuda.Stream, j: usize, x: u64, R: usize) !void {
+        const slot: i32 = for (layers, 0..) |l, i| {
+            if (l == j) break @intCast(i);
+        } else return;
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(t.out);
+        a.add(slot);
+        a.add(@as(i32, 0)); // the mean of the 4 streams (df_tap's mode 0)
+        try cuda.launch.launch(t.f, .{ .grid = .{ .x = @intCast(R), .y = 4096 / 1024 }, .block = .{ .x = 256 } }, s, &a);
+    }
+};

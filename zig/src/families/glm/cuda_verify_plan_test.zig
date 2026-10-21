@@ -1,4 +1,5 @@
 const std = @import("std");
+const cuda = @import("cuda");
 const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
 const backend = @import("cuda_lanes.zig");
@@ -8,6 +9,7 @@ const verify = @import("cuda_verify_plan.zig");
 
 test "verify plan scheduler facts are literal for baseline DFlash wider DFlash and MTP" {
     var e: engine.Engine = undefined;
+    e.drafter = null;
     e.mtp = false;
     e.dflash = @ptrFromInt(256);
     e.settings = .{ .draft = .dflash2 };
@@ -110,7 +112,7 @@ test "verify plan settings are opt in and differ in rank and numerical identitie
     var base = selected;
     base.dflash_verify = .baseline;
     const zero: [32]u8 = @splat(0);
-    const pair = [_]ranks.Fingerprint{ ranks.Fingerprint.of(2, 0, base, 8192, zero, zero, "target"), ranks.Fingerprint.of(2, 1, selected, 8192, zero, zero, "target") };
+    const pair = [_]ranks.Fingerprint{ ranks.Fingerprint.of(2, 0, base, 8192, true, zero, zero, ranks.hashBytes("target")), ranks.Fingerprint.of(2, 1, selected, 8192, true, zero, zero, ranks.hashBytes("target")) };
     try std.testing.expectEqual(ranks.Fingerprint.Field.dflash_verify, ranks.mismatch(&pair).?.field);
     var a = std.crypto.hash.sha2.Sha256.init(.{});
     var b = std.crypto.hash.sha2.Sha256.init(.{});
@@ -123,6 +125,7 @@ test "verify plan settings are opt in and differ in rank and numerical identitie
 
 test "seven draft plan advertises and fills all 64 target rows" {
     var e: engine.Engine = undefined;
+    e.drafter = null;
     e.mtp = false;
     e.dflash = @ptrFromInt(256);
     e.settings = .{ .draft = .dflash2, .dflash_verify = .dflash7 };
@@ -165,4 +168,51 @@ test "Mia decode scratch fits all shared verification boundary shapes" {
         try std.testing.expectEqual(rows, scratch.decode_capacity);
         try std.testing.expect(scratch.work < 0x1000 + bytes);
     }
+}
+
+test "canonical default shared verification allocates 64 rows and admits five eight-row windows" {
+    const dflash = @import("dflash.zig");
+    var e: engine.Engine = undefined;
+    e.drafter = @ptrFromInt(8);
+    e.dflash = null;
+    e.mtp = true;
+    e.settings = .{};
+    e.bs = null;
+    try std.testing.expectEqual(@as(usize, 64), e.verifyPlan().rows());
+    try std.testing.expectEqual(@as(usize, 64), e.sharedLimit());
+    try std.testing.expectEqual(@as(usize, 8), e.targetRows());
+    const allocated = engine.Engine.sharedBufferRows(e.settings, true);
+    try std.testing.expectEqual(@as(usize, 64), allocated);
+    try std.testing.expectEqual(allocated, e.sharedLimit());
+    try std.testing.expectEqual(@as(usize, 64), dflash.STEP_ROWS);
+    var buf: @import("cuda_forward.zig").Buffers = undefined;
+    buf.rows = allocated;
+    e.bs = buf;
+    try std.testing.expectEqual(@as(usize, 64), e.sharedCapacity());
+    var rows: usize = 0;
+    const windows: [5]usize = @splat(8);
+    for (windows) |n| {
+        try std.testing.expect(n > 0 and n <= e.targetRows());
+        try std.testing.expect(rows + n <= e.sharedCapacity());
+        rows += n;
+    }
+    try std.testing.expectEqual(@as(usize, 40), rows);
+    try std.testing.expect(rows > 32);
+    const baseline = e.settings.dflash_verify.active(false).rows();
+    try std.testing.expectEqual(@as(usize, 32), baseline);
+    try std.testing.expect(rows > baseline);
+    buf.rows = baseline;
+    e.bs = buf;
+    try std.testing.expectEqual(baseline, e.sharedCapacity());
+    try std.testing.expect(rows > e.sharedCapacity());
+    var dr: dflash.Drafter = undefined;
+    dr.gpa = std.testing.allocator;
+    dr.slots = .empty;
+    defer dr.slots.deinit(std.testing.allocator);
+    dr.verifies = 0;
+    const ring: cuda.DeviceBuffer = .{ .d = undefined, .ptr = 0x100000, .len = dflash.ring_bytes, .borrowed = true };
+    try dr.slots.append(std.testing.allocator, .{ .ring = ring });
+    try dr.noteVerify(0, 0, 40, 100, true);
+    try std.testing.expectEqual(@as(usize, 40), dr.slots.items[0].v_rows);
+    try std.testing.expectError(error.DrafterContextTooWide, dr.noteVerify(0, 0, 65, 100, true));
 }

@@ -5,26 +5,98 @@ const cuda = @import("cuda");
 
 pub const max_rows = 32;
 pub const Buffer = enum { lone, shared };
-pub const Key = struct { buffer: Buffer, layer: usize, rows: usize };
+// Resource addresses alone cannot identify a new owner allocated at a recycled address.
+var next_lifetime: std.atomic.Value(u64) = .init(1);
+pub fn newLifetime() u64 {
+    const id = next_lifetime.fetchAdd(1, .monotonic);
+    if (id == 0 or id == std.math.maxInt(u64)) @panic("capture lifetime exhausted");
+    return id;
+}
+
+pub const Sink = struct { lifetime: u64 = 0, address: u64 = 0, callback: usize = 0 };
+pub const Context = struct {
+    lifetime: u64 = 0,
+    modules: usize = 0,
+    scratch: usize = 0,
+    weights: usize = 0,
+    transport: usize = 0,
+    prefetch: usize = 0,
+    replicas: usize = 0,
+    packs: usize = 0,
+    local_taps: u64 = 0,
+    tap_rows: usize = 0,
+    policy: u64 = 0,
+    tap: Sink = .{},
+};
+
+pub const max_marks = 512;
+/// Host metadata for event nodes captured in a graph. Replay executes those nodes, not Prof.mark's host work.
+pub const Trace = struct {
+    count: usize = 0,
+    sections: [max_marks]u8 = undefined,
+};
+pub const Profile = struct {
+    ctx: *anyopaque,
+    lifetime: u64,
+    start: usize,
+    rewind: *const fn (*anyopaque, usize) void,
+    save: *const fn (*anyopaque, usize) Trace,
+    replay: *const fn (*anyopaque, usize, *const Trace) void,
+};
+pub const Key = struct {
+    buffer: Buffer,
+    layer: usize,
+    rows: usize,
+    context: Context = .{},
+    profile: ?Profile = null,
+};
+const Identity = struct {
+    context: Context,
+    compute: usize,
+    stream: usize,
+    driver: usize,
+    profile: usize,
+    profile_lifetime: u64,
+    profile_start: usize,
+    profile_callbacks: [3]usize,
+};
 pub const Stats = struct { site_eager: u64 = 0, site_captures: u64 = 0, site_replays: u64 = 0 };
 
 pub const Bank = struct {
     gpa: std.mem.Allocator,
     layers: usize,
     slots: []?cuda.graph.Exec,
+    records: []Record,
     stats: Stats = .{},
+    const Record = struct { identity: ?Identity = null, stream: ?cuda.Stream = null, trace: Trace = .{} };
 
     pub fn init(gpa: std.mem.Allocator, layers: usize) !Bank {
         const count = try std.math.mul(usize, layers, 2 * max_rows);
         const slots = try gpa.alloc(?cuda.graph.Exec, count);
+        errdefer gpa.free(slots);
         @memset(slots, null);
-        return .{ .gpa = gpa, .layers = layers, .slots = slots };
+        const records = try gpa.alloc(Record, count);
+        @memset(records, .{});
+        return .{ .gpa = gpa, .layers = layers, .slots = slots, .records = records };
+    }
+
+    /// Call before releasing/replacing any captured resource. A failed drain leaves the executable and owner alive.
+    pub fn retire(b: *Bank, stream: cuda.Stream) !void {
+        try stream.synchronize();
+        // Settle every captured stream before releasing even the first reference.
+        for (b.records) |record| if (record.stream) |s| try s.synchronize();
+        for (b.slots, b.records) |*slot, *record| {
+            if (slot.*) |*exec| exec.deinit();
+            slot.* = null;
+            record.* = .{};
+        }
     }
 
     /// The owner completes the stream first, and keeps scratch, modules and communicator alive until this returns.
     pub fn deinit(b: *Bank) void {
         for (b.slots) |*slot| if (slot.*) |*exec| exec.deinit();
         b.gpa.free(b.slots);
+        b.gpa.free(b.records);
         b.* = undefined;
     }
 
@@ -36,15 +108,37 @@ pub const Bank = struct {
     /// The first real site runs eager once; capture records the warmed site but never executes it again that round.
     /// Errors propagate to the paired-rank owner: no capture or replay failure silently falls back to eager work.
     pub fn run(b: *Bank, stream: cuda.Stream, key: Key, context: anytype, comptime compute: anytype) !void {
-        const slot = &b.slots[try b.index(key)];
-        if (slot.*) |exec| {
-            try exec.launchOn(stream);
-            b.stats.site_replays += 1;
-            return;
+        const at = try b.index(key);
+        const slot = &b.slots[at];
+        const record = &b.records[at];
+        const identity: Identity = .{
+            .context = key.context,
+            .compute = @intFromPtr(&compute),
+            .stream = @intFromPtr(stream.handle),
+            .driver = @intFromPtr(stream.d),
+            .profile = if (key.profile) |p| @intFromPtr(p.ctx) else 0,
+            .profile_lifetime = if (key.profile) |p| p.lifetime else 0,
+            .profile_start = if (key.profile) |p| p.start else 0,
+            .profile_callbacks = if (key.profile) |p| .{ @intFromPtr(p.rewind), @intFromPtr(p.save), @intFromPtr(p.replay) } else .{ 0, 0, 0 },
+        };
+        if (key.profile) |p| if (p.lifetime == 0) return error.InvalidCaptureLifetime;
+        if (slot.*) |*exec| {
+            if (record.identity != null and std.meta.eql(record.identity.?, identity)) {
+                try exec.launchOn(stream);
+                if (key.profile) |p| p.replay(p.ctx, p.start, &record.trace);
+                b.stats.site_replays += 1;
+                return;
+            }
+            // A replay can still be in flight. Do not destroy its executable or release its references before this.
+            try record.stream.?.synchronize();
+            exec.deinit();
+            slot.* = null;
+            record.* = .{};
         }
         try compute(context, key.layer, key.rows);
         b.stats.site_eager += 1;
         try stream.synchronize();
+        if (key.profile) |p| p.rewind(p.ctx, p.start);
         try cuda.graph.beginCapture(stream, .thread_local);
         compute(context, key.layer, key.rows) catch |err| {
             var discarded = cuda.graph.endCapture(stream) catch return err;
@@ -54,6 +148,9 @@ pub const Bank = struct {
         var graph = try cuda.graph.endCapture(stream);
         defer graph.deinit();
         slot.* = try graph.instantiate();
+        record.identity = identity;
+        record.stream = stream;
+        record.trace = if (key.profile) |p| p.save(p.ctx, p.start) else .{};
         b.stats.site_captures += 1;
     }
 };
@@ -297,4 +394,63 @@ test "failed replay propagates without calling eager compute or counting a succe
     try std.testing.expectEqual(@as(usize, 1), site.writes);
     try std.testing.expectEqual(@as(usize, 1), Fake.launches);
     try std.testing.expectEqual(@as(u64, 0), bank.stats.site_replays);
+}
+
+test "context retirement failures retain the old owner and failed recapture never publishes the new identity" {
+    var d = Fake.driver();
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    var bank = try Bank.init(std.testing.allocator, 1);
+    defer bank.deinit();
+    var site: Fake.Site = .{};
+    var key: Key = .{ .buffer = .lone, .layer = 0, .rows = 1, .context = .{ .tap = .{ .lifetime = newLifetime(), .address = 0x1000 } } };
+    try bank.run(stream, key, &site, Fake.Site.compute);
+    const old = bank.records[0].identity.?;
+    key.context.tap.lifetime = newLifetime();
+    Fake.sync_code = cuda.abi.error_not_ready;
+    try std.testing.expectError(error.NotReady, bank.run(stream, key, &site, Fake.Site.compute));
+    try std.testing.expectEqualDeep(old, bank.records[0].identity.?);
+    try std.testing.expectEqual(@as(usize, 0), Fake.exec_frees);
+    try std.testing.expectEqual(@as(usize, 2), site.calls);
+    try std.testing.expectError(error.NotReady, bank.retire(stream));
+    try std.testing.expectEqual(@as(usize, 0), Fake.exec_frees);
+    Fake.sync_code = 0;
+    Fake.instantiate_code = cuda.abi.error_not_ready;
+    try std.testing.expectError(error.NotReady, bank.run(stream, key, &site, Fake.Site.compute));
+    try std.testing.expectEqual(@as(usize, 1), Fake.exec_frees);
+    try std.testing.expect(bank.slots[0] == null and bank.records[0].identity == null);
+    Fake.instantiate_code = 0;
+    try bank.run(stream, key, &site, Fake.Site.compute);
+    const calls = site.calls;
+    try bank.run(stream, key, &site, Fake.Site.compute);
+    try std.testing.expectEqual(calls, site.calls);
+    try bank.retire(stream);
+    try std.testing.expectEqual(Fake.execs, Fake.exec_frees);
+}
+
+test "capture callback identity participates independently of resource addresses" {
+    const Other = struct {
+        fn compute(s: *Fake.Site, layer: usize, rows: usize) !void {
+            try Fake.Site.compute(s, layer, rows);
+        }
+    };
+    var d = Fake.driver();
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    var bank = try Bank.init(std.testing.allocator, 1);
+    defer bank.deinit();
+    var site: Fake.Site = .{};
+    const key: Key = .{ .buffer = .lone, .layer = 0, .rows = 1 };
+    try bank.run(stream, key, &site, Fake.Site.compute);
+    try bank.run(stream, key, &site, Other.compute);
+    try std.testing.expectEqual(@as(u64, 2), bank.stats.site_captures);
+    try std.testing.expectEqual(@as(usize, 1), Fake.exec_frees);
+}
+
+test "bounded graph slot and metadata allocation failures release earlier ownership" {
+    const Check = struct {
+        fn run(gpa: std.mem.Allocator) !void {
+            var bank = try Bank.init(gpa, 2);
+            defer bank.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

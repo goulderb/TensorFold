@@ -9,7 +9,7 @@ pub const Layout = struct {
     capacity: usize,
     ring_rows: usize,
     dsa_layers: usize,
-    fixed: [8]usize,
+    fixed: [9]usize,
     fixed_end: usize,
     cache_offsets: [4]usize,
     cache_stride: usize,
@@ -20,13 +20,13 @@ pub const Layout = struct {
     total_bytes: usize,
     external_planes: bool = false,
 
-    pub fn init(fixed_sizes: [8]usize, capacity: usize, max_window: usize, dsa_layers: usize, format: cache.Format, latent_width: usize, index_width: usize) !Layout {
+    pub fn init(fixed_sizes: [9]usize, capacity: usize, max_window: usize, dsa_layers: usize, format: cache.Format, latent_width: usize, index_width: usize) !Layout {
         if (capacity == 0 or max_window == 0 or latent_width == 0 or index_width == 0) return error.InvalidGeometry;
         const ring = @min(capacity, (try std.math.add(usize, max_window, 3 + 63)) & ~@as(usize, 63));
         const lat = try rowBytes(format, latent_width);
         const index = try std.math.mul(usize, index_width, 2);
         const pooled = try rowBytes(format, index_width);
-        var fixed: [8]usize = undefined;
+        var fixed: [9]usize = undefined;
         var end: usize = 0;
         for (fixed_sizes, &fixed) |n, *offset| {
             offset.* = end;
@@ -152,9 +152,9 @@ fn rowBytes(format: cache.Format, width: usize) !usize {
 }
 
 test "bounded rings use the widest window plus the prior incomplete pool" {
-    const l = try Layout.init(.{ 4, 0, 0, 0, 0, 0, 0, 0 }, 262144, 2048, 1, .fp8, 512, 128);
+    const l = try Layout.init(.{ 4, 0, 0, 0, 0, 0, 0, 0, 0 }, 262144, 2048, 1, .fp8, 512, 128);
     try std.testing.expectEqual(@as(usize, 2112), l.ring_rows);
-    const small = try Layout.init(.{ 4, 0, 0, 0, 0, 0, 0, 0 }, 17, 2048, 1, .bf16, 512, 128);
+    const small = try Layout.init(.{ 4, 0, 0, 0, 0, 0, 0, 0, 0 }, 17, 2048, 1, .bf16, 512, 128);
     try std.testing.expectEqual(@as(usize, 17), small.ring_rows);
     try std.testing.expectEqual(@as(usize, 256), l.fixed_end);
     try std.testing.expectEqual(@as(usize, 528), l.latent_stride);
@@ -165,7 +165,7 @@ test "bounded rings use the widest window plus the prior incomplete pool" {
 }
 
 test "main and MTP prefixes retain independent incomplete pools" {
-    const l = try Layout.init(.{ 4, 3, 5, 0, 0, 0, 0, 0 }, 8192, 2048, 2, .fp8, 512, 128);
+    const l = try Layout.init(.{ 4, 3, 5, 0, 0, 0, 0, 0, 0 }, 8192, 2048, 2, .fp8, 512, 128);
     const plan = try l.snapshot(.{ .main = 2115, .mtp = 7 });
     var it = plan.ranges();
     try std.testing.expectEqual(Range{ .saved = 0, .bytes = 768 }, it.next().?);
@@ -182,7 +182,7 @@ test "main and MTP prefixes retain independent incomplete pools" {
 
 test "prefix packing restores only visible bytes after storage is reused" {
     for ([_]cache.Format{ .bf16, .fp8 }) |format| {
-        const l = try Layout.init(.{ 4, 17, 31, 9, 5, 3, 2, 1 }, 128, 8, 2, format, 4, 4);
+        const l = try Layout.init(.{ 4, 17, 31, 9, 5, 3, 2, 1, 0 }, 128, 8, 2, format, 4, 4);
         const live = try std.testing.allocator.alloc(u8, l.total_bytes);
         defer std.testing.allocator.free(live);
         for (0..129) |at| {
@@ -212,7 +212,7 @@ test "prefix packing restores only visible bytes after storage is reused" {
 }
 
 test "shared layouts retain private rings and resolve independent resident snapshot bytes" {
-    const full = try Layout.init(.{ 4, 512, 512, 256, 0, 0, 0, 0 }, 8192, 2048, 2, .fp8, 512, 128);
+    const full = try Layout.init(.{ 4, 512, 512, 256, 0, 0, 0, 0, 0 }, 8192, 2048, 2, .fp8, 512, 128);
     const shared = try full.external();
     try std.testing.expect(shared.total_bytes < full.total_bytes);
     try std.testing.expectEqual(@as(usize, 2112 * 256 * 2), shared.cache_stride);

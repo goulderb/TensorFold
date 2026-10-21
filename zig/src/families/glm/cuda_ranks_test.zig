@@ -38,12 +38,12 @@ test "EXL3 decode defaults to scalar, refuses unknown policy and separates ranks
     var problem: []const u8 = "";
     const scalar = try Settings.read(Values.empty, &problem);
     const tensor = try Settings.read(Values.tensor, &problem);
-    try std.testing.expectEqual(cuda.exl3_experts.Decode.scalar, scalar.exl3_decode);
-    try std.testing.expectEqual(cuda.exl3_experts.Decode.tensor, tensor.exl3_decode);
+    try std.testing.expectEqual(cuda.exl3_trellis_experts.Decode.scalar, scalar.exl3_decode);
+    try std.testing.expectEqual(cuda.exl3_trellis_experts.Decode.tensor, tensor.exl3_decode);
     try std.testing.expectError(error.BadSetting, Settings.read(Values.invalid, &problem));
     try std.testing.expectEqualStrings("TF_GLM_EXL3_DECODE: scalar or tensor", problem);
     const h: [32]u8 = @splat(0);
-    const all = [_]Fingerprint{ Fingerprint.of(2, 0, scalar, 256, h, h, "model"), Fingerprint.of(2, 1, tensor, 256, h, h, "model") };
+    const all = [_]Fingerprint{ Fingerprint.of(2, 0, scalar, 256, true, h, h, ranks.hashBytes("model")), Fingerprint.of(2, 1, tensor, 256, true, h, h, ranks.hashBytes("model")) };
     try std.testing.expectEqual(Fingerprint.Field.exl3_decode, mismatch(&all).?.field);
     var scalar_hash = Sha256.init(.{});
     var tensor_hash = Sha256.init(.{});
@@ -57,29 +57,29 @@ test "settings from the environment: the defaults, the choices, and a refusal na
     const s = try Settings.read(&fake, &problem);
     try std.testing.expect(!s.split and s.kda_wide and s.pieces == 2 and s.heat.?.high_c == 92 and s.heat.?.low_c == 88);
     try std.testing.expectError(error.BadSetting, Settings.read(&bad, &problem));
-    try std.testing.expectEqualStrings("TF_GLM_PREFILL_REDUCE: split or gather", problem);
+    try std.testing.expectEqualStrings("TF_GLM_PREFILL_REDUCE: split, ring or gather", problem);
 }
 
 test "fingerprints: agreeing ranks pass; the first differing field and rank are named" {
     const h0: [32]u8 = @splat(1);
     const h1: [32]u8 = @splat(2);
     var all = [_]Fingerprint{
-        Fingerprint.of(2, 0, .{}, 8192, h0, h0, "/hub/snapshots/423acf37/"),
-        Fingerprint.of(2, 1, .{}, 8192, h0, h0, "/hub/snapshots/423acf37"),
+        Fingerprint.of(2, 0, .{}, 8192, true, h0, h0, ranks.hashBytes("/hub/snapshots/423acf37")),
+        Fingerprint.of(2, 1, .{}, 8192, true, h0, h0, ranks.hashBytes("/hub/snapshots/423acf37")),
     };
     try std.testing.expect(mismatch(&all) == null);
     all[1].program = h1;
     try std.testing.expectEqual(Fingerprint.Field.program, mismatch(&all).?.field);
-    all[1] = Fingerprint.of(2, 1, .{ .split = false }, 8192, h0, h0, "/hub/snapshots/423acf37");
+    all[1] = Fingerprint.of(2, 1, .{ .split = false }, 8192, true, h0, h0, ranks.hashBytes("/hub/snapshots/423acf37"));
     try std.testing.expectEqual(Mismatch{ .field = .split, .rank = 1 }, mismatch(&all).?);
-    all[1] = Fingerprint.of(2, 0, .{}, 8192, h0, h0, "/hub/snapshots/423acf37");
+    all[1] = Fingerprint.of(2, 0, .{}, 8192, true, h0, h0, ranks.hashBytes("/hub/snapshots/423acf37"));
     try std.testing.expectEqual(Fingerprint.Field.rank, mismatch(&all).?.field);
     const heat_on: Settings = .{ .heat = .{ .high_c = 92, .low_c = 88 } };
-    all[1] = Fingerprint.of(2, 1, heat_on, 8192, h0, h0, "/hub/snapshots/423acf37");
+    all[1] = Fingerprint.of(2, 1, heat_on, 8192, true, h0, h0, ranks.hashBytes("/hub/snapshots/423acf37"));
     try std.testing.expectEqual(Fingerprint.Field.heat_high, mismatch(&all).?.field);
-    all[1] = Fingerprint.of(2, 1, .{}, 8192, h0, h0, "/hub/snapshots/other");
+    all[1] = Fingerprint.of(2, 1, .{}, 8192, true, h0, h0, ranks.hashBytes("/hub/snapshots/other"));
     try std.testing.expectEqual(Fingerprint.Field.checkpoint, mismatch(&all).?.field);
-    all[1] = Fingerprint.of(2, 1, .{ .draft = .off }, 8192, h0, h0, "/hub/snapshots/423acf37");
+    all[1] = Fingerprint.of(2, 1, .{ .draft = .off }, 8192, true, h0, h0, ranks.hashBytes("/hub/snapshots/423acf37"));
     try std.testing.expectEqual(Mismatch{ .field = .draft, .rank = 1 }, mismatch(&all).?);
 }
 
@@ -100,11 +100,11 @@ test "cache format is parsed once and rank disagreement is refused" {
     try std.testing.expectEqualStrings("TF_GLM_KV: bf16 or fp8", problem);
     const hash: [32]u8 = @splat(1);
     var all = [_]Fingerprint{
-        Fingerprint.of(2, 0, .{}, 8192, hash, hash, "/checkpoint"),
-        Fingerprint.of(2, 1, .{ .kv = .fp8 }, 8192, hash, hash, "/checkpoint"),
+        Fingerprint.of(2, 0, .{}, 8192, true, hash, hash, ranks.hashBytes("/checkpoint")),
+        Fingerprint.of(2, 1, .{ .kv = .fp8 }, 8192, true, hash, hash, ranks.hashBytes("/checkpoint")),
     };
     try std.testing.expectEqual(Mismatch{ .field = .kv, .rank = 1 }, mismatch(&all).?);
-    all[0] = Fingerprint.of(2, 0, .{ .kv = .fp8 }, 8192, hash, hash, "/checkpoint");
+    all[0] = Fingerprint.of(2, 0, .{ .kv = .fp8 }, 8192, true, hash, hash, ranks.hashBytes("/checkpoint"));
     try std.testing.expect(mismatch(&all) == null);
 }
 
@@ -126,7 +126,7 @@ test "shared pool and ownership options are explicit and ranks agree on their ge
     try std.testing.expect(settings.kv_shard);
     try std.testing.expectError(error.BadSetting, Settings.read(Values.missing, &problem));
     const hash: [32]u8 = @splat(0);
-    var all = [_]Fingerprint{ Fingerprint.of(2, 0, settings, 8192, hash, hash, "/checkpoint"), Fingerprint.of(2, 1, settings, 8192, hash, hash, "/checkpoint") };
+    var all = [_]Fingerprint{ Fingerprint.of(2, 0, settings, 8192, true, hash, hash, ranks.hashBytes("/checkpoint")), Fingerprint.of(2, 1, settings, 8192, true, hash, hash, ranks.hashBytes("/checkpoint")) };
     try std.testing.expectEqual(@as(?Mismatch, null), mismatch(&all));
     all[1].kv_pool_tokens = 16384;
     try std.testing.expectEqual(Fingerprint.Field.kv_pool_tokens, mismatch(&all).?.field);
@@ -163,7 +163,7 @@ test "weight precision and spill enablement must agree before rank startup" {
     try std.testing.expectError(error.BadSetting, Settings.read(Values.badHead, &problem));
     try std.testing.expectEqualStrings("TF_GLM_HEAD: bf16 or fp8", problem);
     const hash: [32]u8 = @splat(0);
-    var all = [_]Fingerprint{ Fingerprint.of(2, 0, settings, 8192, hash, hash, "/checkpoint"), Fingerprint.of(2, 1, settings, 8192, hash, hash, "/checkpoint") };
+    var all = [_]Fingerprint{ Fingerprint.of(2, 0, settings, 8192, true, hash, hash, ranks.hashBytes("/checkpoint")), Fingerprint.of(2, 1, settings, 8192, true, hash, hash, ranks.hashBytes("/checkpoint")) };
     try std.testing.expect(mismatch(&all) == null);
     all[1].weight_dense = @splat(0);
     try std.testing.expectEqual(Fingerprint.Field.weight_dense, mismatch(&all).?.field);
@@ -197,11 +197,11 @@ test "effective family policy governs rank and persistent numerical identity" {
     const changed = try Settings.read(&Env.dsa, &problem);
     const file_hash: [32]u8 = @splat(7);
     const pair = [_]Fingerprint{
-        Fingerprint.of(2, 0, base, 8192, file_hash, file_hash, "checkpoint"),
-        Fingerprint.of(2, 1, same, 8192, file_hash, file_hash, "checkpoint"),
+        Fingerprint.of(2, 0, base, 8192, true, file_hash, file_hash, ranks.hashBytes("checkpoint")),
+        Fingerprint.of(2, 1, same, 8192, true, file_hash, file_hash, ranks.hashBytes("checkpoint")),
     };
     try std.testing.expect(mismatch(&pair) == null);
-    const different = [_]Fingerprint{ pair[0], Fingerprint.of(2, 1, changed, 8192, file_hash, file_hash, "checkpoint") };
+    const different = [_]Fingerprint{ pair[0], Fingerprint.of(2, 1, changed, 8192, true, file_hash, file_hash, ranks.hashBytes("checkpoint")) };
     try std.testing.expectEqual(Fingerprint.Field.weight_dense, mismatch(&different).?.field);
     var a = Sha256.init(.{});
     var b = Sha256.init(.{});
@@ -227,6 +227,6 @@ test "vision startup is explicit and requires rank agreement" {
     try std.testing.expectError(error.BadSetting, Settings.read(Values.invalid, &problem));
     try std.testing.expectEqualStrings("TF_GLM_VISION: 0 or 1", problem);
     const hash: [32]u8 = @splat(0);
-    const all = [_]Fingerprint{ Fingerprint.of(2, 0, .{ .vision = true }, 8192, hash, hash, "/checkpoint"), Fingerprint.of(2, 1, .{}, 8192, hash, hash, "/checkpoint") };
-    try std.testing.expectEqual(Fingerprint.Field.vision, mismatch(&all).?.field);
+    const all = [_]Fingerprint{ Fingerprint.of(2, 0, .{ .vision = true }, 8192, true, hash, hash, ranks.hashBytes("/checkpoint")), Fingerprint.of(2, 1, .{}, 8192, true, hash, hash, ranks.hashBytes("/checkpoint")) };
+    try std.testing.expectEqual(Fingerprint.Field.vision_setting, mismatch(&all).?.field);
 }

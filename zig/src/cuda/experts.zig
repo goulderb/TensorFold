@@ -6,7 +6,7 @@ const stream_ = @import("stream.zig");
 const kernels = @import("kernels.zig");
 const grouped = @import("grouped.zig");
 const driver = @import("driver.zig");
-const exl3 = @import("exl3_experts.zig");
+const exl3 = @import("exl3_trellis_experts.zig");
 const ggml = @import("ggml.zig");
 
 const Driver = driver.Driver;
@@ -39,7 +39,7 @@ pub const Layer = struct {
     shared_up: u64 = 0,
     shared_down: u64 = 0,
     exl3: exl3.Widths = .{}, // retained GLM trellis widths and codebook
-    exl3_common: ?@import("exl3_experts_common.zig").Layer = null, // upstream per-expert pointer tables
+    exl3_common: ?@import("exl3_experts.zig").Layer = null, // upstream per-expert pointer tables
 };
 
 /// A call's epilogue: up with its format's activation (affine4 relu^2, else SwiGLU), down to fp32 or to bf16 sums.

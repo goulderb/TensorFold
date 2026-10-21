@@ -86,6 +86,8 @@ pub const Backend = struct {
         /// Partial prompt cohort: setup errors are per-stream outcomes; a shared execution error fails the cohort.
         /// Unlike prefill_many, skipped streams stay untouched and an execution error must not retry them alone.
         prefill_batch: ?*const fn (ptr: *anyopaque, streams: []const *Stream, out: []PrefillOutcome) anyerror!void = null,
+        /// Prompts of at most this many tokens prefill_many takes while prompts otherwise fill by chunks (0: none).
+        many_rows: u32 = 0,
         /// Draw the first token from the prompt's last row at `position`; a handle to it.
         first: *const fn (ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64,
         /// Feed one token and queue the draw of the next at `position` (a one-token round); a handle to it.

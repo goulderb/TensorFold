@@ -126,7 +126,7 @@ fn gather(L: *W.Loader, name: []const u8, c: *const Config.Config, s: Share) !Pa
     return stats;
 }
 
-fn layer(a: std.mem.Allocator, io: std.Io, dir: []const u8, table: *const core.modelopt.Table, c: Config.Config, s: Share, index: u32) !void {
+fn layer(a: std.mem.Allocator, io: std.Io, dir: []const u8, table: *const core.modelopt.Recipes, c: Config.Config, s: Share, index: u32) !void {
     var buf: [128]u8 = undefined;
     const prefix = try std.fmt.bufPrint(&buf, "model.language_model.layers.{d}.", .{index});
     var ck = try core.Checkpoint.openModelPrefix(a, io, dir, prefix);

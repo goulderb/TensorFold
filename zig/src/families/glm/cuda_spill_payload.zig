@@ -28,7 +28,9 @@ pub const Shape = struct {
 
     pub fn digest(s: Shape) [32]u8 {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
-        h.update("glm-cuda-snapshot-layout-v1");
+        // Payload layout epoch, separate from the unchanged metadata codec version.
+        // The ninth fixed field owns the prompt hidden row; old eight-field payloads cannot restore.
+        h.update("glm-cuda-snapshot-layout-v2-prompt-hidden");
         inline for (.{ "capacity", "ring_rows", "dsa_layers", "fixed_end", "cache_stride", "latent_stride", "index_stride", "pooled_stride", "mtp_pos", "total_bytes" }) |field| hashInt(&h, @field(s.layout, field));
         for (s.layout.fixed) |n| hashInt(&h, n);
         for (s.layout.cache_offsets) |n| hashInt(&h, n);
@@ -117,7 +119,7 @@ fn get(comptime T: type, in: []const u8, at: usize) T {
 test "owner and peer roundtrip BF16 and FP8 with separate main and MTP geometry" {
     for ([_]cache.Format{ .bf16, .fp8 }) |format| {
         for ([_]bool{ false, true }) |mtp| {
-            const l = try (try layout.Layout.init(.{ 256, 256, 0, 0, 0, 0, 0, 0 }, 8192, 2048, 2, format, 512, 128)).external();
+            const l = try (try layout.Layout.init(.{ 256, 256, 0, 0, 0, 0, 0, 0, 0 }, 8192, 2048, 2, format, 512, 128)).external();
             for (0..2) |rank| {
                 const shape: Shape = .{ .layout = l, .format = format, .mtp = mtp, .sharded = true, .rank = @intCast(rank), .world = 2, .grid = 2048, .parities = 3 };
                 var out: [max_meta]u8 = undefined;
@@ -141,7 +143,7 @@ test "owner and peer roundtrip BF16 and FP8 with separate main and MTP geometry"
 }
 
 test "codec refuses partial metadata, geometry changes and invalid owner before allocation" {
-    const l = try layout.Layout.init(.{ 256, 0, 0, 0, 0, 0, 0, 0 }, 8192, 2048, 1, .bf16, 512, 128);
+    const l = try layout.Layout.init(.{ 256, 0, 0, 0, 0, 0, 0, 0, 0 }, 8192, 2048, 1, .bf16, 512, 128);
     const shape: Shape = .{ .layout = l, .format = .bf16, .mtp = false, .sharded = false, .rank = 0, .world = 1, .grid = 2048, .parities = 1 };
     var out: [max_meta]u8 = undefined;
     const meta = try encode(shape, 2048, 0, null, &.{1}, &out);
@@ -158,8 +160,34 @@ test "codec refuses partial metadata, geometry changes and invalid owner before 
     try std.testing.expectError(error.SpillPosition, encode(shape, 8192, 0, null, &.{1}, &out));
 }
 
+test "persisted adapter rejects the historical eight-field layout and separates prompt hidden geometry" {
+    const old_layout = try layout.Layout.init(.{ 256, 0, 0, 0, 0, 0, 0, 0, 0 }, 8192, 2048, 1, .bf16, 512, 128);
+    const new_layout = try layout.Layout.init(.{ 256, 0, 0, 0, 0, 0, 0, 0, 4096 * 2 }, 8192, 2048, 1, .bf16, 512, 128);
+    // Pinned pre-integration layout/codec: 7d547958d5, cuda_layout + cuda_spill_payload.
+    // Geometry is the old_layout above with only eight fixed fields; world/grid/parities = 1/2048/1.
+    const historical_digest = [_]u8{ 0xd2, 0xb7, 0x9f, 0x0d, 0x78, 0x9b, 0xfa, 0x08, 0x45, 0x5d, 0xb1, 0x7c, 0x75, 0x4b, 0x65, 0x8e, 0x11, 0xf3, 0xab, 0x17, 0xd2, 0xc0, 0xd5, 0x55, 0x75, 0x70, 0xc2, 0x39, 0xe9, 0x08, 0xd4, 0x96 };
+    const old_shape: Shape = .{ .layout = old_layout, .format = .bf16, .mtp = false, .sharded = false, .rank = 0, .world = 1, .grid = 2048, .parities = 1 };
+    var new_shape = old_shape;
+    new_shape.layout = new_layout;
+    try std.testing.expect(!std.mem.eql(u8, &old_shape.digest(), &new_shape.digest()));
+    try std.testing.expect(!std.mem.eql(u8, &historical_digest, &new_shape.digest()));
+    const old_bytes = (try old_layout.snapshot(.{ .main = 2048, .mtp = 0 })).byteCount();
+    const new_bytes = (try new_layout.snapshot(.{ .main = 2048, .mtp = 0 })).byteCount();
+    try std.testing.expectEqual(@as(usize, 8192), new_bytes - old_bytes);
+    var out: [max_meta]u8 = undefined;
+    const meta = try encode(old_shape, 2048, 0, null, &.{0}, &out);
+    // Current metadata codec, historical payload identity: rejected at decode before any restore occurs.
+    @memcpy(out[16..48], &historical_digest);
+    try std.testing.expectError(error.SpillShape, decode(new_shape, meta, 2048, old_bytes));
+    // The new epoch also rejects old persisted data for zero-sized synthetic hidden-row layouts.
+    try std.testing.expectError(error.SpillShape, decode(old_shape, meta, 2048, old_bytes));
+    const current = try encode(new_shape, 2048, 0, null, &.{0}, &out);
+    _ = try decode(new_shape, current, 2048, new_bytes);
+    try std.testing.expectError(error.SpillShape, decode(old_shape, current, 2048, new_bytes));
+}
+
 test "DFlash ring tail is budgeted and incompatible drafter state is rejected" {
-    const l = try layout.Layout.init(.{ 256, 0, 0, 0, 0, 0, 0, 0 }, 8192, 2048, 1, .bf16, 512, 128);
+    const l = try layout.Layout.init(.{ 256, 0, 0, 0, 0, 0, 0, 0, 0 }, 8192, 2048, 1, .bf16, 512, 128);
     const control: Shape = .{ .layout = l, .format = .bf16, .mtp = false, .sharded = false, .rank = 0, .world = 2, .grid = 2048, .parities = 1 };
     var shape = control;
     shape.draft_bytes = 22_282_240;
@@ -176,4 +204,29 @@ test "DFlash ring tail is budgeted and incompatible drafter state is rejected" {
     other.draft_identity[0] = 8;
     try std.testing.expectError(error.SpillShape, decode(other, meta, 2048, total));
     try std.testing.expectError(error.SpillPayloadLength, decode(shape, meta, 2048, target));
+}
+
+test "canonical saved-state restore refuses content and precision mismatch" {
+    const ranks = @import("cuda_ranks.zig");
+    const l = try layout.Layout.init(.{ 256, 0, 0, 0, 0, 0, 0, 0, 0 }, 8192, 2048, 1, .bf16, 512, 128);
+    const q4 = ranks.CanonicalDraft{ .checkpoint = ranks.hashBytes("saved-q4"), .bits = 4 };
+    const other = ranks.CanonicalDraft{ .checkpoint = ranks.hashBytes("saved-other"), .bits = 4 };
+    const bf16 = ranks.CanonicalDraft{ .checkpoint = ranks.hashBytes("saved-q4"), .bits = 16 };
+    const ring = @import("dflash.zig").ring_bytes;
+    const owned = ranks.persistedDraftSnapshot(true, q4, ring, 0, @splat(0));
+    var shape: Shape = .{ .layout = l, .format = .bf16, .mtp = false, .sharded = false, .rank = 0, .world = 1, .grid = 2048, .parities = 1, .draft_bytes = owned.bytes, .draft_identity = owned.identity };
+    const target = (try l.snapshot(.{ .main = 2048, .mtp = 0 })).byteCount();
+    const total = try shape.payloadBytes(target);
+    var out: [max_meta]u8 = undefined;
+    const meta = try encode(shape, 2048, 0, null, &.{0}, &out);
+    _ = try decode(shape, meta, 2048, total);
+    var content = shape;
+    content.draft_identity = other.snapshotIdentity();
+    try std.testing.expectError(error.SpillShape, decode(content, meta, 2048, total));
+    var bits = shape;
+    bits.draft_identity = bf16.snapshotIdentity();
+    try std.testing.expectError(error.SpillShape, decode(bits, meta, 2048, total));
+    var legacy = shape;
+    legacy.draft_identity = @splat(7);
+    try std.testing.expectError(error.SpillShape, decode(legacy, meta, 2048, total));
 }

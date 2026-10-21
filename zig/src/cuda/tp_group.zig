@@ -15,6 +15,7 @@ pub const Group = struct {
     comm: nccl.Comm,
     rank: usize,
     world: usize,
+    aborted: std.atomic.Value(bool) = .init(false),
     fast: ?*roce.Gather = null, // two ranks' small all-gathers by RoCE writes (openRoce), when both ranks brought it up
 
     /// Rank `rank` of `world` (NCCL opened at run time; NCCL_COMM_ID names rank 0's address, every rank the same).
@@ -50,10 +51,20 @@ pub const Group = struct {
     pub fn close(g: *Group) void {
         g.closeFast();
         if (g.borrowed_lib == null) {
-            _ = g.lib.api.ncclCommDestroy(g.comm);
+            g.destroyComm();
             g.lib.close();
         }
         g.* = undefined;
+    }
+
+    fn destroyComm(g: *Group) void {
+        if (g.borrowed_lib != null) return;
+        if (!g.aborted.swap(true, .acq_rel)) _ = g.lib.api.ncclCommDestroy(g.comm);
+    }
+
+    pub fn abort(g: *Group) void {
+        if (g.borrowed_lib != null) return;
+        if (!g.aborted.swap(true, .acq_rel)) _ = g.lib.api.ncclCommAbort(g.comm);
     }
 
     /// Two ranks: gathers up to `max_bytes` a rank go by RoCE writes if both ranks bring it up; else NCCL keeps them.
@@ -119,18 +130,51 @@ pub const Group = struct {
     }
 };
 
-test "closing a borrowed group never destroys its owner's communicator or library" {
+test "an aborted two-rank communicator is not destroyed a second time" {
     const Fake = struct {
+        var aborts: usize = 0;
         var destroys: usize = 0;
+        fn abort(_: nccl.Comm) callconv(.c) nccl.Result {
+            aborts += 1;
+            return 0;
+        }
         fn destroy(_: nccl.Comm) callconv(.c) nccl.Result {
             destroys += 1;
             return 0;
         }
     };
+    var group: Group = .{ .lib = undefined, .comm = null, .rank = 0, .world = 2 };
+    group.lib.api.ncclCommAbort = Fake.abort;
+    group.lib.api.ncclCommDestroy = Fake.destroy;
+    group.abort();
+    group.abort();
+    group.destroyComm();
+    try std.testing.expectEqual(@as(usize, 1), Fake.aborts);
+    try std.testing.expectEqual(@as(usize, 0), Fake.destroys);
+}
+
+test "a borrowed group never aborts or destroys its owner's communicator or library" {
+    const Fake = struct {
+        var aborts: usize = 0;
+        var destroys: usize = 0;
+        fn abort(_: nccl.Comm) callconv(.c) nccl.Result {
+            aborts += 1;
+            return 0;
+        }
+        fn destroy(_: nccl.Comm) callconv(.c) nccl.Result {
+            destroys += 1;
+            return 0;
+        }
+    };
+    Fake.aborts = 0;
     Fake.destroys = 0;
     var lib: nccl.Library = .{ .lib = undefined, .api = undefined };
+    lib.api.ncclCommAbort = Fake.abort;
     lib.api.ncclCommDestroy = Fake.destroy;
     var group = try Group.borrow(&lib, @ptrFromInt(1), 0, 2);
+    group.abort();
+    group.destroyComm();
     group.close();
+    try std.testing.expectEqual(@as(usize, 0), Fake.aborts);
     try std.testing.expectEqual(@as(usize, 0), Fake.destroys);
 }

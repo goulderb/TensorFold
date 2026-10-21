@@ -5,6 +5,73 @@ const b16 = @import("cuda_b16.zig");
 const quant = @import("cuda_quant.zig");
 const precision = @import("cuda_weight_precision.zig");
 const dense = @import("cuda_weight_source_dense.zig");
+const formats = @import("cuda_formats.zig");
+const stored_source = @import("cuda_weight_source.zig");
+
+/// The stored-format loader is the default. Only an explicit precision setting enters a conversion adapter.
+pub fn cut(L: *W.Loader, group: precision.Group, comptime prefix: []const u8, i: u32, parts: []const formats.Part, wants: []const formats.Format, comptime name: []const u8) !@import("cuda_proj.zig").Proj {
+    return cutNamed(L, group, prefix, i, parts, wants, name, .{i});
+}
+
+pub fn cutNamed(L: *W.Loader, group: precision.Group, comptime prefix: []const u8, i: u32, parts: []const formats.Part, wants: []const formats.Format, comptime name: []const u8, args: anytype) !@import("cuda_proj.zig").Proj {
+    const selected = L.tools.precision.dense.get(group);
+    if (parts.len == 0 or parts.len > 3) return error.UnreadableFormat;
+    var names: [3][224]u8 = undefined;
+    var modules: [3][]const u8 = undefined;
+    for (parts, 0..) |part, j| modules[j] = try std.fmt.bufPrint(&names[j], prefix ++ "layers.{d}.{s}", .{ i, part.rel });
+    if (selected == .bf16) return formats.cut(L, L.ck, modules[0..parts.len], parts, wants, name, args);
+    var stored: [3]stored_source.Source = undefined;
+    var n: usize = 0;
+    var k: ?usize = null;
+    var all_bf16 = true;
+    for (parts, 0..) |part, j| {
+        const module = modules[j];
+        const format = try L.formatOne(L.ck, module, wants);
+        all_bf16 = all_bf16 and format == .bf16;
+        var weight_name: [256]u8 = undefined;
+        const t = try L.ck.get(try std.fmt.bufPrint(&weight_name, "{s}.weight", .{module}));
+        if (t.rank != 2) return error.UnexpectedTensor;
+        const rows = part.rows orelse [2]usize{ 0, t.dim(0) };
+        const cols = part.cols orelse [2]usize{ 0, t.dim(1) };
+        if (rows[0] > rows[1] or rows[1] > t.dim(0) or cols[0] > cols[1] or cols[1] > t.dim(1)) return error.UnexpectedTensor;
+        if (k) |width| {
+            if (width != cols[1] - cols[0]) return error.ShapeMismatch;
+        } else k = cols[1] - cols[0];
+        n = try std.math.add(usize, n, rows[1] - rows[0]);
+        stored[j] = .{ .weight = t, .format = switch (format) {
+            .bf16 => null,
+            .mxfp8 => .mxfp8,
+            .fp8_pb => .fp8_pb_wo,
+            else => return error.UnreadableFormat,
+        }, .scale = if (format == .bf16) null else try L.ck.get(try std.fmt.bufPrint(&weight_name, "{s}.weight_scale", .{module})) };
+    }
+    // Source arithmetic applies to stored FP8 only. BF16 parts retain the candidate's exact-narrowing gate.
+    if (selected == .source) {
+        if (all_bf16) return formats.cut(L, L.ck, modules[0..parts.len], parts, wants, name, args);
+        var stacked: ?dense.Packed = null;
+        defer if (stacked) |*p| p.deinit(L.gpa);
+        for (parts, stored[0..parts.len]) |part, s| {
+            const r = part.rows orelse [2]usize{ 0, s.weight.dim(0) };
+            const c = part.cols orelse [2]usize{ 0, s.weight.dim(1) };
+            var next = try dense.pack(L.gpa, s, &.{.{ .lo = r[0], .hi = r[1] }}, .{ .lo = c[0], .hi = c[1] });
+            if (stacked) |*p| {
+                defer next.deinit(L.gpa);
+                try p.extend(L.gpa, next);
+            } else stacked = next;
+        }
+        return sourceFinish(L, group, name, args, stacked.?);
+    }
+    for (parts, stored[0..parts.len]) |part, s| {
+        const r = part.rows orelse [2]usize{ 0, s.weight.dim(0) };
+        const c = part.cols orelse [2]usize{ 0, s.weight.dim(1) };
+        for (r[0]..r[1]) |row| {
+            const lo = row * s.weight.dim(1) + c[0];
+            const hi = row * s.weight.dim(1) + c[1];
+            if (s.format == null) try L.add(s.weight, lo, hi, .bf16) else try s.append(L.gpa, &L.host, lo, hi, .bf16);
+        }
+    }
+    return finish(L, group, name, args, n, k.?);
+}
 
 fn owned(L: *W.Loader, name: []const u8, suffix: []const u8, bytes: usize) !u64 {
     const label = try std.fmt.allocPrint(L.gpa, "{s}.{s}", .{ name, suffix });
@@ -17,7 +84,7 @@ fn owned(L: *W.Loader, name: []const u8, suffix: []const u8, bytes: usize) !u64 
     return buffer.ptr;
 }
 
-fn fp8Projection(L: *W.Loader, name: []const u8, n: usize, k: usize, source: u64) !b16.Proj {
+fn fp8Projection(L: *W.Loader, name: []const u8, n: usize, k: usize, source: u64) !@import("cuda_proj.zig").Proj {
     if (n == 0 or k == 0 or k % 128 != 0) return error.InvalidFp8Shape;
     const qk = L.tools.quant orelse return error.NoQuantizer;
     const npad = cuda.fp8.padded(n);
@@ -28,7 +95,7 @@ fn fp8Projection(L: *W.Loader, name: []const u8, n: usize, k: usize, source: u64
     return .{ .q = .{ .fp8g = cuda.fp8.weight(codes, scales, n, k) } };
 }
 
-fn nvfp4Projection(L: *W.Loader, name: []const u8, n: usize, k: usize, source: u64) !b16.Proj {
+fn nvfp4Projection(L: *W.Loader, name: []const u8, n: usize, k: usize, source: u64) !@import("cuda_proj.zig").Proj {
     const qk = L.tools.quant orelse return error.NoQuantizer;
     const pack = L.tools.modelopt orelse return error.NoModeloptPacker;
     var codes = try cuda.DeviceBuffer.alloc(L.d, n * k / 2);
@@ -53,7 +120,7 @@ fn nvfp4Projection(L: *W.Loader, name: []const u8, n: usize, k: usize, source: u
     return .{ .q = .{ .nvfp4 = cuda.nvfp4.weight(words, tiles, scale, n, k) } };
 }
 
-fn nativeProjection(L: *W.Loader, name: []const u8, n: usize, k: usize, mode: cuda.ck.NativeMode) !b16.Proj {
+fn nativeProjection(L: *W.Loader, name: []const u8, n: usize, k: usize, mode: cuda.ck.NativeMode) !@import("cuda_proj.zig").Proj {
     const npad = try cuda.ck.shape(n, k);
     const ck = L.tools.ck orelse return error.NoNativeDenseKernels;
     var amax: f32 = 0;
@@ -95,7 +162,7 @@ fn nativeProjection(L: *W.Loader, name: []const u8, n: usize, k: usize, mode: cu
     return .{ .q = .{ .ck4 = .{ .words = words, .scales = tiles, .scale = scale, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad) } } };
 }
 
-pub fn sourceFinish(L: *W.Loader, group: precision.Group, comptime fmt: []const u8, args: anytype, p: dense.Packed) !b16.Proj {
+pub fn sourceFinish(L: *W.Loader, group: precision.Group, comptime fmt: []const u8, args: anytype, p: dense.Packed) !@import("cuda_proj.zig").Proj {
     if (L.tools.precision.dense.get(group) != .source) return error.SourceDenseNeedsPack;
     try p.checkCuda();
     const j = p.job();
@@ -111,10 +178,10 @@ pub fn sourceFinish(L: *W.Loader, group: precision.Group, comptime fmt: []const 
     return .{ .source = .{ .weights = weights, .jobs = jobs, .groups = gptr, .groups_n = @intCast(groups.len), .n = p.outs, .k = p.ins } };
 }
 
-pub fn finish(L: *W.Loader, group: precision.Group, comptime fmt: []const u8, args: anytype, n: usize, k: usize) !b16.Proj {
+pub fn finish(L: *W.Loader, group: precision.Group, comptime fmt: []const u8, args: anytype, n: usize, k: usize) !@import("cuda_proj.zig").Proj {
     const selected = L.tools.precision.dense.get(group);
     if (selected == .source) return error.SourceDenseNeedsPack;
-    if (selected == .bf16) return .{ .b16 = try L.put(fmt, args) };
+    if (selected == .bf16) return .{ .bf16 = try L.put(fmt, args) };
     const elements = std.math.mul(usize, n, k) catch return error.InvalidDenseShape;
     const source_bytes = std.math.mul(usize, elements, 2) catch return error.InvalidDenseShape;
     if (n == 0 or k == 0 or n > std.math.maxInt(i32) or k > std.math.maxInt(i32) or k % 64 != 0 or (selected == .fp8 and k % 128 != 0) or L.host.items.len != source_bytes) return error.InvalidDenseShape;
@@ -168,8 +235,8 @@ pub fn finish(L: *W.Loader, group: precision.Group, comptime fmt: []const u8, ar
 pub fn head(L: *W.Loader) !void {
     if (L.tools.precision.head == .bf16) return;
     const source = switch (L.w.head) {
-        .b16 => |ptr| ptr,
-        .q, .source => return error.HeadPrecisionRequiresBf16Source,
+        .bf16 => |ptr| ptr,
+        .q, .source, .fp8g, .mxfp8 => return error.HeadPrecisionRequiresBf16Source,
     };
     const n = L.w.share.vocab.len();
     const k = L.w.config.hidden;
@@ -183,6 +250,57 @@ pub fn head(L: *W.Loader) !void {
         L.gpa.free(L.w.named.swapRemove(i).name);
         break;
     };
+}
+
+test "projection cut keeps default MXFP8 stored and enters source arithmetic only when explicitly selected" {
+    const core = @import("core");
+    const M = @import("cuda_test_driver.zig").Memory;
+    const gpa = std.testing.allocator;
+    const n = 64;
+    const k = 128;
+    const codes: [n * k]u8 = @splat(0x38);
+    const scales: [n * k / 32]u8 = @splat(127);
+    const bf16: [n * k]u16 = @splat(0x3f80);
+    const tensors = [_]core.shard_edit.New{
+        .{ .name = W.prefix ++ "layers.0.mx.weight", .dtype = .f8_e4m3, .shape = &.{ n, k }, .bytes = &codes },
+        .{ .name = W.prefix ++ "layers.0.mx.weight_scale", .dtype = .u8, .shape = &.{ n, k / 32 }, .bytes = &scales },
+        .{ .name = W.prefix ++ "layers.0.plain.weight", .dtype = .bf16, .shape = &.{ n, k }, .bytes = std.mem.sliceAsBytes(&bf16) },
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir: [96]u8 = undefined;
+    const at = try std.fmt.bufPrint(&dir, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var path: [128]u8 = undefined;
+    try core.shard_edit.create(gpa, try std.fmt.bufPrint(&path, "{s}/model.safetensors", .{at}), &.{}, &tensors);
+    var ck = try core.Checkpoint.openModel(gpa, std.testing.io, at);
+    defer ck.close();
+    var why: core.modelopt.Why = .{};
+    var recipes = try core.modelopt.admitRecipes(gpa,
+        \\{"quantization_config":{"quant_method":"modelopt","quant_algo":"MIXED_PRECISION","quantized_layers":{"model.language_model.layers.0.mx":{"quant_algo":"MXFP8","group_size":32}}}}
+    , &why);
+    defer recipes.deinit();
+    var driver = M.driver();
+    var lane: cuda.qmmf.Lane = undefined; // CPU planning only
+    lane.clusters = true;
+    {
+        var w: W.Weights = .{ .gpa = gpa, .config = undefined, .share = undefined };
+        defer w.deinit();
+        var L: W.Loader = .{ .gpa = gpa, .d = &driver, .stream = .{ .d = &driver, .handle = null }, .pack_dense = .{ .d = &driver, .handle = @ptrFromInt(1) }, .tools = .{ .pack_dense = .{ .d = &driver, .handle = @ptrFromInt(1) }, .lane = &lane }, .w = &w, .ck = &ck, .recipes = &recipes };
+        defer L.host.deinit(gpa);
+        const stored = try cut(&L, .dsa, W.prefix, 0, &.{.{ .rel = "mx" }}, &.{.mxfp8}, "stored.{d}");
+        try std.testing.expect(stored == .mxfp8);
+        try std.testing.expect(w.find("stored.0") == null);
+        L.tools.precision.dense = .uniform(.source);
+        const explicit = try cut(&L, .dsa, W.prefix, 0, &.{.{ .rel = "mx" }}, &.{.mxfp8}, "source.{d}");
+        try std.testing.expect(explicit == .source);
+        try std.testing.expectEqual(n * k + n * k / 32, w.find("source.0").?.len);
+        try std.testing.expectEqualSlices(u8, &codes, M.slice(explicit.source.weights, codes.len));
+        try std.testing.expectEqualSlices(u8, &scales, M.slice(explicit.source.weights + codes.len, scales.len));
+        const plain = try cut(&L, .dsa, W.prefix, 0, &.{.{ .rel = "plain" }}, &.{.bf16}, "plain.{d}");
+        try std.testing.expect(plain == .bf16);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&bf16), M.slice(plain.bf16, @sizeOf(@TypeOf(bf16))));
+    }
+    try std.testing.expect(M.empty());
 }
 
 test "default precision uploads BF16 bytes without a quantizer" {
@@ -202,7 +320,7 @@ test "default precision uploads BF16 bytes without a quantizer" {
     const original = [_]u16{ 0x3f80, 0xbf00, 0x0000, 0x4040 };
     try loader.host.appendSlice(std.testing.allocator, std.mem.sliceAsBytes(&original));
     const projection = try finish(&loader, .kda, "plain", .{}, 2, 2);
-    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&original), M.slice(projection.b16, 8));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&original), M.slice(projection.bf16, 8));
     try std.testing.expectEqual(@as(usize, 1), model.buffers.items.len);
     try std.testing.expectEqual(@as(usize, 8), model.buffers.items[0].len);
     try std.testing.expectEqual(@as(usize, 0), loader.host.items.len);

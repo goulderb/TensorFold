@@ -1,6 +1,6 @@
 //! Encoded still pictures -> native canonical pixels -> exact CPU patches ->
-//! actual native vision Engine -> stable owned BF16 rows and checked binding.
-//! No registration or text-engine vision refusal is changed here.
+//! canonical stored-format Tower -> stable request-owned BF16 rows and checked binding.
+//! The older Engine adapter is retained only for explicit conversion/numerical qualification.
 const std = @import("std");
 const codec = @import("cuda_vision_codec.zig");
 const pre = @import("cuda_vision_preprocess.zig");
@@ -10,6 +10,10 @@ const binding = @import("cuda_vision_binding.zig");
 pub const cuda = encoder.cuda;
 pub const Config = @import("cuda_vision_config.zig").Config;
 const Allocator = std.mem.Allocator;
+
+test {
+    _ = @import("cuda_vision_pipeline_test.zig");
+}
 
 pub const Options = struct {
     max_images: usize = 50,
@@ -271,6 +275,42 @@ pub const Request = struct {
         self.table.?.ready = true;
         self.state = .ready;
     }
+    /// Default serving uses the canonical stored-format Tower, writing directly into this request's owned rows.
+    /// The retained Engine-based encode above is an explicit conversion/numerical-qualification adapter only.
+    pub fn encodeTower(self: *Request, tower: *@import("cuda_vision.zig").Tower, run: *const @import("cuda_vision.zig").Run, options: EncodeOptions) !void {
+        if (self.state != .prepared or self.table != null) return error.VisionPipelineAlreadyEncoded;
+        if (options.replica == 0 or (options.world != 1 and options.world != 2) or options.rank >= options.world) return error.InvalidVisionPipelineReplica;
+        try self.validate();
+        try @import("cuda_vision.zig").checkTowerConfig(self.c);
+        if (self.c.eps != tower.eps or self.c.limit != tower.limit or self.c.theta != tower.theta) return error.VisionPipelineConfigMismatch;
+        const d = options.stream.d;
+        if (tower.d != d or run.stream.d != d or run.stream.handle != options.stream.handle) return error.VisionPipelineDriverMismatch;
+        const context = try current(d, options.expected_context);
+        const bytes = try rowsBytes(self.rows, self.c.output);
+        var ptr: cuda.abi.DevicePtr = 0;
+        try d.check(d.api.cuMemAlloc_v2(&ptr, bytes), "cuMemAlloc");
+        cuda.accountExternalDevice(bytes);
+        self.table = .{ .driver = d, .context = context, .stream = options.stream, .features = .{ .d = d, .ptr = ptr, .len = bytes, .borrowed = false }, .positions = self.positions, .ids = self.ids, .image_token = self.c.image_token, .width = self.c.output, .rows = self.rows, .ready = false, .generation = 1, .replica = options.replica, .world = options.world, .rank = options.rank };
+        self.state = .encoding;
+        errdefer {
+            self.state = .failed;
+            self.table.?.ready = false;
+        }
+        if (ptr == 0 or ptr % 256 != 0) return error.InvalidVisionPipelineAllocation;
+        _ = std.math.add(u64, ptr, bytes) catch return error.InvalidVisionPipelineAllocation;
+        inline for (.{ "mem", "inv_freq", "ws" }) |field| if (try overlaps(self.table.?.features, @field(tower, field))) return error.AliasedVisionPipelineOutput;
+        var row: usize = 0;
+        for (self.images) |image| {
+            _ = try current(d, context);
+            self.pending = true;
+            try tower.encode(run, image.pixels, .{ image.grid[0], image.grid[1], image.grid[2] }, ptr + try rowsBytes(row, self.c.output));
+            row += image.visualTokens();
+            self.pending = false;
+        }
+        self.table.?.ready = true;
+        self.state = .ready;
+    }
+
     pub fn borrowedBinding(self: *Request) !binding.Binding {
         if (self.state != .ready or self.pending) return error.VisionPipelineNotReady;
         const table = if (self.table) |*table| table else return error.VisionPipelineNotReady;

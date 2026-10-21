@@ -1,5 +1,4 @@
-//! GLM-5.3-Flash's shared rows: several streams in one forward, chains per segment.
-//! Local extension: bounded prompt segments commit their own recurrence and convolution state.
+//! GLM shared verify windows and bounded prompt segments, each committing its own recurrence and convolution.
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -10,14 +9,16 @@ const latent = @import("cuda_latent.zig");
 const kda_block = @import("cuda_kda_block.zig");
 const dsa_block = @import("cuda_dsa_block.zig");
 const glue = @import("cuda_glue.zig");
+const projection = @import("cuda_proj.zig");
 
-/// Checks a shared window's segments against its `rows` rows, then each sequence holds its rows until its commit.
+/// Validate all segments before mutating any sequence; cyclic index storage needs no pointer rebase.
 pub fn begin(r: fw.Rank, rows: usize) !void {
     var at: usize = 0;
     const limit: usize = if (r.b.prefill) fw.prefill_rows else fw.window_rows;
+    if (r.b.prefill and r.segs.len > @import("cuda_state.zig").prompt_heads) return error.BadWindow;
     for (r.segs, 0..) |g, i| {
         if (g.row0 != at or g.rows == 0 or g.rows > limit) return error.BadWindow;
-        if (g.st.pos + g.rows > g.st.capacity) return error.PastCapacity;
+        if (g.st.pos > g.st.capacity or g.rows > g.st.capacity - g.st.pos) return error.PastCapacity;
         for (r.segs[0..i]) |prior| if (prior.st == g.st) return error.SlotTwice;
         at += g.rows;
     }
@@ -28,9 +29,16 @@ pub fn begin(r: fw.Rank, rows: usize) !void {
     }
 }
 
-/// Shared mixer: prompts keep each KDA projection's original row count and arithmetic.
-/// Decode projections span the shared window.
-pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: usize, rows: usize, out: u64) !void {
+/// Forward.finish's head on a prompt buffer: each segment's last final-norm row, logits row k for segment k.
+pub fn heads(f: *const fw.Forward, r: fw.Rank) !void {
+    const D = r.w.config.hidden;
+    const b = r.b;
+    for (r.segs, 0..) |g, k| try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(b.normed + k * D * 2, b.fnormed + (g.row0 + g.rows - 1) * D * 2, D * 2, f.stream.handle), "cuMemcpyDtoDAsync");
+    try projection.matmul(f.set(), f.stream, r.w.head, b.normed, D, b.logits, b.kda.mm_part, r.segs.len, r.w.share.vocab.len(), D, false);
+}
+
+/// Forward.mixer on a shared window: all rows' projections, each segment's chain or attention, o_proj (null: pieced).
+pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: usize, rows: usize, out: ?u64) !void {
     const c = &r.w.config;
     const b = r.b;
     switch (l.mixer) {
@@ -74,10 +82,10 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                 if (b.prefill) {
                     try glue.convShift(f.set(), f.stream, conv, v.p, g.rows, g.rows * w, w, 1, st.conv_c);
                     st.cur[li] = 1 - cur;
-                    try kda_block.fill(f.set(), f.stream, k, v, 0, g.rows, out + g.row0 * c.hidden * 4);
+                    if (out) |o| try kda_block.fill(f.set(), f.stream, k, v, 0, g.rows, o + g.row0 * c.hidden * 4);
                 }
             }
-            if (!b.prefill) try kda_block.fill(f.set(), f.stream, k, s, 0, rows, out);
+            if (!b.prefill) if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
         },
         .mla => |a| {
             if (b.prefill) {
@@ -97,11 +105,11 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             if (b.prefill) {
                 for (r.segs) |g| {
                     try latent.expandV(f.set(), f.stream, b.dsa.ol + g.row0 * a.heads * a.lw * 2, a.wv, b.dsa.vn + g.row0 * a.heads * a.dv * 2, g.rows, a.heads, a.dv, a.lw);
-                    try dsa_block.fill(f.set(), f.stream, a, b.dsa, g.row0, g.row0 + g.rows, out + g.row0 * c.hidden * 4);
+                    if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, g.row0, g.row0 + g.rows, o + g.row0 * c.hidden * 4);
                 }
             } else {
                 try latent.expandV(f.set(), f.stream, b.dsa.ol, a.wv, b.dsa.vn, rows, a.heads, a.dv, a.lw);
-                try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, out);
+                if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
             }
         },
     }

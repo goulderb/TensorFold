@@ -21,6 +21,8 @@ const precision = @import("cuda_weight_precision.zig");
 pub const prefill_rows = 2048;
 /// Target/replay storage, independent of the neural draft ceiling or advertised legacy lane width.
 pub const window_rows = @import("cuda_verify_plan.zig").target_rows;
+/// Maximum shared prompts and their separately gathered head rows.
+pub const prompt_heads = 16;
 /// The context the buffers' dense attention partials reach (Buffers' min(capacity, 2560)).
 pub const dense_reach = 2560;
 
@@ -90,7 +92,7 @@ pub fn mixedPartBytes(w: *const weights.Weights, rows: usize) usize {
         mm = @max(mm, rows * (shape.k / 64) * 4);
         mm = @max(mm, lanePartBytes(rows, shape.n, shape.k));
         const mode = w.precision.dense.get(shape.group);
-        if (mode == .source) mm = @max(mm, b16.sourcePartBytes(rows, shape.k));
+        if (mode == .source) mm = @max(mm, @import("cuda_proj.zig").sourcePartBytes(rows, shape.k));
         if (mode == .fp8_native or mode == .nvfp4_native) {
             mm = @max(mm, cuda.ck.workspaceBytes(if (mode == .fp8_native) .fp8 else .nvfp4, rows, shape.n, shape.k) catch unreachable);
         }
@@ -104,13 +106,13 @@ test "source dense scratch covers every TP2 projection and stays bounded at sixt
         var w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try @import("cuda_shard.zig").Share.of(&c, rank, 2) };
         w.precision.dense = .uniform(.source);
         for ([_]usize{ 1, 7, 16, 17, 64, 2048 }) |rows| for (projectionShapes(&w)) |shape| {
-            const need = b16.sourcePartBytes(rows, shape.k);
+            const need = @import("cuda_proj.zig").sourcePartBytes(rows, shape.k);
             try std.testing.expect(need <= mixedPartBytes(&w, rows));
             try std.testing.expect(need <= 16 * shape.k * 4);
         };
-        try std.testing.expectEqual(@as(usize, 0), b16.sourcePartBytes(0, c.hidden));
-        try std.testing.expectEqual(@as(usize, 256 << 10), b16.sourcePartBytes(2048, 4096));
-        try std.testing.expectEqual(@as(usize, 384 << 10), b16.sourcePartBytes(2048, w.share.dense.len()));
+        try std.testing.expectEqual(@as(usize, 0), @import("cuda_proj.zig").sourcePartBytes(0, c.hidden));
+        try std.testing.expectEqual(@as(usize, 256 << 10), @import("cuda_proj.zig").sourcePartBytes(2048, 4096));
+        try std.testing.expectEqual(@as(usize, 384 << 10), @import("cuda_proj.zig").sourcePartBytes(2048, w.share.dense.len()));
     }
 }
 
@@ -209,6 +211,13 @@ pub const Buffers = struct {
         const partial_rows = @max(nch * part_rows, latent.chunksFor(sparse.width) * seg); // dense calls, or one sparse
         const np_max = capacity / sparse.pool;
         const mm = mixedPartBytes(w, rows);
+        var routed_exl3 = false;
+        var split = false;
+        for (w.layers) |l| {
+            split = split or (l.mixer == .kda and l.mixer.kda.qkv != null);
+            routed_exl3 = routed_exl3 or (l.ffn == .moe and l.ffn.moe.exl3 != null);
+        }
+        const x3: [4]usize = if (routed_exl3) @import("cuda_exl3.zig").scratchBytes(rows, D, ew, prefill, w.exl3_shx) else @splat(4);
         const hist_len = if (pairs > cuda.grouped.small) (pairs + cuda.grouped.small - 1) / cuda.grouped.small * (count + 1) else 1;
         const sizes = [_]usize{
             rows * 4,     rows * S * D * 2, rows * D * 2,           rows * (D / 64) * 4,
@@ -243,12 +252,13 @@ pub const Buffers = struct {
             rows * sh * 2,
             rows * (sh / 64) * 4, rows * D * 4, // sxs, sy
             rows * D * 2,         rows * D * 2,
-            rows * (D / 64) * 4,  (if (prefill) 1 else rows) * s.vocab.len() * 2,
+            rows * (D / 64) * 4,  (if (prefill) prompt_heads else rows) * s.vocab.len() * 2,
             rows * D * 2, rows * D * 2, rows * 2 * D * 2, rows * D * 2, // hin, me, mcat, mx
             rows * D * 4, // part: this rank's fp32 partial rows a split exchange sends from
-            if (w.quantizedAttention()) rows * 3 * n * 2 else 4, // the KDA projection's staging (EXL3)
+            if (split) rows * @max(3 * n, kw - 3 * n) * 2 else 4, // KDA split projection staging
             if (owned) 2 * part_rows * HL * lw * 2 else 0,
             if (owned) 4 * part_rows * HL * lw * 2 else 0,
+            x3[0], x3[1], x3[2], x3[3], // routed EXL3 scratch, separate from the trellis projection staging
         };
         var p: [sizes.len]u64 = undefined;
         const a = try arena(d, &sizes, &p);
@@ -293,7 +303,7 @@ pub const Buffers = struct {
                 .owner_out = p[73],
             },
             .dense = .{ .tmp = p[44], .gu = p[45], .act = p[46], .xs_act = p[47], .part = p[42] },
-            .moe = .{ .mlog = p[48], .router_part = p[26], .pick = p[49], .wts = p[50], .plan = .{ .members = p[51], .items = p[52], .counts = p[53], .rank = p[54], .hist = p[55] }, .eact = p[56], .ey = p[57], .sgu = p[58], .sact = p[59], .sxs = p[60], .sy = p[61], .mm_part = p[42] },
+            .moe = .{ .mlog = p[48], .router_part = p[26], .pick = p[49], .wts = p[50], .plan = .{ .members = p[51], .items = p[52], .counts = p[53], .rank = p[54], .hist = p[55] }, .eact = p[56], .ey = p[57], .sgu = p[58], .sact = p[59], .sxs = p[60], .sy = p[61], .mm_part = p[42], .x3 = .{ .picks = p[74], .xg = p[75], .xu = p[76], .z = p[77] } },
             .hidden = p[62],
             .fnormed = p[63],
             .fxs = p[64],
@@ -359,6 +369,7 @@ pub const State = struct {
     rec_layer: usize,
     proj_layer: usize,
     proj_row: usize,
+    prompt_hidden: u64, // sequence-owned first-draft row, charged and snapshotted in layout.fixed
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, format: cache_rows.Format) !State {
         return make(gpa, d, w, capacity, format, false);
@@ -383,19 +394,20 @@ pub const State = struct {
         var layout = try layout_mod.Layout.init(.{
             4,                        nk * 3 * 3 * n * 2,       2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * window_rows * kw * 2,
             nk * window_rows * n * 4, nk * window_rows * n * 2, nk * window_rows * n * 4,                   nk * window_rows * s.kda.len() * 4,
+            c.hidden * 2, // per-sequence prompt hidden row survives scratch reuse and prefix restoration
         }, capacity, @max(prefill_rows, window_rows), nd, format, c.kv_lora, c.i_dim);
         if (external_planes) layout = try layout.external();
         var a: Arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, layout.total_bytes), .used = layout.total_bytes };
         errdefer a.buf.free();
         try a.buf.fill8(0, null);
-        var p: [8]u64 = undefined;
+        var p: [9]u64 = undefined;
         for (layout.fixed, &p) |offset, *ptr| ptr.* = a.buf.ptr + offset;
         const cur = try gpa.alloc(u1, nk);
         errdefer gpa.free(cur);
         @memset(cur, 0);
         const caches = try gpa.alloc(dsa_block.Caches, nd);
         for (caches, 0..) |*x, j| x.* = bindCaches(layout, a.buf.ptr, j, format, pk_rows);
-        return .{ .arena = a, .layout = layout, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = bindCaches(layout, a.buf.ptr, nd, format, pk_rows), .mtp_pos_dev = a.buf.ptr + layout.mtp_pos, .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw };
+        return .{ .arena = a, .layout = layout, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = bindCaches(layout, a.buf.ptr, nd, format, pk_rows), .mtp_pos_dev = a.buf.ptr + layout.mtp_pos, .prompt_hidden = p[8], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw };
     }
 
     fn bindCaches(layout: layout_mod.Layout, base: u64, layer: usize, format: cache_rows.Format, pk_rows: usize) dsa_block.Caches {
@@ -459,6 +471,58 @@ pub const State = struct {
         return st.rec + (@as(usize, copy) * st.kda_layers + li) * st.rec_layer;
     }
 };
+
+test "split stored-format KDA staging is allocated without whole-model trellis" {
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    var d = Memory.driver();
+    const c = @import("config.zig").Config{};
+    var layer: weights.Layer = undefined;
+    var k: kda_block.Layer = undefined;
+    k.qkv = .{ .mxfp8 = .{ .mode = .mxfp8, .codes = 1, .scales = 2, .n = 384, .k = @intCast(c.hidden), .npad = 384 } };
+    layer.mixer = .{ .kda = k };
+    layer.ffn = .{ .dense = undefined };
+    var layers = [_]weights.Layer{layer};
+    const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try @import("cuda_shard.zig").Share.of(&c, 0, 2), .layers = &layers };
+    try std.testing.expect(!w.quantizedAttention());
+    {
+        var b = try Buffers.init(&d, &w, 3, true, 64);
+        defer b.deinit();
+        const n = w.share.kda.len() * c.kda_dim;
+        const bytes = b.rows * @max(3 * n, 2 * c.kda_dim + w.share.kda.len()) * 2;
+        try std.testing.expect(b.kda.tmp >= b.arena.buf.ptr);
+        try std.testing.expect(b.kda.tmp + bytes <= b.arena.buf.ptr + b.arena.buf.len);
+        // Write the entire temporary, not just its address: the next arena allocation must remain untouched.
+        @memset(Memory.slice(b.kda.tmp, bytes), 0x7b);
+        try std.testing.expectEqual(@as(u8, 0), Memory.slice(b.moe.x3.picks, 1)[0]);
+    }
+    try std.testing.expect(Memory.empty());
+}
+
+test "sequence prompt hidden row is charged and restored with fixed snapshot bytes" {
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    var d = Memory.driver();
+    const c = @import("config.zig").Config{};
+    const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try @import("cuda_shard.zig").Share.of(&c, 0, 2) };
+    for ([_]bool{ false, true }) |shared_planes| {
+        var st = if (shared_planes) try State.initShared(std.testing.allocator, &d, &w, 64, .fp8) else try State.init(std.testing.allocator, &d, &w, 64, .fp8);
+        defer st.deinit();
+        const hidden_bytes = c.hidden * 2;
+        try std.testing.expectEqual(st.arena.buf.ptr + st.layout.fixed[8], st.prompt_hidden);
+        try std.testing.expect(st.layout.fixed[8] + hidden_bytes <= st.layout.fixed_end);
+        try std.testing.expectEqual(st.layout.total_bytes, st.arena.buf.len);
+        @memset(Memory.slice(st.prompt_hidden, hidden_bytes), 0x5a);
+        const plan = try st.layout.snapshot(.{ .main = 0, .mtp = 0 });
+        var it = plan.ranges();
+        const fixed = it.next().?;
+        try std.testing.expectEqual(layout_mod.Plane.fixed, fixed.plane);
+        const saved = try std.testing.allocator.dupe(u8, Memory.slice(st.address(fixed), fixed.bytes));
+        defer std.testing.allocator.free(saved);
+        @memset(Memory.slice(st.prompt_hidden, hidden_bytes), 0);
+        @memcpy(Memory.slice(st.address(fixed), fixed.bytes), saved);
+        for (Memory.slice(st.prompt_hidden, hidden_bytes)) |v| try std.testing.expectEqual(@as(u8, 0x5a), v);
+    }
+    try std.testing.expect(Memory.empty());
+}
 
 test "FP8 projection scratch covers decode and unfused prompt tails without clusters" {
     try std.testing.expectEqual(@as(usize, 4096), lanePartBytes(1, 128, 4096));

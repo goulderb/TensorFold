@@ -500,7 +500,7 @@ test "a stream compacts and admits its final request before it opens" {
     const big = try pads(a, "STREAM-", 1200);
     const body = try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"stream\":true,\"max_tokens\":32,\"messages\":[{{\"role\":\"user\",\"content\":\"{s}\"}},{{\"role\":\"user\",\"content\":\"TAIL\"}}]}}", .{big});
     const raw = (try json.parse(a, body)).ok;
-    var conn: Conn = .{ .fd = @import("platform").sock.none, .peer = "", .buf = &.{}, .gpa = a };
+    var conn: Conn = .{ .fd = @import("sys").sock.none, .peer = "", .buf = &.{}, .gpa = a };
     var watch: Watch = .{ .eng = &eng };
     openai.run(srv, a, watch.out(), .{ .conn = &conn }, true, raw);
     try std.testing.expect(watch.opened);

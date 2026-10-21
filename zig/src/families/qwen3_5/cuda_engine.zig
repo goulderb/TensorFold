@@ -3,6 +3,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
+const Round = @import("cuda_round.zig");
 const geometry = @import("cuda_geometry.zig");
 const weights = @import("cuda_weights.zig");
 const caches = @import("cuda_cache.zig");
@@ -11,6 +12,9 @@ const checkpoint = @import("cuda_checkpoint.zig");
 const modelopt = @import("cuda_modelopt.zig");
 const hf = @import("cuda_hf.zig");
 pub const hidden = @import("cuda_hidden.zig");
+const hooks = @import("cuda_learn_hooks.zig");
+const pocket = @import("cuda_pocket.zig");
+const profile = @import("cuda_startup_profile.zig");
 
 pub const Geometry = geometry.Geometry;
 pub const MoeMath = hf.MoeMath;
@@ -24,11 +28,15 @@ const head_dim = geometry.head_dim;
 /// Rows of one forward at most: a prompt chunk, or a shared round's windows.
 pub const max_rows = 128;
 /// Streams' windows in one forward at most.
-pub const max_segs = 32;
+pub const max_segs = Round.max_segs;
 /// Rows of a verify forward at most: each row's logits are kept and drawn.
-pub const most_verify = 32;
+pub const most_verify = Round.most_verify;
+/// tf_q35_argmax_slices' blocks a row (ARGMAX_SLICE entries each).
+fn argmaxSlices(vocab: usize) usize {
+    return (vocab + 4095) / 4096;
+}
 /// A window's rows at most (exact: one-row steps' bits; qwen35.cuh's MAXW, the rows a stream's log holds).
-pub const most_window = 16;
+pub const most_window = Round.most_window;
 /// Experimental committed HF prefixes retain the decode operators' row arithmetic.
 pub const hf_prefill_rows = 16;
 
@@ -349,7 +357,7 @@ test "mixed GDN layouts fail before settling caches or touching CUDA" {
 }
 
 /// What a forward keeps: a prompt chunk its last row's logits, a verify window every row's draw or logits and log.
-pub const Keep = union(enum) { last, draws: []const Draw, logits, prompt_logits, hidden: hidden.Window };
+pub const Keep = union(enum) { last, draws: []const Draw, logits, prompt_logits, hidden: hidden.Window, learn };
 
 fn validateCombined(numerics: checkpoint.Numerics, n8: bool, split: bool, reuse: bool) !void {
     if (split and (numerics != .hf_modelopt or !n8)) return error.UnsupportedQwenExpertUp;
@@ -357,7 +365,7 @@ fn validateCombined(numerics: checkpoint.Numerics, n8: bool, split: bool, reuse:
 }
 
 fn records(keep: Keep) bool {
-    return keep == .draws or keep == .logits;
+    return keep == .draws or keep == .logits or keep == .learn;
 }
 
 fn validateHfWindow(numerics: checkpoint.Numerics, bounded: bool, parts: []const Part, ids: usize, keep: Keep) !void {
@@ -365,7 +373,7 @@ fn validateHfWindow(numerics: checkpoint.Numerics, bounded: bool, parts: []const
     if (numerics != .hf_modelopt) return;
     const limit: usize = if (bounded) hf_prefill_rows else 1;
     if (parts.len != 1 or ids == 0 or ids > limit or parts[0].rows != ids or
-        (keep != .last and keep != .hidden and !(bounded and keep == .prompt_logits))) return error.UnsupportedQwenWindow;
+        (keep != .last and keep != .hidden and keep != .learn and !(bounded and keep == .prompt_logits))) return error.UnsupportedQwenWindow;
     if (parts[0].parents != null or parts[0].images != null) return error.UnsupportedQwenWindow;
 }
 
@@ -424,7 +432,13 @@ test "terminal capture verification is opt in" {
 }
 
 pub const Engine = struct {
+    startup: profile.Times = .{},
     gpa: std.mem.Allocator,
+    dir: []const u8,
+    pockets: pocket.Pockets,
+    learning: ?*const hooks.Keep = null,
+    mlp: ?hooks.MlpAdd = null,
+    taught: u64 = 0,
     d: *const cuda.Driver,
     g: Geometry,
     placement: checkpoint.Placement,
@@ -513,6 +527,7 @@ pub const Engine = struct {
     po: u64,
     logits: u64,
     routed: routed.Scratch = .{}, // qwen3_5_moe's routed rows
+    amax: u64, // the argmax slices' bests: most_verify rows of argmaxSlices(vocab) (f32, i32)
     // per-forward tables (ids, segments, rows' segment, parent and ancestors, the draws' rules) staged in pinned memory
     tables: DeviceBuffer,
     staged: cuda.HostBuffer,
@@ -536,7 +551,7 @@ pub const Engine = struct {
     const meta_at = rules_at + most_verify * @sizeOf(cuda.sample.Rule);
     const tokens_at = meta_at + most_verify * 4;
     pub const params_at = tokens_at + most_verify * 4; // two unused words, the rows, the windows, record
-    const chain_segs_at = aligned(params_at + 8 * 4);
+    pub const chain_segs_at = aligned(params_at + 8 * 4);
     const src_at = chain_segs_at + hf_prefill_rows * @sizeOf(Seg); // image feature rows follow the immutable chain views
     const mpos_at = src_at + max_rows * 4; // and their t, h and w positions, max_rows apart (qwen35.cuh's MAXR)
     const tables_len = mpos_at + 3 * max_rows * 4;
@@ -553,6 +568,7 @@ pub const Engine = struct {
     }
 
     pub fn initPlacedWithOptions(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, admitted: checkpoint.Admitted, placement: checkpoint.Placement, kv8: bool, options: InitOptions) !*Engine {
+        const started = profile.now(io);
         try admitted.requireExecutable();
         try validateMoeMath(admitted, options.moe_math);
         try validateAttentionMode(admitted, options.attention_mode, kv8);
@@ -568,6 +584,13 @@ pub const Engine = struct {
         errdefer gpa.destroy(e);
         e.* = undefined;
         e.gpa = gpa;
+        e.dir = try gpa.dupe(u8, dir);
+        errdefer gpa.free(e.dir);
+        e.pockets = try pocket.Pockets.init(gpa, d, g.hidden, g.layers);
+        errdefer e.pockets.deinit();
+        e.learning = null;
+        e.mlp = null;
+        e.taught = 0;
         e.d = d;
         e.context = ctx.handle;
         e.g = g;
@@ -668,20 +691,22 @@ pub const Engine = struct {
         e.host_logits = try cuda.HostBuffer.alloc(d, TerminalOutput.init(most_verify, g.vocab).bytes);
         errdefer e.host_logits.free();
         if (e.numerics == .mlx_sanitized) try e.warm(gpa);
+        try e.stream.synchronize();
+        const warm_start = profile.now(io);
+        e.startup = .{ .load = warm_start - started };
+        e.startup.add(try profile.withCache(gpa, io, e, Cache));
         return e;
     }
 
     /// Every path a request takes, run once now: WDDM stalls a process's first forwards for seconds (a 20 s launch).
-    fn warm(e: *Engine, gpa: std.mem.Allocator) !void {
-        var warm_cache = try Cache.init(gpa, e, 64);
-        defer warm_cache.deinit(gpa);
+    pub fn warmCache(e: *Engine, warm_cache: *Cache) !void {
         const ids: [32]u32 = @splat(0);
         const greedy: Draw = .{ .rule = null, .position = 33 };
-        try e.forward(&.{.{ .cache = &warm_cache, .rows = ids.len }}, &ids, .last); // a prompt chunk: the prompt GEMMs
-        try e.forward(&.{.{ .cache = &warm_cache, .rows = 1 }}, ids[0..1], .{ .draws = &.{greedy} });
-        try e.forward(&.{.{ .cache = &warm_cache, .rows = 1 }}, ids[0..1], .{ .draws = &.{.{ .rule = .{ .seed = 1, .inv_t = 1.0 / 0.7, .top_p = 0.95, .near = 20.0, .min_log = -std.math.inf(f32), .top_k = 20 }, .position = 34 }} });
+        try e.forward(&.{.{ .cache = warm_cache, .rows = ids.len }}, &ids, .last); // a prompt chunk: the prompt GEMMs
+        try e.forward(&.{.{ .cache = warm_cache, .rows = 1 }}, ids[0..1], .{ .draws = &.{greedy} });
+        try e.forward(&.{.{ .cache = warm_cache, .rows = 1 }}, ids[0..1], .{ .draws = &.{.{ .rule = .{ .seed = 1, .inv_t = 1.0 / 0.7, .top_p = 0.95, .near = 20.0, .min_log = -std.math.inf(f32), .top_k = 20 }, .position = 34 }} });
         // a tree window and a branch of it kept: the keep kernels, and the forward's branch path
-        try e.forward(&.{.{ .cache = &warm_cache, .rows = 3, .parents = &.{ -1, 0, 0 } }}, ids[0..3], .{ .draws = &.{ greedy, greedy, greedy } });
+        try e.forward(&.{.{ .cache = warm_cache, .rows = 3, .parents = &.{ -1, 0, 0 } }}, ids[0..3], .{ .draws = &.{ greedy, greedy, greedy } });
         try warm_cache.keep(e, &.{ 0, 2 });
         try e.stream.synchronize();
     }
@@ -689,6 +714,7 @@ pub const Engine = struct {
     pub fn deinit(e: *Engine) void {
         e.terminal_graph_roster.deinit(e.gpa);
         e.expert_graph_roster.deinit(e.gpa);
+        e.pockets.deinit();
         var it = e.graphs.valueIterator();
         while (it.next()) |x| x.deinit();
         e.graphs.deinit(e.gpa);
@@ -699,6 +725,7 @@ pub const Engine = struct {
         e.arena.free();
         e.gpa.free(e.layers);
         if (e.modelopt) |*m| m.unload();
+        e.gpa.free(e.dir);
         e.affine.deinit();
         e.wide.deinit();
         for (&e.mods) |*m| m.unload();
@@ -708,7 +735,7 @@ pub const Engine = struct {
 
     /// A stream's device bytes at a `cap`-token window: recurrences, convolution tails, keys and values, taps, log.
     pub fn streamBytes(e: *const Engine, cap: usize) usize {
-        return e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + e.g.logBytes(if (e.numerics == .hf_modelopt) 1 else most_window);
+        return 2 * e.g.stateBytes() + e.g.kvBytes(cap, e.kv8) + e.tapBytes() + e.g.logBytes(if (e.numerics == .hf_modelopt) 1 else most_window);
     }
 
     /// A stream's tap ring: tap_rows rows of the tapped layers' residuals.
@@ -783,6 +810,7 @@ pub const Engine = struct {
             }
         }
         if (g.moe()) e.routed = try routed.Scratch.carve(t, g, R);
+        e.amax = try t.alloc(most_verify * argmaxSlices(g.vocab) * 8);
         return total;
     }
 
@@ -824,7 +852,7 @@ pub const Engine = struct {
         try cuda.launch.launch(f, cfg, e.stream, &a);
     }
 
-    /// out (rows, n) = x (rows, k) through `l`: 16-row decode tiles (a row's bits batch-independent) or a prompt GEMM.
+    /// out (rows, n) = x (rows, k) through `l`: row tiles with batch-independent bits or a prompt GEMM.
     pub fn proj(e: *Engine, l: Proj, x: u64, out: u64, rows: usize, prompt: bool) !void {
         return e.projSums(l, x, e.xs, out, rows, prompt, e.tables.ptr + params_at);
     }
@@ -835,6 +863,14 @@ pub const Engine = struct {
             const m = &(e.modelopt orelse return error.QwenFormatNotLoaded);
             return m.linear().decode(e.stream, l.linear, .{ .x = x, .part = m.part }, out, rows);
         }
+        return e.project(l, x, xs, out, rows, prompt, params, true);
+    }
+
+    pub fn projAgain(e: *Engine, l: Proj, x: u64, out: u64, rows: usize, prompt: bool) !void {
+        return e.project(l, x, e.xs, out, rows, prompt, e.tables.ptr + params_at, false);
+    }
+
+    fn project(e: *Engine, l: Proj, x: u64, xs: u64, out: u64, rows: usize, prompt: bool, params: u64, sums: bool) !void {
         const n_out = l.outputs();
         const k = l.inputs();
         if (prompt and rows > 16) return switch (l) {
@@ -842,15 +878,20 @@ pub const Engine = struct {
             .an => |q| e.wide.prompt(e.stream, x, q, out, rows),
             .linear => unreachable,
         };
-        try e.run(e.fns.sums, .{ rows, 1, 1 }, .{ 32, 1, 1 }, .{ x, xs, @as(c_int, @intCast(k)), params });
+        if (sums) try e.run(e.fns.sums, .{ rows, (k / 64 + 63) / 64, 1 }, .{ 64, 1, 1 }, .{ x, xs, @as(c_int, @intCast(k)), params });
+        const tile: usize = switch (l) {
+            .a4 => e.affine.verifyRows(),
+            .an => 16,
+            .linear => unreachable,
+        };
         var at: usize = 0;
-        while (at < rows) : (at += 16) {
-            const n = @min(16, rows - at);
+        while (at < rows) : (at += tile) {
+            const n = @min(tile, rows - at);
             const xa = x + at * k * 2;
             const sa = xs + at * (k / 64) * 4;
             const oa = out + at * n_out * 2;
             switch (l) {
-                .a4 => |q| try e.affine.decode(e.stream, xa, sa, q, oa, n),
+                .a4 => |q| try e.affine.verify(e.stream, xa, sa, q, oa, n),
                 .an => |q| try e.wide.decode(e.stream, xa, sa, q, oa, n),
                 .linear => unreachable,
             }
@@ -863,8 +904,18 @@ pub const Engine = struct {
         try e.run(f, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ ids, e.embed_w, e.embed_s, e.embed_b, out, @as(c_int, @intCast(e.g.hidden)), params });
     }
 
-    fn norm(e: *Engine, residual: bool, w: u64, rows: usize) !void {
-        try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ if (e.numerics == .hf_modelopt) (hf.Launches{}).norm else 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at });
+    /// Logits rows first..first + n's greedy tokens into toks: the highest logit, ties to the lower id.
+    fn argmax(e: *Engine, first: usize, n: usize, toks: u64) !void {
+        if (n == 0) return;
+        const slices = argmaxSlices(e.g.vocab);
+        const pv = e.amax;
+        const pi = e.amax + n * slices * 4;
+        try e.run(e.fns.argmax_slices, .{ slices, n, 1 }, .{ 256, 1, 1 }, .{ e.logits + first * e.g.vocab * 2, @as(c_int, @intCast(e.g.vocab)), pv, pi });
+        try e.run(e.fns.argmax_merge, .{ n, 1, 1 }, .{ 32, 1, 1 }, .{ pv, pi, @as(c_int, @intCast(slices)), toks + first * 4 });
+    }
+
+    pub fn norm(e: *Engine, residual: bool, w: u64, rows: usize) !void {
+        try e.run(e.fns.norm, .{ rows, 1, 1 }, .{ if (e.numerics == .hf_modelopt) (hf.Launches{}).norm else 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at, e.xs });
     }
 
     /// A chain row's rowanc: its index in its window, as a prompt chunk's rows outnumber the bits.
@@ -944,11 +995,13 @@ pub const Engine = struct {
         const g = e.g;
         try validateHfWindow(e.numerics, e.bounded_hf_prefill, parts, ids.len, keep);
         var total: usize = 0;
-        for (parts) |p| {
+        for (parts, 0..) |p, index| {
+            for (parts[0..index]) |prior| if (prior.cache == p.cache) return error.InvalidQwenSegments;
             if (p.rows == 0 or p.cache.len + p.rows > p.cache.cap) return error.QwenContextFull;
             total += p.rows;
         }
         if (parts.len == 0 or parts.len > max_segs or total != ids.len or total > max_rows) return error.InvalidQwenSegments;
+        if (e.learning != null and total != 1) return error.BadLearningRows;
         const record = records(keep);
         if (record and total > e.verify_rows) return error.InvalidQwenSegments;
         if (!record and parts.len != 1) return error.InvalidQwenSegments;
@@ -969,8 +1022,8 @@ pub const Engine = struct {
         // the tables
         const st = e.staged.bytes;
         @memcpy(std.mem.bytesAsSlice(u32, st[ids_at..][0 .. total * 4]), ids);
-        const segs = std.mem.bytesAsSlice(Seg, st[segs_at..][0 .. parts.len * @sizeOf(Seg)]);
         try rowTables(st, parts);
+        const segs = std.mem.bytesAsSlice(Seg, st[segs_at..][0 .. parts.len * @sizeOf(Seg)]);
         var row0: usize = 0;
         for (parts, 0..) |p, i| {
             segs[i] = p.cache.seg(e, p.cache.len, row0, p.rows);
@@ -996,6 +1049,8 @@ pub const Engine = struct {
         params[2] = @intCast(total);
         params[3] = @intCast(parts.len);
         params[4] = @intFromBool(record);
+        defer e.taught = 0;
+        try @import("cuda_forward_extra.zig").stageScales(e, parts, total);
         // an image prompt's chunk (one part, its rows at prompt positions len..): feature rows and t, h, w positions
         const images: ?*const Images = if (record) null else parts[0].images;
         if (images) |im| {
@@ -1011,7 +1066,7 @@ pub const Engine = struct {
         const lone = total == 1 and parts.len == 1;
         const bucket: usize = if (lone) 1 else if (total <= 16) 16 else most_verify;
         const windows: usize = if (lone) 1 else max_segs;
-        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant, .expert_up_layout = e.expert_up_layout, .terminal_greedy = e.terminal != null and !record and keep != .hidden, .moe_math = e.moeMath(), .attention_mode = e.attentionMode(), .normalized_hidden = keep == .hidden };
+        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant, .expert_up_layout = e.expert_up_layout, .terminal_greedy = e.terminal != null and !record and keep != .hidden and keep != .learn, .moe_math = e.moeMath(), .attention_mode = e.attentionMode(), .normalized_hidden = keep == .hidden or keep == .learn };
         e.features = if (images) |im| im.features else 0;
         return shape;
     }
@@ -1024,7 +1079,7 @@ pub const Engine = struct {
         }
         if (shape.terminal_greedy and (e.numerics != .hf_modelopt or !e.placement.ownsHead() or e.terminal == null or shape.record or !shape.prompt)) return error.UnsupportedQwenTerminalGreedy;
         try validateCombined(e.numerics, shape.expert_up_n8, shape.expert_up_split_m, shape.reuse_fp8_quant);
-        if (shape.expert_up_n8 and (e.numerics != .hf_modelopt or (shape.prompt and shape.total > most_window))) return error.UnsupportedQwenExpertUp;
+        if (shape.expert_up_n8 and (e.numerics != .hf_modelopt or (shape.prompt and shape.total > hf_prefill_rows))) return error.UnsupportedQwenExpertUp;
         if (shape.heads_all and e.numerics != .hf_modelopt) return error.UnsupportedQwenWindow;
         if (e.numerics == .hf_modelopt and (shape.total == 0 or shape.total > hf_prefill_rows or shape.nseg != 1 or shape.record or !shape.prompt or shape.taps or
             (!e.bounded_hf_prefill and (shape.total != 1 or shape.heads_all)))) return error.UnsupportedQwenWindow;
@@ -1674,16 +1729,22 @@ pub const Engine = struct {
             },
             .draws => |pk| {
                 const toks = e.tables.ptr + tokens_at;
+                var greedy: usize = 0; // the run of greedy rows ending at i, argmaxed together
                 for (pk, 0..) |p, i| {
-                    const row = e.logits + i * g.vocab * 2;
-                    if (p.rule != null) {
-                        try e.draws.draw(e.stream, row, g.vocab, e.tables.ptr + rules_at + i * @sizeOf(cuda.sample.Rule), e.tables.ptr + meta_at + i * 4, 0, toks + i * 4, 1, null, null);
-                    } else try e.run(e.fns.argmax, .{ 1, 1, 1 }, .{ 1024, 1, 1 }, .{ row, @as(c_int, @intCast(g.vocab)), toks + i * 4 });
+                    if (p.rule == null) {
+                        greedy += 1;
+                        continue;
+                    }
+                    try e.argmax(i - greedy, greedy, toks);
+                    greedy = 0;
+                    try e.draws.draw(e.stream, e.logits + i * g.vocab * 2, g.vocab, e.tables.ptr + rules_at + i * @sizeOf(cuda.sample.Rule), e.tables.ptr + meta_at + i * 4, 0, toks + i * 4, 1, null, null);
                 }
+                try e.argmax(pk.len - greedy, greedy, toks);
                 try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.host_logits.bytes.ptr, toks, total * 4, e.stream.handle), "cuMemcpyDtoHAsync");
                 try e.stream.synchronize();
                 @memcpy(e.tokens[0..total], e.host_logits.slice(u32)[0..total]);
             },
+            .learn => {},
             .logits, .last, .prompt_logits => {
                 const output = TerminalOutput.init(heads, g.vocab);
                 const out = e.host_logits.bytes[0..if (shape.terminal_greedy) output.bytes else output.logits_bytes];
@@ -1717,10 +1778,32 @@ pub const Engine = struct {
         attention_mode: AttentionMode = .reference,
         normalized_hidden: bool = false,
 
-        fn key(s: Shape) u32 {
+        pub fn init(rows: usize, segments: usize, record: bool, taps: bool, slots: u8) Shape {
+            _ = slots;
+            std.debug.assert(rows > 0 and rows <= most_verify and segments > 0 and segments <= rows);
+            const bucket: usize = if (rows == 1) 1 else std.mem.alignForward(usize, rows, 16);
+            const windows = std.math.ceilPowerOfTwo(usize, segments) catch unreachable;
+            return .{ .total = @intCast(if (record) bucket else rows), .nseg = @intCast(if (record) windows else segments), .record = record, .prompt = !record, .taps = taps };
+        }
+
+        pub fn key(s: Shape) u32 {
             return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21 | @as(u32, @intFromBool(s.expert_up_split_m)) << 22 | @as(u32, @intFromBool(s.reuse_fp8_quant)) << 23 | @as(u32, @backingInt(s.expert_up_layout)) << 24 | @as(u32, @intFromBool(s.terminal_greedy)) << 25 | @as(u32, @backingInt(s.moe_math)) << 26 | @as(u32, @backingInt(s.attention_mode)) << 27 | @as(u32, @intFromBool(s.normalized_hidden)) << 28;
         }
     };
+
+    /// The same scan selected by body, exposed for host launch-contract fixtures.
+    pub fn deltaScan(e: *Engine, record: bool, slot_count: u8, segments: usize, layer: c_int) !void {
+        const scan = if (!record) e.fns.gdn_chain else switch (slot_count) {
+            1 => e.fns.gdn_slots_1,
+            2 => e.fns.gdn_slots_2,
+            4 => e.fns.gdn_slots_4,
+            8 => e.fns.gdn_slots_8,
+            16 => e.fns.gdn_slots_16,
+            else => return error.InvalidGdnSlots,
+        };
+        const input = e.tables.ptr + @as(usize, if (record) Round.steps_at else rowpar_at);
+        try e.run(scan, .{ 1, geometry.dk / 4, e.g.v_heads * segments }, .{ 32, 4, 1 }, .{ e.geo, e.q, e.k, e.v, e.g_, e.beta, e.tables.ptr + segs_at, input, layer, e.y, e.tables.ptr + params_at });
+    }
 
     pub fn mark(e: *Engine, phase: Phase) !void {
         if (e.observer) |o| try o.mark(o.ptr, phase, e.observed_layer);
@@ -1828,6 +1911,7 @@ pub const Engine = struct {
                     const n: c_longlong = @intCast(total * g.intermediate);
                     try e.run(e.fns.mlp_act, .{ (total * g.intermediate + 255) / 256, 1, 1 }, .{ 256, 1, 1 }, .{ e.gate, e.up, e.act, n, t_params, @as(c_int, @intCast(g.intermediate)) });
                     try e.proj(m.down, e.act, e.r, total, prompt);
+                    if (e.mlp) |k| try k.f(k.ctx, i, e.x, e.r, total, e.taught) else try e.pockets.add(e.stream, i, e.x, e.r, total, e.taught);
                     try e.mark(.dense);
                 },
                 .moe => |m| try routed.rows(e, m.router, m.experts, m.shared, e.x, e.r, total, prompt and total > most_window, shape.expert_up_n8, shape.expert_up_split_m),

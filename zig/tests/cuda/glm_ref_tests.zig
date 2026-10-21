@@ -206,5 +206,6 @@ pub fn run(gpu: Gpu) !void {
     var ops = try cuda.Module.load(gpu.d, cuda.kernels.glm_ops);
     defer ops.unload();
     for ([_]glm.cache.Format{ .bf16, .fp8 }) |format| try @import("glm_ref_index.zig").selection(&r, set, ops, format);
+    try @import("glm_ref_hc.zig").gammas(&r, set); // last: its draws from r.rng follow every check above
     check.pass("glm-ref: every projection within {e:.3} of its float64 tolerance", .{r.worst});
 }

@@ -3,7 +3,11 @@
 //! EXIF and alpha arithmetic stay in cuda_vision_image*.zig. No Python, subprocess,
 //! URL fetch, gamma correction, resize, or alternate inference backend is used.
 const std = @import("std");
-const dynlib = @import("cuda").dynlib;
+
+test {
+    _ = @import("cuda_vision_codec_test.zig");
+}
+const platform = @import("sys");
 const pre = @import("cuda_vision_preprocess.zig");
 const image = @import("cuda_vision_image.zig");
 const exif = @import("cuda_vision_image_exif.zig");
@@ -188,7 +192,7 @@ pub const Backend = struct {
 };
 
 pub const Library = struct {
-    lib: dynlib.Library,
+    lib: platform.DynLib,
     api: Api,
     context: *anyopaque,
     /// Deployment validates exact library file hashes before loading. Version
@@ -202,10 +206,10 @@ pub const Library = struct {
         defer if (jpeg) |p| a.free(p);
         const webp = try pathZ(a, paths.webp);
         defer if (webp) |p| a.free(p);
-        var lib = dynlib.Library.openFile(shim) catch return error.NativeImageLibraryUnavailable;
+        var lib = platform.openLibraryFile(shim) catch return error.NativeImageLibraryUnavailable;
         errdefer lib.close();
         var missing: []const u8 = "";
-        const api = lib.resolve(Api, &missing) catch return error.NativeImageSymbolMissing;
+        const api = platform.resolveSymbols(&lib, Api, &missing) catch return error.NativeImageSymbolMissing;
         if (api.tf_glm_codec_abi() != c.TF_GLM_CODEC_ABI) return error.NativeImageVersionMismatch;
         var status: c_int = c.TF_GLM_CODEC_OK;
         const context = api.tf_glm_codec_open(if (png) |p| p.ptr else null, if (jpeg) |p| p.ptr else null, if (webp) |p| p.ptr else null, pins.png, pins.jpeg_abi, pins.webp, &status);

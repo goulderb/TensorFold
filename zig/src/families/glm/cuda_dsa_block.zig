@@ -3,6 +3,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const glue = @import("cuda_glue.zig");
+const projection = @import("cuda_proj.zig");
 const b16 = @import("cuda_b16.zig");
 const latent = @import("cuda_latent.zig");
 const sparse = @import("cuda_sparse.zig");
@@ -11,13 +12,13 @@ const cache = @import("cuda_cache.zig");
 /// A prompt chunk's rows one dense latent attention call takes (geometry.MLA_PROMPT_ATT_ROWS).
 pub const prompt_att_rows = 512;
 
-/// The indexer's weights, replicated: [wk | weights_proj] [d + heads][dims], gate, key LayerNorm, pool bias, wq_b.
-pub const Index = struct { kw: b16.Proj, gate: u64, ln_w: u64, ln_b: u64, ape: u64, qb: b16.Proj, heads: usize, d: usize };
+/// The indexer's weights, replicated: [wk | weights_proj] [d + heads][dims], wq_b (as stored), gate, LayerNorm, bias.
+pub const Index = struct { kw: projection.Proj, gate: u64, ln_w: u64, ln_b: u64, ape: u64, qb: projection.Proj, heads: usize, d: usize };
 
 pub const InputProjection = union(enum) {
     combined_bf16: u64,
-    combined: b16.Proj,
-    separate: struct { qa: b16.Proj, kva: b16.Proj },
+    combined: @import("cuda_proj.zig").Proj,
+    separate: struct { qa: @import("cuda_proj.zig").Proj, kva: @import("cuda_proj.zig").Proj },
 };
 
 /// One DSA layer on a rank of `heads` heads: input projection, norms, q_b, kv_b as wk/wv, o, indexer.
@@ -25,10 +26,10 @@ pub const Layer = struct {
     input: InputProjection,
     q_norm: u64,
     kv_norm: u64,
-    q_b: b16.Proj,
+    q_b: @import("cuda_proj.zig").Proj,
     wk: u64,
     wv: u64,
-    o: b16.Proj,
+    o: @import("cuda_proj.zig").Proj,
     index: Index,
     heads: usize,
     qk: usize,
@@ -88,7 +89,7 @@ pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x
 /// forward.out_proj's fill for the DSA block: o_proj of rows lo..hi (s.vn) into out [hi - lo][dims] fp32.
 pub fn fill(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi: usize, out: u64) !void {
     const w = l.heads * l.dv;
-    try b16.proj(set, stream, s.vn + lo * w * 2, w, l.o, out, s.mm_part, hi - lo, l.dims, w, true);
+    try projection.matmul(set, stream, l.o, s.vn + lo * w * 2, w, out, s.mm_part, hi - lo, l.dims, w, true);
 }
 
 /// The block up to its out_proj (s.vn holds the expanded rows).
@@ -238,15 +239,15 @@ pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
 
 pub fn front(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize) !void {
     try prepareInput(set, stream, l, s, x, x_stride, rows);
-    try b16.proj(set, stream, s.qr, l.q_lora, l.q_b, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
+    try @import("cuda_proj.zig").matmul(set, stream, l.q_b, s.qr, l.q_lora, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
 }
 
 pub fn prepareRest(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool) !void {
     const ix = l.index;
-    try b16.proj(set, stream, x, x_stride, ix.kw, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
+    try @import("cuda_proj.zig").matmul(set, stream, ix.kw, x, x_stride, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
     try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
     try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk, l.lw);
-    if (qi) try b16.proj(set, stream, s.qr, l.q_lora, ix.qb, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
+    if (qi) try @import("cuda_proj.zig").matmul(set, stream, ix.qb, s.qr, l.q_lora, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
 }
 
 /// Keep a prompt's projection dispatch while storing its persistent rows in the packed frame.
@@ -269,8 +270,8 @@ fn prepareInput(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64
     switch (l.input) {
         .separate => |pair| {
             const kv = s.dp + rows * l.q_lora * 2;
-            try b16.proj(set, stream, x, x_stride, pair.qa, s.dp, s.mm_part, rows, l.q_lora, l.dims, false);
-            try b16.proj(set, stream, x, x_stride, pair.kva, kv, s.mm_part, rows, l.lw, l.dims, false);
+            try @import("cuda_proj.zig").matmul(set, stream, pair.qa, x, x_stride, s.dp, s.mm_part, rows, l.q_lora, l.dims, false);
+            try @import("cuda_proj.zig").matmul(set, stream, pair.kva, x, x_stride, kv, s.mm_part, rows, l.lw, l.dims, false);
             try glue.rmsnorm(set, stream, s.dp, l.q_lora, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
             try glue.rmsnorm(set, stream, kv, l.lw, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
         },
@@ -280,7 +281,7 @@ fn prepareInput(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64
             try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
         },
         .combined => |proj| {
-            try b16.proj(set, stream, x, x_stride, proj, s.dp, s.mm_part, rows, width, l.dims, false);
+            try @import("cuda_proj.zig").matmul(set, stream, proj, x, x_stride, s.dp, s.mm_part, rows, width, l.dims, false);
             try glue.rmsnorm(set, stream, s.dp, width, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
             try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
         },

@@ -137,9 +137,17 @@
       "sha256": "ea172cc8996235ecae3c1de386c8b3d054ce6f036acc3ab13d0615f85d47c33e",
       "size": 22658
     },
+    "zig/src/core/fixtures/lanes-ref.bin": {
+      "sha256": "1d7b16a85f792189a5a0b47d1d5ebee90b89bd9cafb6fb786fa65ecae99eb914",
+      "size": 114760
+    },
     "zig/src/core/fixtures/glm53_flash_nvfp4/headers.json.gz": {
       "sha256": "a1c695fe92e491851b62f4eb05051af3ba2e27d51e9c2232616187764bc5bcec",
       "size": 434836
+    },
+    "zig/src/families/deepseek_v41/fixtures/engram-hash-ref.bin": {
+      "sha256": "393f6d51d275e83a9fc52a108b4014070decc82e9331ebd005ebc9a866b51cb7",
+      "size": 27596
     },
     "zig/src/families/glm/prompt_aot/absorb.cubin": {
       "sha256": "e0d640075673e53cf6a3bc6a2ff6a6e171f3c1bf21753b1ebd3c9a1885c26744",

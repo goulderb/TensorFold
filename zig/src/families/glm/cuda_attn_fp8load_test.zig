@@ -26,11 +26,11 @@ test "FP8 attention load opt-in: ranks must agree but cache numerical identity s
     const off: ranks.Settings = .{};
     const on: ranks.Settings = .{ .attn_fp8load = true };
     var all = [_]ranks.Fingerprint{
-        ranks.Fingerprint.of(2, 0, off, 8192, hash, hash, "checkpoint"),
-        ranks.Fingerprint.of(2, 1, on, 8192, hash, hash, "checkpoint"),
+        ranks.Fingerprint.of(2, 0, off, 8192, true, hash, hash, ranks.hashBytes("checkpoint")),
+        ranks.Fingerprint.of(2, 1, on, 8192, true, hash, hash, ranks.hashBytes("checkpoint")),
     };
     try std.testing.expectEqual(ranks.Mismatch{ .field = .attn_fp8load, .rank = 1 }, ranks.mismatch(&all).?);
-    all[0] = ranks.Fingerprint.of(2, 0, on, 8192, hash, hash, "checkpoint");
+    all[0] = ranks.Fingerprint.of(2, 0, on, 8192, true, hash, hash, ranks.hashBytes("checkpoint"));
     try std.testing.expect(ranks.mismatch(&all) == null);
     var a = std.crypto.hash.sha2.Sha256.init(.{});
     var b = std.crypto.hash.sha2.Sha256.init(.{});

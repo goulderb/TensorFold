@@ -3,7 +3,7 @@ const std = @import("std");
 const driver = @import("driver.zig");
 const memory = @import("memory.zig");
 const exl3 = @import("exl3.zig");
-const exl3e = @import("exl3_experts_common.zig");
+const exl3e = @import("exl3_experts.zig");
 const Driver = driver.Driver;
 
 /// The tensors one upload holds: appended to `bufs` and freed together.

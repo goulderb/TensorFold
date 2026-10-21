@@ -20,7 +20,7 @@ const Root = struct {
 
     fn make() !Root {
         const tmp = std.testing.tmpDir(.{});
-        return .{ .tmp = tmp, .path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path}) };
+        return .{ .tmp = tmp, .path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/tier", .{tmp.sub_path}) };
     }
 
     fn deinit(r: *Root) void {
@@ -220,10 +220,10 @@ test "a family read failure, a corrupt file and another identity go cold, counte
         defer t.deinit();
         var p: [600]u8 = undefined; // corrupted after the restart's scan indexed it
         const path = root.file(&p, identity_a, spill.Name.of(turn2[0..400], 400));
-        const fd = std.c.open(path, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+        const fd = @import("sys").c.open(path, .{ .ACCMODE = .WRONLY }, @as(@import("sys").c.mode_t, 0));
         try std.testing.expect(fd >= 0);
-        try std.testing.expectEqual(@as(isize, 4), std.c.pwrite(fd, "XXXX", 4, 0));
-        _ = std.c.close(fd);
+        try std.testing.expectEqual(@as(isize, 4), @import("sys").c.pwrite(fd, "XXXX", 4, 0));
+        _ = @import("sys").c.close(fd);
         var f: Fake = .{ .gpa = gpa };
         var s = pc.Store.init(gpa, f.spilling(), rules, 1 << 20);
         defer s.deinit();

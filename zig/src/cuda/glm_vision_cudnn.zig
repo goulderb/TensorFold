@@ -4,7 +4,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cuda = @import("cuda");
-const dynlib = cuda.dynlib;
+const platform = @import("sys");
 const abi = cuda.abi;
 pub const c = @import("cudnn_headers");
 pub const Status = c.cudnnStatus_t;
@@ -48,7 +48,7 @@ fn check(status: Status) Error!void {
 }
 
 pub const Library = struct {
-    lib: dynlib.Library,
+    lib: platform.DynLib,
     api: Api,
     /// Exactly the compiled SDK version; package the full cuDNN sublibrary set, not just this soname.
     pub fn open() Error!Library {
@@ -59,10 +59,10 @@ pub const Library = struct {
         return openPathWithPolicy(path, .exact_header);
     }
     pub fn openPathWithPolicy(path: []const u8, policy: VersionPolicy) Error!Library {
-        var lib = dynlib.Library.open(path) catch return error.LibraryUnavailable;
+        var lib = platform.DynLib.open(path) catch return error.LibraryUnavailable;
         errdefer lib.close();
         var missing: []const u8 = "";
-        const api = lib.resolve(Api, &missing) catch return error.MissingSymbol;
+        const api = platform.resolveSymbols(&lib, Api, &missing) catch return error.MissingSymbol;
         if (!acceptsVersion(api.cudnnGetVersion(), policy)) return error.VersionMismatch;
         return .{ .lib = lib, .api = api };
     }

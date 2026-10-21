@@ -115,7 +115,7 @@ fn complete(backend: *Capture, prompt: []const u8) !?u16 {
     defer arena.deinit();
     const a = arena.allocator();
     const raw = (try json.parse(a, try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"max_tokens\":2,\"prompt\":{s}}}", .{prompt}))).ok;
-    var conn: Conn = .{ .fd = @import("platform").sock.none, .peer = "", .buf = &.{}, .gpa = a };
+    var conn: Conn = .{ .fd = @import("sys").sock.none, .peer = "", .buf = &.{}, .gpa = a };
     var reply: Reply = .{};
     openai.run(srv, a, reply.out(), .{ .conn = &conn }, false, raw);
     return reply.status;
@@ -167,7 +167,7 @@ test "a completion prompt rejects nested ids past u32 before decoding" {
     defer arena.deinit();
     const a = arena.allocator();
     const raw = (try json.parse(a, "{\"model\":\"m\",\"max_tokens\":2,\"prompt\":[[104,4294967295,4294967296,105,9223372036854775807]]}")).ok;
-    var conn: Conn = .{ .fd = @import("platform").sock.none, .peer = "", .buf = &.{}, .gpa = a };
+    var conn: Conn = .{ .fd = @import("sys").sock.none, .peer = "", .buf = &.{}, .gpa = a };
     var reply: Reply = .{};
     openai.run(srv, a, reply.out(), .{ .conn = &conn }, false, raw);
     try std.testing.expectEqual(@as(?u16, 400), reply.status);

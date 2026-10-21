@@ -1,5 +1,4 @@
 //! One TP rank's GLM-5.3-Flash CUDA engine (the Python family's decode.Engine); all ranks draw the same tokens.
-
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -10,6 +9,7 @@ const fw = @import("cuda_forward.zig");
 const ranks = @import("cuda_ranks.zig");
 const sampler = @import("cuda_sampler.zig");
 const greedy_mod = @import("cuda_greedy.zig");
+const prompt_lp = @import("cuda_prompt_logprobs.zig");
 const heat = @import("heat");
 const owner_kv = @import("cuda_kv_owner.zig");
 const cache_pool = @import("cuda_kv_pool.zig");
@@ -27,19 +27,10 @@ const l2pf_plan = @import("cuda_l2pf_plan.zig");
 pub const persistence = @import("cuda_persistence.zig");
 pub const spill_payload = @import("cuda_spill_payload.zig");
 
-pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
-// The mixed-precision equivalence proof currently covers short prompts only.
+pub const Room = types.Room;
+pub const Options = types.Options;
+// Historical equivalence bound for the partial chunk adapter (not prefillMany).
 pub const prompt_batch_rows = 127;
-
-pub const Options = struct {
-    room: ?Room = null,
-    capacity: usize, // tokens a sequence holds
-    mtp: bool, // load the MTP head (drafts)
-    settings: ranks.Settings,
-    draft_kernels: ?[]const u8 = null,
-    /// GPU proof tools may omit target layers; serving always requires the complete DFlash target.
-    partial_dflash_check: bool = false,
-};
 
 fn validateKdaProjection(c: *const config.Config, world: usize, converted: bool) !void {
     if (!converted) return;
@@ -62,6 +53,13 @@ test "converted KDA validates every TP rank from shared geometry" {
     try std.testing.expectError(error.UnalignedKdaProjection, validateKdaProjection(&c, 9, true));
     try validateKdaProjection(&c, 9, false);
 }
+const exl3 = @import("cuda_exl3.zig");
+const images_mod = @import("cuda_images.zig");
+const tile = @import("cuda_tile.zig");
+const mm_mod = @import("cuda_mm.zig");
+const dflash = @import("dflash.zig");
+const prof_mod = @import("cuda_prof.zig");
+const types = @import("cuda_engine_types.zig");
 
 /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
 pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
@@ -71,6 +69,8 @@ pub const max_drafts = verify_plan.max_drafts;
 
 /// A prompt pass's chunk rows (decode.prefill's).
 pub const prompt_rows = fw.prefill_rows;
+pub const max_together = @import("cuda_state.zig").prompt_heads;
+pub const Prompt = struct { slot: u32, ids: []const u32 };
 
 /// Storage ceiling; verifyPlan selects the active row limit below hc_pre's 64-row change.
 pub const shared_rows = verify_plan.max_rows;
@@ -98,46 +98,18 @@ test "production target warmup covers every shared width with at most two sixtee
     }
 }
 
-/// One stream's window of a shared verify: its slot, its ids, and its drawn tokens.
-pub const Part = struct { slot: u32, ids: []const u32, out: []u32 };
+pub const Part = types.Part;
 pub const DraftPart = struct { slot: u32, position: u64, pending: u32, depth: u32 };
 pub const DraftResult = dflash_mod.BatchResult;
-
-/// A kept prompt state as the prompt cache holds it: the id every rank keeps its own copy under, and its position.
-pub const Kept = struct { id: u64, at: u32 };
-
-/// A stream's own sequence: state, sampling rule, MTP drafts; buffers are shared, one stream's round at a time.
-const Seq = struct {
-    st: fw.State,
-    sampling: ?sampler.Sampling = null, // null: greedy
-    in_head: usize = 0, // drafted rows the MTP caches hold past the kept ones (st.mtp_drafted)
-    retained: ?cuda.DeviceBuffer = null, // MTP rows that must survive another sequence using the forward scratch
-    rows_at: u64 = 0, // its last verify's final-norm rows (bf16 [rows][hidden]), which the next draft reads
-    vision: ?VisionOwned = null,
-};
-
-pub const VisionOwned = union(enum) {
-    leader: vision_runtime.Service.Encoded,
-    follower: struct { table: vision_binding.Table, ids: []u32, positions: []u32 },
-
-    pub fn table(self: *VisionOwned) *vision_binding.Table {
-        return switch (self.*) {
-            .leader => |*state| &state.request.table.?,
-            .follower => |*state| &state.table,
-        };
-    }
-};
-
-/// One rank's copy of a kept prompt state: visible cache prefixes, raw index tails and fixed recurrent state.
-const Snap = struct { buf: cuda.DeviceBuffer, pos: usize, mtp_len: usize, cur: []u1, owner: ?u32 = null };
-
-/// Where a prompt pass resumes: a kept state (every rank holds `id`) at `at`, a multiple of the chunk rows.
-pub const Resume = struct { id: u64, at: usize };
-
-/// Rank 0's marks in a prompt pass: `call` may keep the state at a chunk start; other ranks copy at that chunk's gate.
-pub const Marks = struct { at: []const u32, ctx: *anyopaque, call: *const fn (ctx: *anyopaque, at: u32) void };
+pub const Kept = types.Kept;
+const Seq = types.Seq;
+pub const VisionOwned = types.VisionOwned;
+const Snap = types.Snap;
+pub const Resume = types.Resume;
+pub const Marks = types.Marks;
 
 pub const Engine = struct {
+    capture_lifetime: u64 = 0,
     gpa: std.mem.Allocator,
     io: std.Io,
     d: *const cuda.Driver,
@@ -149,6 +121,14 @@ pub const Engine = struct {
     tp_group: ?cuda.tp_group.Group = null,
     prefetch: ?l2pf.Prefetch = null,
     replicas: @import("cuda_dsa_block.zig").Replicas = .{},
+    images: ?*images_mod.Images = null, // borrowed media service; caller closes after engine drains
+    packs: mm_mod.Packed = .{},
+    drafter: ?*dflash.Drafter = null,
+    canonical_owner: bool = false,
+    canonical: ranks.CanonicalDraft = .{},
+    profs: [fw.window_rows]?*prof_mod.Prof = @splat(null),
+    prompt_profs: [4]?*prof_mod.Prof = @splat(null),
+    checkpoint_digest: [32]u8,
     settings: ranks.Settings,
     m: fw.Modules,
     stream: cuda.Stream,
@@ -184,6 +164,11 @@ pub const Engine = struct {
     disk: ?persistence.Port = null,
     announce: u64 = 0, // rank 0: a state kept at this chunk's mark, for the other ranks to copy at its gate
     dropped: std.ArrayList(u32) = .empty, // rank 0: ids dropped since the other ranks last heard (cuda_follow)
+    prompt_logprobs: ?prompt_lp.Want = null, // a prompt pass's rows asked for (every rank runs the head on them)
+    prompt_bufs: ?prompt_lp.Buffers = null, // their head passes' buffers, made at the first pass that asks
+    prompt_tried: bool = false, // that pass came: without buffers after it, the passes take the window's
+    prompt_out: prompt_lp.Output, // a head pass's logprob words, then its picks, host-mapped (rank 0 reads them)
+    structured: bool = false, // a structured output step: every rank's draws gather whole rows, rank 0 masks them
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
@@ -232,12 +217,17 @@ pub const Engine = struct {
                 if (capability != 121) startup_problem = error.UnsupportedNativeDenseDevice;
             } else |err| startup_problem = err;
         }
+        if ((settings.dense_bits != 16 or settings.head_bits != 16) and !settings.tiled)
+            startup_problem = error.PackedNeedsGlmMm;
+        // Canonical --drafter is the default owner. Env-selected DFlash stays only when --drafter is absent.
+        // Read content and decode effective precision before the paired startup vote and before any warmup.
         const startup = try a.alloc(u32, world);
-        try ranks.gather(u32, d, lib, comm, stream, rank, @intFromBool(startup_problem == null), startup);
-        for (startup) |ready| if (ready == 0) return startup_problem orelse error.PeerStartupRefused;
         const with_mtp = settings.draft == .mtp;
-        const fp = ranks.Fingerprint.of(world, rank, settings, o.capacity, try ranks.hashFile(a, io, cfg_path), try ranks.hashFile(a, io, "/proc/self/exe"), checkpoint);
-        try ranks.agree(d, lib, comm, stream, fp, try a.alloc(ranks.Fingerprint, world));
+        const checkpoint_digest = try ranks.artifact(a, io, checkpoint);
+        var fp = ranks.Fingerprint.of(world, rank, settings, o.capacity, with_mtp, try ranks.hashFile(a, io, cfg_path), try ranks.hashFile(a, io, "/proc/self/exe"), checkpoint_digest);
+        if (o.vision) |lim| ranks.mediaFingerprint(&fp, lim);
+        const canonical = try ranks.applyCanonicalStartup(gpa, io, d, lib, comm, stream, rank, .{ .dir = o.drafter, .bits = o.drafter_bits, .drafts = o.mtp }, o.drafter != null, &startup_problem, &fp, startup, try a.alloc(ranks.Fingerprint, world));
+        try ranks.probeStart(d, lib, comm, stream, settings, rank, world);
         if (o.settings.kv_pool_tokens > 0) {
             if (o.settings.kv_shard and (world != 2 or c.mla_heads % 2 != 0)) return error.KvShardNeedsTp2;
             if (c.kv_lora != 512 or c.i_dim != 128) return error.KvPoolShape;
@@ -283,7 +273,7 @@ pub const Engine = struct {
         if (o.settings.layers > c.layers) return error.BadLayers;
         const layers = try a.alloc(u32, if (o.settings.layers > 0) o.settings.layers else c.layers);
         for (layers, 0..) |*l, i| l.* = @intCast(i);
-        e.* = .{ .gpa = gpa, .io = io, .heat_gate = .{ .bands = settings.heat, .root = heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .settings = settings, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .greedy_rows = undefined, .smp = undefined, .mtp = with_mtp };
+        e.* = .{ .capture_lifetime = target_graph.newLifetime(), .gpa = gpa, .io = io, .heat_gate = .{ .bands = settings.heat, .root = @import("cuda_engine_prof.zig").heatRoot() }, .shared_buf = undefined, .d = d, .c = c, .share = share, .spans = spans, .lib = lib, .comm = comm, .checkpoint_digest = checkpoint_digest, .settings = settings, .canonical_owner = o.drafter != null, .canonical = canonical, .m = m, .stream = stream, .pieces = pieces, .w = undefined, .capacity = o.capacity, .bp = undefined, .bd = undefined, .bm = undefined, .greedy_rows = undefined, .smp = undefined, .prompt_out = undefined, .mtp = with_mtp };
         errdefer e.replicas.deinit();
         e.tp_group = try cuda.tp_group.Group.borrow(lib, comm, rank, world);
         errdefer if (e.tp_group) |*group| group.closeFast();
@@ -301,12 +291,36 @@ pub const Engine = struct {
             const policy_hash = o.settings.weight_dense.digest();
             std.log.info("GLM dense conversion policy v1: {s}; head={s}; scope=bf16-source-only; digest={s}", .{ try o.settings.weight_dense.format(&policy_text), @tagName(o.settings.weight_head), std.fmt.bytesToHex(policy_hash, .lower) });
         }
+        const Tile = struct {
+            gpa: std.mem.Allocator,
+            mk: *const mm_mod.Kernels,
+            s: cuda.Stream,
+            d: *const cuda.Driver,
+            enabled: bool,
+            dense: u8,
+            head: u8,
+            packs: *mm_mod.Packed,
+            fn apply(t: @This(), w: *weights.Weights) !void {
+                if (t.enabled) t.packs.* = try tile.tileLinears(t.gpa, w, t.mk, t.s, t.d, t.dense, t.head);
+            }
+        };
+        const tiler: Tile = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = settings.tiled, .dense = settings.dense_bits, .head = settings.head_bits, .packs = &e.packs };
+        errdefer {
+            gpa.free(e.packs.ptrs);
+            gpa.free(e.packs.bits);
+        }
         var loaded: ?weights.Weights = null;
         errdefer if (loaded) |*w| w.deinit();
         var load_problem: ?anyerror = null;
-        loaded = weights.load(gpa, io, d, stream, wt, checkpoint, c, share, layers, with_mtp) catch |err| blk: {
-            load_problem = err;
-            break :blk null;
+        loaded = load: {
+            const w = weights.load(gpa, io, d, stream, wt, checkpoint, c, share, layers, with_mtp) catch |err| {
+                load_problem = err;
+                break :load null;
+            };
+            break :load @import("cuda_load_owner.zig").finish(w, tiler, Tile.apply) catch |err| {
+                load_problem = err;
+                break :load null;
+            };
         };
         try ranks.gather(u32, d, lib, comm, stream, rank, @intFromBool(load_problem == null), startup);
         for (startup) |ready| if (ready == 0) return load_problem orelse error.PeerWeightsRefused;
@@ -359,6 +373,9 @@ pub const Engine = struct {
                 std.log.info("GLM native dense rank={d} family={s} mode={s} matrices={d}", .{ rank, @tagName(group), @tagName(settings.weight_dense.get(group)), e.w.native_conversions[@backingInt(group)] });
             }
         }
+        e.m.mm.prompt_fixed_k = settings.prompt_fixed_k;
+        e.m.tiled = settings.tiled;
+        if (settings.tiled) e.m.packs = &e.packs;
         try e.bind(0);
         errdefer {
             for (0..e.seqs.items.len) |slot| e.free(slot);
@@ -370,9 +387,12 @@ pub const Engine = struct {
         errdefer e.bd.deinit();
         e.bm = if (o.settings.kv_shard) try fw.Buffers.initOwned(d, &e.w, fw.window_rows, false, o.capacity) else try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bm.deinit();
-        const verify_rows = settings.dflash_verify.active(settings.draft == .dflash2).rows();
-        if (rank == 0 and settings.draft == .dflash2) std.log.info("GLM DFlash verify plan: drafts={d} lane_rows={d} shared_rows={d}", .{ settings.dflash_verify.drafts(), 1 + settings.dflash_verify.drafts(), verify_rows });
-        if (with_mtp or settings.draft == .dflash2) e.bs = if (o.settings.kv_shard) try fw.Buffers.initSharedOwned(d, &e.w, verify_rows, o.capacity) else try fw.Buffers.initShared(d, &e.w, verify_rows, o.capacity);
+        const verify_rows = sharedBufferRows(settings, o.drafter != null);
+        if (rank == 0 and (settings.draft == .dflash2 or o.drafter != null)) {
+            const plan = verify_plan.Plan.effective(settings.dflash_verify, settings.draft == .dflash2, o.drafter != null);
+            std.log.info("GLM DFlash verify plan: drafts={d} lane_rows={d} shared_rows={d}", .{ plan.drafts(), 1 + plan.drafts(), verify_rows });
+        }
+        if (with_mtp or settings.draft == .dflash2 or o.drafter != null) e.bs = if (o.settings.kv_shard) try fw.Buffers.initSharedOwned(d, &e.w, verify_rows, o.capacity) else try fw.Buffers.initShared(d, &e.w, verify_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
         const route_samples = try route_trace.samples(ranks.environment("TF_GLM_ROUTE_SAMPLES"));
         const route_participants = try route_trace.participants(ranks.environment("TF_GLM_ROUTE_PARTICIPANTS"));
@@ -384,7 +404,7 @@ pub const Engine = struct {
         }
         errdefer if (e.route_trace) |*trace| trace.deinit();
         errdefer if (e.dflash) |drafter| drafter.deinit();
-        if (settings.draft == .dflash2) {
+        if (settings.draft == .dflash2 or o.drafter != null) {
             try e.bp.enableTaps(d);
             try e.bd.enableTaps(d);
             if (e.bs) |*b| try b.enableTaps(d);
@@ -399,9 +419,19 @@ pub const Engine = struct {
         errdefer e.greedy_rows.deinit();
         e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
         errdefer e.smp.deinit();
+        errdefer e.freeProfs();
+        if (prof_mod.Prof.wanted()) for (&e.profs) |*p| {
+            p.* = try prof_mod.Prof.init(d, io);
+        };
+        if (prof_mod.Prof.wanted()) for (&e.prompt_profs) |*p| {
+            p.* = try prof_mod.Prof.init(d, io);
+            p.*.?.every = 4;
+        };
+        e.prompt_out = try prompt_lp.Output.init(d);
+        errdefer e.prompt_out.free();
         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
         errdefer e.shared_buf.free();
-        if (settings.draft == .dflash2) {
+        if (settings.draft == .dflash2 and o.drafter == null) {
             var draft_problem: ?anyerror = null;
             e.dflash = dflash_mod.DFlash.open(gpa, io, checkpoint, settings.draft_dir.?, max_shared, o.capacity, .{ .driver = d, .context = ctx, .stream = stream, .embed = e.w.embed, .lib = lib, .comm = comm, .rank = rank, .world = world, .kernels_dir = o.draft_kernels, .verify_plan = settings.dflash_verify, .tp_group = e.collectiveGroup() }) catch |err| blk: {
                 draft_problem = err;
@@ -414,7 +444,7 @@ pub const Engine = struct {
                 return err;
             };
         }
-        if (settings.draft_prelaunch and settings.draft != .dflash2) return error.RequiredDraftPrelaunchUnavailable;
+        if (settings.draft_prelaunch and settings.draft != .dflash2 and o.drafter == null) return error.RequiredDraftPrelaunchUnavailable;
         std.log.info("GLM DFlash prelaunch rank={d} requested={} effective={}", .{ rank, settings.draft_prelaunch, settings.draft_prelaunch and e.dflash != null and e.dflash.?.asyncAvailable() });
         errdefer if (e.pool) |*p| p.deinit();
         if (o.settings.kv_pool_tokens > 0) {
@@ -493,7 +523,7 @@ pub const Engine = struct {
                 row0 += n;
             }
             var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..window.count] }};
-            const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .pieces = null, .split = e.settings.split, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .affine_prompt_policy = e.settings.affine_prompt_policy, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .full_target = runtime, .target_buffer = .shared, .target_failure = e.pair_failure };
+            const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .affine_prompt_policy = e.settings.affine_prompt_policy, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .full_target = runtime, .target_buffer = .shared, .target_failure = e.pair_failure, .capture_lifetime = e.capture_lifetime };
             try f.run(ids[0..rows]);
         }
         for (1..profile.target_rows + 1) |rows| {
@@ -569,11 +599,15 @@ pub const Engine = struct {
         e.snaps.deinit(e.gpa);
         e.dropped.deinit(e.gpa);
         if (e.dflash) |drafter| drafter.deinit();
+        if (e.drafter) |dr| dr.deinit();
         if (e.prefetch) |*p| p.deinit() catch |err| {
             e.pair_failure(err);
             return;
         };
         e.shared_buf.free();
+        e.freeProfs();
+        if (e.prompt_bufs) |*b| b.free();
+        e.prompt_out.free();
         e.smp.deinit();
         e.greedy_rows.deinit();
         if (e.bs) |*b| b.deinit();
@@ -583,6 +617,8 @@ pub const Engine = struct {
         for (0..e.seqs.items.len) |i| e.free(i);
         e.seqs.deinit(e.gpa);
         if (e.pool) |*p| p.deinit();
+        e.gpa.free(e.packs.ptrs);
+        e.gpa.free(e.packs.bits);
         e.w.deinit();
         e.pieces.deinit();
         e.m.deinit();
@@ -593,7 +629,9 @@ pub const Engine = struct {
         gpa.destroy(e);
     }
 
-    fn exchange(e: *const Engine) fw.Exchange {
+    const freeProfs = @import("cuda_engine_prof.zig").freeProfs;
+
+    pub fn exchange(e: *const Engine) fw.Exchange {
         return .{ .nccl = .{ .lib = e.lib, .comm = e.comm } };
     }
 
@@ -603,6 +641,28 @@ pub const Engine = struct {
 
     fn prefetchRuntime(e: *Engine) ?*l2pf.Prefetch {
         return if (e.prefetch) |*p| p else null;
+    }
+
+    pub fn drain(e: *const Engine) !void {
+        try e.synchronize();
+        try e.pieces.side.synchronize();
+    }
+
+    /// Before replacing scratch, modules, transport, taps or profilers: settle both streams and retire their graphs.
+    pub fn invalidateCaptures(e: *Engine) !void {
+        try e.drain();
+        if (e.ffn_graphs) |*bank| try bank.retire(e.stream);
+        if (e.full_graphs) |*r| try r.bank.retire(e.stream);
+        e.capture_lifetime = target_graph.newLifetime();
+    }
+
+    /// A replacement owns a fresh generation even when its host/device addresses were recycled.
+    /// On failure ownership of both the current drafter and `next` stays with their respective callers.
+    pub fn replaceDrafter(e: *Engine, next: ?*dflash.Drafter) !void {
+        if (e.drafter == next) return;
+        try e.invalidateCaptures();
+        if (e.drafter) |old| old.deinit();
+        e.drafter = next;
     }
 
     fn synchronize(e: *const Engine) !void {
@@ -627,7 +687,7 @@ pub const Engine = struct {
 
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .affine_prompt_policy = e.settings.affine_prompt_policy, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .target_graphs = if (b == &e.bd) e.graphBank() else null, .full_target = if (b == &e.bd) e.fullGraph() else null, .target_buffer = .lone, .target_failure = e.pair_failure, .vision = if (b == &e.bp) if (e.cur.vision) |*vision| .{ .owner = vision.table(), .generation = vision.table().generation } else null else null };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .affine_prompt_policy = e.settings.affine_prompt_policy, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .target_graphs = if (b == &e.bd) e.graphBank() else null, .full_target = if (b == &e.bd) e.fullGraph() else null, .target_buffer = .lone, .target_failure = e.pair_failure, .capture_lifetime = e.capture_lifetime, .images = if (e.images) |v| .{ .v = v, .slot = e.slot } else null, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .vision = if (b == &e.bp) if (e.cur.vision) |*vision| .{ .owner = vision.table(), .generation = vision.table().generation } else null else null };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -763,6 +823,11 @@ pub const Engine = struct {
     }
 
     /// A fresh sequence with `sampling` (null or temperature 0: greedy).
+    pub fn beginFollowing(e: *Engine, sampling: ?sampler.Sampling) !void {
+        if (e.images) |v| v.clear();
+        return e.begin(sampling);
+    }
+
     pub fn begin(e: *Engine, sampling: ?sampler.Sampling) !void {
         if (e.pool != null and e.slot >= cache_pool.extent.max_slots) return error.BadKvRequest;
         if (e.pool) |*p| if (p.regions.slots[e.slot] == null) {
@@ -805,15 +870,18 @@ pub const Engine = struct {
         if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
         try e.gate(cancel);
         try f.run(as_i32[0..rows]);
+        if (e.prompt_logprobs) |p| if (part.len > 1) try prompt_lp.run(e, p, part[1..]);
+        if (e.drafter) |dr| try dr.prompt(e, e.slot, start, rows, len);
         const last = start + rows == len;
         var first: ?u32 = null;
         if (last) {
             var t: [1]u32 = undefined;
-            try e.draw(e.bp.logits, 1, len, &t);
+            try e.draw(e.bp.logits, 1, len, 0, &t);
             first = t[0];
         }
+        if (f.prof) |p| p.mark(e.stream, .draw);
+        if (last) try e.holdPrompt(e.bp.fnormed + (rows - 1) * e.c.hidden * 2);
         if (e.mtp) {
-            if (last) try e.retainRows(e.bp.fnormed + (rows - 1) * e.c.hidden * 2, 1);
             const nxt = as_i32[1..];
             if (nxt.len > 0) { // decode._absorb_rows
                 try f.mtp(nxt, &.{e.bp.fnormed});
@@ -842,7 +910,7 @@ pub const Engine = struct {
     }
 
     /// The chunk gate on every rank: a kept state at the mark, the heat wait, rank 0's cancel; the id exchanged first.
-    fn gate(e: *Engine, cancel: ?Cancel) !void {
+    pub fn gate(e: *Engine, cancel: ?Cancel) !void {
         if (e.pool != null) {
             while (true) {
                 const kept = e.shared(0) catch |err| {
@@ -894,8 +962,9 @@ pub const Engine = struct {
         for (parts, segs[0..parts.len], 0..) |p, g, i| {
             try e.bind(p.slot);
             const last = g.row0 + g.rows - 1;
-            try @import("cuda_b16.zig").proj(f.set(), e.stream, e.bp.fnormed + last * e.c.hidden * 2, e.c.hidden, e.w.head, e.bp.logits, e.bp.kda.mm_part, 1, e.share.vocab.len(), e.c.hidden, false);
-            try e.draw(e.bp.logits, 1, p.ids.len, out[i..][0..1]);
+            try @import("cuda_proj.zig").matmul(f.set(), e.stream, e.w.head, e.bp.fnormed + last * e.c.hidden * 2, e.c.hidden, e.bp.logits, e.bp.kda.mm_part, 1, e.share.vocab.len(), e.c.hidden, false);
+            try e.draw(e.bp.logits, 1, p.ids.len, 0, out[i..][0..1]);
+            try e.holdPrompt(e.bp.fnormed + last * e.c.hidden * 2);
             if (e.dflash) |drafter| {
                 errdefer e.pair_failure(error.DFlashCommitFailed);
                 try drafter.acceptPrompt(p.slot, e.bp.taps.?.ptr + g.row0 * e.c.hidden * 2, e.bp.rows, g.rows, 0);
@@ -912,13 +981,18 @@ pub const Engine = struct {
         return e.payloadBytes(plan.byteCount()) catch return std.math.maxInt(u64);
     }
 
+    fn spillDraft(e: *const Engine) ranks.DraftSnapshot {
+        return ranks.persistedDraftSnapshot(e.canonical_owner, e.canonical, dflash.ring_bytes, if (e.dflash) |drafter| drafter.snapshotBytes() else 0, e.settings.draft_checkpoint);
+    }
+
     fn payloadBytes(e: *const Engine, target_bytes: u64) !u64 {
-        return spill_payload.withDraftBytes(target_bytes, if (e.dflash) |drafter| drafter.snapshotBytes() else 0);
+        return spill_payload.withDraftBytes(target_bytes, e.spillDraft().bytes);
     }
 
     pub fn spillShape(e: *const Engine) spill_payload.Shape {
         const st = &e.seqs.items[0].?.st;
-        return .{ .layout = st.layout, .format = e.settings.kv, .mtp = e.mtp, .sharded = e.settings.kv_shard, .rank = @intCast(e.share.rank), .world = @intCast(e.share.world), .grid = prompt_rows, .parities = st.cur.len, .draft_bytes = if (e.dflash) |drafter| drafter.snapshotBytes() else 0, .draft_identity = e.settings.draft_checkpoint };
+        const saved = e.spillDraft();
+        return .{ .layout = st.layout, .format = e.settings.kv, .mtp = e.mtp, .sharded = e.settings.kv_shard, .rank = @intCast(e.share.rank), .world = @intCast(e.share.world), .grid = prompt_rows, .parities = st.cur.len, .draft_bytes = saved.bytes, .draft_identity = saved.identity };
     }
 
     pub const HostSnapshot = struct { bytes: []u8, meta: [spill_payload.max_meta]u8, meta_len: usize };
@@ -1102,7 +1176,7 @@ pub const Engine = struct {
     }
 
     /// The ranks' maximum of `v` (an all-reduce on the engine's stream).
-    fn shared(e: *Engine, v: f64) !f64 {
+    pub fn shared(e: *Engine, v: f64) !f64 {
         var x = v;
         try e.shared_buf.uploadAsync(0, std.mem.asBytes(&x), e.stream.handle);
         try e.lib.check(e.lib.api.ncclAllReduce(e.shared_buf.ptr, e.shared_buf.ptr, 1, .f64, .max, e.comm, e.stream.handle), "ncclAllReduce");
@@ -1144,24 +1218,28 @@ pub const Engine = struct {
     };
 
     /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
-    pub fn verify(e: *Engine, ids: []const u32, out: []u32) !void {
-        return e.verifyWithMask(ids, out, false);
+    pub fn verify(e: *Engine, ids: []const u32, out: []u32, bits: u64) !void {
+        return e.verifyWithMask(ids, out, bits, false);
     }
 
     pub fn verifyMasked(e: *Engine, ids: []const u32, out: []u32) !void {
-        return e.verifyWithMask(ids, out, true);
+        return e.verifyWithMask(ids, out, 0, true);
     }
 
-    fn verifyWithMask(e: *Engine, ids: []const u32, out: []u32, masked: bool) !void {
+    fn verifyWithMask(e: *Engine, ids: []const u32, out: []u32, bits: u64, masked: bool) !void {
         errdefer if (e.full_graphs != null) e.pair_failure(error.FullTargetVerificationFailed);
         if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
         var one: [1]fw.Rank = undefined;
-        const f = e.view(&e.bd, &one);
+        var f = e.view(&e.bd, &one);
         const at = e.cur.st.pos;
+        f.prof = e.profs[ids.len - 1];
+        if (f.prof) |p| try p.begin(e.stream, verifyLabel(ids.len));
         try f.run(@ptrCast(ids));
         try e.retainRows(e.bd.fnormed, ids.len);
+        if (e.drafter) |dr| try dr.noteVerify(e.slot, 0, ids.len, at, true);
         if (e.dflash) |drafter| try drafter.stageWindow(e.slot, e.bd.taps.?.ptr, e.bd.rows, 0, ids.len, at);
-        if (masked) try e.drawMasked(e.bd.logits, ids.len, at + 1, out) else try e.draw(e.bd.logits, ids.len, at + 1, out);
+        if (masked) try e.drawMasked(e.bd.logits, ids.len, at + 1, out) else try e.draw(e.bd.logits, ids.len, at + 1, bits, out);
+        if (f.prof) |p| p.end();
         e.verify_lone_widths[ids.len] += 1;
     }
 
@@ -1175,10 +1253,10 @@ pub const Engine = struct {
         var rows: usize = 0;
         var all_greedy = true;
         for (parts, 0..) |p, i| {
-            if (p.ids.len == 0 or p.ids.len > e.targetRows() or rows + p.ids.len > @min(b.rows, e.sharedLimit())) return error.WindowTooWide;
+            if (p.ids.len == 0 or p.ids.len > e.targetRows() or rows + p.ids.len > e.sharedCapacity()) return error.WindowTooWide;
             for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
             try e.bind(p.slot);
-            all_greedy = all_greedy and e.cur.sampling == null;
+            all_greedy = all_greedy and e.cur.sampling == null and p.bits == 0 and !e.structured;
             if (p.out.len < p.ids.len) return error.BadVerifyOutput;
             segs[i] = .{ .st = &e.cur.st, .row0 = rows, .rows = p.ids.len };
             @memcpy(ids[rows..][0..p.ids.len], p.ids);
@@ -1206,14 +1284,15 @@ pub const Engine = struct {
             defer e.gpa.free(line);
             std.log.info("GLM_ROUTE {s}", .{line});
         }
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .pieces = null, .split = e.settings.split, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .affine_prompt_policy = e.settings.affine_prompt_policy, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .route_trace = trace, .target_graphs = e.graphBank(), .full_target = e.fullGraph(), .target_buffer = .shared, .target_failure = e.pair_failure };
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .affine_prompt_policy = e.settings.affine_prompt_policy, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .route_trace = trace, .target_graphs = e.graphBank(), .full_target = e.fullGraph(), .target_buffer = .shared, .target_failure = e.pair_failure, .capture_lifetime = e.capture_lifetime, .taps = if (e.drafter) |dr| dr.taps(false) else null };
         try f.run(@ptrCast(ids[0..rows]));
         if (trace) |t| try t.finish(e.stream);
         for (parts, segs[0..parts.len]) |p, g| {
             try e.bind(p.slot);
             e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
             if (e.dflash) |drafter| try drafter.stageWindow(p.slot, b.taps.?.ptr, b.rows, g.row0, g.rows, g.st.pos);
-            if (!all_greedy) try e.draw(b.logits + g.row0 * e.share.vocab.len() * 2, g.rows, g.st.pos + 1, p.out);
+            if (e.drafter) |dr| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, g.row0 == 0);
+            if (!all_greedy) try e.draw(b.logits + g.row0 * e.share.vocab.len() * 2, g.rows, g.st.pos + 1, p.bits, p.out);
         }
         if (all_greedy) {
             var tokens: [shared_rows]u32 = undefined;
@@ -1222,6 +1301,23 @@ pub const Engine = struct {
         }
         e.verify_widths[rows] += 1;
     }
+
+    pub fn validateDraftBlock(e: *const Engine, reqs: []const dflash.Req) !void {
+        if (e.drafter == null) return error.NoDrafter;
+        for (reqs) |q| {
+            if (q.slot >= e.seqs.items.len or e.seqs.items[q.slot] == null) return error.UnknownSlot;
+        }
+    }
+
+    pub fn draftBlock(e: *Engine, reqs: []dflash.Req) !void {
+        try e.validateDraftBlock(reqs);
+        const dr = e.drafter.?;
+        for (reqs) |*q| q.pos = @intCast(e.seqs.items[q.slot].?.st.pos);
+        try dr.draft(e, reqs);
+    }
+
+    pub const holdPrompt = @import("cuda_prompt_hold.zig").save;
+    pub const prefillMany = @import("cuda_prompts.zig").prefillMany;
 
     /// forward.commit of the last window's first `n` rows (the KDA replay when fewer than it ran).
     pub fn keep(e: *Engine, n: usize) !void {
@@ -1248,11 +1344,11 @@ pub const Engine = struct {
 
     /// decode.draft: the MTP head absorbs the kept rows (committed first) with `follow`, then chains `depth` drafts.
     pub fn drafting(e: *const Engine) bool {
-        return e.mtp or e.dflash != null;
+        return e.mtp or e.dflash != null or e.drafter != null;
     }
 
     pub fn verifyPlan(e: *const Engine) verify_plan.Plan {
-        return e.settings.dflash_verify.active(e.dflash != null);
+        return if (e.drafter != null) .dflash7 else e.settings.dflash_verify.active(e.dflash != null);
     }
 
     pub fn targetRows(e: *const Engine) usize {
@@ -1261,6 +1357,16 @@ pub const Engine = struct {
 
     pub fn sharedLimit(e: *const Engine) usize {
         return if (e.settings.draft_profile.enabled) @import("cuda_draft_profile.zig").shared_rows else e.verifyPlan().rows();
+    }
+
+    /// One geometry for shared buffers, admission and tap staging. Canonical --drafter is dflash7 (64 rows).
+    pub fn sharedBufferRows(settings: ranks.Settings, canonical: bool) usize {
+        return verify_plan.Plan.effective(settings.dflash_verify, settings.draft == .dflash2, canonical).rows();
+    }
+
+    pub fn sharedCapacity(e: *const Engine) usize {
+        const advertised = e.sharedLimit();
+        return if (e.bs) |*b| @min(b.rows, advertised) else advertised;
     }
 
     fn resolveDraftBatch(e: *const Engine, parts: []const DraftPart, out: *[max_shared]dflash_mod.BatchRequest) !void {
@@ -1308,8 +1414,16 @@ pub const Engine = struct {
         if (depth > verify_plan.Plan.baseline.drafts()) return error.TooDeep;
         var one: [1]fw.Rank = undefined;
         const f = e.view(&e.bm, &one);
+        const hidden = if (from_prompt) @import("cuda_prompt_hold.zig").input(e) else e.cur.rows_at;
+        return e.draftMtpWith(follow, depth, out, hidden, f, draw);
+    }
+
+    /// One shared absorption/proposal loop: real Forward/draw in serving, command recorders in CPU lifetime tests.
+    /// State length writes remain the actual State.setMtpLen implementation in either case.
+    pub fn draftMtpWith(e: *Engine, follow: []const u32, depth: usize, out: []u32, hidden: u64, f: anytype, draw_rows: anytype) !usize {
+        if (depth > e.verifyPlan().drafts() or depth > out.len or follow.len == 0 or e.cur.in_head > e.cur.st.mtp_len) return error.BadDraftRequest;
+        for (follow) |token| if (token >= e.c.vocab) return error.BadDraftRequest;
         const D = e.c.hidden;
-        const hidden = e.draftRows(from_prompt);
         try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len - e.cur.in_head);
         e.cur.in_head = 0;
         const next: []const i32 = @ptrCast(follow);
@@ -1320,7 +1434,7 @@ pub const Engine = struct {
             try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + part.len);
         }
         for (0..depth) |j| {
-            try e.draw(e.bm.logits, 1, e.cur.st.pos + 1 + j, out[j..][0..1]);
+            try draw_rows(e, e.bm.logits, 1, e.cur.st.pos + 1 + j, 0, out[j..][0..1]);
             if (j + 1 < depth) {
                 try f.mtp(@ptrCast(out[j..][0..1]), &.{e.bm.fnormed});
                 try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + 1);
@@ -1331,7 +1445,8 @@ pub const Engine = struct {
     }
 
     /// `rows` logits rows of this rank's vocabulary -> the tokens at positions first, first + 1, ...
-    fn draw(e: *Engine, logits: u64, rows: usize, first: u64, out: []u32) !void {
+    pub fn draw(e: *Engine, logits: u64, rows: usize, first: u64, bits: u64, out: []u32) !void {
+        if (e.structured) return e.drawWhole(logits, rows, first, bits, out);
         if (e.cur.sampling) |s| {
             try e.smp.draw(e.stream, e.exchange(), e.spans, &.{.{ .rank = e.share.rank, .logits = logits }}, rows, first, sampler.rule(s), out);
             if (e.tp_group) |*group| try group.check();
@@ -1341,7 +1456,7 @@ pub const Engine = struct {
     }
 
     /// The prompt's target logits survive MTP absorption; redraw them once the lane supplies its first mask.
-    pub fn redrawFirst(e: *Engine, position: u64) !u32 {
+    pub fn redrawQueued(e: *Engine, position: u64) !u32 {
         var out: [1]u32 = undefined;
         try e.drawMasked(e.bp.logits, 1, position, &out);
         return out[0];
@@ -1353,6 +1468,9 @@ pub const Engine = struct {
         if (e.tp_group) |*group| try group.check();
     }
 
+    pub const promptHead = @import("cuda_structured.zig").promptHead;
+    pub const drawWhole = @import("cuda_structured.zig").drawWhole;
+    pub const redrawFirst = @import("cuda_structured.zig").redrawFirst;
     /// decode.sample_rows' greedy pick: per-rank top-1 (tf_glm_top1), all-gathered, largest value then lowest id.
     fn greedy(e: *Engine, logits: u64) !u32 {
         var token: [1]u32 = undefined;
@@ -1365,20 +1483,20 @@ pub const Engine = struct {
         try e.greedy_rows.draw(e.stream, .{ .rank = e.share.rank, .vocab = e.share.vocab, .top1 = e.m.glue.top1, .exchange = e.exchange(), .group = e.collectiveGroup() }, logits, rows, out);
     }
 
-    fn heatRoot() []const u8 {
-        const p = std.c.getenv("TF_HEAT_ROOT") orelse return heat.default_root;
-        const s = std.mem.span(p);
-        return if (s.len == 0) heat.default_root else s;
+    pub fn checkGathers(e: *const Engine) !void {
+        if (e.tp_group) |*group| try group.check();
     }
 
-    fn copy(e: *const Engine, dst: u64, src: u64, bytes: usize) !void {
+    pub fn copy(e: *const Engine, dst: u64, src: u64, bytes: usize) !void {
         try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, e.stream.handle), "cuMemcpyDtoDAsync");
     }
 };
 
-fn projectionFormat(p: @import("cuda_b16.zig").Proj) []const u8 {
+fn projectionFormat(p: @import("cuda_proj.zig").Proj) []const u8 {
     return switch (p) {
-        .b16 => "bf16",
+        .bf16 => "bf16",
+        .fp8g => "fp8g",
+        .mxfp8 => "mxfp8",
         .source => "source",
         .q => |q| @tagName(q),
     };
@@ -1386,7 +1504,7 @@ fn projectionFormat(p: @import("cuda_b16.zig").Proj) []const u8 {
 
 test "prompt snapshot estimates follow the requested mark and MTP setting" {
     var seq: Seq = undefined;
-    seq.st.layout = try @import("cuda_layout.zig").Layout.init(.{ 4, 512, 512, 0, 0, 0, 0, 0 }, 8192, fw.prefill_rows, 2, .fp8, 512, 128);
+    seq.st.layout = try @import("cuda_layout.zig").Layout.init(.{ 4, 512, 512, 0, 0, 0, 0, 0, 0 }, 8192, fw.prefill_rows, 2, .fp8, 512, 128);
     seq.st.pos = 0;
     seq.st.mtp_len = 0;
     var e: Engine = undefined;
@@ -1431,7 +1549,7 @@ test "snapshot capture refuses uncommitted windows and mismatched MTP marks befo
 test "prompt resume refuses a saved position that differs from its requested mark" {
     var seq: Seq = undefined;
     seq.st.capacity = 8192;
-    seq.st.layout = try @import("cuda_layout.zig").Layout.init(.{ 4, 0, 0, 0, 0, 0, 0, 0 }, 8192, fw.prefill_rows, 0, .bf16, 512, 128);
+    seq.st.layout = try @import("cuda_layout.zig").Layout.init(.{ 4, 0, 0, 0, 0, 0, 0, 0, 0 }, 8192, fw.prefill_rows, 0, .bf16, 512, 128);
     var e: Engine = undefined;
     e.tp_group = null;
     e.dflash = null;
@@ -1483,7 +1601,7 @@ test "engine snapshot save and restore preserve visible state through reused sto
     d.api.cuStreamSynchronize = Mock.sync;
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
     for ([_]@import("cuda_cache.zig").Format{ .bf16, .fp8 }) |format| for ([_]bool{ false, true }) |mtp| {
-        const layout = try @import("cuda_layout.zig").Layout.init(.{ 4, 256, 256, 256, 256, 256, 256, 256 }, 4096, fw.prefill_rows, 2, format, 512, 128);
+        const layout = try @import("cuda_layout.zig").Layout.init(.{ 4, 256, 256, 256, 256, 256, 256, 256, 0 }, 4096, fw.prefill_rows, 2, format, 512, 128);
         const live = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(256), layout.total_bytes);
         defer std.testing.allocator.free(live);
         for (live, 0..) |*v, i| v.* = @truncate(i *% 37);
@@ -1546,7 +1664,7 @@ test "spill snapshot roundtrip checks metadata and discards failed imports witho
     var d = M.driver();
     for ([_]@import("cuda_cache.zig").Format{ .bf16, .fp8 }) |format| {
         var seq: Seq = undefined;
-        seq.st.layout = try (try @import("cuda_layout.zig").Layout.init(.{ 256, 0, 0, 0, 0, 0, 0, 0 }, 4096, prompt_rows, 1, format, 512, 128)).external();
+        seq.st.layout = try (try @import("cuda_layout.zig").Layout.init(.{ 256, 0, 0, 0, 0, 0, 0, 0, 0 }, 4096, prompt_rows, 1, format, 512, 128)).external();
         var cur = [_]u1{1};
         seq.st.cur = &cur;
         var e: Engine = undefined;
@@ -1695,7 +1813,7 @@ test "owner-only snapshots carry main and MTP prefixes to a new owner and refuse
         action: enum { restore, capture, reserve } = .restore,
 
         fn init(f: *@This(), d: *const cuda.Driver, lib: *const cuda.nccl.Library, endpoint: *C.End, old_owner: usize, format: @import("cuda_cache.zig").Format) !void {
-            const layout = try (try Layout.init(.{ 4, 256, 256, 256, 256, 256, 256, 256 }, 4096, fw.prefill_rows, 1, format, 512, 128)).external();
+            const layout = try (try Layout.init(.{ 4, 256, 256, 256, 256, 256, 256, 256, 0 }, 4096, fw.prefill_rows, 1, format, 512, 128)).external();
             f.parity = .{@intCast(endpoint.rank)};
             f.failed = null;
             f.seq = undefined;
@@ -1880,4 +1998,14 @@ test "MTP hidden rows survive other sequences reusing prompt and verify scratch"
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0 }), M.slice(e.draftRows(false), 12));
     e.cur = &b;
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&[_]u16{ 0x4180, 0x4190, 0x41a0, 0x41b0 }), M.slice(e.draftRows(false), 8));
+}
+
+fn verifyLabel(rows: usize) []const u8 {
+    return switch (rows) {
+        1 => "verify1",
+        2 => "verify2",
+        4 => "verify4",
+        8 => "verify8",
+        else => "verify",
+    };
 }

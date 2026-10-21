@@ -1,59 +1,79 @@
-//! Rank-zero resident vision weights and per-request native encoder state.
+//! Retained native-codec/request-binding adapter over the canonical stored-format vision Tower.
+//! The old materializing loader and independent BF16 device runtime are not a serving path;
+//! their explicit conversion and numerical qualification APIs retain their original coverage.
 const std = @import("std");
 const cuda = @import("cuda");
-const core = @import("core");
 const probe_mod = @import("cuda_vision_probe.zig");
-const host = @import("cuda_vision_weights.zig");
-const memory = @import("cuda_vision_engine_memory.zig");
-const tower = @import("cuda_vision_engine.zig");
+const vision = @import("cuda_vision.zig");
+const images_mod = @import("cuda_images.zig");
 const pipeline = @import("cuda_vision_pipeline.zig");
-const cudnn = @import("cudnn");
-const sdpa = @import("vision_sdpa");
+
+test "borrowed service retains the published optional Tower owner and never destroys it" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var d = @import("cuda_test_driver.zig").Memory.driver();
+            const images = try a.create(images_mod.Images);
+            defer a.destroy(images);
+            images.* = undefined;
+            images.d = &d;
+            images.run = .{ .stream = .{ .d = &d, .handle = null }, .f = undefined };
+            // Move the unpublished value into its stable owner before taking any loan.
+            const unpublished: vision.Tower = .{ .gpa = a, .d = &d, .lt = undefined, .mem = undefined, .ql = .{}, .inv_freq = undefined, .linears = .init(a), .ws = undefined };
+            images.tower = unpublished;
+            defer images.tower.?.linears.deinit();
+            var probe: probe_mod.Probe = undefined; // borrowed, never used by open/close
+            const service = try Service.open(a, std.testing.io, &d, null, images.run.stream, "not-read", &probe, .{}, images);
+            const actual = if (images.tower) |*owner| owner else unreachable;
+            try std.testing.expect(service.tower == actual);
+            try std.testing.expect(service.owned_tower == null and service.module == null);
+            service.tower.bytes = 173;
+            service.tower.busy.store(true, .release);
+            try std.testing.expectEqual(@as(u64, 173), actual.bytes);
+            try std.testing.expect(actual.busy.load(.acquire));
+            service.close(); // drains the borrowed stream, but does not deinit Tower
+            try std.testing.expect(actual.busy.load(.acquire));
+            try std.testing.expectEqual(@as(u64, 173), actual.bytes);
+            actual.busy.store(false, .release);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
 
 pub const Service = struct {
     gpa: std.mem.Allocator,
     context: cuda.abi.Context,
-    stream: cuda.Stream,
     probe: *probe_mod.Probe,
-    weights: memory.DeviceWeights,
-    conv: cudnn.Library,
-    attention: sdpa.Library,
-    linear: cuda.cublaslt.Library,
+    tower: *vision.Tower,
+    run: vision.Run,
+    owned_tower: ?vision.Tower = null,
+    module: ?cuda.Module = null,
 
-    pub fn open(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, context: cuda.abi.Context, stream: cuda.Stream, dir: []const u8, probe: *probe_mod.Probe) !*Service {
+    /// Reuse Images' canonical owner when present; otherwise load that same stored-format Tower.
+    /// `probe`, `shared` and qlinear's modules outlive this adapter and every encode it issues.
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, context: cuda.abi.Context, stream: cuda.Stream, dir: []const u8, probe: *probe_mod.Probe, ql: cuda.qlinear.Linear, shared: ?*images_mod.Images) !*Service {
         const self = try gpa.create(Service);
         errdefer gpa.destroy(self);
-        var checkpoint = try core.Checkpoint.openModelPrefix(gpa, io, dir, "model.visual.");
-        defer checkpoint.close();
-        const path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
-        defer gpa.free(path);
-        const json = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 24));
-        defer gpa.free(json);
-        var why: core.modelopt.Why = .{};
-        var admission = try @import("cuda_checkpoint.zig").Admission.read(gpa, json, &why);
-        defer admission.deinit();
-        var host_weights = if (admission.recipes) |*table| try host.Weights.loadMixed(gpa, probe.config, &checkpoint, table) else try host.Weights.load(gpa, probe.config, checkpoint.files.items);
-        defer host_weights.deinit(gpa);
-        const weights = try memory.DeviceWeights.init(gpa, d, &host_weights, 2 * 1024 * 1024 * 1024);
-        errdefer {
-            var w = weights;
-            w.deinit();
+        self.* = .{ .gpa = gpa, .context = context, .probe = probe, .tower = undefined, .run = undefined };
+        if (shared) |v| {
+            if (v.d != d or v.run.stream.d != d or v.run.stream.handle != stream.handle) return error.VisionPipelineDriverMismatch;
+            self.tower = if (v.tower) |*t| t else return error.NoVisionTower;
+            self.run = v.run;
+            return self;
         }
-        var conv = try cudnn.Library.open();
-        errdefer conv.close();
-        var attention = try sdpa.Library.open();
-        errdefer attention.close();
-        var linear = try cuda.cublaslt.Library.open();
-        errdefer linear.close();
-        self.* = .{ .gpa = gpa, .context = context, .stream = stream, .probe = probe, .weights = weights, .conv = conv, .attention = attention, .linear = linear };
+        var module = try cuda.Module.load(d, cuda.kernels.glm_vision);
+        errdefer module.unload();
+        const functions = try vision.Funcs.load(module);
+        self.owned_tower = try vision.Tower.load(gpa, io, d, dir, ql);
+        self.tower = if (self.owned_tower) |*t| t else unreachable;
+        self.module = module;
+        self.run = .{ .stream = stream, .f = functions };
         return self;
     }
 
     pub fn close(self: *Service) void {
-        self.linear.close();
-        self.attention.close();
-        self.conv.close();
-        self.weights.deinit();
+        @import("cuda_load_owner.zig").drain(self.run.stream, self.run.stream.d);
+        if (self.owned_tower) |*t| t.deinit();
+        if (self.module) |*m| m.unload();
         const gpa = self.gpa;
         gpa.destroy(self);
     }
@@ -61,16 +81,12 @@ pub const Service = struct {
     pub const Encoded = struct {
         gpa: std.mem.Allocator,
         request: *pipeline.Request,
-        encoders: []*tower.Engine,
 
         pub fn close(self: *Encoded) !void {
+            // Request owns every CPU patch/position/id and the completed device feature table.
+            // Failed fencing/free retains that ownership for a retry.
             try self.request.deinit();
             self.gpa.destroy(self.request);
-            for (self.encoders) |encoder| {
-                try encoder.deinit();
-                self.gpa.destroy(encoder);
-            }
-            self.gpa.free(self.encoders);
             self.* = undefined;
         }
     };
@@ -82,40 +98,12 @@ pub const Service = struct {
         const prepared = pipeline.Request.prepare(self.gpa, &self.probe.library, self.probe.config, encoded, ids, .{ .prompt_limit = ids.len + 1 });
         self.probe.mutex.unlock(self.probe.io);
         request.* = try prepared;
-        errdefer request.deinit() catch {};
-        var encoders: std.ArrayList(*tower.Engine) = .empty;
-        errdefer {
-            for (encoders.items) |encoder| {
-                encoder.deinit() catch {};
-                self.gpa.destroy(encoder);
-            }
-            encoders.deinit(self.gpa);
-        }
-        for (request.images) |image| {
-            const found = for (encoders.items) |encoder| {
-                const geometry = encoder.activations.layout.geometry;
-                if (geometry.gh == image.grid[1] and geometry.gw == image.grid[2]) break true;
-            } else false;
-            if (found) continue;
-            if (encoders.items.len == 4) return error.TooManyVisionGeometries;
-            const encoder = try self.gpa.create(tower.Engine);
-            encoder.* = tower.Engine.init(self.gpa, &self.weights, self.stream, .{ .groups = 1, .gh = image.grid[1], .gw = image.grid[2] }, .{
-                .convolution = &self.conv.api,
-                .sdpa = &self.attention.api,
-                .linear = &self.linear,
-                .image = cuda.kernels.glm_vision_ops,
-                .package = .target_qualification,
-            }, .{ .workspace_limit = 64 * 1024 * 1024, .max_activation_bytes = 1024 * 1024 * 1024 }) catch |err| {
-                self.gpa.destroy(encoder);
-                return err;
-            };
-            encoders.append(self.gpa, encoder) catch |err| {
-                encoder.deinit() catch {};
-                self.gpa.destroy(encoder);
-                return err;
-            };
-        }
-        try request.encode(encoders.items, .{ .stream = self.stream, .replica = replica, .world = world, .rank = 0, .expected_context = self.context });
-        return .{ .gpa = self.gpa, .request = request, .encoders = try encoders.toOwnedSlice(self.gpa) };
+        errdefer request.deinit() catch {
+            // A failed context fence cannot authorize releasing request-owned CUDA/host sources.
+            @import("cuda_load_owner.zig").drain(self.run.stream, self.run.stream.d);
+            request.deinit() catch @panic("vision request cleanup failed after drain");
+        };
+        try request.encodeTower(self.tower, &self.run, .{ .stream = self.run.stream, .replica = replica, .world = world, .rank = 0, .expected_context = self.context });
+        return .{ .gpa = self.gpa, .request = request };
     }
 };

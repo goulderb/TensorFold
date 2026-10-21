@@ -8,11 +8,11 @@ const b16 = @import("cuda_b16.zig");
 
 /// One KDA layer: proj bf16 [3 heads 128 + 256 + heads][dims] (with EXL3's qkv only its last 256 + heads), f_b, g_b, o.
 pub const Layer = struct {
-    proj: b16.Proj,
-    qkv: ?cuda.qlinear.Weight = null,
-    fb: b16.Proj,
-    gb: b16.Proj,
-    o: b16.Proj,
+    proj: @import("cuda_proj.zig").Proj,
+    qkv: ?@import("cuda_proj.zig").Proj = null,
+    fb: @import("cuda_proj.zig").Proj,
+    gb: @import("cuda_proj.zig").Proj,
+    o: @import("cuda_proj.zig").Proj,
     conv_w: u64, // fp32 taps for the serial chain and replay-compatible decode
     prompt_conv_w: ?u64 = null, // bf16 taps for the production WY prompt kernel
     a_log: u64,
@@ -40,7 +40,7 @@ pub fn block(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Laye
 /// forward.out_proj's fill for the KDA block: o_proj of rows lo..hi (s.saves.out) into out [hi - lo][dims] fp32.
 pub fn fill(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi: usize, out: u64) !void {
     const n = l.heads * kda.dk;
-    try b16.proj(set, stream, s.saves.out + lo * n * 2, n, l.o, out, s.mm_part, hi - lo, l.dims, n, true);
+    try @import("cuda_proj.zig").matmul(set, stream, l.o, s.saves.out + lo * n * 2, n, out, s.mm_part, hi - lo, l.dims, n, true);
 }
 
 /// The block up to its out_proj: the projections, the chain, and a prompt chunk's conv window commit.
@@ -58,13 +58,13 @@ pub fn project(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
     if (l.qkv) |q| {
         // EXL3: q, k and v quantized, [f_a | g_a | b] in BF16, each into its columns of s.p through s.tmp
         const small = w - fa;
-        try b16.proj(set, stream, x, x_stride, .{ .q = q }, s.tmp, s.mm_part, rows, fa, l.dims, false);
-        try b16.copyRows(set, stream, s.tmp, fa * 2, s.p, w * 2, rows, fa * 2);
-        try b16.proj(set, stream, x, x_stride, l.proj, s.tmp, s.mm_part, rows, small, l.dims, false);
-        try b16.copyRows(set, stream, s.tmp, small * 2, s.p + fa * 2, w * 2, rows, small * 2);
-    } else try b16.proj(set, stream, x, x_stride, l.proj, s.p, s.mm_part, rows, w, l.dims, false);
-    try b16.proj(set, stream, s.p + fa * 2, w, l.fb, s.ka, s.mm_part, rows, n, kda.dk, false);
-    try b16.proj(set, stream, s.p + (fa + kda.dk) * 2, w, l.gb, s.kg, s.mm_part, rows, n, kda.dk, false);
+        try @import("cuda_proj.zig").matmul(set, stream, q, x, x_stride, s.tmp, s.mm_part, rows, fa, l.dims, false);
+        try @import("cuda_proj.zig").copyRows(set, stream, s.tmp, fa * 2, s.p, w * 2, rows, fa * 2);
+        try @import("cuda_proj.zig").matmul(set, stream, l.proj, x, x_stride, s.tmp, s.mm_part, rows, small, l.dims, false);
+        try @import("cuda_proj.zig").copyRows(set, stream, s.tmp, small * 2, s.p + fa * 2, w * 2, rows, small * 2);
+    } else try @import("cuda_proj.zig").matmul(set, stream, l.proj, x, x_stride, s.p, s.mm_part, rows, w, l.dims, false);
+    try @import("cuda_proj.zig").matmul(set, stream, l.fb, s.p + fa * 2, w, s.ka, s.mm_part, rows, n, kda.dk, false);
+    try @import("cuda_proj.zig").matmul(set, stream, l.gb, s.p + (fa + kda.dk) * 2, w, s.kg, s.mm_part, rows, n, kda.dk, false);
 }
 
 /// The chain over `rows` projected rows (s.p, s.ka, s.kg) on one sequence's conv window and recurrent state.

@@ -110,6 +110,7 @@ test "profile facts use sixteen target rows and fixed seven neural drafts, not l
     const engine = @import("cuda_engine.zig");
     const backend = @import("cuda_lanes.zig");
     var e: engine.Engine = undefined;
+    e.drafter = null;
     e.settings = .{};
     e.mtp = true;
     e.dflash = null;
@@ -143,13 +144,13 @@ test "production profile is shared by TP fingerprints and requires the DFlash lo
     try t.expectEqual(ranks.Drafter.dflash2, settings.draft);
     try t.expectEqual(verify.Plan.dflash7, settings.dflash_verify);
     var all = [_]ranks.Fingerprint{
-        ranks.Fingerprint.of(2, 0, settings, 4096, @splat(0), @splat(0), "fixture"),
-        ranks.Fingerprint.of(2, 1, settings, 4096, @splat(0), @splat(0), "fixture"),
+        ranks.Fingerprint.of(2, 0, settings, 4096, true, @splat(0), @splat(0), ranks.hashBytes("fixture")),
+        ranks.Fingerprint.of(2, 1, settings, 4096, true, @splat(0), @splat(0), ranks.hashBytes("fixture")),
     };
     try t.expect(ranks.mismatch(&all) == null);
     var different = settings;
     different.draft_profile.copy.enabled = false;
-    all[1] = ranks.Fingerprint.of(2, 1, different, 4096, @splat(0), @splat(0), "fixture");
+    all[1] = ranks.Fingerprint.of(2, 1, different, 4096, true, @splat(0), @splat(0), ranks.hashBytes("fixture"));
     try t.expectEqual(ranks.Fingerprint.Field.draft_profile, ranks.mismatch(&all).?.field);
     Env.values = &.{ .{ .name = "TF_GLM_DRAFT_PROFILE", .value = "production" }, .{ .name = "TF_GLM_DRAFTER", .value = "mtp" } };
     try t.expectError(error.BadSetting, ranks.Settings.read(Env.get, &problem));

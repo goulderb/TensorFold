@@ -14,8 +14,8 @@ export fn exl3Compile(d: *const cuda.Driver, dense: *cuda.exl3.Dense, group: *cu
         _ = upload.dense(parts, g) catch return;
     }
     _ = cuda.exl3_upload.layer(&upload, arena.allocator(), 128, 128, .mul1, 0, 0, &.{}, &.{}, &.{}) catch {};
-    const linear: cuda.qlinear.Linear = .{ .exl3_dense = dense };
-    const weight: cuda.qlinear.Weight = .{ .exl3_dense = w.* };
+    const linear: cuda.qlinear.Linear = .{ .exl3 = dense };
+    const weight: cuda.qlinear.Weight = .{ .exl3 = w.* };
     linear.decode(s.*, weight, .{ .x = 0 }, 0, 1) catch {};
     linear.prompt(s.*, weight, .{ .x = 0 }, 0, 1) catch {};
     linear.decodeF32(s.*, weight, .{ .x = 0 }, 0, 1) catch {};
@@ -26,9 +26,9 @@ export fn exl3Compile(d: *const cuda.Driver, dense: *cuda.exl3.Dense, group: *cu
     grouped.prompt(s.*, .down_bf16, .{ .x = 0, .stride = l.width }, l.*, p.*, 0, 1, -1) catch {};
 }
 
-export fn retainedExl3Compile(k: *const cuda.exl3_linear.Kernels, e: *const cuda.exl3_experts.Experts, w: *const cuda.exl3_linear.Matrix, l: *const cuda.experts.Layer, s: *const cuda.Stream, p: *const cuda.grouped.Plan) void {
-    const linear: cuda.qlinear.Linear = .{ .exl3 = k };
-    const weight: cuda.qlinear.Weight = .{ .exl3 = w.* };
+export fn retainedExl3Compile(k: *const cuda.exl3_linear.Kernels, e: *const cuda.exl3_trellis_experts.Experts, w: *const cuda.exl3_linear.Matrix, l: *const cuda.experts.Layer, s: *const cuda.Stream, p: *const cuda.grouped.Plan) void {
+    const linear: cuda.qlinear.Linear = .{ .exl3_trellis = k };
+    const weight: cuda.qlinear.Weight = .{ .exl3_trellis = w.* };
     linear.decode(s.*, weight, .{ .x = 0 }, 0, 1) catch {};
     linear.prompt(s.*, weight, .{ .x = 0 }, 0, 1) catch {};
     linear.decodeF32(s.*, weight, .{ .x = 0 }, 0, 1) catch {};

@@ -5,7 +5,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cuda = @import("cuda");
-const dynlib = cuda.dynlib;
+const platform = @import("sys");
 const abi = cuda.abi;
 pub const c = @import("cudnn_headers");
 pub const Status = c.cudnnStatus_t;
@@ -43,7 +43,7 @@ fn version(api: *const Api) Error!void {
 }
 
 pub const Library = struct {
-    lib: dynlib.Library,
+    lib: platform.DynLib,
     api: Api,
     pub fn open() Error!Library {
         if (builtin.os.tag == .windows) return error.LibraryUnavailable;
@@ -51,10 +51,10 @@ pub const Library = struct {
     }
     /// Package the full matching sublibrary set. No older-version or graph-composition fallback.
     pub fn openPath(path: []const u8) Error!Library {
-        var lib = dynlib.Library.open(path) catch return error.LibraryUnavailable;
+        var lib = platform.DynLib.open(path) catch return error.LibraryUnavailable;
         errdefer lib.close();
         var missing: []const u8 = "";
-        const api = lib.resolve(Api, &missing) catch return error.MissingSymbol;
+        const api = platform.resolveSymbols(&lib, Api, &missing) catch return error.MissingSymbol;
         try version(&api);
         return .{ .lib = lib, .api = api };
     }

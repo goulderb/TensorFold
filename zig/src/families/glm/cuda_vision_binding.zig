@@ -1,6 +1,10 @@
 //! Live-process, full-rank BF16 vision row binding. The pipeline owns Table, its buffer and host slices.
 //! No encoder, allocator, callback or language embedding substitution is hidden in this module.
 const std = @import("std");
+
+test {
+    _ = @import("cuda_vision_binding_test.zig");
+}
 const cuda = @import("cuda");
 const max_context: usize = 256 * 1024;
 const max_rows: usize = @import("cuda_state.zig").prefill_rows;
