@@ -389,6 +389,28 @@ not establish backbone parity or full-engine GPU fit.
 Existing Qwen/Hugging Face, TensorFold and
 transitive notices remain applicable.
 
+## Clef Flash joint schema head design
+
+`zig/src/families/clef/` and `include/tfclef.h` adapt the design of
+`joint_schema_model.py` from
+[Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash), revision
+`fde727a287004204b7518dcc983fe64379776712`, Apache-2.0, whose license and model
+card stay in `clef-flash-fde727a2/`. Type of reuse: design only. The head
+checkpoint walk derives its 122 tensor names and shapes from that file's
+`JointSchemaHead`, `EvidenceRoutingLayer` and PyTorch `TransformerDecoderLayer`
+module tree and `joint_head_config.json`. The C record carries
+`encode_record`'s input ids and question and option spans. Nothing is copied
+from Cloudflare code into Zig, C or CUDA. `zig/src/families/clef/fixtures/`
+retains the unmodified `joint_head_config.json` and `joint_head.safetensors`
+JSON header bytes; `capture.json` records their SHA256 digests, the file size
+and the pinned file digest from the revision's Hugging Face metadata. No head
+weights are included.
+
+Local changes: strict config and header admission, a device packing plan
+through the existing BF16 lane packer, a digest check on the mapped file before
+any upload, record validation with a derived option-to-question map, a checked
+device budget and the versioned C export layer with host tests.
+
 ## Qwen host sampler tuning
 
 The local change at `b864564587f00f308ff9215c9870bffcd11da61f`

@@ -29,6 +29,15 @@ reuses existing kernel bindings, stages bounded host embedding rows and separate
 terminal weights from final normalization. Native serving remains disabled.
 No model implementation, checkpoint weights or joint-head arithmetic is copied.
 
+The native Clef library (`zig/src/families/clef/`, `include/tfclef.h`) adapts
+the design of Cloudflare's `joint_schema_model.py` from the same revision,
+Apache-2.0: the joint schema head's tensor roles, from its module tree, and
+the encoded record's question and option spans. It is a reimplementation; no
+Cloudflare code is copied into Zig, C or CUDA. `zig/src/families/clef/fixtures/`
+copies the unmodified `joint_head_config.json` and the `joint_head.safetensors`
+JSON header; `capture.json` records their hashes and the pinned file digest.
+No head weights are included.
+
 TensorFold uses [MLX](https://github.com/ml-explore/mlx) and
 [mlx-lm](https://github.com/ml-explore/mlx-lm), MIT License, Copyright © 2023 Apple Inc.
 The native engine installs and links neither. It reads checkpoints in their formats, and its Metal kernels under

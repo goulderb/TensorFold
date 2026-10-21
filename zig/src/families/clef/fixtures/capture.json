@@ -1,0 +1,12 @@
+{
+  "repository": "Cloudflare/clef-flash",
+  "revision": "fde727a287004204b7518dcc983fe64379776712",
+  "capture": "Original joint_head.safetensors JSON header bytes and joint_head_config.json only; no weight payloads.",
+  "file_bytes": 243538016,
+  "header_bytes": 12368,
+  "header_sha256": "1495a5c4f5dfb6e43b55910fc520acb17f61b88db9b3741746e9958280ac53b1",
+  "file_sha256": "19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0",
+  "file_sha256_source": "Hugging Face download metadata for the pinned revision, rechecked against the staged file at capture",
+  "config_sha256": "77efe959a38b5b17b241543e129e695f3c77465ece55a25985279bd8176279a0",
+  "tensors": 122
+}

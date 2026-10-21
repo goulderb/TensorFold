@@ -3,3 +3,5 @@ LICENSES/donors/clef-flash-fde727a2/* -text whitespace=blank-at-eol,blank-at-eof
 zig/src/families/qwen3_5/fixtures/clef_flash/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
 # Safetensors JSON headers include format padding covered by their hashes.
 zig/src/families/qwen3_5/fixtures/clef_flash/headers/*.safetensors.header.json -whitespace
+zig/src/families/clef/fixtures/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+zig/src/families/clef/fixtures/*.safetensors.header.json -whitespace

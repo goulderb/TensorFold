@@ -307,6 +307,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     b.step("test-qwen35-bundle-operators-host", "Split-M and atomic FP8 group tests (CPU only)").dependOn(&bundle_operators.step);
     @import("h3_host.zig").targets(b, cuda, step);
     const mods = family(b, host, .debug, cuda, draft_ids);
+    @import("clef.zig").hostTests(b, cuda, mods.core, mods.qwen35, step);
     const deferred_run = b.addRunArtifact(b.addTest(.{ .root_module = mods.lanes, .filters = &.{"deferred draft shape"} }));
     b.step("test-deferred-draft-host", "Deferred head selection after host work and copy precedence").dependOn(&deferred_run.step);
     const contract_glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);
