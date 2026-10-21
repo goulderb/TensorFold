@@ -124,13 +124,13 @@ test "canonical Engine.verifyShared stages five 8-row windows and refuses a redu
         p.* = .{ .slot = @intCast(i), .ids = id, .out = out };
     }
     var e: Engine = undefined;
-    e.full_graphs = null;
+    e.full_graphs = @as(target_forward.Runtime, undefined);
     e.ffn_graphs = null;
     e.route_trace = null;
     e.prefetch = null;
     e.tp_group = null;
     e.replicas = .{};
-    e.target_graphs_active = false;
+    e.target_graphs_active = true;
     e.capture_lifetime = 0;
     e.structured = false;
     e.pair_failure = struct {
@@ -159,7 +159,27 @@ test "canonical Engine.verifyShared stages five 8-row windows and refuses a redu
     e.m.prompt_latent = null;
     e.m.source_dense = null;
     e.m.source_upcast = null;
-    e.m.copy_rows = dummy;
+    e.m.copy_rows = .{ .d = &d, .handle = @ptrFromInt(7) };
+    const TapCopy = struct {
+        var copies: usize = 0;
+        fn launch(f: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            if (f == @as(cuda.abi.Function, @ptrFromInt(7))) {
+                const a = args.?;
+                const src = @as(*const u64, @ptrCast(@alignCast(a[0].?))).*;
+                const src_stride = @as(*const i64, @ptrCast(@alignCast(a[1].?))).*;
+                const dst = @as(*const u64, @ptrCast(@alignCast(a[2].?))).*;
+                const dst_stride = @as(*const i64, @ptrCast(@alignCast(a[3].?))).*;
+                const nrows: usize = @intCast(@as(*const i32, @ptrCast(@alignCast(a[4].?))).*);
+                const bytes: usize = @intCast(@as(*const i32, @ptrCast(@alignCast(a[5].?))).*);
+                for (0..nrows) |r| @memcpy(Memory.slice(dst + r * @as(u64, @intCast(dst_stride)), bytes), Memory.slice(src + r * @as(u64, @intCast(src_stride)), bytes));
+                copies += 1;
+            }
+            _ = Memory.launches.fetchAdd(1, .monotonic);
+            return 0;
+        }
+    };
+    TapCopy.copies = 0;
+    d.api.cuLaunchKernel = TapCopy.launch;
     e.greedy_rows = try greedy_mod.Greedy.init(std.testing.allocator, &d, 1, 64);
     defer e.greedy_rows.deinit();
     defer {
@@ -188,9 +208,12 @@ test "canonical Engine.verifyShared stages five 8-row windows and refuses a redu
         var wide_out: [9]u32 = undefined;
         const overflow = [_]Part{.{ .slot = 0, .ids = &wide, .out = &wide_out }};
         try std.testing.expectError(error.WindowTooWide, e.verifyShared(&overflow));
-        for (0..40) |row| std.mem.writeInt(u32, Memory.slice(dr.taps_step + row * dflash.TAP_ROW, 4)[0..4], @intCast(0xC0DE0000 + row), .little);
+        const tap_src = e.bs.?.taps.?;
+        for (0..40) |row| std.mem.writeInt(u32, Memory.slice(tap_src.ptr + row * @import("cuda_taps.zig").hidden * 2, 4)[0..4], @intCast(0xC0DE0000 + row), .little);
         Memory.launches.store(0, .monotonic);
+        TapCopy.copies = 0;
         try e.verifyShared(parts[0..5]);
+        try std.testing.expect(TapCopy.copies >= @import("cuda_taps.zig").layers.len);
         try std.testing.expect(Memory.launches.load(.monotonic) >= 44);
         try std.testing.expectEqual(@as(u64, 1), dr.verifies);
         try std.testing.expectEqual(@as(u64, 1), e.verify_widths[40]);
@@ -206,12 +229,53 @@ test "canonical Engine.verifyShared stages five 8-row windows and refuses a redu
                 try std.testing.expectEqual(@as(u32, @intCast(0xC0DE0000 + slot * 8 + r)), got);
             }
         }
+        {
+            const D = dflash.D;
+            const dense: @import("cuda_mm.zig").Tiled = .{ .w = 0, .n = D, .k = D };
+            dr.fc = .{ .bf16 = dense };
+            dr.hproj = dense;
+            for (&dr.layers) |*layer| layer.* = .{ .in_norm = 0, .post_norm = 0, .qn = 0, .kn = 0, .a_base = 0, .m_base = 0, .qkv = .{ .bf16 = dense }, .kv = .{ .bf16 = dense }, .o = .{ .bf16 = dense }, .gu = .{ .bf16 = dense }, .down = dense, .a_proj = .{ .bf16 = dense }, .m_proj = .{ .bf16 = dense } };
+            e.m.mm = .{ .by_rows = @splat(dummy), .packed_rows = @splat(@splat(dummy)), .prompt = dummy, .reduce = dummy, .tile = dummy, .tile_packed = @splat(dummy), .pdl = false };
+            e.m.q4 = .{ .group = dummy, .pack_dense = dummy, .transpose = dummy, .gb10 = false };
+            var cin = try cuda.DeviceBuffer.alloc(&d, 40 * dflash.TAP_ROW);
+            defer cin.free();
+            dr.cin = cin.ptr;
+            var c1 = try cuda.DeviceBuffer.alloc(&d, 40 * D * 2);
+            defer c1.free();
+            dr.c1 = c1.ptr;
+            var ctx_h = try cuda.DeviceBuffer.alloc(&d, 40 * D * 2);
+            defer ctx_h.free();
+            dr.ctx = ctx_h.ptr;
+            var ckv = try cuda.DeviceBuffer.alloc(&d, 40 * D * 2);
+            defer ckv.free();
+            dr.ckv = ckv.ptr;
+            var cpos = try cuda.DeviceBuffer.alloc(&d, dflash.MAX_CTX * 8);
+            defer cpos.free();
+            dr.cpos = cpos.ptr;
+            var crings = try cuda.DeviceBuffer.alloc(&d, dflash.MAX_CTX * 8);
+            defer crings.free();
+            dr.crings = crings.ptr;
+            var positions: [dflash.MAX_CTX]i64 = undefined;
+            var rings: [dflash.MAX_CTX]u64 = undefined;
+            dr.h_cpos = &positions;
+            dr.h_crings = &rings;
+            var matching: [5]dflash.Req = undefined;
+            for (&matching, 0..) |*q, i| q.* = .{ .slot = @intCast(i), .pos = 8, .n = 8, .anchor = 1, .propose = false };
+            dr.lost = 0;
+            try dr.draft(&e, &matching);
+            try std.testing.expectEqual(@as(u64, 0), dr.lost);
+            for (0..5) |slot| {
+                try std.testing.expectEqual(@as(i64, 0), dr.slots.items[slot].from);
+                try std.testing.expectEqual(@as(i64, 8), dr.slots.items[slot].upto);
+            }
+            try std.testing.expectEqualSlices(i64, &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, dr.h_cpos[0..8]);
+        }
         var stale: [5]dflash.Req = undefined;
         for (&stale, 0..) |*q, i| q.* = .{ .slot = @intCast(i), .pos = 99, .n = 8, .anchor = 1, .propose = false };
         dr.lost = 0;
         try dr.draft(&e, &stale);
         try std.testing.expectEqual(@as(u64, 5), dr.lost);
-        for (0..64) |row| std.mem.writeInt(u32, Memory.slice(dr.taps_step + row * dflash.TAP_ROW, 4)[0..4], @intCast(0xDA7A0000 + row), .little);
+        for (0..64) |row| std.mem.writeInt(u32, Memory.slice(tap_src.ptr + row * @import("cuda_taps.zig").hidden * 2, 4)[0..4], @intCast(0xDA7A0000 + row), .little);
         Memory.launches.store(0, .monotonic);
         try e.verifyShared(&parts);
         try std.testing.expect(Memory.launches.load(.monotonic) >= 68);
@@ -332,11 +396,8 @@ pub const Engine = struct {
             startup_problem = err;
             break :blk settings.draft;
         };
-        if (settings.draft_profile.enabled and startup_problem == null) {
-            if (settings.draft != .dflash2 or settings.dflash_verify != .dflash7) startup_problem = error.BadDraftProfile;
-            settings.draft_profile.copy.validate() catch |err| {
-                startup_problem = err;
-            };
+        if (startup_problem == null) {
+            if (ranks.validateDraftOwner(settings, o.drafter != null)) |err| startup_problem = err;
         }
         if (settings.draft == .dflash2 and startup_problem == null) {
             if (world != 2 or c.hidden != 4096 or c.hc != 4 or c.vocab != 154880 or (!o.partial_dflash_check and settings.layers != 0 and settings.layers != c.layers)) startup_problem = error.UnsupportedDFlashTarget;
@@ -623,7 +684,7 @@ pub const Engine = struct {
             if (!try e.pairedReady(graph_problem == null)) return graph_problem orelse error.PeerTargetGraphsRefused;
             std.log.info("GLM complete target graphs rank={d}: embedding, all target layers, taps and head; exact rows 1..{d}", .{ rank, target_graph.max_rows });
             e.full_graphs.?.tp_group = e.collectiveGroup();
-            if (settings.draft_profile.enabled) {
+            if (ranks.selectedDraftProfile(o.drafter != null, settings)) {
                 e.prepareTargetGraphs() catch |err| {
                     e.pair_failure(err);
                     return err;
@@ -1973,6 +2034,21 @@ test "canonical owner snapshot export import restore preserves initialized draft
     try std.testing.expectError(error.SpillShape, e.importState(2, 2048, host.meta[0..host.meta_len], host.bytes.len, @ptrCast(&host.bytes), Pump.copy));
     try std.testing.expect(!e.holds(2));
     e.canonical = previous;
+    {
+        var shape = e.spillShape();
+        var epoch = std.crypto.hash.sha2.Sha256.init(.{});
+        epoch.update("glm-dflash2-saved-v1\x00");
+        epoch.update(&e.canonical.checkpoint);
+        var bits: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bits, e.canonical.bits, .little);
+        epoch.update(&bits);
+        shape.draft_identity = epoch.finalResult();
+        var meta: [spill_payload.max_meta]u8 = undefined;
+        const encoded = try spill_payload.encode(shape, 2048, 0, null, saved.cur, &meta);
+        defer if (e.holds(3)) e.discardState(3);
+        try std.testing.expectError(error.SpillShape, e.importState(3, 2048, encoded, host.bytes.len, @ptrCast(&host.bytes), Pump.copy));
+        try std.testing.expect(!e.holds(3));
+    }
     try e.importState(2, 2048, host.meta[0..host.meta_len], host.bytes.len, @ptrCast(&host.bytes), Pump.copy);
     defer e.discardState(2);
     @memset(M.slice(ring0.ptr, ring0.len), 0x11);
@@ -1994,6 +2070,17 @@ test "canonical owner snapshot export import restore preserves initialized draft
     };
     Failed.err = null;
     e.pair_failure = Failed.fail;
+    {
+        const draft_at = std.mem.alignForward(usize, plan.byteCount(), 256);
+        std.mem.writeInt(u32, M.slice(e.snaps.get(2).?.buf.ptr + draft_at, 12)[8..12], dflash.snapshot_version_unmaterialized, .little);
+        dr.slots.items[0].from = 77;
+        dr.slots.items[0].upto = 77;
+        try std.testing.expectError(error.BadDraftSnapshot, e.restoreAt(2, 2048));
+        try std.testing.expectEqual(@as(i64, 77), dr.slots.items[0].from);
+        try std.testing.expectEqual(@as(i64, 77), dr.slots.items[0].upto);
+        try std.testing.expectEqual(error.PairedRestoreFailed, Failed.err.?);
+    }
+    Failed.err = null;
     M.slice(e.snaps.get(2).?.buf.ptr + std.mem.alignForward(usize, plan.byteCount(), 256), 8)[0] = 'X';
     try std.testing.expectError(error.BadDraftSnapshot, e.restoreAt(2, 2048));
     try std.testing.expectEqual(error.PairedRestoreFailed, Failed.err.?);

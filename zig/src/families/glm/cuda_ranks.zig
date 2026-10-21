@@ -31,6 +31,19 @@ pub fn targetMtp(canonical: bool, draft: Drafter) bool {
     return draft == .mtp and !canonical;
 }
 
+/// Leftover TF_GLM_DRAFT_PROFILE is not the selected owner when --drafter is set.
+pub fn selectedDraftProfile(canonical: bool, settings: Settings) bool {
+    return settings.draft_profile.enabled and !canonical;
+}
+
+/// Engine.init's profile check: leftover production must not refuse canonical MTP, and selected production still requires DFlash2/7.
+pub fn validateDraftOwner(settings: Settings, canonical: bool) ?anyerror {
+    if (!selectedDraftProfile(canonical, settings)) return null;
+    if (settings.draft != .dflash2 or settings.dflash_verify != .dflash7) return error.BadDraftProfile;
+    settings.draft_profile.copy.validate() catch |err| return err;
+    return null;
+}
+
 /// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
 pub const Settings = struct {
     kv: cache.Format = .bf16,
@@ -458,7 +471,7 @@ pub const CanonicalDraft = struct {
     /// Saved-state identity for the chosen canonical owner. Distinct from Fingerprint.layout.
     pub fn snapshotIdentity(self: CanonicalDraft) [32]u8 {
         var h = Sha256.init(.{});
-        h.update("glm-dflash2-saved-v1\x00");
+        h.update("glm-dflash2-saved-v2\x00");
         h.update(&self.checkpoint);
         var bits: [4]u8 = undefined;
         std.mem.writeInt(u32, &bits, self.bits, .little);
@@ -1485,4 +1498,45 @@ test "saved-state identity uses canonical content and precision, not the wire la
     const env = persistedDraftSnapshot(false, a, 4096, 22_282_240, legacy);
     try std.testing.expectEqual(@as(u64, 22_282_240), env.bytes);
     try std.testing.expectEqualSlices(u8, &legacy, &env.identity);
+    var old = Sha256.init(.{});
+    old.update("glm-dflash2-saved-v1\x00");
+    old.update(&a.checkpoint);
+    var bits: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bits, a.bits, .little);
+    old.update(&bits);
+    try std.testing.expect(!std.mem.eql(u8, &a.snapshotIdentity(), &old.finalResult()));
+}
+
+test "canonical leftover production profile votes success through startupVote" {
+    const M = @import("cuda_test_driver.zig").Memory;
+    const Env = struct {
+        fn get(name: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "TF_GLM_DRAFT_PROFILE")) return "production";
+            if (std.mem.eql(u8, name, "TF_GLM_DRAFTER")) return "dflash2";
+            if (std.mem.eql(u8, name, "TF_GLM_DFLASH_DIR")) return "/draft";
+            return null;
+        }
+    };
+    var problem_text: []const u8 = "";
+    const settings = try Settings.readForOwner(Env.get, &problem_text, true);
+    try std.testing.expectEqual(Drafter.mtp, settings.draft);
+    const local = validateDraftOwner(settings, true);
+    try std.testing.expect(local == null);
+    const Recording = struct {
+        fn allGather(src: u64, dst: u64, n: usize, dtype: cuda.nccl.DataType, _: cuda.nccl.Comm, _: cuda.abi.Stream) callconv(.c) cuda.nccl.Result {
+            std.debug.assert(n == 4 and dtype == .u8);
+            const mine: *const u32 = @ptrFromInt(src);
+            const votes = [_]u32{ mine.*, mine.* };
+            @memcpy(M.slice(dst, 8), std.mem.sliceAsBytes(&votes));
+            return 0;
+        }
+    };
+    var d = M.driver();
+    var lib: cuda.nccl.Library = .{ .lib = undefined, .api = undefined };
+    lib.api.ncclAllGather = Recording.allGather;
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    var all: [2]u32 = undefined;
+    try startupVote(&d, &lib, null, stream, 0, local, &all);
+    try std.testing.expectEqual(@as(u32, 1), all[0]);
+    try std.testing.expect(M.empty());
 }

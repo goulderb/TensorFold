@@ -38,6 +38,11 @@ test {
 
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
+
+/// Captured full-target graphs cover 1..32 rows. Wider canonical shared windows stay eager.
+pub fn usesCapturedFullTarget(rows: usize) bool {
+    return rows > 0 and rows <= target_graph.max_rows;
+}
 pub const State = state.State;
 pub const Buffers = state.Buffers;
 
@@ -892,6 +897,7 @@ pub const Forward = struct {
             }
         }
         for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, rows, c.hidden, c.hc);
+        try f.publishEnabledTaps(rows);
         try f.finish(rows);
         try f.joinPrefetch();
     }
@@ -899,11 +905,13 @@ pub const Forward = struct {
     /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.
     pub fn run(f: *const Forward, ids: []const i32) !void {
         if (f.full_target) |runtime| {
-            runtime.run(f, ids) catch |err| {
-                f.target_failure(err);
-                return err;
-            };
-            return;
+            if (usesCapturedFullTarget(ids.len)) {
+                runtime.run(f, ids) catch |err| {
+                    f.target_failure(err);
+                    return err;
+                };
+                return;
+            }
         }
         const R = ids.len;
         try f.beginRows(R);
@@ -931,6 +939,7 @@ pub const Forward = struct {
             try f.productionPrompt(f.pieces.?, R);
             _ = overlap_dispatch[f.prefill_overlap - 1].fetchAdd(1, .monotonic);
         } else if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
+        try f.publishEnabledTaps(R);
         try f.finish(R);
         if (f.prof) |p| p.mark(f.stream, .head);
         try f.joinPrefetch();
@@ -1028,6 +1037,16 @@ pub const Forward = struct {
         try projection.copyRows(f.set(), f.stream, source.ptr + plane * r.b.rows * D * 2, D * 2, target.out + plane * D * 2, taps_mod.layers.len * D * 2, rows, D * 2);
     }
 
+    /// Tap layers already present in the mixer loop published from ffnSite. Remaining configured tap layers still use captureTap/publishTaps.
+    fn publishEnabledTaps(f: *const Forward, rows: usize) !void {
+        const n_layers = f.ranks[0].w.layers.len;
+        for (taps_mod.layers) |layer| {
+            if (layer < n_layers) continue;
+            for (f.ranks) |r| try f.captureTap(r, layer, 0, rows);
+            try f.publishTaps(layer, rows);
+        }
+    }
+
     /// The final norm and this rank's rows of the head (a prompt buffer's last row only).
     fn finish(f: *const Forward, R: usize) !void {
         const c = &f.ranks[0].w.config;
@@ -1118,6 +1137,14 @@ pub const Forward = struct {
         }
     }
 };
+
+test "full target graphs capture at most 32 rows and leave wider shared windows eager" {
+    try std.testing.expect(usesCapturedFullTarget(1));
+    try std.testing.expect(usesCapturedFullTarget(32));
+    try std.testing.expect(!usesCapturedFullTarget(0));
+    try std.testing.expect(!usesCapturedFullTarget(40));
+    try std.testing.expect(!usesCapturedFullTarget(64));
+}
 
 test "actual forward and MTP bodies refuse invalid input before launches or token upload" {
     const Trace = struct {

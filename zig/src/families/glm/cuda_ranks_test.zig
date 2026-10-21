@@ -252,6 +252,21 @@ test "canonical owner ignores leftover DFlash env and still refuses active bad s
             if (std.mem.eql(u8, name, "TF_GLM_DFLASH_DIR")) return "/draft";
             return null;
         }
+        fn leftover_profile_no_dir(name: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "TF_GLM_DRAFT_PROFILE")) return "production";
+            if (std.mem.eql(u8, name, "TF_GLM_DRAFTER")) return "dflash2";
+            return null;
+        }
+        fn leftover_profile_bad_tile(name: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "TF_GLM_DRAFT_PROFILE")) return "production";
+            if (std.mem.eql(u8, name, "TF_GLM_PROMPT_TILE")) return "nope";
+            return null;
+        }
+        fn leftover_profile_bad_copy(name: [:0]const u8) ?[]const u8 {
+            if (std.mem.eql(u8, name, "TF_GLM_DRAFT_PROFILE")) return "production";
+            if (std.mem.eql(u8, name, "TF_GLM_COPY_MAX")) return "99";
+            return null;
+        }
     };
     var problem: []const u8 = "";
     try std.testing.expectError(error.BadSetting, Settings.read(Values.leftover, &problem));
@@ -271,6 +286,18 @@ test "canonical owner ignores leftover DFlash env and still refuses active bad s
     try std.testing.expectEqual(ranks.Drafter.mtp, profiled.draft);
     try std.testing.expect(ranks.loadDraftHead(true, profiled.draft));
     try std.testing.expect(!ranks.targetMtp(true, profiled.draft));
+    try std.testing.expect(!ranks.selectedDraftProfile(true, profiled));
+    try std.testing.expect(ranks.validateDraftOwner(profiled, true) == null);
+    const no_dir = try Settings.readForOwner(Values.leftover_profile_no_dir, &problem, true);
+    try std.testing.expectEqual(ranks.Drafter.mtp, no_dir.draft);
+    try std.testing.expect(ranks.validateDraftOwner(no_dir, true) == null);
+    try std.testing.expectError(error.BadSetting, Settings.readForOwner(Values.leftover_profile_bad_tile, &problem, true));
+    try std.testing.expectEqualStrings("TF_GLM_PROMPT_TILE: 0 or 1", problem);
+    try std.testing.expectError(error.BadSetting, Settings.readForOwner(Values.leftover_profile_bad_copy, &problem, true));
     const legacy_profile = try Settings.read(Values.leftover_profile, &problem);
     try std.testing.expectEqual(ranks.Drafter.dflash2, legacy_profile.draft);
+    try std.testing.expect(ranks.selectedDraftProfile(false, legacy_profile));
+    try std.testing.expect(ranks.validateDraftOwner(legacy_profile, false) == null);
+    const stale = profiled;
+    try std.testing.expectEqual(error.BadDraftProfile, ranks.validateDraftOwner(stale, false).?);
 }

@@ -18,6 +18,7 @@ const dflash = @import("dflash.zig");
 const dflash_load = @import("dflash_load.zig");
 
 pub const model_type = "glm5_next";
+pub const takes_drafter = true;
 pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "modelopt-mixed", "exl3" };
 // cc-defer: a fixed window; the Python family sizes it from free memory (capacity.admit), port that when serving needs
 pub const default_context: i64 = 8192;
@@ -249,12 +250,13 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .vision = own.vision, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED"), .lone_costs = lone_costs };
     own.lanes.batch_prefill = if (@import("sys").getenv("TF_GLM_MULTI_PREFILL")) |v| std.mem.eql(u8, v, "1") else false;
     if (lone_costs != null) std.log.info("GLM lone-stream round costs: {s} ms (one row, each further row)", .{@import("sys").getenv("TF_GLM_LONE_COSTS").?});
+    const profile_active = ranks.selectedDraftProfile(o.drafter != null, set);
     return .{
         .backend = own.lanes.backend(),
         .facts = own.lanes.facts(),
-        .rows = if (set.draft_profile.enabled) glm_lanes.max_rows else 1 + engine.max_drafts,
-        .trim = if (set.draft_profile.enabled) own.e.settings.draft_profile.rowPolicy() else null,
-        .proposers = if (set.draft_profile.enabled) own.e.settings.draft_profile.proposers() else null,
+        .rows = if (profile_active) glm_lanes.max_rows else 1 + engine.max_drafts,
+        .trim = if (profile_active) own.e.settings.draft_profile.rowPolicy() else null,
+        .proposers = if (profile_active) own.e.settings.draft_profile.proposers() else null,
         .stream_bytes = extraStreamBytes(@intCast(own.e.seqBytes()), o.drafter != null, if (own.images) |v| v.streamBytes() else 0), // each stream past the first makes its own sequence on every rank; first canonical ring is allocated at load
         .lane_limit = laneLimit(own.e.drafter != null, own.e.dflash != null, own.e.pool != null),
         .free_streams = 1, // the first is the sequence the engine made

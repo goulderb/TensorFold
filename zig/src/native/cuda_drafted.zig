@@ -69,7 +69,7 @@ pub fn wrap(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, loaded: 
     return s;
 }
 
-test "--drafter: a family owning the option serves its loaded drafter; a retained environment-only GLM refuses" {
+test "--drafter: a family owning the option serves its loaded drafter; GLM takes --drafter as the family-owned owner" {
     const F = struct {
         pub const model_type = "own_drafter";
         pub const Options = struct { drafter: ?[]const u8 = null };
@@ -90,6 +90,11 @@ test "--drafter: a family owning the option serves its loaded drafter; a retaine
     };
     try std.testing.expect((try wrap(Plain, arena.allocator(), std.testing.allocator, std.testing.io, loaded, o, &problem)) == null);
     try std.testing.expectEqualStrings("--drafter: plain checkpoints load no draft model on CUDA", problem);
-    try std.testing.expect((try wrap(@import("glm_cuda").native, arena.allocator(), std.testing.allocator, std.testing.io, loaded, o, &problem)) == null);
-    try std.testing.expectEqualStrings("--drafter: glm5_next checkpoints load no draft model on CUDA", problem);
+    const glm_native = @import("glm_cuda").native;
+    try std.testing.expect(glm_native.takes_drafter);
+    const glm_served = (try wrap(glm_native, arena.allocator(), std.testing.allocator, std.testing.io, loaded, o, &problem)) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(glm_served.held == null and glm_served.stream_bytes == 7);
+    var glm_opts: glm_native.Options = .{ .context = 8192, .drafts = true };
+    try std.testing.expect(@import("cuda_options.zig").set(glm_native, o, &glm_opts, &problem));
+    try std.testing.expectEqualStrings("dflash2", glm_opts.drafter.?);
 }

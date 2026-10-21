@@ -80,9 +80,15 @@ test "--drafter opens only a family that takes one" {
     const Drafted = struct {
         pub const takes_drafter = true;
     };
+    const OptionOnly = struct {
+        pub const Options = struct { drafter: ?[]const u8 = null };
+    };
     try std.testing.expectStringStartsWith(family(Mtp, .{ .dir = "d", .model_type = "m", .drafter = "/x" }) orelse "", "--drafter loads a separate drafter");
     try std.testing.expect(family(Drafted, .{ .dir = "d", .model_type = "m", .drafter = "/x" }) == null);
     try std.testing.expect(family(Mtp, .{ .dir = "d", .model_type = "m" }) == null);
+    try std.testing.expectStringStartsWith(family(OptionOnly, .{ .dir = "d", .model_type = "m", .drafter = "/x" }) orelse "", "--drafter loads a separate drafter");
+    try std.testing.expect(family(@import("glm_cuda").native, .{ .dir = "d", .model_type = "glm5_next", .drafter = "/x" }) == null);
+    try std.testing.expect(family(@import("glm_cuda").native, .{ .dir = "d", .model_type = "glm5_next" }) == null);
 }
 
 test "--kv-cache fp8 opens only a family whose options take it" {
