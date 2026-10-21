@@ -29,6 +29,19 @@ test "no spill settings is no tier; an orphan setting, a missing or bad host cei
     try std.testing.expectEqualStrings("/nvme/spill", c.tier.dir);
 }
 
+test "RAM_GIB without GIB is the RAM-only tier: it still needs the host ceiling, and refuses the disk's settings" {
+    const c = (try f.Config.fromEnv(gpa, Env{ .vars = &.{ .{ "TENSORFOLD_SPILL_RAM_GIB", "12" }, .{ "TENSORFOLD_SPILL_HOST_GIB", "1" }, .{ "TENSORFOLD_SPILL_MIN_TOKENS", "2048" } } })).?;
+    defer gpa.free(c.tier.dir);
+    try std.testing.expect(!c.tier.disk());
+    try std.testing.expectEqual(@as(u64, 12 << 30), c.tier.ram_cap);
+    try std.testing.expectEqual(@as(u32, 2048), c.tier.min_tokens);
+    try std.testing.expectEqual(@as(u64, 1 << 30), c.host_bytes);
+    try std.testing.expectError(error.SpillHostGibRequired, f.Config.fromEnv(gpa, Env{ .vars = &.{.{ "TENSORFOLD_SPILL_RAM_GIB", "12" }} }));
+    try std.testing.expectError(error.SpillDiskSettingWithoutDisk, f.Config.fromEnv(gpa, Env{ .vars = &.{ .{ "TENSORFOLD_SPILL_RAM_GIB", "12" }, .{ "TENSORFOLD_SPILL_HOST_GIB", "1" }, .{ "TENSORFOLD_SPILL_DIR", "/x" } } }));
+    // RAM_GIB 0 with no GIB is no tier, and the orphan check still applies
+    try std.testing.expectError(error.SpillSettingWithoutGib, f.Config.fromEnv(gpa, Env{ .vars = &.{ .{ "TENSORFOLD_SPILL_RAM_GIB", "0" }, .{ "TENSORFOLD_SPILL_HOST_GIB", "1" } } }));
+}
+
 const Scratch = struct {
     tmp: std.testing.TmpDir,
     path: []u8,

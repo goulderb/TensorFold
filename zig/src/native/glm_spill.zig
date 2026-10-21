@@ -27,6 +27,7 @@ pub const Adapter = struct {
     pub fn prepare(gpa: std.mem.Allocator, io: std.Io, checkpoint: []const u8) !?*Adapter {
         const settings = try spill.Settings.fromEnv(gpa, spill.ProcessEnv{}) orelse return null;
         errdefer gpa.free(settings.dir);
+        if (!settings.disk()) return error.SpillRamOnlyUnsupported; // this adapter writes through the disk level
         const raw = std.c.getenv("TENSORFOLD_SPILL_HOST_GIB") orelse return error.SpillHostGibRequired;
         const gib = std.fmt.parseFloat(f64, std.mem.span(raw)) catch return error.BadSpillHostGib;
         if (!std.math.isFinite(gib) or gib <= 0 or gib > 1024) return error.BadSpillHostGib;

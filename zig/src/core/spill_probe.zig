@@ -40,6 +40,10 @@ pub fn main(init: std.process.Init) !u8 {
     };
     var text: [128]u8 = undefined;
     say("SPILL_SETTINGS {s}", .{settings.text(&text) catch "?"});
+    if (!settings.disk()) {
+        say("SPILL_RAM_ONLY", .{}); // no directory to probe
+        return 0;
+    }
     const root = try a.dupeSentinel(u8, settings.dir, 0);
     spill.checkRoot(root) catch |e| {
         say("SPILL_PROBE_FAIL stage=root error={s}", .{@errorName(e)});

@@ -412,7 +412,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     var disk_config: ?spill_facts.Config = null;
     if (F != glm.native) {
         disk_config = spill_facts.Config.fromEnv(gpa, api.prompt_cache.spill.ProcessEnv{}) catch |e| {
-            problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_SPILL_*: {s} (an enabled tier needs TENSORFOLD_SPILL_GIB and TENSORFOLD_SPILL_HOST_GIB; docs/spill-tier.md)", .{@errorName(e)});
+            problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_SPILL_*: {s} (an enabled tier needs TENSORFOLD_SPILL_GIB, or TENSORFOLD_SPILL_RAM_GIB alone for RAM only, and TENSORFOLD_SPILL_HOST_GIB; docs/spill-tier.md)", .{@errorName(e)});
             return null;
         };
     }
@@ -491,12 +491,13 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
             return null;
         },
     };
-    // the spill tier's identity: the files the load reads, stat'ed before it and hashed whole after it
+    // the spill tier's identity: the files the load reads, stat'ed before it and hashed whole after it (RAM only: no
+    // state outlives the process, so none is hashed)
     var model_files: ?spill_facts.Artifacts = null;
     defer if (model_files) |*m| m.deinit(gpa);
     var exe_files: ?spill_facts.Artifacts = null;
     defer if (exe_files) |*m| m.deinit(gpa);
-    if (F == nemotron.native) if (disk_config != null) {
+    if (F == nemotron.native) if (disk_config) |c| if (c.tier.disk()) {
         const paths = F.artifacts(gpa, io, o.dir, o.drafts) catch |e| {
             problem.* = try std.fmt.allocPrint(a, "spill tier: the checkpoint's files in {s} cannot be listed ({s})", .{ o.dir, @errorName(e) });
             return null;
@@ -653,7 +654,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const kept = if (split and !tp) kv_pages.Kept{ .snaps = 0, .copied = 0, .snap_bytes = 0 } else kv_pages.kept(F, loaded, paged, o, room, held, host_budget, host_cache);
     const store_cache = if (@hasDecl(F, "snap_save")) try snaps.cacheBudget(F, loaded.target, kept.copied) else 0;
     // Mamba spares are prepaid; the tier reservation is charged once inside the remaining Store budget.
-    const disk: ?*nspill.Disk = if (F != nemotron.native) null else if (disk_config) |*c| (try openDisk(F, a, gpa, io, g, loaded, c, &model_files.?, &exe_files.?, kernels, segments, store_cache, after.unified, problem)) orelse return null else null;
+    const disk: ?*nspill.Disk = if (F != nemotron.native) null else if (disk_config) |*c| (try openDisk(F, a, gpa, io, g, loaded, c, if (model_files) |*m| m else null, if (exe_files) |*m| m else null, kernels, segments, store_cache, after.unified, problem)) orelse return null else null;
     defer if (!opened) if (disk) |d| d.abandon(null); // after the store's own unwind, which detaches it
     if (disk != null) disk_config.?.tier.dir = ""; // the tier owns it now
     if (!try kv_pages.attach(F, a, loaded.ctx, paged, problem)) return null;
@@ -1049,7 +1050,7 @@ test "a cancel during a long prompt stops it, and the next request's reply is un
 
 /// The spill tier for a loaded family, or null with `problem` set: the layout from the engine, the reservation inside
 /// the cache, the identity from the files the load read and the facts it ran with.
-fn openDisk(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, g: *Gpu, loaded: F.Loaded, c: *spill_facts.Config, model_files: *const spill_facts.Artifacts, exe_files: *const spill_facts.Artifacts, kernels: ?[]const u8, segments: u32, cache: u64, unified: bool, problem: *[]const u8) !?*nspill.Disk {
+fn openDisk(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, g: *Gpu, loaded: F.Loaded, c: *spill_facts.Config, model_files: ?*const spill_facts.Artifacts, exe_files: ?*const spill_facts.Artifacts, kernels: ?[]const u8, segments: u32, cache: u64, unified: bool, problem: *[]const u8) !?*nspill.Disk {
     const t = loaded.target;
     // two-GPU TP: each file holds both ranks' shares, which the kept states copy through each rank's own engine
     const ranks: u32 = if (t.e.tp_link != null) 2 else 1;
@@ -1062,6 +1063,10 @@ fn openDisk(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, g: *Gpu,
     };
     const payload = try layout.payload();
     const slot: u64 = if (nspill.Disk.slotless(payload, c.tier)) 0 else payload;
+    if (!c.tier.disk() and slot != 0) {
+        problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_SPILL_RAM_GIB={d:.2} with no disk level must hold one {d:.2} GiB max-window state, so every state is captured straight into memory: raise it or lower --context", .{ toGib(c.tier.ram_cap), toGib(payload) });
+        return null;
+    }
     const reservation = try nspill.Disk.reservationFor(slot, 64 << 20);
     // a rank's kept state; the cache's budget is a rank's (both hold the same bytes)
     const device_bytes = F.snap_bytes(t, @intCast(layout.max_len));
@@ -1075,31 +1080,38 @@ fn openDisk(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, g: *Gpu,
         };
         return null;
     };
-    var driver: c_int = 0;
-    g.driver.check(g.driver.api.cuDriverGetVersion(&driver), "cuDriverGetVersion") catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "spill tier: no driver version ({s})", .{@errorName(e)});
-        return null;
+    // RAM only: states never outlive this process, so a per-process identity binds them; else the loaded bytes do
+    const identity: [32]u8 = if (!c.tier.disk()) blk: {
+        var id: [32]u8 = undefined;
+        io.random(&id);
+        break :blk id;
+    } else bound: {
+        var driver: c_int = 0;
+        g.driver.check(g.driver.api.cuDriverGetVersion(&driver), "cuDriverGetVersion") catch |e| {
+            problem.* = try std.fmt.allocPrint(a, "spill tier: no driver version ({s})", .{@errorName(e)});
+            return null;
+        };
+        const weights = model_files.?.digest(gpa) catch |e| {
+            problem.* = try std.fmt.allocPrint(a, "spill tier: the checkpoint's files changed or failed to read while loading ({s})", .{@errorName(e)});
+            return null;
+        };
+        const exe = exe_files.?.digest(gpa) catch |e| {
+            problem.* = try std.fmt.allocPrint(a, "spill tier: the executable or its kernel set changed or failed to read ({s})", .{@errorName(e)});
+            return null;
+        };
+        const capability = g.ctx.capability() catch |e| {
+            problem.* = try std.fmt.allocPrint(a, "spill tier: no compute capability ({s})", .{@errorName(e)});
+            return null;
+        };
+        const facts: spill_facts.Facts = .{ .weights = weights, .executable = exe, .kernels = kernels orelse "embedded", .driver = driver, .capability = capability, .format = F.formatName(t), .planes = .{ layout.kv_row, layout.mamba, 0, 0, 0, 0, 0 }, .head = @intFromBool(layout.head), .max_len = layout.max_len, .grid = layout.grid, .lookahead = nspill.lookahead, .segments = @intCast(segments), .kv = if (t.e.c.kv_fp8) "fp8-e4m3" else "bf16", .tp = ranks };
+        break :bound try facts.identity();
     };
-    const weights = model_files.digest(gpa) catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "spill tier: the checkpoint's files changed or failed to read while loading ({s})", .{@errorName(e)});
-        return null;
-    };
-    const exe = exe_files.digest(gpa) catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "spill tier: the executable or its kernel set changed or failed to read ({s})", .{@errorName(e)});
-        return null;
-    };
-    const capability = g.ctx.capability() catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "spill tier: no compute capability ({s})", .{@errorName(e)});
-        return null;
-    };
-    const facts: spill_facts.Facts = .{ .weights = weights, .executable = exe, .kernels = kernels orelse "embedded", .driver = driver, .capability = capability, .format = F.formatName(t), .planes = .{ layout.kv_row, layout.mamba, 0, 0, 0, 0, 0 }, .head = @intFromBool(layout.head), .max_len = layout.max_len, .grid = layout.grid, .lookahead = nspill.lookahead, .segments = @intCast(segments), .kv = if (t.e.c.kv_fp8) "fp8-e4m3" else "bf16", .tp = ranks };
-    const identity = try facts.identity();
     const d = nspill.Disk.open(gpa, io, gpa, .{ .ctx = &g.ctx, .stream = t.e.stream }, layout, c.tier, identity, c.host_bytes) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "spill tier at {s}: {s}", .{ c.tier.dir, @errorName(e) });
         return null;
     };
     d.charged = unified;
-    std.log.info("spill tier: {s}, {d:.1} GiB on disk, {d:.1} GiB in host memory, {d} rank{s} a state, {s}", .{ c.tier.dir, toGib(c.tier.cap), toGib(c.tier.ram_cap), ranks, if (ranks == 1) "" else "s", if (slot == 0) "captured straight into memory" else "through a host slot" });
+    if (c.tier.disk()) std.log.info("spill tier: {s}, {d:.1} GiB on disk, {d:.1} GiB in host memory, {d} rank{s} a state, {s}", .{ c.tier.dir, toGib(c.tier.cap), toGib(c.tier.ram_cap), ranks, if (ranks == 1) "" else "s", if (slot == 0) "captured straight into memory" else "through a host slot" }) else std.log.info("spill tier: RAM only, {d:.1} GiB in host memory (no disk level: the least recently used state leaves past it, none outlives the process), {d} rank{s} a state", .{ toGib(c.tier.ram_cap), ranks, if (ranks == 1) "" else "s" });
     return d;
 }
 

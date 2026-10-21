@@ -6,7 +6,8 @@
 //! MiaAI-Lab's GLM-5.3-Flash TensorFold recipe (tensorfold/cuda/spill.py, Apache-2.0): its settings, its LRU by bytes
 //! under a cap and a free-disk floor, its write-then-rename files and its one-directory-per-build layout. The file and
 //! directory conventions also follow upstream TensorFold's --learn (zig/src/core/prompt_imprint.zig).
-//! Local fork changes add model-neutral source/sink interfaces, Nemotron/TP2 adapters and Windows/RAM tiers.
+//! Local fork changes add model-neutral source/sink interfaces, Nemotron/TP2 adapters, Windows/RAM tiers and a RAM-only
+//! mode with no disk level.
 //! Original notices and transitive design credits are retained in LICENSES/donors/README.md.
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,7 +28,9 @@ const extension = ".tfs";
 
 /// TENSORFOLD_SPILL_*: every rank reads the same values (the ranks compare `text` at start).
 pub const Settings = struct {
+    /// "" with no disk level
     dir: []const u8,
+    /// 0: no disk level (RAM only: `ram_cap` holds every state, and none outlives the process)
     cap: u64,
     highwater: f64 = 0.70,
     min_tokens: u32 = 8192,
@@ -40,11 +43,16 @@ pub const Settings = struct {
     /// 0: every state goes to disk alone.
     ram_cap: u64 = 0,
 
-    /// The tier's settings from `env.get(name)`, null when TENSORFOLD_SPILL_GIB is unset or 0; `dir` is allocated.
+    /// The settings only a disk level reads: refused with no disk level rather than ignored.
+    pub const disk_only = [_][:0]const u8{ "TENSORFOLD_SPILL_DIR", "TENSORFOLD_SPILL_HIGHWATER", "TENSORFOLD_SPILL_MIN_FREE_GIB", "TENSORFOLD_SPILL_FLUSH_S", "TENSORFOLD_SPILL_KEEP_BUILDS" };
+
+    /// The tier's settings from `env.get(name)`, null when TENSORFOLD_SPILL_GIB is 0, or unset with no
+    /// TENSORFOLD_SPILL_RAM_GIB; `dir` is allocated. TENSORFOLD_SPILL_RAM_GIB with TENSORFOLD_SPILL_GIB unset is the
+    /// RAM-only tier (`cap` 0, `dir` ""): no files, no writer, the least recently used state leaving past the cap.
     /// Every number is finite and in range before it is converted: NaN, infinities, negatives and sizes past
     /// `most_gib` are refused, never clamped or truncated.
     pub fn fromEnv(a: Allocator, env: anytype) !?Settings {
-        const gib = try gibs(env.get("TENSORFOLD_SPILL_GIB") orelse return null);
+        const gib = try gibs(env.get("TENSORFOLD_SPILL_GIB") orelse return ramOnly(env));
         if (gib == 0) return null;
         var s: Settings = .{ .dir = undefined, .cap = @intFromFloat(gib * (1 << 30)) };
         if (env.get("TENSORFOLD_SPILL_HIGHWATER")) |v| s.highwater = try float(v);
@@ -69,6 +77,20 @@ pub const Settings = struct {
             return error.SpillDirNotAbsolute;
         }
         return s;
+    }
+
+    fn ramOnly(env: anytype) !?Settings {
+        const ram = try gibs(env.get("TENSORFOLD_SPILL_RAM_GIB") orelse return null);
+        if (ram == 0) return null;
+        for (disk_only) |n| if (env.get(n) != null) return error.SpillDiskSettingWithoutDisk;
+        var s: Settings = .{ .dir = "", .cap = 0, .ram_cap = @intFromFloat(ram * (1 << 30)) };
+        if (env.get("TENSORFOLD_SPILL_MIN_TOKENS")) |v| s.min_tokens = std.fmt.parseInt(u32, trim(v), 10) catch return error.BadSpillSetting;
+        return s;
+    }
+
+    /// Whether there is a disk level: else every state lives in memory alone.
+    pub fn disk(s: Settings) bool {
+        return s.cap > 0;
     }
 
     /// What both ranks must share, as text for the ranks' settings comparison.
@@ -179,6 +201,7 @@ pub const Stats = struct {
     ram_released: u64 = 0, // held states whose memory went for room, their file in place
     ram_promoted: u64 = 0, // states read back from disk and held again (a hot state's next read is memory's)
     ram_dropped: u64 = 0, // held states that left memory with no file (no disk room, a failed write)
+    ram_evicted: u64 = 0, // RAM only: held states that left the tier for memory room (no disk level to keep them)
 };
 
 /// What /health reports of a tier.
@@ -416,13 +439,21 @@ pub const Tier = struct {
     advise_file: *const fn (fd: fs.File, at: u64, len: u64) void = pageAdvice,
 
     /// The tier under `settings.dir` for `family` at `identity` and `rank`: made when missing, its partial and foreign
-    /// files deleted, other identities past `keep_builds` deleted, its states indexed oldest first.
+    /// files deleted, other identities past `keep_builds` deleted, its states indexed oldest first. With no disk level
+    /// (`Settings.disk`) no directory is touched: the tier starts empty in memory.
     pub fn open(gpa: Allocator, io: std.Io, settings: Settings, family: []const u8, identity: [32]u8, rank: u32, world: u32) !*Tier {
         if (family.len == 0 or family.len > 16) return error.BadFamilyName;
+        if (!settings.disk() and settings.ram_cap == 0) return error.NoSpillLevel;
         const t = try gpa.create(Tier);
         errdefer gpa.destroy(t);
         var fam: [16]u8 = @splat(0);
         @memcpy(fam[0..family.len], family);
+        if (!settings.disk()) {
+            const top = try gpa.allocSentinel(u8, 0, 0);
+            errdefer gpa.free(top);
+            t.* = .{ .gpa = gpa, .io = io, .settings = settings, .family = fam, .identity = identity, .rank = rank, .world = world, .top = top, .dir = try gpa.allocSentinel(u8, 0, 0) };
+            return t;
+        }
         const top = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}-{x}", .{ settings.dir, family, identity[0..8] }, 0);
         errdefer gpa.free(top);
         const dir = try std.fmt.allocPrintSentinel(gpa, "{s}/rank{d}", .{ top, rank }, 0);
@@ -456,7 +487,7 @@ pub const Tier = struct {
         t.gone.deinit(t.gpa);
         t.gpa.free(t.wbuf);
         t.gpa.free(t.rbuf);
-        fs.closeDir(t.dfd);
+        if (t.settings.disk()) fs.closeDir(t.dfd);
         t.gpa.free(t.dir);
         t.gpa.free(t.top);
         t.gpa.destroy(t);
@@ -650,8 +681,10 @@ pub const Tier = struct {
 
     /// Queues `name` (its `tokens`, the family's `meta` and `payload_len` bytes from `source`) for the writer. The least
     /// recently used stored states go first until it fits the cap and leaves the free-disk floor; the hook hears of
-    /// each. The caller holds a reference to the job until `release`.
+    /// each. The caller holds a reference to the job until `release`. With no disk level there is nowhere to write:
+    /// a family hands states over whole (`adopt`) instead.
     pub fn write(t: *Tier, name: Name, tokens: []const u32, meta: []const u8, payload_len: u64, source: Source) !*Job {
+        if (!t.settings.disk()) return error.NoDiskLevel;
         if (meta.len > meta_most) return error.MetaTooLong;
         const bytes = Header.payloadOffset(tokens.len) + payload_len;
         var gone: std.ArrayList(Name) = .empty;
@@ -747,7 +780,8 @@ pub const Tier = struct {
 
     /// `name` (its `tokens`, the family's `meta`) held in memory from `payload`, which the tier now owns (from
     /// `ramAlloc`; freed on any error). The least recently used held states go on to disk until memory fits its
-    /// cap, or leave when the disk has no room; the hook hears of those, here on the owner's thread.
+    /// cap, or leave when the disk has no room (or there is no disk level); the hook hears of those, here on the
+    /// owner's thread.
     pub fn adopt(t: *Tier, name: Name, tokens: []const u32, meta: []const u8, payload: []u8) !void {
         const ram_gpa = t.ram_gpa orelse t.gpa;
         var owned = true;
@@ -784,7 +818,7 @@ pub const Tier = struct {
         t.entries.appendAssumeCapacity(e);
         t.stats.ram_adopted += 1;
         // written behind: its file goes to disk now while it stays held (no room: it stays in memory alone)
-        _ = t.demote(t.entries.items.len - 1, &gone, true);
+        if (t.settings.disk()) _ = t.demote(t.entries.items.len - 1, &gone, true);
         t.fitRam(e, &gone);
     }
 
@@ -801,7 +835,8 @@ pub const Tier = struct {
 
     /// Memory back under its cap (lock held): the least recently used held states other than `keep` leave memory
     /// when their file is in place, else go on to disk for room, else leave altogether (their names in `gone`) when
-    /// the disk has no room. One written behind and still on its way stays until its file is in place (`trimRam`).
+    /// the disk has no room or there is no disk level. One written behind and still on its way stays until its file
+    /// is in place (`trimRam`).
     fn fitRam(t: *Tier, keep: ?*const Entry, gone: *std.ArrayList(Name)) void {
         while (t.ramCommitted() > t.settings.ram_cap) {
             var out: ?usize = null;
@@ -814,7 +849,8 @@ pub const Tier = struct {
                 const name = t.entries.items[i].name;
                 gone.append(t.gpa, name) catch {};
                 t.drop(i);
-                t.stats.ram_dropped += 1;
+                // with no disk level leaving is the policy, not a failure
+                if (t.settings.disk()) t.stats.ram_dropped += 1 else t.stats.ram_evicted += 1;
                 t.stats.forgotten += 1;
             }
         }
@@ -839,6 +875,7 @@ pub const Tier = struct {
     /// released then: false when the disk has no room or no write starts. With its file in place already, its
     /// memory simply goes (unless written behind, which has nothing left to do).
     fn demote(t: *Tier, i: usize, gone: *std.ArrayList(Name), behind: bool) bool {
+        if (!t.settings.disk()) return false;
         const e = t.entries.items[i];
         const r = e.ram.?;
         if (e.on_disk) { // its file is in place already: the memory alone goes
@@ -1209,7 +1246,7 @@ pub const Tier = struct {
             pending_count += @intFromBool(!readable(e));
             ram_entries += @intFromBool(e.ram != null);
         }
-        return .{ .stats = t.stats, .entries = t.entries.items.len - pending_count, .pending = pending_count, .stored_bytes = sums.all - sums.queued, .queued_bytes = sums.queued, .disk_free = t.free_space(t.dir), .cap = t.settings.cap, .ram_entries = ram_entries, .ram_bytes = t.ram_bytes, .ram_cap = t.settings.ram_cap };
+        return .{ .stats = t.stats, .entries = t.entries.items.len - pending_count, .pending = pending_count, .stored_bytes = sums.all - sums.queued, .queued_bytes = sums.queued, .disk_free = if (t.settings.disk()) t.free_space(t.dir) else 0, .cap = t.settings.cap, .ram_entries = ram_entries, .ram_bytes = t.ram_bytes, .ram_cap = t.settings.ram_cap };
     }
 
     /// Counts a state the store chose not to write.

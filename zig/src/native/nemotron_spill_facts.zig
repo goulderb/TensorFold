@@ -1,8 +1,10 @@
 //! The Nemotron spill tier's configuration and identity: what the environment asks for, and what the engine loaded.
 //!
-//! Configuration is opt-in: no TENSORFOLD_SPILL_GIB means no tier and no work (no hashing, no allocation). A set GIB of
-//! 0 turns it off. Any other TENSORFOLD_SPILL_* setting without GIB is an error, as is an enabled tier without a valid
-//! TENSORFOLD_SPILL_HOST_GIB (the host bytes its slot, transfer buffers and index may use).
+//! Configuration is opt-in: no TENSORFOLD_SPILL_GIB or TENSORFOLD_SPILL_RAM_GIB means no tier and no work (no hashing,
+//! no allocation). A set GIB of 0 turns it off. RAM_GIB alone is the RAM-only tier: states live in host memory and none
+//! outlives the process, so the disk's settings are refused and no artifact is hashed. Any other TENSORFOLD_SPILL_*
+//! setting without a size is an error, as is an enabled tier without a valid TENSORFOLD_SPILL_HOST_GIB (the host bytes
+//! its slot, transfer buffers and index may use).
 //!
 //! Identity binds a stored state to the bytes the engine computed with: each artifact file is stat'ed before the load
 //! and hashed in full after it, its metadata unchanged throughout (a file replaced or rewritten in between refuses
@@ -50,12 +52,12 @@ pub const Config = struct {
     const names = [_][:0]const u8{ "TENSORFOLD_SPILL_DIR", "TENSORFOLD_SPILL_HIGHWATER", "TENSORFOLD_SPILL_MIN_TOKENS", "TENSORFOLD_SPILL_MIN_FREE_GIB", "TENSORFOLD_SPILL_FLUSH_S", "TENSORFOLD_SPILL_KEEP_BUILDS", "TENSORFOLD_SPILL_HOST_GIB" };
 
     /// The configured tier, null when none is configured; a wrong or incomplete configuration is an error.
+    /// TENSORFOLD_SPILL_RAM_GIB without TENSORFOLD_SPILL_GIB is the RAM-only tier (no disk settings allowed).
     pub fn fromEnv(gpa: std.mem.Allocator, env: anytype) !?Config {
-        if (env.get("TENSORFOLD_SPILL_GIB") == null) {
-            for (names) |n| if (env.get(n) != null) return error.SpillSettingWithoutGib;
+        const tier = (try spill.Settings.fromEnv(gpa, env)) orelse {
+            if (env.get("TENSORFOLD_SPILL_GIB") == null) for (names) |n| if (env.get(n) != null) return error.SpillSettingWithoutGib;
             return null;
-        }
-        const tier = (try spill.Settings.fromEnv(gpa, env)) orelse return null;
+        };
         errdefer gpa.free(tier.dir);
         const text = env.get("TENSORFOLD_SPILL_HOST_GIB") orelse return error.SpillHostGibRequired;
         const g = std.fmt.parseFloat(f64, std.mem.trim(u8, text, " \t\r\n")) catch return error.BadSpillHostGib;

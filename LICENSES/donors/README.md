@@ -263,7 +263,8 @@ by Robert Wojciechowski ([wojo](https://github.com/wojo)), Mia patch `0088`,
 as the source of the settings, eviction behavior, and multi-rank rules.
 The local implementation is new Zig, with model-neutral source and sink
 interfaces. Later work adds the qualified Nemotron adapter, Windows file
-handling, a host-memory cache level, and TP=2 persistence.
+handling, a host-memory cache level, TP=2 persistence, and a RAM-only mode
+with no disk level.
 Those local changes do not make the inherited design a local invention.
 
 Mia's retained credits identify the earlier lineage:

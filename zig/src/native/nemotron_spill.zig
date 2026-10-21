@@ -290,6 +290,8 @@ pub const Disk = struct {
     /// it cannot account.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, copy_gpa: std.mem.Allocator, device: Device, layout: Layout, settings: spill.Settings, identity: [32]u8, host_ceiling: u64) !*Disk {
         const payload = try layout.payload();
+        // with no disk level a slot's write has nowhere to go: every state must be captured straight into memory
+        if (!settings.disk() and !slotless(payload, settings)) return error.SpillRamBelowState;
         const slot_bytes: u64 = if (slotless(payload, settings)) 0 else payload;
         const reservation = try reservationFor(slot_bytes, 64 << 20);
         if (reservation > host_ceiling) return error.SpillHostCeiling;
@@ -544,11 +546,12 @@ pub const Disk = struct {
     /// disk (most recently used first), each write waiting for the slot, none submitted after TENSORFOLD_SPILL_FLUSH_S
     /// or after a write failed; then the Store detached, every write final before the tier stops, and the tier, the
     /// slot and the settings freed. A failed context bind skips the flush; the rest still runs (error.SpillContext).
-    /// The caller frees the Store and the device copies after this returns.
+    /// The caller frees the Store and the device copies after this returns. With no disk level there is no flush pass:
+    /// nothing held in memory outlives the process.
     pub fn close(d: *Disk, store: *pc.Store) !Flushed {
         var out: Flushed = .{};
         const bound = if (d.device.ctx.makeCurrent()) |_| true else |_| false;
-        if (bound) {
+        if (bound and d.tier.settings.disk()) {
             d.settleAll(); // serving's writes final first: their outcomes are not the stop's
             const written = d.counts.written;
             const lost = d.counts.lost;
@@ -744,4 +747,5 @@ pub fn trim(p: *anyopaque, room: u64) void {
 test {
     _ = @import("nemotron_spill_test.zig");
     _ = @import("nemotron_spill_close_test.zig");
+    _ = @import("nemotron_spill_ram_test.zig");
 }

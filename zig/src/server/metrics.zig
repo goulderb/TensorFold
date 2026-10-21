@@ -169,6 +169,7 @@ pub const Metrics = struct {
             try gauge(w, "spill_ram_entries", "gauge", "Kept states the spill tier holds in host memory.", sp.tier.ram_entries);
             try gauge(w, "spill_ram_read_states_total", "counter", "Reads the spill tier served from host memory, not disk.", sp.tier.stats.ram_loaded);
             try gauge(w, "spill_ram_demoted_total", "counter", "Held states written on to disk for host-memory room.", sp.tier.stats.ram_demoted);
+            try gauge(w, "spill_ram_evicted_total", "counter", "RAM-only tier: held states that left for host-memory room (no disk level keeps them).", sp.tier.stats.ram_evicted);
             try gauge(w, "spill_restored_states_total", "counter", "Read-back states whose restore committed and a prompt pass resumed from.", sp.cache.recalled);
             try gauge(w, "spill_restored_tokens_total", "counter", "Prompt tokens committed restores from the spill tier covered.", sp.cache.recalled_tokens);
             try gauge(w, "spill_write_submitted_total", "counter", "States handed to the spill tier's writer (not proof of persistence).", sp.writes.submitted);
@@ -395,7 +396,7 @@ test "render separates raw spill reads, committed restores, write outcomes and e
     const Spilling = struct {
         stub: RenderStub = .{ .status_value = .{ .prefill = .{ .submitted_rows = 6144, .completed_rows = 4096, .passes = 2 } } },
         fn spill(_: *anyopaque, out: *api.SpillStatus) bool {
-            out.* = .{ .tier = .{ .stats = .{ .loaded_tokens = 8192 }, .entries = 1, .pending = 0, .stored_bytes = 1, .queued_bytes = 0, .disk_free = 1, .cap = 1 }, .age_ms = 7 };
+            out.* = .{ .tier = .{ .stats = .{ .loaded_tokens = 8192, .ram_evicted = 3 }, .entries = 1, .pending = 0, .stored_bytes = 1, .queued_bytes = 0, .disk_free = 1, .cap = 1 }, .age_ms = 7 };
             out.cache.read_back = 2;
             out.cache.recalled_tokens = 4096;
             out.writes.skipped_busy = 5;
@@ -421,5 +422,6 @@ test "render separates raw spill reads, committed restores, write outcomes and e
         "tensorfold:spill_write_skipped_total 5\n",
         "tensorfold:spill_write_lost_total 1\n",
         "tensorfold:spill_status_age_ms 7\n",
+        "tensorfold:spill_ram_evicted_total 3\n",
     }) |want| try std.testing.expect(std.mem.indexOf(u8, body, want) != null);
 }

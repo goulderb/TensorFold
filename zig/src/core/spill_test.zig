@@ -1058,3 +1058,129 @@ test "a state read back from disk is held again, so its next read is memory's" {
     info = t.info();
     try std.testing.expectEqual(@as(u64, 1), info.stats.ram_loaded);
 }
+
+// -- RAM only (TENSORFOLD_SPILL_RAM_GIB, no TENSORFOLD_SPILL_GIB) -------------------------------------------------------
+
+const MapEnv = struct {
+    vars: []const [2][]const u8,
+    pub fn get(e: @This(), name: [:0]const u8) ?[]const u8 {
+        for (e.vars) |kv| if (std.mem.eql(u8, kv[0], name)) return kv[1];
+        return null;
+    }
+};
+
+test "RAM_GIB without GIB is the RAM-only tier; GIB 0 is off; disk-only settings are refused, not ignored" {
+    const s = (try spill.Settings.fromEnv(gpa, MapEnv{ .vars = &.{ .{ "TENSORFOLD_SPILL_RAM_GIB", "2" }, .{ "TENSORFOLD_SPILL_MIN_TOKENS", "4096" } } })).?;
+    defer gpa.free(s.dir);
+    try std.testing.expect(!s.disk());
+    try std.testing.expectEqual(@as(u64, 0), s.cap);
+    try std.testing.expectEqual(@as(usize, 0), s.dir.len);
+    try std.testing.expectEqual(@as(u64, 2 << 30), s.ram_cap);
+    try std.testing.expectEqual(@as(u32, 4096), s.min_tokens);
+    var tb: [128]u8 = undefined;
+    _ = try s.text(&tb);
+    try std.testing.expect((try spill.Settings.fromEnv(gpa, MapEnv{ .vars = &.{} })) == null);
+    try std.testing.expect((try spill.Settings.fromEnv(gpa, MapEnv{ .vars = &.{.{ "TENSORFOLD_SPILL_RAM_GIB", "0" }} })) == null);
+    try std.testing.expect((try spill.Settings.fromEnv(gpa, MapEnv{ .vars = &.{ .{ "TENSORFOLD_SPILL_GIB", "0" }, .{ "TENSORFOLD_SPILL_RAM_GIB", "2" } } })) == null);
+    try std.testing.expectError(error.BadSpillSetting, spill.Settings.fromEnv(gpa, MapEnv{ .vars = &.{.{ "TENSORFOLD_SPILL_RAM_GIB", "-1" }} }));
+    try std.testing.expectError(error.BadSpillSetting, spill.Settings.fromEnv(gpa, MapEnv{ .vars = &.{ .{ "TENSORFOLD_SPILL_RAM_GIB", "2" }, .{ "TENSORFOLD_SPILL_MIN_TOKENS", "x" } } }));
+    for (spill.Settings.disk_only) |n| {
+        try std.testing.expectError(error.SpillDiskSettingWithoutDisk, spill.Settings.fromEnv(gpa, MapEnv{ .vars = &.{ .{ "TENSORFOLD_SPILL_RAM_GIB", "2" }, .{ n, "1" } } }));
+    }
+    try std.testing.expectError(error.NoSpillLevel, Tier.open(gpa, io, .{ .dir = "", .cap = 0 }, "flashnext", identity_a, 0, 1));
+}
+
+/// A RAM-only tier whose settings name `root` nowhere: the test checks nothing appears there.
+fn ramOnly(cap: u64) spill.Settings {
+    return .{ .dir = "", .cap = 0, .ram_cap = cap };
+}
+
+fn exists(path: []const u8) !bool {
+    const z = try gpa.dupeSentinel(u8, path, 0);
+    defer gpa.free(z);
+    var l = @import("spill_fs.zig").Lister.open(z) orelse return false;
+    l.close();
+    return true;
+}
+
+test "RAM only: held states read back byte for byte, the least recently used leaves past the cap, and no file is made" {
+    var root = try Root.make();
+    defer root.deinit();
+    const t = try Tier.open(gpa, io, ramOnly(25_000), "flashnext", identity_a, 0, 1); // two of three 10_000-byte states
+    defer t.deinit();
+    t.chunk = 4096;
+    var forgot: Forgot = .{};
+    defer forgot.names.deinit(gpa);
+    t.setHook(forgot.hook());
+    var tok: [3][100]u32 = undefined;
+    var pay: [3][10_000]u8 = undefined;
+    const a = try hold(t, tokensOf(&tok[0], 1), 90, "a", payloadOf(&pay[0], 1));
+    const b = try hold(t, tokensOf(&tok[1], 101), 90, "b", payloadOf(&pay[1], 2));
+    var meta: [64]u8 = undefined;
+    const first = try readBack(t, a, &meta); // a is now more recent than b
+    gpa.free(first);
+    const c = try hold(t, tokensOf(&tok[2], 201), 90, "c", payloadOf(&pay[2], 3));
+    try std.testing.expect(t.has(a) and t.has(c));
+    try std.testing.expect(!t.has(b));
+    try std.testing.expect(t.best(&tok[1], 0, {}, anyAt) == null);
+    try std.testing.expectError(error.NotStored, t.read(b));
+    try std.testing.expectEqual(@as(usize, 1), forgot.names.items.len);
+    try std.testing.expect(forgot.names.items[0].eql(b));
+    for ([_]Name{ a, c }, [_]usize{ 0, 2 }) |n, i| {
+        const got = try readBack(t, n, &meta);
+        defer gpa.free(got);
+        try std.testing.expectEqualSlices(u8, &pay[i], got);
+    }
+    // nowhere to write: a family hands states over whole
+    var m: Mem = .{ .bytes = &pay[0] };
+    try std.testing.expectError(error.NoDiskLevel, t.write(Name.of(tok[0][0..50], 50), tok[0][0..50], "", pay[0].len, m.source()));
+    t.flushRam(); // a clean stop has nothing to write
+    try std.testing.expect(t.drain(1));
+    const info = t.info();
+    try std.testing.expectEqual(@as(u64, 3), info.stats.ram_adopted);
+    try std.testing.expectEqual(@as(u64, 1), info.stats.ram_evicted);
+    try std.testing.expectEqual(@as(u64, 0), info.stats.ram_dropped); // leaving is the policy, not a failure
+    try std.testing.expectEqual(@as(u64, 0), info.stats.ram_demoted);
+    try std.testing.expectEqual(@as(u64, 0), info.stats.written);
+    try std.testing.expectEqual(@as(u64, 0), info.stats.write_failed);
+    try std.testing.expectEqual(@as(u64, 3), info.stats.ram_loaded);
+    try std.testing.expectEqual(@as(usize, 2), info.entries);
+    try std.testing.expectEqual(@as(usize, 2), info.ram_entries);
+    try std.testing.expectEqual(@as(u64, 20_000), info.ram_bytes);
+    try std.testing.expectEqual(@as(u64, 0), info.stored_bytes);
+    try std.testing.expectEqual(@as(u64, 0), info.cap);
+    try std.testing.expectEqual(@as(u64, 0), info.disk_free);
+    try std.testing.expect(t.thread == null); // no writer ever started
+    try std.testing.expect(!try exists(root.path));
+}
+
+test "RAM only: a read under way keeps its state whole when the cap evicts it" {
+    const t = try Tier.open(gpa, io, ramOnly(15_000), "flashnext", identity_a, 0, 1); // one 10_000-byte state
+    defer t.deinit();
+    t.chunk = 4096;
+    var tok: [2][100]u32 = undefined;
+    var pay: [2][10_000]u8 = undefined;
+    const a = try hold(t, tokensOf(&tok[0], 7), 90, "a", payloadOf(&pay[0], 7));
+    var r = try t.read(a);
+    defer r.close();
+    _ = try hold(t, tokensOf(&tok[1], 107), 90, "b", payloadOf(&pay[1], 8)); // a leaves the tier mid-read
+    try std.testing.expect(!t.has(a));
+    var c: Collect = .{};
+    defer c.out.deinit(gpa);
+    try r.pump(c.sink());
+    try std.testing.expectEqualSlices(u8, &pay[0], c.out.items);
+    try std.testing.expectEqual(@as(u64, 10_000), t.info().ram_bytes); // only b's bytes count once a left
+}
+
+test "RAM only: a state larger than the cap is refused and nothing held leaves for it" {
+    const t = try Tier.open(gpa, io, ramOnly(12_000), "flashnext", identity_a, 0, 1);
+    defer t.deinit();
+    var tok: [2][100]u32 = undefined;
+    var small: [10_000]u8 = undefined;
+    var big: [20_000]u8 = undefined;
+    const a = try hold(t, tokensOf(&tok[0], 3), 90, "a", payloadOf(&small, 3));
+    try std.testing.expect(!t.holds(big.len));
+    try std.testing.expectError(error.LargerThanRam, hold(t, tokensOf(&tok[1], 103), 90, "b", payloadOf(&big, 4)));
+    try std.testing.expect(t.has(a));
+    try std.testing.expectEqual(@as(u64, 0), t.info().stats.ram_evicted);
+}

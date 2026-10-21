@@ -656,6 +656,17 @@ hands its payload to `Tier.adopt`; the tier owns the bytes from then on. Each he
   (`ram_released`); a state whose file could not be made (no room, a failed write) leaves the tier instead
   (`ram_dropped`) and the owner's hook hears of it on its own thread (`Tier.gone`, drained at the next owner call).
 
+**RAM only.** `TENSORFOLD_SPILL_RAM_GIB` with `TENSORFOLD_SPILL_GIB` unset is a tier with no disk level
+(`Settings.disk()` false: `cap` 0, no directory). Nothing is created, scanned or pruned, no writer thread starts and
+nothing is written behind: a held state that memory has no room for leaves the tier, least recently used first
+(`ram_evicted`, the owner's hook hears of it), and none outlives the process. `ram_dropped` stays a failure counter.
+`TENSORFOLD_SPILL_DIR`, `_HIGHWATER`, `_MIN_FREE_GIB`, `_FLUSH_S` and `_KEEP_BUILDS` are refused rather than ignored
+(`SpillDiskSettingWithoutDisk`); `_MIN_TOKENS` applies, and a family still needs its own host ceiling. `Tier.write`
+refuses (`NoDiskLevel`), so only a family that hands states over whole can use it. Nemotron requires `ram_cap` to hold
+one max-window state (`SpillRamBelowState`), skips artifact hashing (a random per-process identity binds the held
+states) and has no flush pass at a clean stop. GLM's adapter refuses RAM only (`SpillRamOnlyUnsupported`).
+`TENSORFOLD_SPILL_GIB=0` still turns every level off.
+
 A state read back from disk is held again when memory holds it (`ram_promoted`): a hot conversation that once fell
 to disk is memory's again. Disk accounting (cap, floor, LRU eviction) counts only states with a file in place or on
 its way; the memory cap counts held bytes. A clean stop still writes any held state still without a file
