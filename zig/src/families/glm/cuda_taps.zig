@@ -8,6 +8,16 @@ pub fn index(layer: usize) ?usize {
     return null;
 }
 
+pub fn requiredLayers() usize {
+    var n: usize = 0;
+    for (layers) |layer| n = @max(n, layer + 1);
+    return n;
+}
+
+pub fn covers(n_layers: usize) bool {
+    return n_layers >= requiredLayers();
+}
+
 pub const View = struct {
     ptr: u64,
     plane_rows: usize,
@@ -53,6 +63,11 @@ test "only the five post-layer residuals are drafter taps" {
     try std.testing.expectEqual(@as(?usize, 4), index(42));
     try std.testing.expectEqual(@as(?usize, null), index(43));
     try std.testing.expectEqual(@as(?usize, null), index(4));
+    try std.testing.expectEqual(@as(usize, 43), requiredLayers());
+    try std.testing.expect(covers(45));
+    try std.testing.expect(covers(43));
+    try std.testing.expect(!covers(42));
+    try std.testing.expect(!covers(0));
 }
 
 const cuda = @import("cuda");

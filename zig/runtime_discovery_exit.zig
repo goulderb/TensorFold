@@ -3,7 +3,9 @@ const std = @import("std");
 const platform = @import("sys");
 const libs = platform.optional_libraries;
 const fixture = @import("discovery_fixture");
+const fixture_path = @import("fixture_path");
 var selected: libs.Id = .verbs;
+var library: [:0]const u8 = "";
 const Probe = struct {
     pub fn getenv(_: [*:0]const u8) ?[:0]const u8 {
         return null;
@@ -11,14 +13,15 @@ const Probe = struct {
     pub const DynLib = struct {
         pub fn open(path: []const u8) !platform.DynLib {
             if (!std.mem.eql(u8, path, libs.spec(selected).names[0])) return error.FileNotFound;
-            return platform.DynLib.open(fixture.library);
+            return platform.DynLib.open(library);
         }
     };
 };
 fn child(init: std.process.Init, kind: []const u8, marker: []const u8) !void {
     selected = if (std.mem.eql(u8, kind, "verbs")) .verbs else if (std.mem.eql(u8, kind, "grammar")) .grammar else return error.BadKind;
+    library = try fixture_path.absolute(init.io, init.arena.allocator(), fixture.library);
     if (!libs.found(libs.spec(selected), init.arena.allocator(), Probe, null)) return error.DiscoveryMissedFixture;
-    var own = try platform.DynLib.open(fixture.library);
+    var own = try platform.DynLib.open(library);
     defer own.close();
     const mark = own.lookup(*const fn ([*:0]const u8) callconv(.c) c_int, "tf_probe_ready") orelse return error.MissingFixtureExport;
     if (mark(try init.arena.allocator().dupeSentinel(u8, marker, 0)) != 0) return error.BadMarkerPath;
@@ -43,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
         defer init.gpa.free(result.stdout);
         defer init.gpa.free(result.stderr);
         if (result.term != .exited or result.term.exited != 0) {
-            std.debug.print("discovery {s}: child termination {any}\n", .{ kind, result.term });
+            std.debug.print("discovery {s}: child termination {any}\nstderr:\n{s}\n", .{ kind, result.term, result.stderr });
             failed = true;
             continue;
         }

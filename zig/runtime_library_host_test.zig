@@ -85,12 +85,20 @@ test "runtime library: discovery uses overrides and retains found libraries with
 
 const words = @import("src/fabric/words.zig");
 const fixtures = @import("rpc_fixtures");
+const fixture_path = @import("fixture_path");
 test "runtime library: a loadable RPC helper missing each required export keeps the dependency identity" {
-    for ([_][:0]const u8{ (fixtures.abi ++ ""), (fixtures.wait ++ ""), (fixtures.store ++ "") }) |path| {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ fixtures.abi, fixtures.wait, fixtures.store }) |rel| {
+        const path = try fixture_path.absolute(std.testing.io, a, rel);
+        defer a.free(path);
         try std.testing.expectError(error.McdmaRpcUnavailable, words.Library.openPath(path));
     }
-    try std.testing.expectError(error.WrongAbi, words.Library.openPath((fixtures.wrong ++ "")));
-    var lib = try words.Library.openPath((fixtures.complete ++ ""));
+    const wrong = try fixture_path.absolute(std.testing.io, a, fixtures.wrong);
+    defer a.free(wrong);
+    try std.testing.expectError(error.WrongAbi, words.Library.openPath(wrong));
+    const complete = try fixture_path.absolute(std.testing.io, a, fixtures.complete);
+    defer a.free(complete);
+    var lib = try words.Library.openPath(complete);
     defer lib.close();
     var word: u64 = 0;
     lib.words().store(&word, 42);

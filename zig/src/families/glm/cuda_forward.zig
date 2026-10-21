@@ -897,7 +897,6 @@ pub const Forward = struct {
             }
         }
         for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, rows, c.hidden, c.hc);
-        try f.publishEnabledTaps(rows);
         try f.finish(rows);
         try f.joinPrefetch();
     }
@@ -939,7 +938,6 @@ pub const Forward = struct {
             try f.productionPrompt(f.pieces.?, R);
             _ = overlap_dispatch[f.prefill_overlap - 1].fetchAdd(1, .monotonic);
         } else if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
-        try f.publishEnabledTaps(R);
         try f.finish(R);
         if (f.prof) |p| p.mark(f.stream, .head);
         try f.joinPrefetch();
@@ -985,7 +983,7 @@ pub const Forward = struct {
     }
 
     /// Only engine-owned scratch and fixed weights: no sequence pointers, positions, parities or KV extents.
-    fn ffnSite(f: *const Forward, layer: usize, rows: usize) !void {
+    pub fn ffnSite(f: *const Forward, layer: usize, rows: usize) !void {
         for (f.ranks) |r| {
             const l = r.w.layers[layer];
             try f.post(r, rows);
@@ -1035,16 +1033,6 @@ pub const Forward = struct {
         const D = r.w.config.hidden;
         if (D != taps_mod.hidden or rows > r.b.rows) return error.BadTapView;
         try projection.copyRows(f.set(), f.stream, source.ptr + plane * r.b.rows * D * 2, D * 2, target.out + plane * D * 2, taps_mod.layers.len * D * 2, rows, D * 2);
-    }
-
-    /// Tap layers already present in the mixer loop published from ffnSite. Remaining configured tap layers still use captureTap/publishTaps.
-    fn publishEnabledTaps(f: *const Forward, rows: usize) !void {
-        const n_layers = f.ranks[0].w.layers.len;
-        for (taps_mod.layers) |layer| {
-            if (layer < n_layers) continue;
-            for (f.ranks) |r| try f.captureTap(r, layer, 0, rows);
-            try f.publishTaps(layer, rows);
-        }
     }
 
     /// The final norm and this rank's rows of the head (a prompt buffer's last row only).

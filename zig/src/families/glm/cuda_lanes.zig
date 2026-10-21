@@ -3,6 +3,7 @@
 const std = @import("std");
 const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
+const ranks = @import("cuda_ranks.zig");
 const follow = @import("cuda_follow.zig");
 const fw = @import("cuda_forward.zig");
 const vision_runtime = @import("cuda_vision_runtime.zig");
@@ -155,18 +156,19 @@ pub const Lanes = struct {
         const block = self.x.e.drafter != null;
         const plan = self.x.e.verifyPlan();
         const profile = self.x.e.settings.draft_profile;
+        const profile_active = ranks.selectedDraftProfile(self.x.e.canonical_owner, self.x.e.settings);
         const costs: ?*const LoneCosts = if (drafting) if (self.lone_costs) |*c| c else null else null;
         return .{
-            .copy_drafts = if (profile.enabled) profile.copy.enabled else true,
+            .copy_drafts = if (profile_active) profile.copy.enabled else true,
             .window_costs = if (costs) |c| c.window[0 .. 1 + plan.drafts()] else if (block) &gb10_window_costs else &.{},
             .shared_costs = if (costs) |c| &c.flat else if (block) &gb10_shared_costs else &.{},
-            .exact_width = if (profile.enabled) @intCast(self.x.e.targetRows()) else if (drafting) @intCast(1 + plan.drafts()) else 1,
+            .exact_width = if (profile_active) @intCast(self.x.e.targetRows()) else if (drafting) @intCast(1 + plan.drafts()) else 1,
             .gpu_tokens = false,
             .mtp = drafting,
             .speculate = drafting,
             .speculate_early = false,
             .drafts = @intCast(plan.drafts()),
-            .fixed_drafts = profile.enabled,
+            .fixed_drafts = profile_active,
             .hidden_rows = sharing,
             .batch_rows = if (sharing) @intCast(self.x.e.sharedLimit()) else 0,
             .max_streams = if (sharing) engine.max_shared else 1,
@@ -578,7 +580,7 @@ pub const Lanes = struct {
             if (w.rows() > self.x.e.targetRows()) return error.WindowTooWide;
             total += w.rows();
         }
-        if (self.x.e.settings.draft_profile.enabled and total > self.x.e.sharedLimit()) return error.WindowTooWide;
+        if (ranks.selectedDraftProfile(self.x.e.canonical_owner, self.x.e.settings) and total > self.x.e.sharedLimit()) return error.WindowTooWide;
         const constrained = for (windows) |w| {
             if (w.masks.len > 0) break true;
         } else false;
@@ -912,6 +914,33 @@ test "DFlash facts enable batched head scheduling only while sharing" {
     e.dflash = null;
     e.mtp = true;
     try std.testing.expect(!backend.facts().draft_streams);
+}
+
+test "canonical leftover production profile keeps dflash7 lane facts" {
+    var e: engine.Engine = undefined;
+    e.canonical_owner = true;
+    e.settings = .{ .draft_profile = @import("cuda_draft_profile.zig").Settings.production() };
+    e.mtp = false;
+    e.dflash = null;
+    e.drafter = @ptrFromInt(8);
+    e.pool = null;
+    e.bs = null;
+    var link: follow.Link = undefined;
+    var backend: Lanes = .{ .x = .{ .e = &e, .link = &link } };
+    const leftover = backend.facts();
+    try std.testing.expectEqual(@as(u32, 64), leftover.batch_rows);
+    try std.testing.expectEqual(@as(u32, 8), leftover.exact_width);
+    try std.testing.expect(!leftover.fixed_drafts);
+    try std.testing.expect(leftover.copy_drafts);
+    try std.testing.expectEqual(@as(usize, 8), e.targetRows());
+    try std.testing.expectEqual(@as(usize, 64), e.sharedLimit());
+    e.canonical_owner = false;
+    const selected = backend.facts();
+    try std.testing.expectEqual(@as(u32, 32), selected.batch_rows);
+    try std.testing.expectEqual(@as(u32, 16), selected.exact_width);
+    try std.testing.expect(selected.fixed_drafts);
+    try std.testing.expectEqual(@as(usize, 16), e.targetRows());
+    try std.testing.expectEqual(@as(usize, 32), e.sharedLimit());
 }
 
 test "TF_GLM_LONE_COSTS takes two positive ms and models each window width" {

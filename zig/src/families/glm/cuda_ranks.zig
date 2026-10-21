@@ -44,6 +44,14 @@ pub fn validateDraftOwner(settings: Settings, canonical: bool) ?anyerror {
     return null;
 }
 
+/// Canonical --drafter needs every named tap layer present before weights load. Legacy partial diagnostics stay allowed.
+pub fn unsupportedCanonicalTarget(canonical: bool, loaded: u32, config_layers: u32) ?anyerror {
+    if (!canonical) return null;
+    const n: usize = if (loaded > 0) loaded else config_layers;
+    if (!@import("cuda_taps.zig").covers(n)) return error.UnsupportedDrafterTarget;
+    return null;
+}
+
 /// The forward's knobs a rank reads from its environment (the Python family's names and defaults).
 pub const Settings = struct {
     kv: cache.Format = .bf16,
@@ -1538,5 +1546,76 @@ test "canonical leftover production profile votes success through startupVote" {
     var all: [2]u32 = undefined;
     try startupVote(&d, &lib, null, stream, 0, local, &all);
     try std.testing.expectEqual(@as(u32, 1), all[0]);
+    try std.testing.expect(M.empty());
+}
+
+test "canonical missing tap layers refuse through the actual startup vote before weights" {
+    try std.testing.expectEqual(@as(?anyerror, error.UnsupportedDrafterTarget), unsupportedCanonicalTarget(true, 6, 45));
+    try std.testing.expectEqual(@as(?anyerror, error.UnsupportedDrafterTarget), unsupportedCanonicalTarget(true, 42, 45));
+    try std.testing.expect(unsupportedCanonicalTarget(true, 0, 45) == null);
+    try std.testing.expect(unsupportedCanonicalTarget(true, 45, 45) == null);
+    try std.testing.expect(unsupportedCanonicalTarget(false, 6, 45) == null);
+    const M = @import("cuda_test_driver.zig").Memory;
+    const Recording = struct {
+        var votes: [2]u32 = .{ 0, 1 };
+        var rank: usize = 0;
+        var votes_seen: usize = 0;
+        var agrees: usize = 0;
+        fn allGather(src: u64, dst: u64, n: usize, dtype: cuda.nccl.DataType, _: cuda.nccl.Comm, _: cuda.abi.Stream) callconv(.c) cuda.nccl.Result {
+            std.debug.assert(dtype == .u8);
+            if (n == 4) {
+                const mine: *const u32 = @ptrFromInt(src);
+                std.debug.assert(mine.* == votes[rank]);
+                @memcpy(M.slice(dst, 8), std.mem.sliceAsBytes(&votes));
+                votes_seen += 1;
+                return 0;
+            }
+            var fps: [2]Fingerprint = .{ std.mem.bytesToValue(Fingerprint, M.slice(src, n)[0..@sizeOf(Fingerprint)]), undefined };
+            fps[1] = fps[0];
+            fps[1].rank = 1;
+            @memcpy(M.slice(dst, n * 2), std.mem.sliceAsBytes(&fps));
+            agrees += 1;
+            return 0;
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try digestFixture(io, tmp.dir, "drafter", 1);
+    const path = try tmp.dir.realPathFileAlloc(io, "drafter", a);
+    defer a.free(path);
+    var d = M.driver();
+    var lib: cuda.nccl.Library = .{ .lib = undefined, .api = undefined };
+    lib.api.ncclAllGather = Recording.allGather;
+    const stream: cuda.Stream = .{ .d = &d, .handle = null };
+    const zero: [32]u8 = @splat(0);
+    const settings: Settings = .{};
+    Recording.votes_seen = 0;
+    Recording.agrees = 0;
+    for (0..2) |rank| {
+        Recording.rank = rank;
+        var problem: ?anyerror = if (rank == 0) unsupportedCanonicalTarget(true, 6, 45) else null;
+        var fp = Fingerprint.of(2, rank, settings, 8192, true, zero, zero, hashBytes("target"));
+        var vote: [2]u32 = undefined;
+        var all: [2]Fingerprint = undefined;
+        const err = applyCanonicalStartup(a, io, &d, &lib, null, stream, rank, .{ .dir = path, .bits = 4, .drafts = true }, true, &problem, &fp, &vote, &all);
+        if (rank == 0) try std.testing.expectEqual(@as(?anyerror, error.UnsupportedDrafterTarget), problem) else try std.testing.expect(problem == null);
+        try std.testing.expectError(if (rank == 0) error.UnsupportedDrafterTarget else error.PeerStartupRefused, err);
+    }
+    try std.testing.expectEqual(@as(usize, 2), Recording.votes_seen);
+    try std.testing.expectEqual(@as(usize, 0), Recording.agrees);
+    Recording.votes = .{ 1, 1 };
+    Recording.votes_seen = 0;
+    Recording.agrees = 0;
+    Recording.rank = 0;
+    var ok: ?anyerror = unsupportedCanonicalTarget(true, 0, 45);
+    var fp = Fingerprint.of(2, 0, settings, 8192, true, zero, zero, hashBytes("target"));
+    var vote: [2]u32 = undefined;
+    var all: [2]Fingerprint = undefined;
+    _ = try applyCanonicalStartup(a, io, &d, &lib, null, stream, 0, .{ .dir = path, .bits = 4, .drafts = true }, true, &ok, &fp, &vote, &all);
+    try std.testing.expect(ok == null);
+    try std.testing.expectEqual(@as(usize, 1), Recording.votes_seen);
+    try std.testing.expectEqual(@as(usize, 1), Recording.agrees);
     try std.testing.expect(M.empty());
 }

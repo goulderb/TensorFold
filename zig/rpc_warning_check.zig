@@ -2,6 +2,7 @@
 const std = @import("std");
 const words = @import("src/fabric/words.zig");
 const fixtures = @import("rpc_fixtures");
+const fixture_path = @import("fixture_path");
 var warnings: usize = 0;
 var refusals: usize = 0;
 pub const std_options: std.Options = .{ .logFn = log };
@@ -12,8 +13,9 @@ fn log(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime f
     if (level == .warn) warnings += 1;
     if (level == .err) refusals += 1;
 }
-pub fn main() !void {
-    var lib = try words.Library.openCandidates(&.{ "/__tf_missing_runtime__/rpc", (fixtures.complete ++ "") });
+pub fn main(init: std.process.Init) !void {
+    const complete = try fixture_path.absolute(init.io, init.arena.allocator(), fixtures.complete);
+    var lib = try words.Library.openCandidates(&.{ "/__tf_missing_runtime__/rpc", complete });
     lib.close();
     if (warnings != 0) return error.SuccessfulFallbackWarned;
     warnings = 0;

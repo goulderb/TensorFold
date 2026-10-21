@@ -100,7 +100,6 @@ test "production target warmup covers every shared width with at most two sixtee
 
 test "canonical Engine.verifyShared stages five 8-row windows and refuses a reduced allocation" {
     const Memory = @import("cuda_test_driver.zig").Memory;
-    const block = @import("dflash_block.zig");
     var d = Memory.driver();
     const c = config.Config{};
     const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try shard.Share.of(&c, 0, 2) };
@@ -114,8 +113,6 @@ test "canonical Engine.verifyShared stages five 8-row windows and refuses a redu
     var tap_store = try cuda.DeviceBuffer.alloc(&d, dflash.STEP_ROWS * dflash.TAP_ROW);
     defer tap_store.free();
     dr.taps_step = tap_store.ptr;
-    var consumed = try cuda.DeviceBuffer.alloc(&d, 64 * dflash.TAP_ROW);
-    defer consumed.free();
     var ids: [8][8]u32 = undefined;
     var outs: [8][8]u32 = undefined;
     var parts: [8]Part = undefined;
@@ -208,13 +205,10 @@ test "canonical Engine.verifyShared stages five 8-row windows and refuses a redu
         var wide_out: [9]u32 = undefined;
         const overflow = [_]Part{.{ .slot = 0, .ids = &wide, .out = &wide_out }};
         try std.testing.expectError(error.WindowTooWide, e.verifyShared(&overflow));
-        const tap_src = e.bs.?.taps.?;
-        for (0..40) |row| std.mem.writeInt(u32, Memory.slice(tap_src.ptr + row * @import("cuda_taps.zig").hidden * 2, 4)[0..4], @intCast(0xC0DE0000 + row), .little);
         Memory.launches.store(0, .monotonic);
         TapCopy.copies = 0;
         try e.verifyShared(parts[0..5]);
-        try std.testing.expect(TapCopy.copies >= @import("cuda_taps.zig").layers.len);
-        try std.testing.expect(Memory.launches.load(.monotonic) >= 44);
+        try std.testing.expectEqual(@as(usize, 0), TapCopy.copies);
         try std.testing.expectEqual(@as(u64, 1), dr.verifies);
         try std.testing.expectEqual(@as(u64, 1), e.verify_widths[40]);
         for (0..5) |slot| {
@@ -223,73 +217,26 @@ test "canonical Engine.verifyShared stages five 8-row windows and refuses a redu
             try std.testing.expectEqual(@as(usize, 8), s.v_rows);
             try std.testing.expectEqual(@as(i64, 0), s.v_pos0);
             try std.testing.expectEqual(dr.verifies, s.v_step);
-            try block.copy(&e, consumed.ptr + slot * 8 * dflash.TAP_ROW, dr.taps_step + s.v_row0 * dflash.TAP_ROW, 8 * dflash.TAP_ROW);
-            for (0..8) |r| {
-                const got = std.mem.readInt(u32, Memory.slice(consumed.ptr + (slot * 8 + r) * dflash.TAP_ROW, 4)[0..4], .little);
-                try std.testing.expectEqual(@as(u32, @intCast(0xC0DE0000 + slot * 8 + r)), got);
-            }
         }
-        {
-            const D = dflash.D;
-            const dense: @import("cuda_mm.zig").Tiled = .{ .w = 0, .n = D, .k = D };
-            dr.fc = .{ .bf16 = dense };
-            dr.hproj = dense;
-            for (&dr.layers) |*layer| layer.* = .{ .in_norm = 0, .post_norm = 0, .qn = 0, .kn = 0, .a_base = 0, .m_base = 0, .qkv = .{ .bf16 = dense }, .kv = .{ .bf16 = dense }, .o = .{ .bf16 = dense }, .gu = .{ .bf16 = dense }, .down = dense, .a_proj = .{ .bf16 = dense }, .m_proj = .{ .bf16 = dense } };
-            e.m.mm = .{ .by_rows = @splat(dummy), .packed_rows = @splat(@splat(dummy)), .prompt = dummy, .reduce = dummy, .tile = dummy, .tile_packed = @splat(dummy), .pdl = false };
-            e.m.q4 = .{ .group = dummy, .pack_dense = dummy, .transpose = dummy, .gb10 = false };
-            var cin = try cuda.DeviceBuffer.alloc(&d, 40 * dflash.TAP_ROW);
-            defer cin.free();
-            dr.cin = cin.ptr;
-            var c1 = try cuda.DeviceBuffer.alloc(&d, 40 * D * 2);
-            defer c1.free();
-            dr.c1 = c1.ptr;
-            var ctx_h = try cuda.DeviceBuffer.alloc(&d, 40 * D * 2);
-            defer ctx_h.free();
-            dr.ctx = ctx_h.ptr;
-            var ckv = try cuda.DeviceBuffer.alloc(&d, 40 * D * 2);
-            defer ckv.free();
-            dr.ckv = ckv.ptr;
-            var cpos = try cuda.DeviceBuffer.alloc(&d, dflash.MAX_CTX * 8);
-            defer cpos.free();
-            dr.cpos = cpos.ptr;
-            var crings = try cuda.DeviceBuffer.alloc(&d, dflash.MAX_CTX * 8);
-            defer crings.free();
-            dr.crings = crings.ptr;
-            var positions: [dflash.MAX_CTX]i64 = undefined;
-            var rings: [dflash.MAX_CTX]u64 = undefined;
-            dr.h_cpos = &positions;
-            dr.h_crings = &rings;
-            var matching: [5]dflash.Req = undefined;
-            for (&matching, 0..) |*q, i| q.* = .{ .slot = @intCast(i), .pos = 8, .n = 8, .anchor = 1, .propose = false };
-            dr.lost = 0;
-            try dr.draft(&e, &matching);
-            try std.testing.expectEqual(@as(u64, 0), dr.lost);
-            for (0..5) |slot| {
-                try std.testing.expectEqual(@as(i64, 0), dr.slots.items[slot].from);
-                try std.testing.expectEqual(@as(i64, 8), dr.slots.items[slot].upto);
-            }
-            try std.testing.expectEqualSlices(i64, &.{ 0, 1, 2, 3, 4, 5, 6, 7 }, dr.h_cpos[0..8]);
-        }
+        e.settings.draft_profile = @import("cuda_draft_profile.zig").Settings.production();
+        try std.testing.expectEqual(@as(usize, 8), e.targetRows());
+        try std.testing.expectEqual(@as(usize, 64), e.sharedLimit());
+        try e.verifyShared(parts[0..5]);
+        try std.testing.expectEqual(@as(u64, 2), dr.verifies);
+        try std.testing.expectEqual(@as(u64, 2), e.verify_widths[40]);
         var stale: [5]dflash.Req = undefined;
         for (&stale, 0..) |*q, i| q.* = .{ .slot = @intCast(i), .pos = 99, .n = 8, .anchor = 1, .propose = false };
         dr.lost = 0;
         try dr.draft(&e, &stale);
         try std.testing.expectEqual(@as(u64, 5), dr.lost);
-        for (0..64) |row| std.mem.writeInt(u32, Memory.slice(tap_src.ptr + row * @import("cuda_taps.zig").hidden * 2, 4)[0..4], @intCast(0xDA7A0000 + row), .little);
         Memory.launches.store(0, .monotonic);
         try e.verifyShared(&parts);
-        try std.testing.expect(Memory.launches.load(.monotonic) >= 68);
-        try std.testing.expectEqual(@as(u64, 2), dr.verifies);
+        try std.testing.expectEqual(@as(u64, 3), dr.verifies);
         try std.testing.expectEqual(@as(u64, 1), e.verify_widths[64]);
         for (0..8) |slot| {
             const s = dr.slots.items[slot];
             try std.testing.expectEqual(slot * 8, s.v_row0);
             try std.testing.expectEqual(@as(usize, 8), s.v_rows);
-            try block.copy(&e, consumed.ptr + slot * 8 * dflash.TAP_ROW, dr.taps_step + s.v_row0 * dflash.TAP_ROW, 8 * dflash.TAP_ROW);
-            for (0..8) |r| {
-                const got = std.mem.readInt(u32, Memory.slice(consumed.ptr + (slot * 8 + r) * dflash.TAP_ROW, 4)[0..4], .little);
-                try std.testing.expectEqual(@as(u32, @intCast(0xDA7A0000 + slot * 8 + r)), got);
-            }
         }
         var extra: [9]Part = undefined;
         @memcpy(extra[0..8], &parts);
@@ -297,6 +244,219 @@ test "canonical Engine.verifyShared stages five 8-row windows and refuses a redu
         extra[8].slot = 8;
         try std.testing.expectError(error.WindowTooWide, e.verifyShared(&extra));
     }
+}
+
+test "canonical named tap layers publish distinct planes and ingest recorded sources" {
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    const taps_mod = @import("cuda_taps.zig");
+    var d = Memory.driver();
+    const c = config.Config{};
+    var w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try shard.Share.of(&c, 0, 2) };
+    const dummy_layers = try std.testing.allocator.alloc(weights.Layer, taps_mod.requiredLayers());
+    defer std.testing.allocator.free(dummy_layers);
+    const proj: @import("cuda_proj.zig").Proj = .{ .bf16 = 0 };
+    const hc: weights.Hc = .{ .fn_w = 0, .base = 0, .scale = 0 };
+    for (dummy_layers, 0..) |*layer, i| layer.* = .{
+        .index = @intCast(i),
+        .attn_hc = hc,
+        .ffn_hc = hc,
+        .in_norm = .{ .bf16 = 0 },
+        .post_norm = .{ .bf16 = 0 },
+        .mixer = .{ .kda = .{ .proj = proj, .fb = proj, .gb = proj, .o = proj, .conv_w = 0, .a_log = 0, .dt_bias = 0, .norm_w = 0, .eps = 1e-5, .lower = -5.0, .heads = 64, .dims = 4096 } },
+        .ffn = .{ .dense = .{ .input = .{ .combined = proj }, .down = proj, .width = 12288, .dims = 4096, .limit = 10.0 } },
+    };
+    var dr: dflash.Drafter = .{ .gpa = std.testing.allocator, .d = &d, .module = undefined, .k = undefined, .weights = undefined, .split = false, .ff = 0, .rank = 0, .world = 1 };
+    defer {
+        for (dr.slots.items) |*s| if (s.ring) |*r| r.free();
+        dr.slots.deinit(std.testing.allocator);
+    }
+    const dummy = Memory.dummyFunction(&d);
+    inline for (@typeInfo(dflash.Kernels).@"struct".field_names) |name| @field(dr.k, name) = dummy;
+    var tap_store = try cuda.DeviceBuffer.alloc(&d, dflash.STEP_ROWS * dflash.TAP_ROW);
+    defer tap_store.free();
+    dr.taps_step = tap_store.ptr;
+    var ids: [5][8]u32 = undefined;
+    var outs: [5][8]u32 = undefined;
+    var parts: [5]Part = undefined;
+    for (&parts, &ids, &outs, 0..) |*p, *id, *out, i| {
+        for (id, 0..) |*tok, r| tok.* = @intCast(i * 8 + r + 1);
+        p.* = .{ .slot = @intCast(i), .ids = id, .out = out };
+    }
+    var e: Engine = undefined;
+    e.full_graphs = null;
+    e.ffn_graphs = null;
+    e.route_trace = null;
+    e.prefetch = null;
+    e.tp_group = null;
+    e.replicas = .{};
+    e.target_graphs_active = true;
+    e.capture_lifetime = 0;
+    e.structured = false;
+    e.pair_failure = struct {
+        fn ignore(_: anyerror) void {}
+    }.ignore;
+    e.settings = .{ .kv = .bf16 };
+    e.drafter = &dr;
+    e.canonical_owner = true;
+    e.dflash = null;
+    e.gpa = std.testing.allocator;
+    e.d = &d;
+    e.w = w;
+    e.c = c;
+    e.share = w.share;
+    e.capacity = 64;
+    e.mtp = false;
+    e.pool = null;
+    e.verify_widths = @splat(0);
+    e.seqs = .empty;
+    e.stream = .{ .d = &d, .handle = null };
+    e.m = undefined;
+    e.m.glue = Memory.dummyGlue(&d);
+    e.m.glue.stream_mean.handle = @ptrFromInt(11);
+    e.m.tiled = false;
+    e.m.packs = null;
+    e.m.ck = null;
+    e.m.prompt_latent = null;
+    e.m.source_dense = null;
+    e.m.source_upcast = null;
+    e.m.copy_rows = .{ .d = &d, .handle = @ptrFromInt(7) };
+    const Capture = struct {
+        var copies: usize = 0;
+        var ingest_n: usize = 0;
+        var ingest_src: [8]u64 = undefined;
+        fn launch(f: cuda.abi.Function, gx: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
+            if (f == @as(cuda.abi.Function, @ptrFromInt(7))) {
+                const a = args.?;
+                const src = @as(*const u64, @ptrCast(@alignCast(a[0].?))).*;
+                const src_stride = @as(*const i64, @ptrCast(@alignCast(a[1].?))).*;
+                const dst = @as(*const u64, @ptrCast(@alignCast(a[2].?))).*;
+                const dst_stride = @as(*const i64, @ptrCast(@alignCast(a[3].?))).*;
+                const nrows: usize = @intCast(@as(*const i32, @ptrCast(@alignCast(a[4].?))).*);
+                const bytes: usize = @intCast(@as(*const i32, @ptrCast(@alignCast(a[5].?))).*);
+                for (0..nrows) |r| @memcpy(Memory.slice(dst + r * @as(u64, @intCast(dst_stride)), bytes), Memory.slice(src + r * @as(u64, @intCast(src_stride)), bytes));
+                copies += 1;
+            } else if (f == @as(cuda.abi.Function, @ptrFromInt(11))) {
+                const a = args.?;
+                const src = @as(*const u64, @ptrCast(@alignCast(a[0].?))).*;
+                const dst = @as(*const u64, @ptrCast(@alignCast(a[1].?))).*;
+                const rows: usize = gx;
+                for (0..rows) |r| @memcpy(Memory.slice(dst + r * taps_mod.hidden * 2, 4), Memory.slice(src + r * 4 * taps_mod.hidden * 2, 4));
+            }
+            _ = Memory.launches.fetchAdd(1, .monotonic);
+            return 0;
+        }
+        fn copyDtoD(dst: u64, src: u64, n: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+            if (ingest_n < ingest_src.len) {
+                ingest_src[ingest_n] = src;
+                ingest_n += 1;
+            }
+            @memcpy(Memory.slice(dst, n), Memory.slice(src, n));
+            return 0;
+        }
+    };
+    d.api.cuLaunchKernel = Capture.launch;
+    defer cuda.copy_source.dropSpares(&d, cuda.copy_source.current());
+    e.greedy_rows = try greedy_mod.Greedy.init(std.testing.allocator, &d, 1, 64);
+    defer e.greedy_rows.deinit();
+    defer {
+        for (e.seqs.items) |q| if (q) |s| {
+            s.st.deinit();
+            e.gpa.destroy(s);
+        };
+        e.seqs.deinit(e.gpa);
+    }
+    var shared = try fw.Buffers.initShared(&d, &w, 64, 64);
+    defer shared.deinit();
+    try shared.enableTaps(&d);
+    e.bs = shared;
+    try e.verifyShared(&parts);
+    try std.testing.expectEqual(@as(u64, 1), e.verify_widths[40]);
+    e.w.layers = dummy_layers;
+    try d.check(d.api.cuMemsetD8_v2(dr.taps_step, 0, dflash.STEP_ROWS * dflash.TAP_ROW), "clear packed taps");
+    try d.check(d.api.cuMemsetD8_v2(e.bs.?.taps.?.ptr, 0, e.bs.?.taps.?.len), "clear rank taps");
+    var one: [1]fw.Rank = .{.{ .w = &e.w, .st = &e.seqs.items[0].?.st, .b = &e.bs.?, .segs = &.{} }};
+    const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = .local, .replicas = &e.replicas, .taps = dr.taps(false), .target_failure = e.pair_failure };
+    Capture.copies = 0;
+    for (taps_mod.layers) |layer| {
+        const marker: u32 = 0xA5000000 | @as(u32, @intCast(layer));
+        for (0..40) |row| std.mem.writeInt(u32, Memory.slice(e.bs.?.x + row * c.hc * c.hidden * 2, 4)[0..4], marker, .little);
+        try f.ffnSite(layer, 40);
+    }
+    try std.testing.expectEqual(taps_mod.layers.len, Capture.copies);
+    for (taps_mod.layers, 0..) |layer, plane| {
+        const marker: u32 = 0xA5000000 | @as(u32, @intCast(layer));
+        for (0..40) |row| {
+            const got = std.mem.readInt(u32, Memory.slice(dr.taps_step + row * dflash.TAP_ROW + plane * dflash.D * 2, 4)[0..4], .little);
+            try std.testing.expectEqual(marker, got);
+        }
+    }
+    const D = dflash.D;
+    const dense: @import("cuda_mm.zig").Tiled = .{ .w = 0, .n = D, .k = D };
+    dr.fc = .{ .bf16 = dense };
+    dr.hproj = dense;
+    for (&dr.layers) |*layer| layer.* = .{ .in_norm = 0, .post_norm = 0, .qn = 0, .kn = 0, .a_base = 0, .m_base = 0, .qkv = .{ .bf16 = dense }, .kv = .{ .bf16 = dense }, .o = .{ .bf16 = dense }, .gu = .{ .bf16 = dense }, .down = dense, .a_proj = .{ .bf16 = dense }, .m_proj = .{ .bf16 = dense } };
+    e.m.mm = .{ .by_rows = @splat(dummy), .packed_rows = @splat(@splat(dummy)), .prompt = dummy, .reduce = dummy, .tile = dummy, .tile_packed = @splat(dummy), .pdl = false };
+    e.m.q4 = .{ .group = dummy, .pack_dense = dummy, .transpose = dummy, .gb10 = false };
+    var cin = try cuda.DeviceBuffer.alloc(&d, 40 * dflash.TAP_ROW);
+    defer cin.free();
+    dr.cin = cin.ptr;
+    var c1 = try cuda.DeviceBuffer.alloc(&d, 40 * D * 2);
+    defer c1.free();
+    dr.c1 = c1.ptr;
+    var ctx_h = try cuda.DeviceBuffer.alloc(&d, 40 * D * 2);
+    defer ctx_h.free();
+    dr.ctx = ctx_h.ptr;
+    var ckv = try cuda.DeviceBuffer.alloc(&d, 40 * D * 2);
+    defer ckv.free();
+    dr.ckv = ckv.ptr;
+    var cpos = try cuda.DeviceBuffer.alloc(&d, dflash.MAX_CTX * 8);
+    defer cpos.free();
+    dr.cpos = cpos.ptr;
+    var crings = try cuda.DeviceBuffer.alloc(&d, dflash.MAX_CTX * 8);
+    defer crings.free();
+    dr.crings = crings.ptr;
+    var ids_dev = try cuda.DeviceBuffer.alloc(&d, dflash.MAX_M * 4);
+    defer ids_dev.free();
+    dr.ids = ids_dev.ptr;
+    var bpos = try cuda.DeviceBuffer.alloc(&d, dflash.MAX_M * 4);
+    defer bpos.free();
+    dr.bpos = bpos.ptr;
+    var rings_dev = try cuda.DeviceBuffer.alloc(&d, dflash.MAX_S * 8);
+    defer rings_dev.free();
+    dr.rings = rings_dev.ptr;
+    var starts = try cuda.DeviceBuffer.alloc(&d, dflash.MAX_S * 8);
+    defer starts.free();
+    dr.starts = starts.ptr;
+    var froms = try cuda.DeviceBuffer.alloc(&d, dflash.MAX_S * 8);
+    defer froms.free();
+    dr.froms = froms.ptr;
+    var positions: [dflash.MAX_CTX]i64 = undefined;
+    var ring_host: [dflash.MAX_CTX]u64 = undefined;
+    dr.h_cpos = &positions;
+    dr.h_crings = &ring_host;
+    d.api.cuMemcpyDtoDAsync_v2 = Capture.copyDtoD;
+    Capture.ingest_n = 0;
+    var matching: [5]dflash.Req = undefined;
+    for (&matching, 0..) |*q, i| q.* = .{ .slot = @intCast(i), .pos = 8, .n = 8, .anchor = 1, .propose = false };
+    dr.lost = 0;
+    try dr.draft(&e, &matching);
+    try std.testing.expectEqual(@as(u64, 0), dr.lost);
+    try std.testing.expectEqual(@as(usize, 5), Capture.ingest_n);
+    for (0..5) |slot| {
+        try std.testing.expectEqual(dr.taps_step + slot * 8 * dflash.TAP_ROW, Capture.ingest_src[slot]);
+        try std.testing.expectEqual(@as(i64, 0), dr.slots.items[slot].from);
+        try std.testing.expectEqual(@as(i64, 8), dr.slots.items[slot].upto);
+        for (0..8) |r| {
+            const row = slot * 8 + r;
+            for (taps_mod.layers, 0..) |layer, plane| {
+                const marker: u32 = 0xA5000000 | @as(u32, @intCast(layer));
+                const got = std.mem.readInt(u32, Memory.slice(dr.cin + row * dflash.TAP_ROW + plane * dflash.D * 2, 4)[0..4], .little);
+                try std.testing.expectEqual(marker, got);
+            }
+        }
+    }
+    try e.stream.synchronize();
+    cuda.copy_source.dropSpares(&d, cuda.copy_source.current());
 }
 
 pub const Part = types.Part;
@@ -398,6 +558,9 @@ pub const Engine = struct {
         };
         if (startup_problem == null) {
             if (ranks.validateDraftOwner(settings, o.drafter != null)) |err| startup_problem = err;
+        }
+        if (startup_problem == null) {
+            if (ranks.unsupportedCanonicalTarget(o.drafter != null, settings.layers, c.layers)) |err| startup_problem = err;
         }
         if (settings.draft == .dflash2 and startup_problem == null) {
             if (world != 2 or c.hidden != 4096 or c.hc != 4 or c.vocab != 154880 or (!o.partial_dflash_check and settings.layers != 0 and settings.layers != c.layers)) startup_problem = error.UnsupportedDFlashTarget;
@@ -1577,11 +1740,11 @@ pub const Engine = struct {
     }
 
     pub fn targetRows(e: *const Engine) usize {
-        return if (e.settings.draft_profile.enabled) verify_plan.target_rows else 1 + e.verifyPlan().drafts();
+        return if (ranks.selectedDraftProfile(e.canonical_owner, e.settings)) verify_plan.target_rows else 1 + e.verifyPlan().drafts();
     }
 
     pub fn sharedLimit(e: *const Engine) usize {
-        return if (e.settings.draft_profile.enabled) @import("cuda_draft_profile.zig").shared_rows else e.verifyPlan().rows();
+        return if (ranks.selectedDraftProfile(e.canonical_owner, e.settings)) @import("cuda_draft_profile.zig").shared_rows else e.verifyPlan().rows();
     }
 
     /// One geometry for shared buffers, admission and tap staging. Canonical --drafter is dflash7 (64 rows).

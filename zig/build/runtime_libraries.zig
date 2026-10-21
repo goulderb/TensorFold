@@ -10,8 +10,10 @@ pub fn tests(b: *std.Build, all: *std.Build.Step) void {
     const fixture_library = b.addLibrary(.{ .name = "runtime-discovery-mock", .linkage = .dynamic, .root_module = fixture_module });
     const fixture = b.addOptions();
     fixture.addOptionPath("library", fixture_library.getEmittedBin());
+    const fixture_path = b.createModule(.{ .root_source_file = b.path("zig/runtime_fixture_path.zig"), .target = b.graph.host });
     const exit_module = b.createModule(.{ .root_source_file = b.path("zig/runtime_discovery_exit.zig"), .target = b.graph.host, .link_libc = true });
     exit_module.addOptions("discovery_fixture", fixture);
+    exit_module.addImport("fixture_path", fixture_path);
     const exit_run = b.addRunArtifact(b.addExecutable(.{ .name = "runtime-discovery-exit", .root_module = exit_module }));
     exit_run.has_side_effects = true;
     b.step("test-runtime-discovery-exit-host", "Discovery preserves loaded exit callbacks in separate host processes").dependOn(&exit_run.step);
@@ -25,12 +27,14 @@ pub fn tests(b: *std.Build, all: *std.Build.Step) void {
         fixtures.addOptionPath(kind, lib.getEmittedBin());
     }
     root.addOptions("rpc_fixtures", fixtures);
+    root.addImport("fixture_path", fixture_path);
     const run = b.addRunArtifact(b.addTest(.{ .root_module = root, .filters = &.{"runtime library:"} }));
     const step = b.step("test-runtime-libraries-host", "Optional library refusals and discovery without a GPU");
     step.dependOn(&run.step);
     step.dependOn(&exit_run.step);
     const warnings = b.createModule(.{ .root_source_file = b.path("zig/rpc_warning_check.zig"), .target = b.graph.host, .link_libc = true });
     warnings.addOptions("rpc_fixtures", fixtures);
+    warnings.addImport("fixture_path", fixture_path);
     const check = b.addRunArtifact(b.addExecutable(.{ .name = "rpc-warning-check", .root_module = warnings }));
     step.dependOn(&check.step);
     all.dependOn(&check.step);
