@@ -296,6 +296,37 @@ The separate automated comment-only check remains failed/open after two invalid
 reports. Required legal notices and API ownership contracts remain intact.
 No automated style pass is claimed.
 
+## Bounded hidden-backbone diagnostic
+
+The first full text-backbone run completed on the decision eGPU on 2026-10-21
+UTC, using initializer source `98c1b613`. The private official-reference harness
+captured all-token post-final-RMSNorm rows before the joint head. Native captures
+used the same seven inputs at chunk sizes 1 and 16, with lengths 1, 2, 15, 16,
+17, 33 and 151. Every capture returned finite BF16 rows. The two native captures
+are bitwise identical for every case, and all six native prefixes match their
+full-record prefix exactly.
+
+The native/reference outputs are not bitwise equal. The 151-token record has
+normalized RMS error 0.0267971, minimum row cosine 0.9876798 and maximum absolute
+error 2.125. Token 61 has the largest squared error and row-normalized RMS error
+0.1569954. The reference's short-prefix rows also differ from its own full-record
+prefixes. That sequence-length sensitivity does not explain or excuse the
+native/reference discrepancy. No numerical acceptance threshold or parity verdict
+is assigned. Layer-level localization and a controlled reference-order comparison
+remain open.
+
+The approved Clef-only window restored the original Python BF16 service. Direct
+and public requests returned HTTP 200, with the public request served locally.
+Nemotron and proxy listener identities were unchanged. Across 116 physical GPU
+samples during test children, the internal GPUs retained at least 4518/4760 MiB
+free and the decision eGPU at least 2540 MiB. These bounded samples do not qualify
+full 4096-token capacity, the joint head, probabilities or serving. No production
+pin or route changed.
+
+The fleet records sanitized results in
+`fleet/trials/clef-tensorfold-hidden-backbone-20261021.json`. Raw files and build
+receipts remain private. This is a diagnostic checkpoint, not a promotion.
+
 ## Public-history port
 
 The reviewed preparation from archived source
