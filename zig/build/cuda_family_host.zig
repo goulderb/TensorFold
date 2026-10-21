@@ -17,6 +17,9 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, mods: anytype, step: *std.B
     const pattn_run = b.addRunArtifact(b.addTest(.{ .root_module = mods.nemotron, .filters = &.{"pattn "} }));
     b.step("test-nemotron-pattn-host", "Nemotron prefill attention symbol and contiguous launch args without a GPU").dependOn(&pattn_run.step);
     step.dependOn(&pattn_run.step);
+    const grammar_run = b.addRunArtifact(b.addTest(.{ .root_module = mods.lanes, .filters = &.{"grammar library:"} }));
+    grammar_run.has_side_effects = true; // the environment names the library under test, and is no cache input
+    b.step("test-grammar-library-host", "libtfgrammar name and loader refusals; with TF_GRAMMAR_TEST_LIBRARY and TF_GRAMMAR_TEST_TOKENIZER set, the built library's ABI over that tokenizer").dependOn(&grammar_run.step);
     step.dependOn(&mtp_run.step);
     const decode_host = b.createModule(.{ .root_source_file = b.path("zig/qwen35_decode_host.zig"), .target = host, .optimize = .debug, .imports = &.{.{ .name = "core", .module = mods.core }} });
     b.step("test-qwen35-decode-records-host", "Optimized Qwen decode launch records on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = decode_host })).step);

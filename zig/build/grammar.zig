@@ -22,8 +22,18 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, dir: ?[]const u8) 
         step.dependOn(&b.addFail(b.fmt("-Dxgrammar={s} is not an xgrammar " ++ pinned ++ " checkout: " ++ clone, .{root})).step);
         return;
     };
-    const into = if (target.result.os.tag == .macos) "native/lib" else "lib";
+    // beside the server's bin, where it looks (../lib)
+    const into = if (target.result.os.tag == .macos or target.result.os.tag == .windows) "native/lib" else "lib";
     step.dependOn(&b.addInstallArtifact(lib, .{ .dest_dir = .{ .override = .{ .custom = into } } }).step);
+}
+
+/// The library's file name where the server looks for it (core/lanes/grammar.zig, platform/optional_libraries.zig).
+pub fn fileName(os: std.Target.Os.Tag) []const u8 {
+    return switch (os) {
+        .macos => "libtfgrammar.dylib",
+        .windows => "tfgrammar.dll",
+        else => "libtfgrammar.so",
+    };
 }
 
 /// libtfgrammar for `target` from the checkout at `dir`; null unless `dir` is a git checkout at the pinned tag.
@@ -48,8 +58,7 @@ pub fn library(b: *std.Build, target: std.Build.ResolvedTarget, dir: []const u8)
 pub fn overlay(b: *std.Build, target: std.Build.ResolvedTarget, dir: []const u8) ?std.Build.LazyPath {
     const lib = library(b, target, dir) orelse return null;
     const files = b.addWriteFiles();
-    const name = if (target.result.os.tag == .macos) "libtfgrammar.dylib" else "libtfgrammar.so";
-    _ = files.addCopyFile(lib.getEmittedBin(), b.fmt("lib/{s}", .{name}));
+    _ = files.addCopyFile(lib.getEmittedBin(), b.fmt("lib/{s}", .{fileName(target.result.os.tag)}));
     const root: std.Build.LazyPath = .{ .cwd_relative = dir };
     _ = files.addCopyFile(root.path(b, "LICENSE"), "LICENSES/xgrammar-Apache-2.0.txt");
     _ = files.addCopyFile(root.path(b, "NOTICE"), "LICENSES/xgrammar-NOTICE.txt");

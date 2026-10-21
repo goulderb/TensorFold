@@ -26,9 +26,6 @@ var lib_mutex: std.atomic.Mutex = .unlocked;
 
 /// The library from the server's ../lib (an archive's lib, zig build grammar's), beside it, else the loader's path.
 fn load(io: std.Io, a: Allocator) ?Fns {
-    // libtfgrammar is built as a .so or .dylib only, and Zig 0.17's std.DynLib is a compile error on Windows:
-    // structured output stays refused there, as the vision helper is (docs/windows-port.md).
-    if (comptime builtin.os.tag == .windows) return null;
     while (!lib_mutex.tryLock()) std.atomic.spinLoopHint();
     defer lib_mutex.unlock();
     if (lib) |l| return l;
@@ -40,21 +37,30 @@ fn load(io: std.Io, a: Allocator) ?Fns {
         std.fs.path.join(a, &.{ exe, library }) catch return null,
         library,
     };
-    var dl = for (names) |name| {
-        break platform.DynLib.open(name) catch continue;
+    const f = for (names) |name| {
+        break bind(name) orelse continue;
     } else return null;
-    var f: Fns = undefined;
-    const info = @typeInfo(Fns).@"struct";
-    inline for (info.field_names, info.field_types) |name, T| {
-        @field(f, name) = dl.lookup(T, "tfg_" ++ name) orelse return null;
-    }
     lib_failed = false;
     lib = f;
     return f;
 }
 
+/// The library at `path` with all of its entry points, or null; a library missing one is closed again.
+fn bind(path: []const u8) ?Fns {
+    var dl = platform.DynLib.open(path) catch return null;
+    var f: Fns = undefined;
+    const info = @typeInfo(Fns).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        @field(f, name) = dl.lookup(T, "tfg_" ++ name) orelse {
+            dl.close();
+            return null;
+        };
+    }
+    return f;
+}
+
 /// The library's file name, for the refusal when it cannot be loaded.
-pub const library = if (builtin.os.tag == .macos) "libtfgrammar.dylib" else "libtfgrammar.so";
+pub const library = platform.optional_libraries.spec(.grammar).names[0];
 
 /// libtfgrammar's kinds in order: structural_tag is xgrammar's JSON form (a tool call's markup around its arguments).
 pub const Kind = enum(u8) { json, json_schema, regex, choice, grammar, structural_tag };
@@ -480,6 +486,54 @@ test "a chain grows past its last kept row with the grammar's own drafts, never 
     // forced rows never grow
     const f = try c.window(a, &.{ 9, 5 }, &.{ -1, 0 }, true, 16);
     try std.testing.expectEqual(@as(usize, 0), f.extra.len);
+}
+
+test "grammar library: the file name and the refusals follow the platform" {
+    const want = switch (builtin.os.tag) {
+        .macos => "libtfgrammar.dylib",
+        .windows => "tfgrammar.dll",
+        else => "libtfgrammar.so",
+    };
+    try std.testing.expectEqualStrings(want, library);
+    // a library that loads but lacks the entry points is closed and refused, not half-bound
+    try std.testing.expect(bind(if (builtin.os.tag == .windows) "kernel32.dll" else "libc.so.6") == null);
+    // on Windows a bare name searches System32 only, never the working directory
+    if (builtin.os.tag == .windows) try std.testing.expect(bind(library) == null);
+    try std.testing.expect(bind("no-such-dir/" ++ library) == null);
+}
+
+test "grammar library: the built library binds and walks a schema" {
+    const lib_path = platform.getenv("TF_GRAMMAR_TEST_LIBRARY") orelse return error.SkipZigTest;
+    const tok_path = platform.getenv("TF_GRAMMAR_TEST_TOKENIZER") orelse return error.SkipZigTest;
+    const vocab: c_int = 131072;
+    const gpa = std.testing.allocator;
+    const tok = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, tok_path, gpa, .limited(64 << 20));
+    defer gpa.free(tok);
+    const f = bind(lib_path) orelse return error.GrammarLibraryUnbound;
+    var err: [512]u8 = undefined;
+    const stops = [_]i32{ 2, 11 };
+    const h = f.open(tok.ptr, tok.len, vocab, &stops, stops.len, &err, err.len) orelse return error.GrammarSetup;
+    defer f.close(h);
+    const words: usize = @intCast(f.words(h));
+    try std.testing.expectEqual(@as(usize, 4096), words);
+    const schema = "{\"type\": \"object\", \"properties\": {\"n\": {\"type\": \"integer\"}}, \"required\": [\"n\"]}";
+    const g = f.compile(h, @backingInt(Kind.json_schema), schema.ptr, schema.len, &err, err.len) orelse return error.Grammar;
+    defer f.free(g);
+    const m = f.matcher(g) orelse return error.Grammar;
+    defer f.matcher_free(m);
+    var bits: [4096]i32 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), f.fill(m, &bits, @intCast(words)));
+    var allowed: usize = 0;
+    for (bits) |w| allowed += @popCount(@as(u32, @bitCast(w)));
+    try std.testing.expect(allowed > 0 and allowed < 1024);
+    const forbidden: i32 = for (0..words * 32) |t| {
+        if (bits[t / 32] & (@as(i32, 1) << @intCast(t % 32)) == 0 and t != 2 and t != 11) break @intCast(t);
+    } else return error.NoForbiddenToken;
+    try std.testing.expectEqual(@as(c_int, 0), f.accept(m, forbidden));
+    try std.testing.expectEqual(@as(c_int, 0), f.terminated(m));
+    const bad = "{\"type\": \"no-such-type\"}";
+    try std.testing.expect(f.compile(h, @backingInt(Kind.json_schema), bad.ptr, bad.len, &err, err.len) == null);
+    try std.testing.expect(std.mem.sliceTo(&err, 0).len > 0);
 }
 
 test {

@@ -79,10 +79,17 @@ const char* OBJECT = "{\"type\": \"object\"}";  // grammar.py OBJECT: json_objec
 
 }  // namespace
 
+// A Windows DLL exports only what it names; elsewhere the default visibility already does.
+#ifdef _WIN32
+#define TFG_API __declspec(dllexport)
+#else
+#define TFG_API
+#endif
+
 extern "C" {
 
 // tokenizer.json's text; vocab: the logits' width; stops: the model's eos ids. NULL with ``err`` on failure.
-void* tfg_open(const char* tokenizer_json, size_t len, int vocab, const int32_t* stops, int nstops, char* err, size_t errlen) {
+TFG_API void* tfg_open(const char* tokenizer_json, size_t len, int vocab, const int32_t* stops, int nstops, char* err, size_t errlen) {
     try {
         std::string text(tokenizer_json, len);
         picojson::value v;
@@ -126,13 +133,13 @@ void* tfg_open(const char* tokenizer_json, size_t len, int vocab, const int32_t*
     return nullptr;
 }
 
-void tfg_close(void* c) { delete static_cast<Compiler*>(c); }
+TFG_API void tfg_close(void* c) { delete static_cast<Compiler*>(c); }
 
 // Words a row's bitmask holds.
-int tfg_words(void* c) { return (static_cast<Compiler*>(c)->vocab + 31) / 32; }
+TFG_API int tfg_words(void* c) { return (static_cast<Compiler*>(c)->vocab + 31) / 32; }
 
 // kind: 0 json (any object), 1 json_schema, 2 regex, 3 choice (JSON strings), 4 EBNF, 5 structural tag (xgrammar JSON).
-void* tfg_compile(void* cp, int kind, const char* text, size_t len, char* err, size_t errlen) {
+TFG_API void* tfg_compile(void* cp, int kind, const char* text, size_t len, char* err, size_t errlen) {
     auto* c = static_cast<Compiler*>(cp);
     try {
         std::string t(text, len);
@@ -167,9 +174,9 @@ void* tfg_compile(void* cp, int kind, const char* text, size_t len, char* err, s
     return nullptr;
 }
 
-void tfg_free(void* g) { delete static_cast<Compiled*>(g); }
+TFG_API void tfg_free(void* g) { delete static_cast<Compiled*>(g); }
 
-void* tfg_matcher(void* g) {
+TFG_API void* tfg_matcher(void* g) {
     try {
         auto* c = static_cast<Compiled*>(g);
         return new Matcher{xgrammar::GrammarMatcher(c->g), c->spell};
@@ -178,10 +185,10 @@ void* tfg_matcher(void* g) {
     }
 }
 
-void tfg_matcher_free(void* m) { delete static_cast<Matcher*>(m); }
+TFG_API void tfg_matcher_free(void* m) { delete static_cast<Matcher*>(m); }
 
 // 1 taken, 0 rejected, -1 failed.
-int tfg_accept(void* m, int32_t token) {
+TFG_API int tfg_accept(void* m, int32_t token) {
     try {
         return static_cast<Matcher*>(m)->m.AcceptToken(token) ? 1 : 0;
     } catch (...) {
@@ -189,7 +196,7 @@ int tfg_accept(void* m, int32_t token) {
     }
 }
 
-int tfg_rollback(void* m, int n) {
+TFG_API int tfg_rollback(void* m, int n) {
     try {
         static_cast<Matcher*>(m)->m.Rollback(n);
         return 0;
@@ -198,10 +205,10 @@ int tfg_rollback(void* m, int n) {
     }
 }
 
-int tfg_terminated(void* m) { return static_cast<Matcher*>(m)->m.IsTerminated() ? 1 : 0; }
+TFG_API int tfg_terminated(void* m) { return static_cast<Matcher*>(m)->m.IsTerminated() ? 1 : 0; }
 
 // The next token's allowed bits into ``words`` (tfg_words of them). 0, or -1 when it failed.
-int tfg_fill(void* m, int32_t* words, int n) {
+TFG_API int tfg_fill(void* m, int32_t* words, int n) {
     try {
         int64_t shape[2] = {1, n};
         DLTensor t{};
@@ -218,7 +225,7 @@ int tfg_fill(void* m, int32_t* words, int n) {
 }
 
 // Up to n tokens spelling the grammar's forced text, longest first, never its last character (models join it on).
-int tfg_drafts(void* mp, int32_t* out, int n) {
+TFG_API int tfg_drafts(void* mp, int32_t* out, int n) {
     auto* w = static_cast<Matcher*>(mp);
     int got = 0;
     bool failed = false;
