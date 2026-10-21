@@ -471,6 +471,39 @@ Recording-driver host tests check launch order against the graph, every write
 extent against named buffers, and zero allocations and syncs per head run.
 These checks bound control flow and extents, not values.
 
+### SM89 build record
+
+`zig build tfclef -Dnvcc=... -Dsm=89 -Dclef-source=18b1107ec8419b9f253924befe1f36fa8df3e1aa`
+ran on Windows from that commit with no tracked changes, with Zig 0.17.0, CUDA 12.8
+nvcc and the default `fast` optimization.
+
+| Artifact | Bytes | SHA256 |
+| --- | ---: | --- |
+| `tfclef.dll` | 4,577,280 | `1837f6085a41ba2f506c251256c905a09e57f44c3d4ec1a44a49d333257d799a` |
+| `qwen35` image | 127,560 | `48b35638af167160b3da936100fdf3aa7eaa8946660f3fdd35a71f6fbfd95bf6` |
+| `qwen35_hf` image | 207,944 | `2c699f50c453019f0e04c3e568b2cc99b74f4ce18fff60b97df50bc758314dcf` |
+| `qmmf` image | 2,628,656 | `ad070906186f96ec8675ac55790f4b6dd685b2839f39f30547559865ca95ba08` |
+| `modelopt_pack` image | 33,080 | `2a9e434d7f56d5832d94f3369133fce0d577efd6ed6f056d328d1c13a27206e3` |
+| `vit` image | 32,176 | `eca3d78160c1dc568019d70b143b8c547c15892a079b743d3e574a2d1249abb4` |
+| `clef_head` image | 103,920 | `3c84ebc8c1b0e18009aa4fa8a40cb547520ea5d7eb7f74bfdb5f8bc0baba7e31` |
+
+The library exports exactly `tf_clef_abi_version`, `tf_clef_open`,
+`tf_clef_decide`, `tf_clef_head`, `tf_clef_info_get`, `tf_clef_last_error` and
+`tf_clef_close`. It imports only the C runtime, `KERNEL32.dll` and
+`ntdll.dll`; the CUDA driver is loaded at open. Offline symbol tables show
+every kernel the library binds in its image: 17 in `qwen35`, 10 in
+`qwen35_hf`, 72 in `qmmf`, 5 in `modelopt_pack`, 6 in `vit` and all 10 that
+`clef_head` exports. The `qwen35`, `qwen35_hf` and `modelopt_pack` images
+equal the ones the bounded hidden-backbone diagnostic used; that run's `qmmf`
+image differs only in its string table. A host-only load returned ABI version
+1 and refused null, unknown-flag and out-of-range options before any driver
+call.
+
+A second build from the same commit with a fresh cache differed only in the
+PE timestamp and debug record and in nvcc's per-compilation names inside the
+`qmmf` string table; every code section and the other five images matched.
+Pin the library by the hash of the file actually deployed.
+
 ### Unqualified
 
 - No kernel, head or engine has run on a device. Head parity against the
