@@ -692,7 +692,7 @@ pub const Engine = struct {
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
     pub fn bind(e: *Engine, slot: u32) !void {
-        if (e.settings.draft == .dflash2 and slot >= max_shared) return error.BadDraftSlot;
+        if ((e.drafter != null and slot >= dflash.MAX_S) or (e.settings.draft == .dflash2 and slot >= max_shared)) return error.BadDraftSlot;
         if (e.settings.kv_pool_tokens > 0 and slot >= cache_pool.extent.max_slots) return error.BadKvRequest;
         if (slot >= e.seqs.items.len) try e.seqs.appendNTimes(e.gpa, null, slot + 1 - e.seqs.items.len);
         if (e.seqs.items[slot] == null) {
@@ -863,6 +863,9 @@ pub const Engine = struct {
         const r = from orelse return 0;
         if (r.at == 0 or r.at >= len or r.at % fw.prefill_rows != 0) return error.BadResume;
         try e.restoreAt(r.id, r.at);
+        if (e.drafter) |dr| {
+            if (!dr.snapshotReady(e.slot, r.at)) try dr.restart(e.slot, r.at);
+        }
         return r.at;
     }
 
@@ -965,7 +968,7 @@ pub const Engine = struct {
         }
         try e.gate(null);
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = &e.bp, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .affine_prompt_policy = e.settings.affine_prompt_policy, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load };
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .tp_group = e.collectiveGroup(), .prefetch = e.prefetchRuntime(), .replicas = &e.replicas, .prefill_overlap = e.settings.prefill_overlap, .prefill_pieces = e.settings.prefill_pieces, .kda_prompt = e.settings.kda_prompt, .affine_prompt_policy = e.settings.affine_prompt_policy, .kda_wide = e.settings.kda_wide, .attn_fp8load = e.settings.attn_fp8load, .taps = if (e.drafter) |dr| dr.taps(true) else null };
         try f.run(@ptrCast(ids[0..rows]));
         for (parts, segs[0..parts.len], 0..) |p, g, i| {
             try e.bind(p.slot);
@@ -973,6 +976,10 @@ pub const Engine = struct {
             try @import("cuda_proj.zig").matmul(f.set(), e.stream, e.w.head, e.bp.fnormed + last * e.c.hidden * 2, e.c.hidden, e.bp.logits, e.bp.kda.mm_part, 1, e.share.vocab.len(), e.c.hidden, false);
             try e.draw(e.bp.logits, 1, p.ids.len, 0, out[i..][0..1]);
             try e.holdPrompt(e.bp.fnormed + last * e.c.hidden * 2);
+            if (e.drafter) |dr| {
+                errdefer e.pair_failure(error.DFlashCommitFailed);
+                try dr.promptSegment(e, p.slot, 0, g.rows, p.ids.len, g.row0);
+            }
             if (e.dflash) |drafter| {
                 errdefer e.pair_failure(error.DFlashCommitFailed);
                 try drafter.acceptPrompt(p.slot, e.bp.taps.?.ptr + g.row0 * e.c.hidden * 2, e.bp.rows, g.rows, 0);

@@ -116,7 +116,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const p = try place();
     if (p.world > 1 and @import("sys").getenv("NCCL_COMM_ID") == null) return error.NoCommId;
     var problem: []const u8 = "";
-    const set = ranks.Settings.read(&ranks.environment, &problem) catch |err| {
+    const set = ranks.Settings.readForOwner(&ranks.environment, &problem, o.drafter != null) catch |err| {
         std.log.err("{s}", .{problem});
         return err;
     };
@@ -255,7 +255,7 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .trim = if (set.draft_profile.enabled) own.e.settings.draft_profile.rowPolicy() else null,
         .proposers = if (set.draft_profile.enabled) own.e.settings.draft_profile.proposers() else null,
         .stream_bytes = own.e.seqBytes() + (if (o.drafter != null) dflash.ring_bytes else 0) + (if (own.images) |v| v.streamBytes() else @as(usize, 0)), // each stream past the first makes its own sequence on every rank
-        .lane_limit = if (own.e.dflash != null) engine.max_shared else if (own.e.pool != null) @import("cuda_kv_extent.zig").max_slots else std.math.maxInt(u32),
+        .lane_limit = laneLimit(own.e.drafter != null, own.e.dflash != null, own.e.pool != null),
         .free_streams = 1, // the first is the sequence the engine made
         .ctx = own,
         .deinit = close,
@@ -269,6 +269,25 @@ fn openRank(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
 fn fits(ptr: *anyopaque, prompt: u32, output: u32) bool {
     const e: *const engine.Engine = @ptrCast(@alignCast(ptr));
     return e.fits(prompt, output);
+}
+
+/// Canonical DFlash owns 16 slots; leftover env DFlash uses the shared window; a KV pool is tighter still.
+pub fn laneLimit(canonical: bool, legacy: bool, pool: bool) u32 {
+    var limit: u32 = std.math.maxInt(u32);
+    if (canonical) limit = @min(limit, @as(u32, @intCast(dflash.MAX_S)));
+    if (legacy) limit = @min(limit, @as(u32, @intCast(engine.max_shared)));
+    if (pool) limit = @min(limit, @as(u32, @intCast(@import("cuda_kv_extent.zig").max_slots)));
+    return limit;
+}
+
+test "canonical admission includes MAX_S and pool bounds" {
+    try std.testing.expectEqual(@as(u32, 16), laneLimit(true, false, false));
+    try std.testing.expect(laneLimit(true, false, false) < 17);
+    try std.testing.expectEqual(@as(u32, @intCast(engine.max_shared)), laneLimit(false, true, false));
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), laneLimit(false, false, false));
+    const pooled = laneLimit(true, false, true);
+    try std.testing.expect(pooled <= 16);
+    try std.testing.expect(pooled <= @as(u32, @intCast(@import("cuda_kv_extent.zig").max_slots)));
 }
 
 // Each rank keeps a copy under rank 0's id, in the room rank 0 admitted by (the smallest over the ranks).

@@ -498,6 +498,30 @@ test "split stored-format KDA staging is allocated without whole-model trellis" 
     try std.testing.expect(Memory.empty());
 }
 
+test "canonical shared verify allocates 64 rows through Buffers.initShared" {
+    const Memory = @import("cuda_test_driver.zig").Memory;
+    const dflash = @import("dflash.zig");
+    var d = Memory.driver();
+    const c = @import("config.zig").Config{};
+    var layer: weights.Layer = undefined;
+    var k: kda_block.Layer = undefined;
+    k.qkv = .{ .mxfp8 = .{ .mode = .mxfp8, .codes = 1, .scales = 2, .n = 384, .k = @intCast(c.hidden), .npad = 384 } };
+    layer.mixer = .{ .kda = k };
+    layer.ffn = .{ .dense = undefined };
+    var layers = [_]weights.Layer{layer};
+    const w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try @import("cuda_shard.zig").Share.of(&c, 0, 2), .layers = &layers };
+    const rows = @import("cuda_verify_plan.zig").Plan.effective(.baseline, false, true).rows();
+    try std.testing.expectEqual(@as(usize, 64), rows);
+    try std.testing.expectEqual(@as(usize, 64), dflash.STEP_ROWS);
+    {
+        var b = try Buffers.initShared(&d, &w, rows, 64);
+        defer b.deinit();
+        try std.testing.expectEqual(rows, b.rows);
+        try std.testing.expect(b.arena.buf.len > 0);
+    }
+    try std.testing.expect(Memory.empty());
+}
+
 test "sequence prompt hidden row is charged and restored with fixed snapshot bytes" {
     const Memory = @import("cuda_test_driver.zig").Memory;
     var d = Memory.driver();

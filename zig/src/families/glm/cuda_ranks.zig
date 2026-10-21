@@ -100,6 +100,11 @@ pub const Settings = struct {
 
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
+        return readForOwner(get, problem, false);
+    }
+
+    /// Canonical `--drafter` is selected before leftover TF_GLM_DRAFTER is validated or applied.
+    pub fn readForOwner(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8, canonical: bool) !Settings {
         var s: Settings = .{};
         if (get("TF_GLM_PROMPT_LATENT_AOT")) |v| {
             if (std.mem.eql(u8, v, "1")) s.prompt_latent_aot = true else if (!std.mem.eql(u8, v, "0")) {
@@ -184,10 +189,12 @@ pub const Settings = struct {
             };
         }
         if (get("TF_GLM_DRAFTER")) |v| {
-            s.draft = std.meta.stringToEnum(Drafter, v) orelse {
-                problem.* = "TF_GLM_DRAFTER: off, mtp or dflash2";
-                return error.BadSetting;
-            };
+            if (!canonical) {
+                s.draft = std.meta.stringToEnum(Drafter, v) orelse {
+                    problem.* = "TF_GLM_DRAFTER: off, mtp or dflash2";
+                    return error.BadSetting;
+                };
+            }
         }
         if (s.draft_profile.enabled and s.draft != .dflash2) {
             problem.* = "TF_GLM_DRAFT_PROFILE=production requires TF_GLM_DRAFTER=dflash2";
@@ -200,7 +207,7 @@ pub const Settings = struct {
                 return error.BadSetting;
             };
         }
-        if (s.draft == .dflash2 and (s.draft_dir == null or s.draft_dir.?.len == 0)) {
+        if (!canonical and s.draft == .dflash2 and (s.draft_dir == null or s.draft_dir.?.len == 0)) {
             problem.* = "TF_GLM_DFLASH_DIR is required for dflash2";
             return error.BadSetting;
         }
