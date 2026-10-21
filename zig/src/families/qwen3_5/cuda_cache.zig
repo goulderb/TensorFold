@@ -1,4 +1,5 @@
 //! A stream's state on CUDA: recurrences, conv tails, keys and values, the drafter's tap ring, the last window's log.
+//! Local modification: failed hidden requests require a clean cache reset.
 const std = @import("std");
 const cuda = @import("cuda");
 const geometry = @import("cuda_geometry.zig");
@@ -26,6 +27,9 @@ pub const Cache = struct {
 
     /// Fixed when allocated. Reset preserves the recurrence's physical axes.
     gdn_layout: GdnLayout = .value_key,
+    owner: ?*const Engine = null,
+    hidden_invalid: bool = false,
+    reset_epoch: u64 = 0,
     state: DeviceBuffer,
     kv: DeviceBuffer,
     /// A drafter's tapped rows (`Engine.taps`), a ring of tap_rows: the row at position p in slot p % tap_rows.
@@ -64,17 +68,20 @@ pub const Cache = struct {
             try tap.?.fill8(0, null);
         }
         errdefer if (tap) |*t| t.free();
-        return .{ .gdn_layout = layout, .state = state, .kv = kv, .tap = tap, .log = log, .cap = cap, .logits = try gpa.alloc(u16, e.g.vocab) };
+        return .{ .gdn_layout = layout, .owner = e, .state = state, .kv = kv, .tap = tap, .log = log, .cap = cap, .logits = try gpa.alloc(u16, e.g.vocab) };
     }
 
     /// Ready for another stream: no rows, the recurrences and tails zero (on the engine's stream, before its forwards).
     pub fn reset(self: *Cache, e: *const Engine) !void {
+        self.hidden_invalid = true;
         self.terminal_greedy = null;
         self.len = 0;
         self.written = 0;
         self.last = null;
         self.delta = 0;
         try self.state.fill8(0, e.stream.handle);
+        self.reset_epoch = try std.math.add(u64, self.reset_epoch, 1);
+        self.hidden_invalid = false;
     }
 
     pub fn deinit(self: *Cache, gpa: std.mem.Allocator) void {
@@ -93,6 +100,7 @@ pub const Cache = struct {
 
     /// Keeps `path` (window rows, ascending from 0): the state as that chain would leave it, a tree's keys moved down.
     pub fn keep(self: *Cache, e: *Engine, path: []const u32) !void {
+        if (self.hidden_invalid) return error.QwenHiddenNeedsReset;
         if (e.numerics == .hf_modelopt) return error.UnsupportedQwenRewind;
         const last = self.last orelse return error.NothingToKeep;
         if (path.len == 0 or path.len > last.rows or path[0] != 0) return error.NothingToKeep;
@@ -115,6 +123,7 @@ pub const Cache = struct {
 
     /// The newest window kept whole (the round loop keeps nothing when every row landed), before the next forward.
     pub fn settle(self: *Cache, e: *Engine) !void {
+        if (self.hidden_invalid) return error.QwenHiddenNeedsReset;
         const last = self.last orelse return;
         var all: [engine.most_window]u32 = undefined;
         for (all[0..last.rows], 0..) |*r, i| r.* = @intCast(i);

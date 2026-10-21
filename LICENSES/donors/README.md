@@ -361,6 +361,31 @@ only. Each `source.json` names the producer, immutable model revision and
 header hashes. Checkpoint weights are not included and retain their producers'
 separate terms.
 
+## Clef Flash configuration and tensor metadata
+
+`zig/src/families/qwen3_5/fixtures/clef_flash/` retains the unmodified
+configuration, safetensors index and JSON shard headers from
+[Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash), revision
+`fde727a287004204b7518dcc983fe64379776712`. Cloudflare's model card identifies
+the Apache-2.0 license and the `Qwen/Qwen3.5-9B` base. The original license and
+model card are retained unchanged in `clef-flash-fde727a2/`. `source.json`
+records their SHA256 digests and the config digest. `headers/capture.json` pins
+the original index/header hashes and shard sizes; `headers/provenance.json`
+states the capture scope. Header capture does not rehash checkpoint payloads.
+
+Local changes add strict BF16 config admission, a CPU-only validated tensor
+manifest and allocation plan, mapped payload ownership and host row gathers.
+The weight loader consumes that manifest through the existing TensorFold BF16
+packer, projection views and parameter conversion. A separate binding owner
+reuses the existing HF operators without the ModelOpt-only expert bundle.
+The shared backbone also gains request-owned hidden output with host lifetime
+and graph-identity tests. Plain BF16 engine execution remains disabled pending
+integration and qualification. No Cloudflare model implementation, checkpoint
+weights, joint-head arithmetic or CUDA kernels are copied. Metadata, primitive
+and weight-only checks do not establish backbone parity or full-engine GPU fit.
+Existing Qwen/Hugging Face, TensorFold and
+transitive notices remain applicable.
+
 ## Qwen host sampler tuning
 
 The local change at `b864564587f00f308ff9215c9870bffcd11da61f`

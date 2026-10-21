@@ -1,0 +1,40 @@
+{
+  "repository": "Cloudflare/clef-flash",
+  "revision": "fde727a287004204b7518dcc983fe64379776712",
+  "capture": "Original safetensors JSON header bytes and index only; no weight payloads.",
+  "index_sha256": "941305ff9f77551e145a6cea976ef456cd5cb208cbece99f168376c752fcf96c",
+  "files": {
+    "model-00001-of-00004.safetensors": {
+      "source_metadata_sha256": "8b45a8e968141cdcc58fb71c9adfc258e2c77b5f062bc636c1fd5bc5d916b565",
+      "payload_hash_verified_by_capture": false,
+      "file_bytes": 4942706120,
+      "header_bytes": 4672,
+      "header_sha256": "42ef31dbba3592511696c9110d1dba4d8817e64e558002578bd5cbc102abd901",
+      "tensors": 36
+    },
+    "model-00002-of-00004.safetensors": {
+      "source_metadata_sha256": "7590856c713eed844a2dcf48e6c43c4de165b788bc3f80e328311183cdbc7db8",
+      "payload_hash_verified_by_capture": false,
+      "file_bytes": 4987757928,
+      "header_bytes": 19552,
+      "header_sha256": "5c0213fa6e05e137723f5a9514ee7ca4e3bcd268a946dab9f11fdb7d7746caba",
+      "tensors": 150
+    },
+    "model-00003-of-00004.safetensors": {
+      "source_metadata_sha256": "e6eac2467952c33361ed7dcb3c7959d1086bbe57201cd3749c3d769fdc17fe63",
+      "payload_hash_verified_by_capture": false,
+      "file_bytes": 4954810240,
+      "header_bytes": 20216,
+      "header_sha256": "b8baeaae09549ce18cc1ec7ed9e2070990f7375a8bddac65bb5262cfb6cd9511",
+      "tensors": 154
+    },
+    "model-00004-of-00004.safetensors": {
+      "source_metadata_sha256": "9fcecc6556b39171238373a465f409794b7f821fb4cd1e6459e3a9c0fe317af7",
+      "payload_hash_verified_by_capture": false,
+      "file_bytes": 3934446832,
+      "header_bytes": 49160,
+      "header_sha256": "2db97c47a628c411d6fc5ce98a0bc35ff770985d7c8d02aab410f9ef53def544",
+      "tensors": 420
+    }
+  }
+}

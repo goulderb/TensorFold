@@ -30,3 +30,12 @@ The Qwen CUDA text operations and host mathematical references adapt work
 Copyright 2025 The Qwen Team and The HuggingFace Inc. team, under Apache-2.0.
 The original license and exact source revision are retained in
 LICENSES/donors/transformers-e0eb2810/ and LICENSES/donors/README.md.
+
+The Clef CPU checkpoint inspector retains Cloudflare's unmodified Clef Flash
+configuration, safetensors index and JSON shard headers, based on
+Qwen/Qwen3.5-9B. Its pinned source, hashes and capture scope are recorded beside
+the fixtures. Cloudflare's original Apache-2.0 license and model card are
+retained in LICENSES/donors/clef-flash-fde727a2/. Local changes add strict BF16
+metadata admission, allocation planning, mapped payload ownership, host row
+gathers, loading through shared Qwen projection components and request-owned
+hidden output from the shared backbone. Native serving remains disabled. No checkpoint weights or Clef model implementation are included.

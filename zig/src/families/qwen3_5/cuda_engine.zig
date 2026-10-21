@@ -1,4 +1,5 @@
 //! Qwen3.5's hybrids on CUDA: qlinear projections, qwen35.cu glue, one captured forward over every stream's window.
+//! Local modifications: refuse metadata-only BF16 execution; retain request-owned normalized hidden rows.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -9,6 +10,7 @@ const routed = @import("cuda_routed.zig");
 const checkpoint = @import("cuda_checkpoint.zig");
 const modelopt = @import("cuda_modelopt.zig");
 const hf = @import("cuda_hf.zig");
+pub const hidden = @import("cuda_hidden.zig");
 
 pub const Geometry = geometry.Geometry;
 pub const MoeMath = hf.MoeMath;
@@ -129,6 +131,15 @@ test "terminal Pick validation preserves nonfinite fallback and rejects malforme
         @memcpy(bytes[output.pick_at..][0..8], std.mem.asBytes(&pick));
         try std.testing.expectError(error.InvalidTerminalPick, output.token(&bytes, 3));
     }
+}
+
+test "hidden terminal graph identity cannot alias vocabulary or greedy terminals" {
+    for ([_]usize{ 1, 2, 16, 128 }) |rows| for ([_]bool{ false, true }) |all| for ([_]bool{ false, true }) |greedy| {
+        var s: Engine.Shape = .{ .total = @intCast(rows), .nseg = 1, .record = false, .prompt = true, .taps = false, .heads_all = all, .terminal_greedy = greedy };
+        const before = s.key();
+        s.normalized_hidden = true;
+        try std.testing.expectEqual(@as(u32, 1 << 28), before ^ s.key());
+    };
 }
 
 test "terminal graph key occupies bit 25 without changing prior shape dimensions" {
@@ -338,7 +349,7 @@ test "mixed GDN layouts fail before settling caches or touching CUDA" {
 }
 
 /// What a forward keeps: a prompt chunk its last row's logits, a verify window every row's draw or logits and log.
-pub const Keep = union(enum) { last, draws: []const Draw, logits, prompt_logits };
+pub const Keep = union(enum) { last, draws: []const Draw, logits, prompt_logits, hidden: hidden.Window };
 
 fn validateCombined(numerics: checkpoint.Numerics, n8: bool, split: bool, reuse: bool) !void {
     if (split and (numerics != .hf_modelopt or !n8)) return error.UnsupportedQwenExpertUp;
@@ -354,7 +365,7 @@ fn validateHfWindow(numerics: checkpoint.Numerics, bounded: bool, parts: []const
     if (numerics != .hf_modelopt) return;
     const limit: usize = if (bounded) hf_prefill_rows else 1;
     if (parts.len != 1 or ids == 0 or ids > limit or parts[0].rows != ids or
-        (keep != .last and !(bounded and keep == .prompt_logits))) return error.UnsupportedQwenWindow;
+        (keep != .last and keep != .hidden and !(bounded and keep == .prompt_logits))) return error.UnsupportedQwenWindow;
     if (parts[0].parents != null or parts[0].images != null) return error.UnsupportedQwenWindow;
 }
 
@@ -445,6 +456,7 @@ pub const Engine = struct {
     observer: ?Observer = null,
     observed_layer: usize = 0,
     geo: Geo,
+    context: cuda.abi.Context,
     stream: cuda.Stream,
     mods: [16]cuda.Module,
     kv8: bool, // attention caches as e4m3 rows with a scale each
@@ -541,6 +553,7 @@ pub const Engine = struct {
     }
 
     pub fn initPlacedWithOptions(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, admitted: checkpoint.Admitted, placement: checkpoint.Placement, kv8: bool, options: InitOptions) !*Engine {
+        try admitted.requireExecutable();
         try validateMoeMath(admitted, options.moe_math);
         try validateAttentionMode(admitted, options.attention_mode, kv8);
         const g = try placement.localGeometry(admitted.geometry);
@@ -556,6 +569,7 @@ pub const Engine = struct {
         e.* = undefined;
         e.gpa = gpa;
         e.d = d;
+        e.context = ctx.handle;
         e.g = g;
         e.placement = placement;
         e.numerics = admitted.numerics();
@@ -720,6 +734,7 @@ pub const Engine = struct {
     }
 
     pub fn scratchBytes(admitted: checkpoint.Admitted, placement: checkpoint.Placement) !usize {
+        try admitted.requireExecutable();
         var e: Engine = undefined;
         e.g = try placement.localGeometry(admitted.geometry);
         e.numerics = admitted.numerics();
@@ -874,19 +889,51 @@ pub const Engine = struct {
         }
     }
 
+    /// A request owns these rows across forward scratch reuse. Plain BF16 execution is still refused.
+    pub fn hiddenRows(e: *Engine, tokens: usize) !hidden.Rows {
+        return hidden.Rows.init(e, tokens);
+    }
+
+    pub fn validateHiddenProfile(e: *const Engine) !void {
+        switch (e.numerics) {
+            .hf_dense_bf16 => return error.UnsupportedQwenPlainExecution,
+            .mlx_sanitized, .hf_modelopt => {},
+        }
+        if (!e.placement.ownsEmbedding() or !e.placement.ownsHead() or e.kv8 or e.n_taps != 0 or
+            e.verify_terminal_graphs or (e.observer != null and e.captured)) return error.UnsupportedQwenHiddenProfile;
+        if (e.context != cuda.copy_source.current()) return error.QwenHiddenDeviceMismatch;
+    }
+
+    fn validateHidden(e: *const Engine, parts: []const Part, ids: []const u32, w: hidden.Window) !void {
+        try e.validateHiddenProfile();
+        if (parts.len != 1 or parts[0].parents != null or parts[0].images != null or
+            ids.len == 0 or ids.len > max_rows or parts[0].rows != ids.len) return error.InvalidQwenHiddenShape;
+        try w.validate(e, ids.len);
+        try w.validateCache(parts[0].cache);
+    }
+
     /// One forward over `parts`' windows, `ids` in order; `keep` names the kept rows; an unkept verify is kept first.
     pub fn forward(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !void {
         if (!e.placement.ownsEmbedding() or !e.placement.ownsHead()) return error.QwenRequiresPipeline;
-        const shape = try e.prepare(parts, ids, keep);
+        const shape = try e.prepareForward(parts, ids, keep);
         errdefer {
             for (parts) |p| p.cache.terminal_greedy = null;
+            if (keep == .hidden) keep.hidden.fail();
         }
         try e.execute(shape);
         try e.finish(parts, keep, shape);
         commit(parts, shape.record);
+        if (keep == .hidden) keep.hidden.commit();
     }
 
+    /// Hidden output is a whole forward transaction, not a pipeline terminal.
     pub fn prepare(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !Shape {
+        if (keep == .hidden) return error.QwenHiddenRequiresForward;
+        return e.prepareForward(parts, ids, keep);
+    }
+
+    fn prepareForward(e: *Engine, parts: []const Part, ids: []const u32, keep: Keep) !Shape {
+        if (keep == .hidden) try e.validateHidden(parts, ids, keep.hidden);
         if (parts.len == 0 or parts.len > max_segs) return error.InvalidQwenSegments;
         const gdn_layout = parts[0].cache.gdn_layout;
         for (parts[1..]) |p| if (p.cache.gdn_layout != gdn_layout) return error.MixedQwenGdnLayouts;
@@ -909,6 +956,9 @@ pub const Engine = struct {
         for (ids) |id| if (id >= g.vocab) return error.InvalidQwenToken;
         for (parts) |p| if (p.parents != null and !record) return error.InvalidQwenParents;
         for (parts) |p| if (p.images != null and record) return error.InvalidQwenImages;
+        for (parts) |p| if (p.cache.hidden_invalid) return error.QwenHiddenNeedsReset;
+        if (keep == .hidden) keep.hidden.begin(parts[0].cache);
+        errdefer if (keep == .hidden) keep.hidden.fail();
         for (parts) |p| p.cache.terminal_greedy = null;
         errdefer {
             for (parts) |p| p.cache.terminal_greedy = null;
@@ -961,12 +1011,17 @@ pub const Engine = struct {
         const lone = total == 1 and parts.len == 1;
         const bucket: usize = if (lone) 1 else if (total <= 16) 16 else most_verify;
         const windows: usize = if (lone) 1 else max_segs;
-        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant, .expert_up_layout = e.expert_up_layout, .terminal_greedy = e.terminal != null and !record, .moe_math = e.moeMath(), .attention_mode = e.attentionMode() };
+        const shape: Shape = .{ .total = @intCast(if (prompt) total else bucket), .nseg = @intCast(if (prompt) parts.len else windows), .record = record, .prompt = prompt, .taps = e.n_taps > 0, .gdn_layout = gdn_layout, .expert_up_n8 = e.expert_up_n8, .heads_all = keep == .prompt_logits, .expert_up_split_m = e.expert_up_split_m, .reuse_fp8_quant = e.reuse_fp8_quant, .expert_up_layout = e.expert_up_layout, .terminal_greedy = e.terminal != null and !record and keep != .hidden, .moe_math = e.moeMath(), .attention_mode = e.attentionMode(), .normalized_hidden = keep == .hidden };
         e.features = if (images) |im| im.features else 0;
         return shape;
     }
 
     pub fn execute(e: *Engine, shape: Shape) !void {
+        if (shape.normalized_hidden) {
+            try e.validateHiddenProfile();
+            if (!shape.prompt or shape.record or shape.taps or shape.heads_all or shape.terminal_greedy or
+                shape.nseg != 1 or shape.total == 0 or shape.total > max_rows) return error.InvalidQwenHiddenShape;
+        }
         if (shape.terminal_greedy and (e.numerics != .hf_modelopt or !e.placement.ownsHead() or e.terminal == null or shape.record or !shape.prompt)) return error.UnsupportedQwenTerminalGreedy;
         try validateCombined(e.numerics, shape.expert_up_n8, shape.expert_up_split_m, shape.reuse_fp8_quant);
         if (shape.expert_up_n8 and (e.numerics != .hf_modelopt or (shape.prompt and shape.total > most_window))) return error.UnsupportedQwenExpertUp;
@@ -1179,7 +1234,7 @@ pub const Engine = struct {
                 try e.addCkProjection(&list, m.down, e.act, if (layer.mlp == .dense) e.r else e.routed.shared, shape.total, true);
             }
         }
-        if (e.placement.ownsHead()) {
+        if (e.placement.ownsHead() and !shape.normalized_hidden) {
             const heads: usize = if (shape.record or shape.heads_all) shape.total else 1;
             try e.addCkProjection(&list, e.head, e.x + (shape.total - heads) * e.g.hidden * 2, e.logits, heads, true);
         }
@@ -1613,6 +1668,10 @@ pub const Engine = struct {
         for (parts) |p| total += p.rows;
         const heads: usize = if (shape.record or shape.heads_all) total else 1;
         switch (keep) {
+            .hidden => |w| {
+                if (!shape.normalized_hidden) return error.InvalidQwenHiddenShape;
+                try w.copy(e.x);
+            },
             .draws => |pk| {
                 const toks = e.tables.ptr + tokens_at;
                 for (pk, 0..) |p, i| {
@@ -1656,9 +1715,10 @@ pub const Engine = struct {
         terminal_greedy: bool = false,
         moe_math: MoeMath = .legacy,
         attention_mode: AttentionMode = .reference,
+        normalized_hidden: bool = false,
 
         fn key(s: Shape) u32 {
-            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21 | @as(u32, @intFromBool(s.expert_up_split_m)) << 22 | @as(u32, @intFromBool(s.reuse_fp8_quant)) << 23 | @as(u32, @backingInt(s.expert_up_layout)) << 24 | @as(u32, @intFromBool(s.terminal_greedy)) << 25 | @as(u32, @backingInt(s.moe_math)) << 26 | @as(u32, @backingInt(s.attention_mode)) << 27;
+            return @as(u32, s.total) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, @backingInt(s.gdn_layout)) << 19 | @as(u32, @intFromBool(s.expert_up_n8)) << 20 | @as(u32, @intFromBool(s.heads_all)) << 21 | @as(u32, @intFromBool(s.expert_up_split_m)) << 22 | @as(u32, @intFromBool(s.reuse_fp8_quant)) << 23 | @as(u32, @backingInt(s.expert_up_layout)) << 24 | @as(u32, @intFromBool(s.terminal_greedy)) << 25 | @as(u32, @backingInt(s.moe_math)) << 26 | @as(u32, @backingInt(s.attention_mode)) << 27 | @as(u32, @intFromBool(s.normalized_hidden)) << 28;
         }
     };
 
@@ -1778,6 +1838,7 @@ pub const Engine = struct {
         }
         if (!e.placement.ownsHead()) return;
         try e.norm(true, e.final_norm, total);
+        if (shape.normalized_hidden) return;
         // the head over the kept rows
         try e.proj(e.head, e.x + (total - heads) * g.hidden * 2, e.logits, heads, false);
         if (shape.terminal_greedy) try e.pickTerminal(heads);
@@ -2201,6 +2262,15 @@ test "expert graph verification rejects opposite arms, wrong arguments, duplicat
     try std.testing.expectEqual([3]u32{ 128, 1, 1 }, roster[2].grid);
     try std.testing.expectEqual([3]u32{ 256, 1, 1 }, roster[2].block);
     try std.testing.expectEqualSlices(u8, &roster[0].args_sha256, &roster[2].args_sha256);
+}
+
+test "plain BF16 execution refuses before checkpoint I/O or CUDA access" {
+    const admitted = try checkpoint.admit(std.testing.allocator, @embedFile("fixtures/clef_flash/config.json"));
+    const placement: checkpoint.Placement = .{ .first = 0, .end = 32, .total = 32 };
+    try std.testing.expectError(error.UnsupportedQwenPlainExecution, Engine.initPlacedWithOptions(std.testing.allocator, std.testing.io, undefined, "missing-checkpoint", admitted, placement, false, .{}));
+    try std.testing.expectError(error.UnsupportedQwenPlainExecution, Engine.scratchBytes(admitted, placement));
+    try std.testing.expectError(error.UnsupportedQwenPlainExecution, weights.plan(@as(*core.Checkpoint, undefined), admitted, placement));
+    try std.testing.expectError(error.UnsupportedQwenPlainExecution, weights.loadPlaced(undefined, undefined, undefined, admitted, placement));
 }
 
 test "combined candidates require HF and split-M requires the N8 contract" {

@@ -1,0 +1,12 @@
+{
+  "repository": "Cloudflare/clef-flash",
+  "revision": "fde727a287004204b7518dcc983fe64379776712",
+  "base_model": "Qwen/Qwen3.5-9B",
+  "capture_receipt": "capture.json",
+  "captured_from": "C:/Development/tf/clef-flash/.artifacts/clef-headers-pinned-fde727a2",
+  "copied_on": "2026-10-20",
+  "reuse": "Unmodified original safetensors index and JSON header bytes, including padding. No tensor payloads or model implementation copied.",
+  "changes": "Added this local provenance receipt. Captured metadata and capture.json are byte-for-byte copies.",
+  "verification_scope": "Tests verify captured header/index hashes and lengths. Source checkpoint payload hashes were not verified by this metadata capture.",
+  "retained_documents": "See ../source.json and LICENSES/donors/clef-flash-fde727a2 in the repository. Local reuse and changes are recorded in LICENSES/donors/README.md, NOTICE and THIRD_PARTY_NOTICES.md."
+}

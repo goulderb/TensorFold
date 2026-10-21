@@ -1,0 +1,14 @@
+{
+  "repo": "Cloudflare/clef-flash",
+  "revision": "fde727a287004204b7518dcc983fe64379776712",
+  "base_model": "Qwen/Qwen3.5-9B",
+  "license": "Apache-2.0",
+  "config_sha256": "66f87f6fb2616b46604daf2a9c67ddc87938296d07156efa34d59b5be49e3238",
+  "retained_documents": {
+    "LICENSES/donors/clef-flash-fde727a2/LICENSE": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+    "LICENSES/donors/clef-flash-fde727a2/README.md": "9036da69502d2888f54cdee8bff832e534f74e164e7a02124c4bc511b18dc821"
+  },
+  "metadata_capture": "headers/capture.json",
+  "metadata_provenance": "headers/provenance.json",
+  "reuse": "Unmodified configuration, safetensors index and JSON-header fixtures only. No checkpoint weights or model implementation copied."
+}

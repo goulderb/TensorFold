@@ -16,6 +16,17 @@ with staged metadata and fixed owner communication. Exact donor image/file pins,
 local changes and original production-lineage legal documents are retained in
 LICENSES/donors/. Existing notices and transitive credits still apply.
 
+The Clef Flash CPU checkpoint fixtures copy Cloudflare's unmodified configuration,
+safetensors index and JSON shard headers from `Cloudflare/clef-flash` revision
+`fde727a287004204b7518dcc983fe64379776712`, based on `Qwen/Qwen3.5-9B`.
+Its original Apache-2.0 license and model card are retained in
+`LICENSES/donors/clef-flash-fde727a2/`. The fixture's `source.json` and
+`headers/capture.json` record hashes; `headers/provenance.json` bounds the
+capture. Local changes add BF16 metadata admission, allocation planning, mapped
+payload ownership, host row gathers, shared Qwen weight loading and request-owned
+hidden output from the shared backbone. No model implementation, checkpoint
+weights or joint-head arithmetic is copied.
+
 TensorFold uses [MLX](https://github.com/ml-explore/mlx) and
 [mlx-lm](https://github.com/ml-explore/mlx-lm), MIT License, Copyright © 2023 Apple Inc.
 The native engine installs and links neither. It reads checkpoints in their formats, and its Metal kernels under

@@ -1,4 +1,5 @@
 //! A Qwen3.5 hybrid's widths (2B, 27B) as the CUDA engine reads them from config.json; what qwen35.cu fixes is checked.
+//! Local addition: a pinned Clef Flash configuration test; checkpoint admission is unchanged.
 const std = @import("std");
 const core = @import("core");
 
@@ -401,6 +402,29 @@ test "a mixed checkpoint's widths by module, under any spelling; other groups an
     const gptq = try std.mem.replaceOwned(u8, std.testing.allocator, text, "\"mode\":\"affine\"", "\"mode\":\"gptq\"");
     defer std.testing.allocator.free(gptq);
     try std.testing.expectError(error.UnsupportedQwenQuantization, parse(std.testing.allocator, gptq));
+}
+
+test "Clef Flash BF16 config fits the shared Qwen backbone geometry" {
+    const doc = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, @embedFile("fixtures/clef_flash/config.json"), .{});
+    defer doc.deinit();
+    const g = try dimensions(doc.value.object);
+    try std.testing.expect(!g.moe());
+    try std.testing.expect(!g.tied);
+    try std.testing.expectEqual(@as(usize, 4096), g.hidden);
+    try std.testing.expectEqual(@as(usize, 12288), g.intermediate);
+    try std.testing.expectEqual(@as(usize, 248320), g.vocab);
+    try std.testing.expectEqual(@as(usize, 32), g.layers);
+    try std.testing.expectEqual(@as(usize, 24), g.deltas());
+    try std.testing.expectEqual(@as(usize, 8), g.attentions());
+    for (g.linear[0..g.layers], 0..) |linear, i| try std.testing.expectEqual(i % 4 != 3, linear);
+    try std.testing.expectEqual(@as(usize, 16), g.k_heads);
+    try std.testing.expectEqual(@as(usize, 32), g.v_heads);
+    try std.testing.expectEqual(@as(usize, 16), g.q_heads);
+    try std.testing.expectEqual(@as(usize, 4), g.kv_heads);
+    try std.testing.expectEqual(@as(f32, 1e-6), g.eps);
+    try std.testing.expectEqual(@as(usize, 8192), g.convWidth());
+    try std.testing.expectEqual(@as(usize, 4096), g.valueWidth());
+    try std.testing.expectEqual(@as(usize, 4096), g.attnWidth());
 }
 
 test "fp8 caches take e4m3 rows and a scale each: 520 bytes a position and head against bf16's 1024" {

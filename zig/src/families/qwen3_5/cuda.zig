@@ -1,4 +1,5 @@
 //! The Qwen3.5 hybrids on CUDA (2B, Qwen3.8-27B): the engine and its native family entry; Metal's 2B is qwen3_5.zig.
+//! Local modification: expose BF16 checkpoint preparation and include its host tests.
 pub const config = @import("config.zig");
 pub const geometry = @import("cuda_geometry.zig");
 pub const engine = @import("cuda_engine.zig");
@@ -27,10 +28,16 @@ test {
 }
 
 pub const checkpoint = @import("cuda_checkpoint.zig");
+pub const bf16 = @import("cuda_bf16_checkpoint.zig");
+pub const bf16_weights = @import("cuda_bf16_weights.zig");
+pub const bf16_bindings = @import("cuda_bf16.zig");
 pub const weights = @import("cuda_weights.zig");
 pub const pipeline = @import("cuda_pipeline.zig");
 test {
     _ = @import("cuda_checkpoint_test.zig");
+    _ = bf16;
+    _ = bf16_weights;
+    _ = bf16_bindings;
     _ = @import("cuda_modelopt_weights.zig");
     _ = pipeline;
     _ = @import("cuda_pipeline_test.zig");

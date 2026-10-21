@@ -1,3 +1,4 @@
+// Local modification: BF16 admission and conflicting-quantization refusal tests.
 const std = @import("std");
 const core = @import("core");
 const ck = @import("cuda_checkpoint.zig");
@@ -214,6 +215,52 @@ test "shared admission selects numerics and global placement without changing ML
     defer a.free(malformed);
     try std.testing.expect(try ck.claimsBytes(a, malformed));
     try std.testing.expectError(error.UnsupportedQwenQuantization, ck.admit(a, malformed));
+}
+
+test "plain BF16 config admission names its own numerics but does not enable execution" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("fixtures/clef_flash/config.json");
+    const admitted = try ck.admit(a, bytes);
+    try std.testing.expect(admitted.encoding == .plain_bf16);
+    try std.testing.expectEqual(ck.Numerics.hf_dense_bf16, admitted.numerics());
+    try std.testing.expectError(error.UnsupportedQwenPlainExecution, admitted.requireExecutable());
+    try std.testing.expect(!try ck.claimsBytes(a, bytes));
+    const modelopt = try ck.admit(a, @embedFile("fixtures/ornith_nvfp4/config.json"));
+    try modelopt.requireExecutable();
+    try std.testing.expectEqual(ck.Numerics.hf_modelopt, modelopt.numerics());
+}
+
+test "plain BF16 cannot absorb unknown or conflicting quantization declarations" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const fixture = @embedFile("fixtures/clef_flash/config.json");
+    inline for (.{ "quantization", "quantization_config" }) |key| {
+        inline for (.{ "null", "false", "{}", "{\"quant_method\":\"unknown\"}" }) |value| {
+            var doc = try std.json.parseFromSliceLeaky(std.json.Value, a, fixture, .{});
+            try doc.object.put(a, key, try std.json.parseFromSliceLeaky(std.json.Value, a, value, .{}));
+            var serialized: std.Io.Writer.Allocating = .init(a);
+            try std.json.Stringify.value(doc, .{}, &serialized.writer);
+            try std.testing.expectError(error.UnsupportedQwenQuantization, ck.admit(a, serialized.written()));
+        }
+        var nested = try std.json.parseFromSliceLeaky(std.json.Value, a, fixture, .{});
+        try nested.object.getPtr("text_config").?.object.put(a, key, .null);
+        var serialized: std.Io.Writer.Allocating = .init(a);
+        try std.json.Stringify.value(nested, .{}, &serialized.writer);
+        try std.testing.expectError(error.UnsupportedQwenQuantization, ck.admit(a, serialized.written()));
+    }
+    var mlx = try std.json.parseFromSliceLeaky(std.json.Value, a, fixture, .{});
+    try mlx.object.put(a, "quantization", try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"bits\":4,\"group_size\":64,\"mode\":\"affine\"}", .{}));
+    var serialized: std.Io.Writer.Allocating = .init(a);
+    try std.json.Stringify.value(mlx, .{}, &serialized.writer);
+    const admitted = try ck.admit(a, serialized.written());
+    try std.testing.expect(admitted.encoding == .mlx);
+    try std.testing.expectEqual(ck.Numerics.mlx_sanitized, admitted.numerics());
+    try admitted.requireExecutable();
+    try mlx.object.put(a, "quantization_config", .null);
+    var conflicting: std.Io.Writer.Allocating = .init(a);
+    try std.json.Stringify.value(mlx, .{}, &conflicting.writer);
+    try std.testing.expectError(error.UnsupportedQwenQuantization, ck.admit(a, conflicting.written()));
 }
 
 test "shared expert projections admit mixed BF16 FP8 NVFP4 but routed experts stay NVFP4" {

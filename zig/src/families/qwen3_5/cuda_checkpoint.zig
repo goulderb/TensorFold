@@ -1,3 +1,4 @@
+// Local modification: plain BF16 metadata admission with a separate, disabled execution profile.
 const std = @import("std");
 const core = @import("core");
 const general = @import("config.zig");
@@ -7,8 +8,8 @@ pub const Geometry = dimensions.Geometry;
 const Tensor = core.checkpoint.Tensor;
 const DType = core.checkpoint.DType;
 
-pub const Numerics = enum { mlx_sanitized, hf_modelopt };
-pub const Encoding = union(enum) { mlx, modelopt: Config };
+pub const Numerics = enum { mlx_sanitized, hf_modelopt, hf_dense_bf16 };
+pub const Encoding = union(enum) { mlx, modelopt: Config, plain_bf16 };
 pub const Admitted = struct {
     geometry: Geometry,
     encoding: Encoding,
@@ -17,7 +18,12 @@ pub const Admitted = struct {
         return switch (a.encoding) {
             .mlx => .mlx_sanitized,
             .modelopt => .hf_modelopt,
+            .plain_bf16 => .hf_dense_bf16,
         };
+    }
+
+    pub fn requireExecutable(a: Admitted) !void {
+        if (a.encoding == .plain_bf16) return error.UnsupportedQwenPlainExecution;
     }
 };
 
@@ -52,11 +58,23 @@ pub const Placement = struct {
 };
 
 pub fn admit(gpa: std.mem.Allocator, bytes: []const u8) !Admitted {
+    const doc = try std.json.parseFromSlice(std.json.Value, gpa, bytes, .{});
+    defer doc.deinit();
+    if (doc.value != .object) return error.UnsupportedQwenQuantization;
+    const root = doc.value.object;
+    if (root.contains("quantization") and root.contains("quantization_config")) return error.UnsupportedQwenQuantization;
+    if (root.get("text_config")) |tower| if (tower == .object and
+        (tower.object.contains("quantization") or tower.object.contains("quantization_config"))) return error.UnsupportedQwenQuantization;
     if (try claimsBytes(gpa, bytes)) {
         const cfg = try Config.parse(gpa, bytes);
         return .{ .geometry = cfg.geometry, .encoding = .{ .modelopt = cfg } };
     }
-    return .{ .geometry = try dimensions.parse(gpa, bytes), .encoding = .mlx };
+    if (root.contains("quantization_config")) return error.UnsupportedQwenQuantization;
+    if (root.get("quantization")) |quant| {
+        if (quant != .object) return error.UnsupportedQwenQuantization;
+        return .{ .geometry = try dimensions.parse(gpa, bytes), .encoding = .mlx };
+    }
+    return .{ .geometry = try @import("cuda_bf16_config.zig").parse(gpa, bytes), .encoding = .plain_bf16 };
 }
 
 /// Claim the encoding before geometry validation so malformed ModelOpt never falls through to MLX.

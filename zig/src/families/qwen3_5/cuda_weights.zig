@@ -1,4 +1,5 @@
 //! The checkpoint's weights onto the device: affine projections packed as qlinear tiles of their served width.
+//! Local modification: refuse plain BF16 execution until its payload loader exists.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -13,6 +14,7 @@ pub fn plan(source: anytype, admitted: checkpoint.Admitted, placement: checkpoin
     _ = try placement.localGeometry(admitted.geometry);
     return switch (admitted.encoding) {
         .modelopt => |cfg| modelopt.plan(source, cfg, placement),
+        .plain_bf16 => error.UnsupportedQwenPlainExecution,
         .mlx => blk: {
             if (!placement.ownsEmbedding() or !placement.ownsHead()) return error.UnsupportedQwenPlacement;
             break :blk .{ .weights_bytes = total(admitted.geometry), .staging_bytes = stageBytes(admitted.geometry) };
@@ -24,6 +26,7 @@ pub fn loadPlaced(e: *Engine, ck: *core.Checkpoint, stage: *DeviceBuffer, admitt
     _ = try placement.localGeometry(admitted.geometry);
     switch (admitted.encoding) {
         .modelopt => |cfg| try modelopt.load(e, ck, stage, cfg, placement),
+        .plain_bf16 => return error.UnsupportedQwenPlainExecution,
         .mlx => {
             if (!placement.ownsEmbedding() or !placement.ownsHead()) return error.UnsupportedQwenPlacement;
             try load(e, ck, stage);
