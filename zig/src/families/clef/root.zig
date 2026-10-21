@@ -12,4 +12,6 @@ test {
     _ = engine;
     _ = abi;
     _ = @import("abi_test.zig");
+    _ = @import("head_test.zig");
+    _ = @import("engine_test.zig");
 }

@@ -398,9 +398,13 @@ transitive notices remain applicable.
 card stay in `clef-flash-fde727a2/`. Type of reuse: design only. The head
 checkpoint walk derives its 122 tensor names and shapes from that file's
 `JointSchemaHead`, `EvidenceRoutingLayer` and PyTorch `TransformerDecoderLayer`
-module tree and `joint_head_config.json`. The C record carries
-`encode_record`'s input ids and question and option spans. Nothing is copied
-from Cloudflare code into Zig, C or CUDA. `zig/src/families/clef/fixtures/`
+module tree and `joint_head_config.json`. `head.zig` and
+`zig/kernels/cuda/clef_head.cu` reimplement `JointSchemaHead.forward` for one
+record. The C record carries `encode_record`'s input ids and question and
+option spans. Nothing is copied from Cloudflare code into Zig, C or CUDA.
+Numerical semantics follow PyTorch 2.8 (BSD-3-Clause, `../PyTorch-BSD-3.txt`)
+as read from the installed `torch/nn` sources and ATen headers, including the
+memory-efficient SDPA forward's 64-key tiles; no PyTorch code is copied. `zig/src/families/clef/fixtures/`
 retains the unmodified `joint_head_config.json` and `joint_head.safetensors`
 JSON header bytes; `capture.json` records their SHA256 digests, the file size
 and the pinned file digest from the revision's Hugging Face metadata. No head
@@ -409,7 +413,11 @@ weights are included.
 Local changes: strict config and header admission, a device packing plan
 through the existing BF16 lane packer, a digest check on the mapped file before
 any upload, record validation with a derived option-to-question map, a checked
-device budget and the versioned C export layer with host tests.
+device budget and the versioned C export layer with host tests. The forward
+reuses vit.cu's LayerNorm, bias and pointwise kernels and the BF16 lane matmul;
+`clef_head.cu` adds span means, the option-query and field adds, attention,
+the per-question routing summary, normalization, the score features and the
+logit combination, plus a 4096-wide copy of vit.cu's LayerNorm arithmetic.
 
 ## Qwen host sampler tuning
 

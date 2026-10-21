@@ -29,11 +29,17 @@ reuses existing kernel bindings, stages bounded host embedding rows and separate
 terminal weights from final normalization. Native serving remains disabled.
 No model implementation, checkpoint weights or joint-head arithmetic is copied.
 
-The native Clef library (`zig/src/families/clef/`, `include/tfclef.h`) adapts
-the design of Cloudflare's `joint_schema_model.py` from the same revision,
-Apache-2.0: the joint schema head's tensor roles, from its module tree, and
+The native Clef library (`zig/src/families/clef/`,
+`zig/kernels/cuda/clef_head.cu`, `include/tfclef.h`) adapts the design of
+Cloudflare's `joint_schema_model.py` from the same revision, Apache-2.0: the
+joint schema head's tensor roles, from its module tree, its forward pass, and
 the encoded record's question and option spans. It is a reimplementation; no
-Cloudflare code is copied into Zig, C or CUDA. `zig/src/families/clef/fixtures/`
+Cloudflare code is copied into Zig, C or CUDA. The head's BF16 rounding points
+follow PyTorch 2.8 (BSD-3-Clause, `LICENSES/PyTorch-BSD-3.txt`):
+`nn.LayerNorm`, `nn.MultiheadAttention`, `nn.TransformerDecoderLayer`,
+`F.normalize`, `cosine_similarity` as it decomposes, and the memory-efficient
+SDPA forward's tile softmax as its shipped CUTLASS headers state it. No PyTorch
+code is copied; the attention kernel is written for this head. `zig/src/families/clef/fixtures/`
 copies the unmodified `joint_head_config.json` and the `joint_head.safetensors`
 JSON header; `capture.json` records their hashes and the pinned file digest.
 No head weights are included.
