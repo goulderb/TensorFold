@@ -504,18 +504,133 @@ PE timestamp and debug record and in nvcc's per-compilation names inside the
 `qmmf` string table; every code section and the other five images matched.
 Pin the library by the hash of the file actually deployed.
 
-### Unqualified
+### First head and full-engine device diagnostic
 
-- No kernel, head or engine has run on a device. Head parity against the
-  official head on identical hidden rows, the kernel units against FP64
-  references, and the noise-floor thresholds remain the next device unit.
+The SM89 library above ran on the decision GPU on 2026-10-21. The test used
+the pinned official encoder and checkpoint, six complete text records and
+eight questions covering choice, yes/no and score. The cases included 151,
+186, 208, 235, 4032 and exactly 4096 tokens. This is a bounded diagnostic,
+not a serving promotion.
+
+The head ran on identical captured hidden bytes from each of two sources:
+the official BF16 backbone and the native BF16 backbone. Before the native
+head ran, the official head ran in CUDA BF16 and CPU FP32 on each corpus to
+measure their precision variation. Across the eight questions, the native
+head's maximum and mean absolute logit and probability differences from
+CUDA BF16 were within those measured reference differences.
+
+| Hidden rows | Native vs CUDA BF16 maximum probability difference | CUDA BF16 vs CPU FP32 maximum probability difference |
+| --- | ---: | ---: |
+| Official BF16 | 0.00344658 | 0.00404972 |
+| Native BF16 | 0.00190562 | 0.00247425 |
+
+No top choice changed. Each native head call repeated with identical logits.
+The complete engine also ran all six records twice with identical logits.
+Its outputs exactly matched the head-only calls on separately captured
+native hidden rows. Against the official BF16 backbone and head, the maximum
+probability difference over these eight questions was 0.00903040, with no
+top-choice change.
+
+The two 4096-token full-engine forwards took 15.0398 and 15.0365 seconds;
+the head alone on those rows took 0.01522 and 0.01528 seconds. These are
+direct-library timings excluding encoding and HTTP, not a user-facing
+speed comparison. Native-engine construction through the Python adapter,
+including checkpoint verification and CPU processor loading, took 23.08
+seconds. Physical GPU samples during the
+full-engine unit retained at least 1880 MiB free on the decision GPU and
+4530/4772 MiB on the untouched internal GPUs. These physical readings are
+distinct from the CUDA context's memory accounting. The result establishes
+fit for the tested one-record 4096-token shape, not sustained headroom or a
+soak.
+
+The backbone captures additionally compared native BF16 and official BF16
+against a layer-streamed FP32 reference with TF32 disabled and the explicit
+PyTorch chunked GDN implementation. Both BF16 paths differ from FP32;
+neither uniformly has the smaller hidden-row error. Hidden metrics remain
+diagnostic and do not assign an output-parity verdict.
+
+### Paired decision corpus and latency
+
+The same pinned library then ran the existing Decisions corpus through an
+opt-in HTTP adapter, alternating five fresh Python and native services. Each
+run had one warmup followed by the same 231 labeled requests, sequentially,
+with no proxy fallback. Timings include encoding, the backbone and head,
+answer formatting and HTTP through response parsing; they exclude startup
+and warmup. Both engines used the same checkpoint, encoder and production
+Python settings. The native library was ReleaseFast with 16-row backbone
+chunks. Brief CPU preparation for the next probe overlapped the fifth pair;
+the first four pairs independently show the same large gap.
+
+| Per-run quantile, median of five runs (range) | Python BF16 | Current native build |
+| --- | ---: | ---: |
+| Request p50 | 91 ms (89–98) | 719 ms (717–721) |
+| Request p95 | 668 ms (666–676) | 9225 ms (9222–9234) |
+
+All 2310 measured requests succeeded. Each engine scored 191/231 in every
+run. Answers repeated identically within each engine; native probabilities
+are close to, rather than identical to, Python. Paired native/Python maximum
+option-probability differences had mean 0.00206840, p95 0.0095, p99 0.015 and
+maximum 0.0248, with zero top-choice flips or confidence-threshold crossings.
+The 18 continuous-score answers differed by at most 0.0108.
+
+These results meet the output envelope registered before native execution,
+using measured Python/independent-hosted spread. Native ECE was 0.0624736
+against a limit of 0.0735017, and Brier was 0.193323 against 0.194310. Native
+Brier is slightly worse than Python's 0.192572 while remaining inside that
+hosted envelope. The head-only precision-variation gate above is separate.
+No latency benefit is established: this native build is about 7.9 times
+slower at p50 and 13.8 times slower at p95, and is not a promotion candidate.
+
+The original Python service was restored and verified with direct and
+public-local completions. The benchmark's OS exit status was unavailable
+after an adopted-process monitor lost its Windows process handle; completion
+was independently checked from all ten complete results, raw answers,
+server counters and absence of the trial listener before restoration.
+Serving-phase GPU samples buffered in the monitors are unavailable. The
+earlier full-DLL physical capacity samples remain intact; this run does not
+establish continuous serving-phase memory headroom.
+
+### Bounded projection batching screen
+
+A separate short experiment reused the existing shared BF16 `qmmf` lane and
+SM89 image, with a real 12288-by-4096 Clef up-projection and 128 saved hidden
+rows. It compared the same complete work as eight 16-row calls and two
+64-row calls. The inputs use final-normalized backbone rows as representative
+values, not that projection's actual layer activations. The weight is 96 MiB,
+larger than the GPU's last-level cache. After warmup, five alternating pairs
+each timed 100 complete repetitions, with synchronized wall and CUDA-event
+timings and output readback outside the timed region.
+
+| Complete 128-row projection | Wall time, median (range) |
+| --- | ---: |
+| 16-row tiles | 1.351742 ms (1.351111–1.404410) |
+| 64-row tiles | 0.353288 ms (0.352974–0.353847) |
+
+The 64-row path is about 3.83 times faster at this seam. All 1572864 BF16
+outputs were finite and bit-identical after warmup and every measured pair;
+the selected plans used BM16/BM64, split-K 1 and no reduction. This supports
+the hypothesis that larger row batches can amortize the projection work.
+It does not measure projections' share of the full backbone or a whole-engine
+speedup. The next useful measurement is that share, before changing the
+coupled prefill buffers, attention/GDN state and row-mask limits. No engine
+setting or production pin changed. After this test, the original Python
+service again completed direct and public-local requests. An initial busy
+direct probe is retained separately from the successful bounded recheck.
+
+### Remaining qualification
+
+- Kernel units against FP64 references remain separate from the passing
+  application-output envelope.
 - The SDPA backend torch selects on the service, its key-tile size and the
   cuBLAS reduction policy were not observed at runtime.
-- Physical device fit at 4096 tokens, open time, latency and the attention
-  kernel's speed are unmeasured.
-- The backbone's native/reference discrepancy above remains open.
+- The measured HTTP regression needs backbone cost attribution and a matched
+  full-engine comparison after any surviving batching change. The projection
+  microbenchmark alone does not justify integration or promotion.
+- The backbone's native/reference discrepancy above is measured against
+  FP32 as well, but its layer-level causes remain open.
 - The Python service integration (`NativeClefEngine`, its owner thread and the
-  launcher branch) is a separate fleet unit.
+  launcher branch) is a separate fleet unit. Public native routing, spill,
+  supervised recovery and sustained full-capacity behavior remain unqualified.
 
 ## Public-history port
 
